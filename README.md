@@ -1,13 +1,15 @@
 # qnxprobe
 
-Decide whether an extraction holds a QNX6 filesystem, by locating and validating
-the superblock rather than trusting a partition type byte.
+Read QNX6 and ext2/3/4 filesystems out of raw disk images: identify by superblock rather than trusting a partition type byte, list, and extract to a zip with a provenance manifest. No mounting, no admin rights, standard library only.
 
-QNX is what a lot of vehicle infotainment runs on. When a head unit image lands on
-your desk, the first question is what filesystems are in it, and the usual tools do
-not answer it: `blkid`, `file` and The Sleuth Kit have no QNX6 support, and the
-partition table will happily call a qnx6 volume `0x83 Linux`. This reads the
-superblock and tells you what is actually there.
+QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
+exists and keeps its name. When a head unit image lands on your desk, the first
+question is what filesystems are in it, and the usual tools do not answer it:
+`blkid`, `file` and The Sleuth Kit have no QNX6 support, and the partition table
+will happily call a qnx6 volume `0x83 Linux`. This reads the superblock and tells
+you what is actually there, then lists and extracts what it found. It reads
+ext2/3/4 the same way, so a mixed vehicle landscape (Ford runs QNX, BMW runs
+Linux) is one tool rather than two.
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image.
@@ -89,6 +91,28 @@ A head unit runs to tens of gigabytes and most of it is not evidence.
 ```
 python3 qnxprobe.py --triage mmcblk0.img
 ```
+
+## What an extraction is named, and how to check it
+
+Every volume extracts under a directory named from the partition table, not from
+the filesystem:
+
+```
+p2_lba65536                MBR primary 2
+p6_lba13168672             second logical volume (logicals number from 5, as OSes do)
+p3_lba16384_dps_mfg        GPT partition 3, carrying its name
+lba0                       no partition table: a whole-disk filesystem or bare region
+```
+
+The LBA is the identity. It is a physical fact about the image that any partition
+tool reproduces, and two volumes cannot share one, so names cannot collide. A
+label is only ever a suffix.
+
+The zip also carries `volumes.json`: per volume, the LBA, byte offset, partition
+size, filesystem type, the recorded volume id or UUID, and what was extracted.
+For a bare image with no vendor export alongside it, that file is the record
+tying every extracted path back to a place on the disk, checkable against
+`mmls` or `fdisk` without trusting the directory names.
 
 `--triage` ranks the volumes by how much each has been written, using only what the
 probe already read: the qnx6 superblock serial is a commit counter, and ext exposes
