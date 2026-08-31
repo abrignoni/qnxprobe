@@ -1,6 +1,9 @@
 # qnxprobe
 
-Read QNX6 and ext2/3/4 filesystems out of raw disk images: identify by superblock rather than trusting a partition type byte, list, and extract to a zip with a provenance manifest. No mounting, no admin rights, standard library only.
+Read QNX6, ext2/3/4, FAT32 and exFAT filesystems out of raw disk images:
+identify by superblock rather than trusting a partition type byte, list, and
+extract to a zip with a provenance manifest. No mounting, no admin rights,
+standard library only.
 
 QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
 exists and keeps its name. When a head unit image lands on your desk, the first
