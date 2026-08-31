@@ -1,7 +1,7 @@
 # qnxprobe
 
-Read QNX6, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems, and QNX IFS boot
-images, out of raw disk images: identify each by its own on-disk structure
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems, and QNX IFS
+boot images, out of raw disk images: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
 
@@ -24,6 +24,16 @@ Their byte layouts are transcribed from the Kaitai specs in
 (Apache-2.0), whose ETFS spec is itself sourced to QNX's `fs/etfs.h` and whose EFS
 spec to `fs/f3s_spec.h`, and both readers are validated by round-trip against
 qnxmount's own committed test images.
+
+It also reads QNX4, the filesystem of QNX 4 systems, still met on older embedded
+and industrial gear. The MBR type bytes `0x4d/0x4e/0x4f` announce a QNX4
+partition but never prove one; this reads the actual structure, the `/` root
+inode that doubles as the `0x002f` magic, and walks it the way the Linux
+kernel's own read-only `fs/qnx4` driver does, inline 64-byte inode entries,
+long names resolved through `.inodes` links, and multi-extent files through
+their `IamXblk` chains. The reader is validated by round-trip against that
+kernel driver on a populated fixture; see
+[Where the constants come from](#where-the-constants-come-from).
 
 It also reads QNX IFS boot images, the compressed boot filesystem behind a head
 unit's `ifs_*` partitions, holding the kernel, the boot drivers and the startup
@@ -181,7 +191,7 @@ and the manual zip in one step. `--exclude` is repeatable.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, ext2/3/4, FAT32, exFAT, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -284,6 +294,40 @@ summed to zero against the trailer's checksum, and the extracted files were
 valid, including the AArch64 ELF kernel `procnto-smp-instr` whose machine matched
 the startup header. That checksum is reported on every run as a decode self-check.
 
+QNX4, from the Linux kernel's read-only qnx4 driver, the same sourcing as qnx6:
+
+```
+QNX4_SUPER_MAGIC       0x002f   linux/include/uapi/linux/magic.h:54
+struct qnx4_inode_entry         linux/include/uapi/linux/qnx4_fs.h:44
+struct qnx4_link_info           linux/include/uapi/linux/qnx4_fs.h:63
+struct qnx4_xblk ("IamXblk")    linux/include/uapi/linux/qnx4_fs.h:71
+field widths                    linux/include/uapi/linux/qnxtypes.h
+directory entry union           linux/fs/qnx4/qnx4.h:75
+```
+
+The `0x002f` magic is simply the `/` name of the root directory inode at the
+start of the superblock, 512 bytes into the volume. Blocks are 512 bytes and
+1-based on disk. A directory's data is a run of 64-byte entries: a name up to
+16 bytes is a full inode entry stored inline, a longer name (up to 48) is a
+link entry resolving to the real inode by block and index, conventionally
+inside the `.inodes` file. A file's extents 2..n live in a chain of `IamXblk`
+blocks, followed exactly as `fs/qnx4/inode.c qnx4_block_map()` follows them.
+Detection requires what the kernel itself requires to mount: the `/` root
+inode with a directory mode and a `.bitmap` entry in the root directory
+(`qnx4_checkroot`). A QNX4 boot block can end in `0x55AA`, so the MBR parser
+declines a sector whose following sector is a QNX4 root superblock, the same
+shared-magic rule as FAT above.
+
+The QNX4 reader was validated by round-trip against the Linux kernel driver
+itself: a fixture populated with nested directories, a multi-extent file, a
+long name, a symlink, an empty file and distinct modes, owners and mtimes was
+mounted read-only with `fs/qnx4` on kernel 7.0.0, and every path, type,
+permission, owner, size, mtime, symlink target and byte of content the kernel
+reported matched what this walker reads, 15 of 15 entries. The fixture was
+written by a separate generator program (its skeleton follows Peter
+Waechtler's Linux-side QNX4 `dinit`, a second independent statement of the
+layout), not by this parser, so the two sides are independent.
+
 QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0):
 
@@ -317,8 +361,11 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
   either.
-- **QNX4 is recognised only as an MBR partition type**, from util-linux's
-  `pt-mbr-partnames.h`. There is no QNX4 filesystem parser here.
+- **QNX4 is validated against a synthetic fixture, not yet against a real QNX4
+  volume.** The round-trip oracle is the Linux kernel's own `fs/qnx4` driver, an
+  independent implementation, but no confirmed real QNX4 volume exists in the
+  test corpus; the one candidate partition (a Ford Sync G4 slot named
+  `boot_fs`) turned out to carry a `RAW0` container, not QNX4.
 - **ETFS and EFS are validated against qnxmount's synthetic test images, not yet
   against a real vehicle extraction.** No confirmed ETFS or EFS volume was available to
   test on. ETFS in particular keeps its transaction metadata in the NAND spare/out-of-band
