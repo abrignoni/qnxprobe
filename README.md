@@ -1,9 +1,9 @@
 # qnxprobe
 
-Read QNX6, ext2/3/4, FAT32 and exFAT filesystems out of raw disk images:
-identify by superblock rather than trusting a partition type byte, list, and
-extract to a zip with a provenance manifest. No mounting, no admin rights,
-standard library only.
+Read QNX6, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems out of raw disk
+images: identify each by its own on-disk structure rather than trusting a
+partition type byte, list, and extract to a zip with a provenance manifest. No
+mounting, no admin rights, standard library only.
 
 QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
 exists and keeps its name. When a head unit image lands on your desk, the first
@@ -13,6 +13,17 @@ will happily call a qnx6 volume `0x83 Linux`. This reads the superblock and tell
 you what is actually there, then lists and extracts what it found. It reads
 ext2/3/4 the same way, so a mixed vehicle landscape (Ford runs QNX, BMW runs
 Linux) is one tool rather than two.
+
+It also reads QNX's two flash filesystems, ETFS and EFS, the kind a head unit
+keeps its manufacturing and configuration data on. Both are typically imaged bare
+with no partition table, so they arrive as the whole image and are read at LBA 0.
+ETFS has no superblock at all, so it is rebuilt by replaying the transaction
+records in each page's spare area; EFS is found by its `QSSL_F3S` boot record.
+Their byte layouts are transcribed from the Kaitai specs in
+[NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
+(Apache-2.0), whose ETFS spec is itself sourced to QNX's `fs/etfs.h` and whose EFS
+spec to `fs/f3s_spec.h`, and both readers are validated by round-trip against
+qnxmount's own committed test images.
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image.
@@ -159,7 +170,7 @@ and the manual zip in one step. `--exclude` is repeatable.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6 and ext2/3/4) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, ext2/3/4, FAT32, exFAT, ETFS and EFS) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -178,14 +189,18 @@ Run it once before you trust a negative result on real evidence.
 python3 qnxprobe.py --self-test
 ```
 
-It builds three throwaway images in a temp directory, two that must be detected and
-one that must not, checks all three, and removes the directory.
+It builds throwaway images in a temp directory, some that must be detected and one
+that must not, across qnx6 (both endians), FAT32, exFAT, ETFS and EFS, checks them,
+and removes the directory. For ETFS it also round-trips one file out of a synthetic
+image, so a broken structure offset, not just a broken constant, turns the leg red.
 
 The expected values in it are written as literal bytes rather than derived from the
 constant they verify. That matters: an earlier version built its fixtures from
 `QNX6_MAGIC`, and it passed with the magic deliberately corrupted to `0x68191123`,
 which is a build that cannot identify a single real filesystem. A test whose fixture
-moves with the bug is not a test.
+moves with the bug is not a test. The same discipline covers the ETFS reserved names
+and the EFS `QSSL_F3S` signature: break one of those literals and the self-test
+exits 1.
 
 ## A magic match is not a finding
 
@@ -238,6 +253,26 @@ confirms. The `machine` field is an ELF machine type, reported through `EM_386` 
 `EM_ARM` 40, `EM_X86_64` 62 and `EM_AARCH64` 183 from
 `linux/include/uapi/linux/elf-em.h`.
 
+QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
+(Apache-2.0):
+
+```
+etfs_trans, fid scheme, ftable + dir entry   qnxmount/etfs/parser.ksy -> fs/etfs.h
+F3S extent, unit, boot, dir entry            qnxmount/efs/parser.ksy  -> fs/f3s_spec.h
+```
+
+qnxmount is a peer institute's vehicle-forensics reader. Its ETFS spec cross-references
+QNX's own `fs/etfs.h` and its EFS spec `fs/f3s_spec.h`; only the field layouts are
+transcribed here, into the same hand-written struct style, so the Kaitai runtime is not
+a dependency and the tool stays standard library only. Both readers were validated by
+extracting qnxmount's own committed test images and comparing every name, mode, owner,
+timestamp, symlink target and byte of content against the tar archive built from the
+same live filesystem, which qnxmount produced on QNX independently of this code: ETFS
+matched 32 of 32 entries, EFS 31 of 31. ETFS has no magic, so it is claimed only when
+the page geometry divides evenly and the `.filetable` carries its fixed reserved names
+at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
+u-boot, boot_fs or ext partitions of the two vehicle images tested.
+
 `--help` prints this same sourcing, so it travels with the tool.
 
 ## What it does not do
@@ -251,6 +286,12 @@ confirms. The `machine` field is an ELF machine type, reported through `EM_386` 
   either.
 - **QNX4 is recognised only as an MBR partition type**, from util-linux's
   `pt-mbr-partnames.h`. There is no QNX4 filesystem parser here.
+- **ETFS and EFS are validated against qnxmount's synthetic test images, not yet
+  against a real vehicle extraction.** No confirmed ETFS or EFS volume was available to
+  test on. ETFS in particular keeps its transaction metadata in the NAND spare/out-of-band
+  area, so an ETFS volume is only readable if the acquisition captured that spare area;
+  an image that dropped it will not divide into pages and will be reported as not
+  recognised rather than misread.
 
 ## License
 
