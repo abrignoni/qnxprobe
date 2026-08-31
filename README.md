@@ -90,6 +90,28 @@ A head unit runs to tens of gigabytes and most of it is not evidence.
 python3 qnxprobe.py --triage mmcblk0.img
 ```
 
+## What an extraction is named, and how to check it
+
+Every volume extracts under a directory named from the partition table, not from
+the filesystem:
+
+```
+p2_lba65536                MBR primary 2
+p6_lba13168672             second logical volume (logicals number from 5, as OSes do)
+p3_lba16384_dps_mfg        GPT partition 3, carrying its name
+lba0                       no partition table: a whole-disk filesystem or bare region
+```
+
+The LBA is the identity. It is a physical fact about the image that any partition
+tool reproduces, and two volumes cannot share one, so names cannot collide. A
+label is only ever a suffix.
+
+The zip also carries `volumes.json`: per volume, the LBA, byte offset, partition
+size, filesystem type, the recorded volume id or UUID, and what was extracted.
+For a bare image with no vendor export alongside it, that file is the record
+tying every extracted path back to a place on the disk, checkable against
+`mmls` or `fdisk` without trusting the directory names.
+
 `--triage` ranks the volumes by how much each has been written, using only what the
 probe already read: the qnx6 superblock serial is a commit counter, and ext exposes
 mount count and lifetime kilobytes written. It also samples filenames and says so
