@@ -1,13 +1,15 @@
 # qnxprobe
 
-Decide whether an extraction holds a QNX6 filesystem, by locating and validating
-the superblock rather than trusting a partition type byte.
+Read QNX6 and ext2/3/4 filesystems out of raw disk images: identify by superblock rather than trusting a partition type byte, list, and extract to a zip with a provenance manifest. No mounting, no admin rights, standard library only.
 
-QNX is what a lot of vehicle infotainment runs on. When a head unit image lands on
-your desk, the first question is what filesystems are in it, and the usual tools do
-not answer it: `blkid`, `file` and The Sleuth Kit have no QNX6 support, and the
-partition table will happily call a qnx6 volume `0x83 Linux`. This reads the
-superblock and tells you what is actually there.
+QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
+exists and keeps its name. When a head unit image lands on your desk, the first
+question is what filesystems are in it, and the usual tools do not answer it:
+`blkid`, `file` and The Sleuth Kit have no QNX6 support, and the partition table
+will happily call a qnx6 volume `0x83 Linux`. This reads the superblock and tells
+you what is actually there, then lists and extracts what it found. It reads
+ext2/3/4 the same way, so a mixed vehicle landscape (Ford runs QNX, BMW runs
+Linux) is one tool rather than two.
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image.
