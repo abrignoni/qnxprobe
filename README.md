@@ -1,9 +1,9 @@
 # qnxprobe
 
-Read QNX6, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems out of raw disk
-images: identify each by its own on-disk structure rather than trusting a
-partition type byte, list, and extract to a zip with a provenance manifest. No
-mounting, no admin rights, standard library only.
+Read QNX6, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems, and QNX IFS boot
+images, out of raw disk images: identify each by its own on-disk structure
+rather than trusting a partition type byte, list, and extract to a zip with a
+provenance manifest. No mounting, no admin rights, standard library only.
 
 QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
 exists and keeps its name. When a head unit image lands on your desk, the first
@@ -24,6 +24,17 @@ Their byte layouts are transcribed from the Kaitai specs in
 (Apache-2.0), whose ETFS spec is itself sourced to QNX's `fs/etfs.h` and whose EFS
 spec to `fs/f3s_spec.h`, and both readers are validated by round-trip against
 qnxmount's own committed test images.
+
+It also reads QNX IFS boot images, the compressed boot filesystem behind a head
+unit's `ifs_*` partitions, holding the kernel, the boot drivers and the startup
+scripts. The image filesystem is UCL-compressed, which is not in the standard
+library, so a small pure-Python UCL NRV2B decoder is carried in the file rather
+than taken as a dependency: the tool still installs nothing. The format and the
+decompression are sourced from QNX's own `dumpifs` and `sys/image.h`, and the
+decoder is proven byte for byte against the three Ford Sync G4 IFS volumes (each
+decompresses to exactly the size its header records and the image checksum
+balances). See [What it does not do](#what-it-does-not-do) for the compression
+methods it recognises but does not yet read.
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image.
@@ -170,7 +181,7 @@ and the manual zip in one step. `--exclude` is repeatable.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, ext2/3/4, FAT32, exFAT, ETFS and EFS) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, ext2/3/4, FAT32, exFAT, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -190,9 +201,13 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), FAT32, exFAT, ETFS and EFS, checks them,
-and removes the directory. For ETFS it also round-trips one file out of a synthetic
-image, so a broken structure offset, not just a broken constant, turns the leg red.
+that must not, across qnx6 (both endians), FAT32, exFAT, ETFS, EFS and QNX IFS,
+checks them, and removes the directory. For ETFS it also round-trips one file out of
+a synthetic image, so a broken structure offset, not just a broken constant, turns
+the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
+expected output is written out by hand, and a flipped byte in a synthetic imagefs
+must break the image checksum, so a regression in the decompressor or the walk
+turns a leg red rather than passing against itself.
 
 The expected values in it are written as literal bytes rather than derived from the
 constant they verify. That matters: an earlier version built its fixtures from
@@ -240,18 +255,34 @@ The ext field offsets were derived from that header and cross-checked against it
 `/*NN*/` offset markers, all fifteen of which agreed, with the struct totalling the
 expected 1024 bytes.
 
-QNX IFS boot images:
+QNX IFS boot images, from QNX's own `dumpifs` and `sys/image.h`:
 
 ```
 STARTUP_HDR_SIGNATURE  0x00ff7eeb   qnx sys/startup.h:88
 STARTUP_HDR_VERSION             1   qnx sys/startup.h:89
 struct startup_header               qnx sys/startup.h
+flags1 compression, block framing   qnx dumpifs.c  (none/zlib/lzo/ucl)
+struct image_header, image_dirent   qnx sys/image.h
+UCL NRV2B (_8) decompressor          Oberhumer UCL src/n2b_d.c, src/getbit.h
 ```
 
-Those field widths sum to 256 bytes, which each image's own `header_size` field
-confirms. The `machine` field is an ELF machine type, reported through `EM_386` 3,
-`EM_ARM` 40, `EM_X86_64` 62 and `EM_AARCH64` 183 from
-`linux/include/uapi/linux/elf-em.h`.
+The startup header's field widths sum to 256 bytes, which each image's own
+`header_size` field confirms, and the `machine` field is an ELF machine type
+(`EM_386` 3, `EM_ARM` 40, `EM_X86_64` 62, `EM_AARCH64` 183 from
+`linux/include/uapi/linux/elf-em.h`). `flags1` gives the compression method; a
+compressed imagefs is a run of blocks, each a two-byte big-endian length then
+that many bytes decompressing to at most 64 KiB, ending at a zero length. Each
+UCL block is NRV2B, ported from Oberhumer's UCL into a small pure-Python decoder
+so the tool still installs nothing, and `zlib` images are read through the
+standard library. The decompressed image is walked from its `image_header` and a
+flat table of `image_dirent` records.
+
+This is proven byte for byte against the Ford Sync G4 `ifs_a`, `ifs_b` and
+`ifs_recovery` volumes: each decompressed to exactly the `imagefs_size` its own
+header records, the 32-bit words from the header through the `image_trailer`
+summed to zero against the trailer's checksum, and the extracted files were
+valid, including the AArch64 ELF kernel `procnto-smp-instr` whose machine matched
+the startup header. That checksum is reported on every run as a decode self-check.
 
 QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0):
@@ -277,9 +308,11 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
 ## What it does not do
 
-- **IFS contents are not listed.** The IFS directory format is not sourced here, and
-  on every image tested the filesystem is stored compressed, so listing it would mean
-  guessing a layout. The header is reported and nothing is invented.
+- **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
+  QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
+  Becker HBCIFS container are recognised and reported but not decompressed, because no
+  sample exists to validate a reader against. A big-endian IFS is declined the same way.
+  In each case the header is still reported and the walk is declined out loud.
 - **It does not decrypt.** A volume with encrypted filenames is flagged, not opened.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
