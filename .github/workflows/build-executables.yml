@@ -79,7 +79,7 @@ jobs:
           cli = os.path.join("dist", "qnxprobe.exe")
           gui = os.path.join("dist", "qnxprobe_gui.exe")
           fixtures = sorted(glob.glob("fixtures/*.img") + glob.glob("fixtures/*.bin"))
-          assert len(fixtures) == 12, fixtures
+          assert len(fixtures) == 14, fixtures
 
           r = subprocess.run([cli, "--self-test"], capture_output=True, text=True)
           print(r.stdout[-600:]); assert r.returncode == 0 and "SELF-TEST PASSED" in r.stdout
@@ -95,7 +95,7 @@ jobs:
           r = subprocess.run([gui, "--check-discovery"] + fixtures, capture_output=True, text=True)
           print(r.stdout); assert r.returncode == 0, r.stderr[-2000:]
           lines = [l for l in r.stdout.splitlines() if l.strip()]
-          assert len(lines) == 12 and all(l.startswith("OK") for l in lines), lines
+          assert len(lines) == 14 and all(l.startswith("OK") for l in lines), lines
           print("all executables ran on", os.environ.get("RUNNER_ARCH"))
 
       - name: Check the window starts and stays up

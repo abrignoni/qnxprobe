@@ -372,6 +372,19 @@ inode with a directory mode and a `.bitmap` entry in the root directory
 declines a sector whose following sector is a QNX4 root superblock, the same
 shared-magic rule as FAT above.
 
+A qnx6 boot block can end in `0x55AA` as well: on qnxmount's qnx6 reference image
+sector 0 is x86 boot code, and its bytes at 446 parse as two partitions starting
+1.5 and 1.8 TB into a 400 KB file. Taking that table at face value hid the
+filesystem entirely, since the qnx6 at offset 0 then had no partition to be listed
+or extracted from and its end-of-volume superblock, the active generation, was never
+probed. So the MBR parser first checks for a consistent qnx6 superblock at `0x2000`,
+the offset the Linux driver reads (`fs/qnx6/inode.c`, `qnx6_fill_super`), and
+declines the sector if one is there. As a last resort it also declines any table none
+of whose partitions begins inside the image. The boot indicator byte is not used as a
+test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table on it.
+The self-test builds an image of this shape and requires both superblock copies to be
+found and the volume to be listed.
+
 The QNX4 reader was validated by round-trip against the Linux kernel driver
 itself: a fixture populated with nested directories, a multi-extent file, a
 long name, a symlink, an empty file and distinct modes, owners and mtimes was
