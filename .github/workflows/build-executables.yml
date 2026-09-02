@@ -1,4 +1,4 @@
-name: Build Windows executables
+name: Build executables
 
 on:
   workflow_dispatch:
@@ -22,6 +22,14 @@ jobs:
             label: windows-x64
           - os: windows-11-arm
             label: windows-arm64
+          - os: macos-latest
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-x64
+          - os: ubuntu-22.04
+            label: linux-x64
+          - os: ubuntu-22.04-arm
+            label: linux-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +47,10 @@ jobs:
           tag = os.environ["GITHUB_REF_NAME"]
           assert tag == "v" + version, f"tag {tag} does not match QNXPROBE_VERSION {version}"
           print("tag", tag, "matches QNXPROBE_VERSION")
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
 
       - name: Install PyInstaller
         run: |
@@ -76,8 +88,9 @@ jobs:
         shell: python
         run: |
           import glob, os, subprocess
-          cli = os.path.join("dist", "qnxprobe.exe")
-          gui = os.path.join("dist", "qnxprobe_gui.exe")
+          ext = ".exe" if os.name == "nt" else ""
+          cli = os.path.join("dist", "qnxprobe" + ext)
+          gui = os.path.join("dist", "qnxprobe_gui" + ext)   # the bare binary; macOS also gets a .app
           fixtures = sorted(glob.glob("fixtures/*.img") + glob.glob("fixtures/*.bin"))
           assert len(fixtures) == 14, fixtures
 
@@ -96,19 +109,23 @@ jobs:
           print(r.stdout); assert r.returncode == 0, r.stderr[-2000:]
           lines = [l for l in r.stdout.splitlines() if l.strip()]
           assert len(lines) == 14 and all(l.startswith("OK") for l in lines), lines
-          print("all executables ran on", os.environ.get("RUNNER_ARCH"))
+          print("all executables ran on", os.environ.get("RUNNER_OS"), os.environ.get("RUNNER_ARCH"))
 
       - name: Check the window starts and stays up
         shell: python
         run: |
-          import os, subprocess, time
-          p = subprocess.Popen([os.path.join("dist", "qnxprobe_gui.exe"), "fixtures/positive_le.img"])
+          import os, subprocess, sys, time
+          ext = ".exe" if os.name == "nt" else ""
+          cmd = [os.path.join("dist", "qnxprobe_gui" + ext), "fixtures/positive_le.img"]
+          if sys.platform.startswith("linux"):
+              cmd = ["xvfb-run", "-a"] + cmd
+          p = subprocess.Popen(cmd)
           time.sleep(20)
           alive = p.poll() is None
           if alive:
               p.terminate()
           print("gui process alive after 20 s:", alive, "| exit code:", p.poll())
-          assert alive, "qnxprobe_gui.exe exited early"
+          assert alive, "qnxprobe_gui exited early"
 
       - name: Package
         shell: bash
@@ -117,16 +134,29 @@ jobs:
           name="qnxprobe-${GITHUB_REF_NAME//\//-}-${{ matrix.label }}"
           mkdir -p "pkg/$name"
           cp packaging/README.txt LICENSE "pkg/$name/"
-          cp dist/qnxprobe.exe dist/qnxprobe_gui.exe "pkg/$name/"
-          (cd "pkg/$name" && sha256sum qnxprobe.exe qnxprobe_gui.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          (cd pkg && 7z a -bd "../$name.zip" "$name" > /dev/null)
-          ls -la "$name.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp dist/qnxprobe.exe dist/qnxprobe_gui.exe "pkg/$name/"
+            (cd "pkg/$name" && sha256sum qnxprobe.exe qnxprobe_gui.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && 7z a -bd "../$name.zip" "$name" > /dev/null)
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp dist/qnxprobe "pkg/$name/"
+            cp -R dist/qnxprobe_gui.app "pkg/$name/"
+            (cd "pkg/$name" && shasum -a 256 qnxprobe qnxprobe_gui.app/Contents/MacOS/qnxprobe_gui > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && ditto -c -k --keepParent "$name" "../$name.zip")
+          else
+            cp dist/qnxprobe dist/qnxprobe_gui "pkg/$name/"
+            (cd "pkg/$name" && sha256sum qnxprobe qnxprobe_gui > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && tar -czf "../$name.tar.gz" "$name")
+          fi
+          ls -la "$name".*
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: qnxprobe-${{ matrix.label }}
-          path: qnxprobe-*.zip
+          path: |
+            qnxprobe-*.zip
+            qnxprobe-*.tar.gz
           if-no-files-found: error
 
   release:
@@ -145,7 +175,7 @@ jobs:
 
       - name: Checksums of the archives
         run: |
-          cd artifacts && sha256sum qnxprobe-*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt
+          cd artifacts && sha256sum qnxprobe-* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: Create the release
         env:
