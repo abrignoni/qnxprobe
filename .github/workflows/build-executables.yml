@@ -128,3 +128,30 @@ jobs:
           name: qnxprobe-${{ matrix.label }}
           path: qnxprobe-*.zip
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums of the archives
+        run: |
+          cd artifacts && sha256sum qnxprobe-*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sed "s/{{VERSION}}/${GITHUB_REF_NAME}/g" packaging/release-notes.md > notes.md
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --title "qnxprobe ${GITHUB_REF_NAME}" \
+            --notes-file notes.md
