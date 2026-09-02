@@ -109,6 +109,17 @@ before this was published, and all agreed. A qnx6 found only by the brute scan
 is reported but has no partition to walk, so it appears in the report and not in
 the Contents pane, in the window exactly as on the command line.
 
+## Windows executables
+
+For a machine with no Python, the repository's GitHub Actions workflow
+(`.github/workflows/build-executables.yml`) builds both files into standalone
+executables with PyInstaller, `qnxprobe.exe` for the command line and
+`qnxprobe_gui.exe` for the window, for x64 and for arm64 Windows. Each build runs
+the self-test, the discovery check and a window liveness check on the runner
+before it is packaged with `SHA256SUMS.txt` and a README. The executables are not
+code signed. They are published on the release for a `v*` tag and are otherwise
+available as workflow artifacts.
+
 ## What a run looks like
 
 ```
