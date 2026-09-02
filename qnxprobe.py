@@ -27,7 +27,7 @@ Read-only throughout. Never writes to the image.
 """
 import os, re, struct, sys, datetime, json, time, uuid, zipfile
 
-QNXPROBE_VERSION = "1.9"
+QNXPROBE_VERSION = "1.10"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
