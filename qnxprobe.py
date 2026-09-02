@@ -73,6 +73,15 @@ def sb_slots(fh, base, label, sized_regions):
         total = head[1]["num_blocks"] * head[1]["blocksize"]
         if 0 < total < (1 << 42):
             ends.append(total)
+            # Where the kernel itself reads the second superblock: block
+            # sb_num_blocks + (QNX6_BOOTBLOCK_SIZE + QNX6_SUPERBLOCK_AREA) /
+            # blocksize, fs/qnx6/inode.c qnx6_fill_super, with the area 0x1000
+            # from include/linux/qnx6_fs.h. The region-size candidates above
+            # reach the same place only when the partition is exactly
+            # BOOTBLOCK + area + volume + area long; this reaches it when the
+            # partition is larger, or when there is no partition at all.
+            second = BOOTBLOCK_SIZE + 0x1000 + total
+            rels += [second, second + 0xE00]
     for e in ends:
         rels += [e - 0x1000, e - 0x200]
 
