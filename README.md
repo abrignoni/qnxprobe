@@ -47,7 +47,8 @@ balances). See [What it does not do](#what-it-does-not-do) for the compression
 methods it recognises but does not yet read.
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
-it never writes to the image.
+it never writes to the image. A second, optional file, `qnxprobe_gui.py`, puts a
+window over it (see [The window](#the-window)); it is standard library too.
 
 ## Requirements
 
@@ -65,6 +66,48 @@ python3 qnxprobe.py partition2.dd          # a partition already carved out
 python3 qnxprobe.py --self-test            # prove it reports both ways
 python3 qnxprobe.py --help                 # every option, with sourcing
 ```
+
+## The window
+
+`qnxprobe_gui.py` is a tkinter front end for people who would rather not use a
+terminal. It needs the same Python and nothing else; tkinter ships with the
+standard Python installers on macOS and Windows and with the `python3-tk` package
+on most Linux distributions.
+
+```
+python3 qnxprobe_gui.py                 # open the window
+python3 qnxprobe_gui.py mmcblk0.img     # open it with an image already added
+```
+
+Add one or more images, set the same options the command line takes, and press
+**Run report** or **Extract to zip**. Both run `qnxprobe.py` as a subprocess and
+stream its output into the Report pane as it is printed, so the report in the
+window is byte for byte the report the command line prints. During an extraction
+the progress bar is driven by the tool's own `--progress` stream, with exact file
+and byte counts per volume. Cancel stops the subprocess; a zip left behind by a
+cancelled run is not a complete extraction and the window says so.
+
+The **Contents** pane browses an image without extracting it. It opens the image
+read-only, finds each volume with the same partition-table and superblock code
+the report uses, and walks it with the same reader classes the extractor uses.
+Directories load when you expand them, and a selected file can be saved out on
+its own. The Kind column tells regular files from directories, symlinks and
+special entries; only regular files can be saved.
+
+The two halves are kept honest against each other by a check you can run on any
+image, with no window:
+
+```
+python3 qnxprobe_gui.py --check-discovery mmcblk0.img
+```
+
+It runs the report, reads back which volumes it named and what it called each
+one, and requires the Contents pane's own discovery to name exactly the same
+set. It was run on the 12 synthetic self-test images, qnxmount's four reference
+images, a Ford Sync G4 eMMC image (9 volumes) and a BMW MGU image (11 volumes)
+before this was published, and all agreed. A qnx6 found only by the brute scan
+is reported but has no partition to walk, so it appears in the report and not in
+the Contents pane, in the window exactly as on the command line.
 
 ## What a run looks like
 
