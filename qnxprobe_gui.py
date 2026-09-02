@@ -24,6 +24,10 @@ The image is never written to. Both halves open it "rb".
                                                no window: prove the Contents
                                                pane's volume discovery names
                                                the same volumes the report does
+    python3 qnxprobe_gui.py --cli ...          run qnxprobe's own command line;
+                                               this is how the window starts
+                                               the tool, and it is what makes a
+                                               single frozen executable work
 """
 
 import os
@@ -33,12 +37,31 @@ import queue
 import struct
 import threading
 import subprocess
+import runpy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import qnxprobe as q                                   # noqa: E402
 
-PROBE = os.path.join(HERE, "qnxprobe.py")
+
+
+def probe_command():
+    """How to start the command line tool as a subprocess.
+
+    Frozen into one executable (PyInstaller) there is no qnxprobe.py beside us
+    and sys.executable is this program, so the window re-enters itself with
+    --cli, which runs qnxprobe's own command line entry point in that process.
+    The unfrozen case takes the same route so it is the path that gets tested.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--cli"]
+    return [sys.executable, os.path.abspath(__file__), "--cli"]
+
+
+def run_cli(argv):
+    """Run qnxprobe.py's command line with these arguments, in this process."""
+    sys.argv = ["qnxprobe.py"] + list(argv)
+    runpy.run_module("qnxprobe", run_name="__main__", alter_sys=False)
 S = q.SECTOR
 EXT_TYPES = (0x05, 0x0f, 0x85)                         # extended containers, as main() has them
 
@@ -239,6 +262,7 @@ def run_window(initial_paths):
 
     def add_images():
         for p in filedialog.askopenfilenames(title="Disk image, partition image or raw dump"):
+            p = os.path.normpath(os.path.abspath(p))
             if p not in images.get(0, "end"):
                 images.insert("end", p)
         refresh_image_combo()
@@ -375,7 +399,7 @@ def run_window(initial_paths):
         if not paths:
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
-        args = [sys.executable, PROBE, "--progress"]
+        args = probe_command() + ["--progress"]
         try:
             args += ["--scan-limit", str(int(v_scan.get()))]
             if v_list.get():
@@ -412,15 +436,15 @@ def run_window(initial_paths):
         if args is None:
             return
         clear_text()
-        append_text("$ " + " ".join(a if " " not in a else f'"{a}"' for a in args[1:]) + "\n\n")
+        shown = ["qnxprobe.py"] + args[args.index("--cli") + 1:]
+        append_text("$ " + " ".join(a if " " not in a else f'"{a}"' for a in shown) + "\n\n")
         progress["value"] = 0
         status["text"] = "running..."
         for b in (b_report, b_extract):
             b["state"] = "disabled"
         b_cancel["state"] = "normal"
         try:
-            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             cwd=HERE)
+            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:
             messagebox.showerror("qnxprobe", f"could not start qnxprobe.py: {exc}")
             finish()
@@ -617,15 +641,20 @@ def run_window(initial_paths):
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    # Absolute from the start: the subprocess and the frozen build's re-entry
+    # must not depend on whatever the working directory happens to be.
     for p in initial_paths:
         if os.path.exists(p):
-            images.insert("end", p)
+            images.insert("end", os.path.abspath(p))
     refresh_image_combo()
     root.mainloop()
 
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
+    if argv and argv[0] == "--cli":
+        run_cli(argv[1:])
+        sys.exit(0)
     if argv and argv[0] == "--check-discovery":
         paths = argv[1:]
         missing = [p for p in paths if not os.path.exists(p)]
