@@ -262,6 +262,7 @@ def run_window(initial_paths):
 
     def add_images():
         for p in filedialog.askopenfilenames(title="Disk image, partition image or raw dump"):
+            p = os.path.normpath(os.path.abspath(p))
             if p not in images.get(0, "end"):
                 images.insert("end", p)
         refresh_image_combo()
@@ -443,8 +444,7 @@ def run_window(initial_paths):
             b["state"] = "disabled"
         b_cancel["state"] = "normal"
         try:
-            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             cwd=HERE)
+            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:
             messagebox.showerror("qnxprobe", f"could not start qnxprobe.py: {exc}")
             finish()
@@ -641,9 +641,11 @@ def run_window(initial_paths):
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    # Absolute from the start: the subprocess and the frozen build's re-entry
+    # must not depend on whatever the working directory happens to be.
     for p in initial_paths:
         if os.path.exists(p):
-            images.insert("end", p)
+            images.insert("end", os.path.abspath(p))
     refresh_image_combo()
     root.mainloop()
 
