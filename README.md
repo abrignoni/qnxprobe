@@ -200,7 +200,9 @@ tool reproduces, and two volumes cannot share one, so names cannot collide. A
 label is only ever a suffix.
 
 The zip also carries `volumes.json`: per volume, the LBA, byte offset, partition
-size, filesystem type, the recorded volume id or UUID, and what was extracted.
+size, filesystem type, the recorded volume id or UUID, and what was extracted,
+including `short` (files whose blocks reach past the end of the image) and, on a
+volume that does, `extends_past_image_by_bytes`.
 For a bare image with no vendor export alongside it, that file is the record
 tying every extracted path back to a place on the disk, checkable against
 `mmls` or `fdisk` without trusting the directory names.
@@ -421,6 +423,19 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
 ## What it does not do
 
+- **It does not join a split image.** FTK Imager and its peers write a raw image as
+  numbered segments (`.001`, `.002`, ...) unless told otherwise, and the first segment
+  alone carries the partition table and the boot volumes, so it identifies cleanly and
+  its front volumes read correctly while the volume holding the user data ends past the
+  cut, where every read answers empty. Measured on a Ford Sync G4 image cut at 1,500 MB:
+  every boot partition extracted in full and the 28.8 GiB storage volume walked to 0
+  files with nothing raised. Since 1.12 a run on such a file says
+  `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names the partitions that reach past the
+  end, marks each affected volume `INCOMPLETE` in the report and in `volumes.json`
+  (`extends_past_image_by_bytes`), and stores a file whose blocks lie past the cut under
+  a name ending `.SHORT-<here>-of-<size>-bytes`, counted as `short` rather than as
+  extracted. Join the segments first (`cat`, `copy /b`, or the imaging tool's own export)
+  and read the joined file.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
   Becker HBCIFS container are recognised and reported but not decompressed, because no
