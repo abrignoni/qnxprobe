@@ -202,7 +202,8 @@ label is only ever a suffix.
 The zip also carries `volumes.json`: per volume, the LBA, byte offset, partition
 size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image) and, on a
-volume that does, `extends_past_image_by_bytes`.
+volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
+first segment and `image_segments` lists every segment joined, with its byte count.
 For a bare image with no vendor export alongside it, that file is the record
 tying every extracted path back to a place on the disk, checkable against
 `mmls` or `fdisk` without trusting the directory names.
@@ -236,6 +237,7 @@ python3 qnxprobe.py --list --depth 4 --list-max 3000 img    # deeper, higher cap
 python3 qnxprobe.py --extract case.zip mmcblk0.img          # everything, into one zip
 python3 qnxprobe.py --extract storage.zip --only storage img   # one volume by name
 python3 qnxprobe.py --extract case.zip --exclude ECRYPTFS img  # leave out what will not parse
+python3 qnxprobe.py --extract case.zip mmcblk0.img.001        # any segment of a split image; the set is joined
 ```
 
 `--list` walks qnx6 through the same block resolution the kernel uses in
@@ -244,6 +246,39 @@ of line in the Longfile tree, and walks ext through its extent trees. Both read-
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
+
+## Split images
+
+FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
+unless told to write one file, and the first segment alone is a trap: it carries the
+partition table and the boot volumes, so it identifies cleanly and its front volumes
+read correctly, while the volume holding the user data ends past the cut, where every
+read answers empty. Measured on a Ford Sync G4 image cut at 1,500 MB: every boot
+partition extracted in full and the 28.8 GiB storage volume walked to 0 files with
+nothing raised.
+
+Since 1.13 the tool joins the set itself. Name any one segment and every segment
+beside it (same folder, same stem, same number of digits) is read as one image, in
+order, with nothing copied or concatenated on disk:
+
+```
+python3 qnxprobe.py --extract case.zip mmcblk0.img.001    # .001 through the last segment beside it
+```
+
+The report says what was joined (`20 segments joined, mmcblk0.img.001 ..
+mmcblk0.img.020`, with the segment sizes), and in `volumes.json` every volume's
+`image` names the first segment while `image_segments` lists each one with its byte
+count, so the extraction can be checked back against the set.
+
+A set is joined only when it is whole from its first segment. A hole in the numbering
+(`.001` and `.003` with no `.002`), a set whose lowest segment is not `.000` or `.001`,
+and segments numbered at two different widths are each refused by name, with exit
+status 1, because a set joined around a hole reads every volume past it at the wrong
+offset and answers wrong rather than empty. A set that simply ends early cannot be
+told from a small disk by its numbering; that case is caught the other way, by the
+partition table reaching past the joined size, which draws the
+`IMAGE IS SHORTER THAN ITS PARTITION TABLE` warning described under "What it does not
+do".
 
 ## Options
 
@@ -423,19 +458,15 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
 ## What it does not do
 
-- **It does not join a split image.** FTK Imager and its peers write a raw image as
-  numbered segments (`.001`, `.002`, ...) unless told otherwise, and the first segment
-  alone carries the partition table and the boot volumes, so it identifies cleanly and
-  its front volumes read correctly while the volume holding the user data ends past the
-  cut, where every read answers empty. Measured on a Ford Sync G4 image cut at 1,500 MB:
-  every boot partition extracted in full and the 28.8 GiB storage volume walked to 0
-  files with nothing raised. Since 1.12 a run on such a file says
-  `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names the partitions that reach past the
-  end, marks each affected volume `INCOMPLETE` in the report and in `volumes.json`
-  (`extends_past_image_by_bytes`), and stores a file whose blocks lie past the cut under
-  a name ending `.SHORT-<here>-of-<size>-bytes`, counted as `short` rather than as
-  extracted. Join the segments first (`cat`, `copy /b`, or the imaging tool's own export)
-  and read the joined file.
+- **It reads raw images only: one file, or the numbered segments of one.** E01, AFF4,
+  AD1 and the other evidence containers are not opened; export the raw image from the
+  imaging tool first. A segment set is joined only when it is whole from its first
+  segment (see "Split images" above). A lone first segment is read as the file it is,
+  and since 1.12 a run on it says `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names
+  the partitions that reach past the end, marks each affected volume `INCOMPLETE` in
+  the report and in `volumes.json` (`extends_past_image_by_bytes`), and stores a file
+  whose blocks lie past the cut under a name ending `.SHORT-<here>-of-<size>-bytes`,
+  counted as `short` rather than as extracted.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
   Becker HBCIFS container are recognised and reported but not decompressed, because no

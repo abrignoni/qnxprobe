@@ -91,8 +91,11 @@ jobs:
           ext = ".exe" if os.name == "nt" else ""
           cli = os.path.join("dist", "qnxprobe" + ext)
           gui = os.path.join("dist", "qnxprobe_gui" + ext)   # the bare binary; macOS also gets a .app
-          fixtures = sorted(glob.glob("fixtures/*.img") + glob.glob("fixtures/*.bin"))
-          assert len(fixtures) == 16, fixtures
+          # *.001 is the first segment of the split set the self-test leaves behind
+          # (its .002 and .003 sit beside it) and the lone cut segment
+          fixtures = sorted(glob.glob("fixtures/*.img") + glob.glob("fixtures/*.bin")
+                            + glob.glob("fixtures/*.001"))
+          assert len(fixtures) == 17, fixtures
 
           r = subprocess.run([cli, "--self-test"], capture_output=True, text=True)
           print(r.stdout[-600:]); assert r.returncode == 0 and "SELF-TEST PASSED" in r.stdout
@@ -108,7 +111,7 @@ jobs:
           r = subprocess.run([gui, "--check-discovery"] + fixtures, capture_output=True, text=True)
           print(r.stdout); assert r.returncode == 0, r.stderr[-2000:]
           lines = [l for l in r.stdout.splitlines() if l.strip()]
-          assert len(lines) == 16 and all(l.startswith("OK") for l in lines), lines
+          assert len(lines) == 17 and all(l.startswith("OK") for l in lines), lines
           print("all executables ran on", os.environ.get("RUNNER_OS"), os.environ.get("RUNNER_ARCH"))
 
       - name: Check the window starts and stays up
