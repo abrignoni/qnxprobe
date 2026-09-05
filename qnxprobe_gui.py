@@ -205,8 +205,8 @@ def check_discovery(paths):
     import contextlib
     bad = 0
     for path in paths:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
+        with q.open_image(path) as fh:
+            size = q.image_size(fh)
             found = {(v["label"], v["kind"]) for v in discover_volumes(fh, size)
                      if v["kind"] != "extended container"}
         buf = io.StringIO()
@@ -532,8 +532,8 @@ def run_window(initial_paths):
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
             try:
-                fh = open(path, "rb")
-                q_con.put(("ok", path, fh, discover_volumes(fh, os.path.getsize(path))))
+                fh = q.open_image(path)          # one file, or a split set joined
+                q_con.put(("ok", path, fh, discover_volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
         threading.Thread(target=work, daemon=True).start()
