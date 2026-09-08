@@ -280,6 +280,37 @@ partition table reaching past the joined size, which draws the
 `IMAGE IS SHORTER THAN ITS PARTITION TABLE` warning described under "What it does not
 do".
 
+## EnCase/EWF images
+
+An `.E01` acquisition is read directly, so a run on one works exactly like a run
+on a raw image:
+
+    python3 qnxprobe.py evidence.E01
+
+The segments of a multi-segment acquisition are joined by the reader from the
+format's own records, not from the file names, and an acquisition missing a
+segment is refused rather than read short. Point it at the `.E01`; the rest of
+the set is found beside it.
+
+This is `ewfprobe.py`, vendored from
+[abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
+`vendored.json`. It is MIT, pure Python and standard library only, so it adds
+nothing to build and nothing to install. `tools/check_vendored.py` confirms the
+copy still matches what was vendored, and reports a copy it could not check
+separately from one that has drifted, because those are different results.
+
+The reader is optional. Without `ewfprobe.py` beside this script everything else
+works as before, and an `.E01` is refused with a message saying what is missing.
+It is never read as raw bytes: a container read that way holds no filesystem the
+walkers can see, so the run would report an empty image instead of saying it
+could not read the container.
+
+Measured on a 15-segment FTK Imager acquisition of a 232.9 GiB Windows disk: the
+segments join, the GPT and its four partitions are read, and the EFI system
+partition is walked as FAT32, in about a second. The two NTFS partitions are
+reported as not recognised, with their first bytes shown, because there is no
+NTFS walker here yet.
+
 ## Options
 
 | Option | What it does |

@@ -27,6 +27,20 @@ Read-only throughout. Never writes to the image.
 """
 import os, re, struct, sys, datetime, json, time, uuid, zipfile, bisect, collections
 
+# ewfprobe is vendored beside this file (see vendored.json) so an EnCase/EWF
+# .E01 acquisition can be read as an ordinary image. It is optional: without it
+# everything else works exactly as before, and an .E01 is refused with a message
+# saying what is missing rather than being read as raw bytes, which would find
+# no filesystem and look like an empty image.
+try:
+    import ewfprobe
+except ImportError:                  # not on sys.path when imported as a module
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import ewfprobe
+    except ImportError:
+        ewfprobe = None
+
 QNXPROBE_VERSION = "1.13"
 
 QNX6_MAGIC     = 0x68191122
@@ -119,6 +133,40 @@ def read_at(fh, off, n):
     if len(data) < n:
         EOF_SHORTFALL["bytes"] += n - len(data)
     return data
+
+
+class ImageUnreadable(Exception):
+    """This tool cannot open the image, and the message says why."""
+
+
+EWF_SIGNATURE = b"EVF\x09\x0d\x0a\xff\x00"
+
+
+def _ewf_refused_by_reader(path):
+    """True when the vendored reader rejects a damaged acquisition rather than
+    returning something that would be walked as though it were an image."""
+    if ewfprobe is None:
+        return True
+    try:
+        ewfprobe.open_ewf(path)
+    except ewfprobe.EwfError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def looks_like_ewf(path):
+    """True when the file begins with the EWF signature.
+
+    Checked here rather than in ewfprobe so an .E01 is still recognised, and
+    refused with a useful message, when the vendored reader is absent.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(8) == EWF_SIGNATURE
+    except OSError:
+        return False
 
 
 class SplitImageError(Exception):
@@ -282,13 +330,33 @@ def image_size(fh):
     size = getattr(fh, "size", None)
     if size is not None:
         return size
-    return os.fstat(fh.fileno()).st_size
+    try:
+        return os.fstat(fh.fileno()).st_size
+    except (AttributeError, OSError, ValueError):
+        # No file descriptor behind it. Anything seekable can still say where
+        # its end is, which is what a reader over a container answers to.
+        here = fh.tell()
+        try:
+            fh.seek(0, os.SEEK_END)
+            return fh.tell()
+        finally:
+            fh.seek(here)
 
 
 def open_image(path, segments=None):
     """Open an image read-only: the one file, or every segment of the split
     image it belongs to, joined. segments is split_segments(path) when the
     caller already has it."""
+    if looks_like_ewf(path):
+        if ewfprobe is None:
+            raise ImageUnreadable(
+                f"{os.path.basename(path)} is an EnCase/EWF (.E01) acquisition. "
+                f"Reading one needs ewfprobe.py beside this script; it is "
+                f"normally vendored here (see vendored.json) and is missing. "
+                f"Export the image to raw, or put ewfprobe.py back.")
+        # ewfprobe joins the segments of the set itself, from the format's own
+        # records rather than from the file names, and refuses an incomplete set.
+        return ewfprobe.open_ewf(path)
     if segments is None:
         segments = split_segments(path)
     if segments:
@@ -2448,18 +2516,31 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
     size = image_size(image)
     print("=" * 78)
     print(path)
+    ewf_parts = [] if segments else list(getattr(image, "paths", []) or [])
     if segments:
         print(f"  one segment of a split image: {len(segments)} segments joined, "
               f"{os.path.basename(segments[0])} .. {os.path.basename(segments[-1])}")
         print(f"    {describe_segment_sizes(image.sizes)}")
+    elif len(ewf_parts) > 1:
+        print(f"  an EWF acquisition of {len(ewf_parts)} segments, joined by the "
+              f"reader: {os.path.basename(ewf_parts[0])} .. "
+              f"{os.path.basename(ewf_parts[-1])}")
+    elif ewf_parts:
+        print("  an EWF acquisition of one segment")
     print(f"  {size:,} bytes ({human(size)})")
     print("=" * 78)
     # what volumes.json ties each volume to: the one file, or the first
     # segment of the set, with every segment and its size beside it
     image_rec = {"image": os.path.basename(segments[0] if segments else path)}
-    if segments:
-        image_rec["image_segments"] = [{"name": os.path.basename(p), "bytes": s}
-                                       for p, s in zip(image.paths, image.sizes)]
+    if segments or ewf_parts:
+        # A joined raw set records its own segment sizes; a reader over a
+        # container need not, so they are measured here rather than required.
+        parts = list(image.paths)
+        part_sizes = getattr(image, "sizes", None)
+        if part_sizes is None:
+            part_sizes = [os.path.getsize(q) for q in parts]
+        image_rec["image_segments"] = [{"name": os.path.basename(q), "bytes": s}
+                                       for q, s in zip(parts, part_sizes)]
 
     candidates, regions, sized_regions, triage = [], [], [], []
     containers, protective = set(), set()
@@ -3704,6 +3785,73 @@ def self_test():
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
+        # An EnCase/EWF acquisition is read through the vendored ewfprobe. The
+        # case that matters is the negative one: an .E01 must never be opened as
+        # raw bytes, because a container read that way holds no filesystem the
+        # walkers can see and the run would report an empty image rather than
+        # say it could not read the container.
+        # This literal is deliberately NOT EWF_SIGNATURE. A fixture built from
+        # the constant it is meant to verify moves with it, so the check passes
+        # on a build whose signature is wrong. It is the EWF file signature from
+        # the format documentation, written out again here on purpose.
+        TRUE_EWF_SIG = b"\x45\x56\x46\x09\x0d\x0a\xff\x00"    # "EVF\t\r\n\xff\0"
+        if EWF_SIGNATURE != TRUE_EWF_SIG:
+            ok = False
+            print(f"  [FAIL] EWF_SIGNATURE is {EWF_SIGNATURE!r}, "
+                  f"expected {TRUE_EWF_SIG!r}")
+        ewf_fake = os.path.join(d, "fake.E01")
+        with open(ewf_fake, "wb") as fh:
+            fh.write(TRUE_EWF_SIG + b"\x01\x01\x00\x00\x00" + b"\x00" * 4096)
+        # Deliberately not named *.img: this is not an image, and the build
+        # workflow harvests the self-test's synthetic images by that glob to
+        # smoke-test the frozen executables.
+        not_ewf = os.path.join(d, "not_an_acquisition.dat")
+        with open(not_ewf, "wb") as fh:
+            fh.write(b"PK\x03\x04not an acquisition" + b"\x00" * 512)
+
+        def _opened_as_raw(path):
+            """True when open_image handed back a plain file over the container."""
+            try:
+                handle = open_image(path)
+            except Exception:
+                return False
+            try:
+                return isinstance(handle, io.IOBase) and not hasattr(handle, "media_size")
+            finally:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+        saved_reader = ewfprobe
+        try:
+            globals()["ewfprobe"] = None
+            try:
+                open_image(ewf_fake)
+                refused_without_reader = False
+            except ImageUnreadable as exc:
+                refused_without_reader = "ewfprobe" in str(exc)
+            except Exception:
+                refused_without_reader = False
+        finally:
+            globals()["ewfprobe"] = saved_reader
+
+        for label, cond in (
+                ("the EWF signature is recognised, and other bytes are not",
+                 looks_like_ewf(ewf_fake) and not looks_like_ewf(not_ewf)),
+                ("an .E01 is never opened as raw bytes",
+                 not _opened_as_raw(ewf_fake)),
+                ("a file that is not an acquisition still opens normally",
+                 _opened_as_raw(not_ewf)),
+                ("without the vendored reader an .E01 is refused, saying what "
+                 "is missing", refused_without_reader),
+                ("with the reader present a damaged acquisition is refused by "
+                 "it, not read",
+                 saved_reader is None or _ewf_refused_by_reader(ewf_fake))):
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
         print()
         print("  SELF-TEST PASSED. The detector reports positives and negatives"
               if ok else
@@ -4058,8 +4206,8 @@ if __name__ == "__main__":
                      extract=args.extract, only=args.only, zf=zf,
                      do_triage=args.triage, exclude=args.exclude,
                      reporter=reporter, manifest=manifest)
-            except SplitImageError as exc:
-                # a segment set that is not whole: said out loud and left
+            except (SplitImageError, ImageUnreadable) as exc:
+                # a segment set that is not whole, or an image this tool cannot open: said out loud and left
                 # unread, never joined around, and the exit status says so
                 print("=" * 78)
                 print(p)
