@@ -3802,7 +3802,10 @@ def self_test():
         ewf_fake = os.path.join(d, "fake.E01")
         with open(ewf_fake, "wb") as fh:
             fh.write(TRUE_EWF_SIG + b"\x01\x01\x00\x00\x00" + b"\x00" * 4096)
-        not_ewf = os.path.join(d, "plain.img")
+        # Deliberately not named *.img: this is not an image, and the build
+        # workflow harvests the self-test's synthetic images by that glob to
+        # smoke-test the frozen executables.
+        not_ewf = os.path.join(d, "not_an_acquisition.dat")
         with open(not_ewf, "wb") as fh:
             fh.write(b"PK\x03\x04not an acquisition" + b"\x00" * 512)
 

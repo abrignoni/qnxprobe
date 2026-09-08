@@ -1,0 +1,4 @@
+# Checkout on Windows converts LF to CRLF by default, which changes a file's
+# bytes and so its hash. vendored.json records the hash of the vendored reader,
+# so without this the vendor guard fails on Windows and nowhere else.
+* text=auto eol=lf
