@@ -1,0 +1,17 @@
+{
+  "vendored": [
+    {
+      "path": "ewfprobe.py",
+      "name": "ewfprobe",
+      "version": "0.1.0",
+      "upstream": "https://github.com/abrignoni/ewfprobe",
+      "upstream_file": "ewfprobe.py",
+      "commit": "cfb46f195bf7722e8d5ab1030b9afae155063e01",
+      "commit_date": "2026-09-08T18:27:29-04:00",
+      "sha256": "d9c5839dce39274eea9853c63d3de8fd9e7f5ea34f1a58f27d41d1d193137630",
+      "licence": "MIT",
+      "licence_file": "LICENSE-ewfprobe",
+      "note": "Copied verbatim. Fix upstream and re-vendor; edits here are reverted by the next sync."
+    }
+  ]
+}

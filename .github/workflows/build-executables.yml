@@ -57,18 +57,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
 
+      - name: Check the vendored reader still matches what was vendored
+        run: python tools/check_vendored.py
+
       - name: Self-test from source
         run: python qnxprobe.py --self-test
 
       - name: Build the command line executable
         run: >
           pyinstaller --noconfirm --clean --onefile --console
-          --name qnxprobe qnxprobe.py
+          --name qnxprobe --hidden-import ewfprobe qnxprobe.py
 
       - name: Build the window executable
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
-          --name qnxprobe_gui --hidden-import qnxprobe qnxprobe_gui.py
+          --name qnxprobe_gui --hidden-import qnxprobe --hidden-import ewfprobe
+          qnxprobe_gui.py
 
       - name: Keep the self-test's synthetic images as fixtures
         shell: python
