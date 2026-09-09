@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT, NTFS and HFS+ filesystems, and QNX IFS
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT, NTFS, HFS+ and APFS filesystems, and QNX IFS
 boot images, out of raw disk images: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
@@ -247,6 +247,42 @@ of line in the Longfile tree, and walks ext through its extent trees. Both read-
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
 
+## APFS
+
+Every Mac since 2017 is APFS, so `--list` and `--extract` read a container. It is
+claimed by the `NXSB` magic in the first block's object header together with a block
+size that is a power of two, and only reported once its newest checkpoint and object
+map have been read far enough to name the volumes inside it.
+
+A container holds several volumes, and on a Mac the user's data is not the first of
+them, so the container is listed as a **directory whose children are its volumes**.
+One walk reaches all of them and each file lands under its volume's name.
+
+What it reads: the checkpoint with the highest transaction id whose Fletcher-64
+checksum is right, the container and volume object maps, the file-system B-tree,
+directory records, inodes and their extended fields, file extents including sparse
+ones, symbolic links, and files compressed with the `decmpfs` attribute in its zlib
+forms.
+
+What it does not do: an encrypted volume is named and not walked, and a file
+compressed with LZVN or LZFSE is listed with its size and refuses to be read. Nothing
+here reads a snapshot: what is walked is the volume as the newest checkpoint leaves it.
+
+Validated against The Sleuth Kit's APFS support, an entirely separate implementation.
+A 32 MiB container written by macOS itself and populated through its own driver ships
+gzipped under `tests/fixtures`; the self-test walks it and requires all 411 files to
+match hashes `fls` and `icat` recorded from the same image, and
+`tools/make_apfs_fixture.sh` rebuilds it on any Mac as an ordinary user. It carries a
+file in 2,046 extents, a sparse file whose hole is a real one, a compressed file, a
+symbolic link, two names for one inode, a directory of 400 entries so the tree is
+several levels deep, a UTF-16 name and an empty file.
+
+Two defects the comparison found, both in the same place and neither visible by
+reading: the object map's own tree points at blocks while the file-system tree points
+at virtual ids, so reading the first through the second walks whatever happens to sit
+at that offset; and a run of records can begin part way through the leaf before the
+first one whose key matches, so starting at the matching leaf lost 13 of 400 children.
+
 ## HFS+
 
 A Mac before APFS is an HFS+ volume, and so is an older iOS device, so `--list` and
@@ -392,7 +428,7 @@ NTFS walker here yet.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, HFS+, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -412,7 +448,7 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, HFS+, ETFS, EFS and QNX IFS,
+that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
 checks them, and removes the directory. For ETFS it also round-trips one file out of
 a synthetic image, so a broken structure offset, not just a broken constant, turns
 the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
