@@ -202,6 +202,17 @@ def _sections(fh, segment_path):
         offset = next_offset
 
 
+def _compressed_bound(size):
+    """The most bytes a zlib stream of ``size`` bytes can occupy.
+
+    Deflate falls back to stored blocks when nothing compresses, which costs five
+    bytes per 65,535-byte block, on top of the zlib header and the Adler-32. The
+    margin is deliberately generous: a few bytes short would truncate a chunk, and a
+    few kilobytes long costs one short read.
+    """
+    return size + 5 * (size // 65535 + 1) + 1024
+
+
 def _inflate(data):
     """Inflate a zlib stream, tolerating trailing bytes after its end."""
     obj = zlib.decompressobj()
@@ -346,6 +357,15 @@ class EwfImage:
 
         self.chunk_size = self.sectors_per_chunk * self.sector_size
         self.media_size = self.sector_count * self.sector_size
+        # ``size`` is the byte length of the acquired disk, which is what seek
+        # and read address. A consumer that already handles a joined set of raw
+        # segments asks an image object for exactly this, so answering it here
+        # lets such a consumer take an E01 without a special case.
+        self.size = self.media_size
+        # The size each segment FILE occupies on disk. These sum to the size of
+        # the acquisition on disk, not to media_size, because the chunks in them
+        # are usually compressed.
+        self.sizes = [os.path.getsize(p) for p in self.paths]
         self._indexed_chunks = chunks
         if chunks < self._needed_chunks():
             raise EwfIncompleteSetError(
@@ -416,6 +436,14 @@ class EwfImage:
             end = table.limit
         if end <= start:
             end = table.limit
+        # The last entry of a table has no next entry to bound it, so the fallback is
+        # the end of the segment file. On a real acquisition that is most of a gigabyte
+        # read and allocated to produce one 32 KiB chunk: measured on a 232.9 GiB FTK
+        # Imager set of 15 segments, 471 tables whose last-chunk spans summed to 364 GB,
+        # the worst single one 1.47 GB. A chunk holds chunk_size bytes, so its stored
+        # form cannot be longer than deflate can make of that, whatever the section
+        # boundary says.
+        end = min(end, start + _compressed_bound(self.chunk_size))
         return table.segment, start, end, compressed
 
     def _chunk(self, n):
