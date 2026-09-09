@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32 and exFAT filesystems, and QNX IFS
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT and NTFS filesystems, and QNX IFS
 boot images, out of raw disk images: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
@@ -247,6 +247,48 @@ of line in the Longfile tree, and walks ext through its extent trees. Both read-
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
 
+## NTFS
+
+An acquisition of a Windows computer is an NTFS volume, so `--list` and `--extract`
+read one directly. The volume is claimed by the `NTFS` name in its boot sector plus a
+geometry that has to make sense, and an NTFS boot sector is declined as a partition
+table for the same reason a FAT one is: it ends in `0x55AA` and its boot code sits
+where partition entries would be.
+
+What it reads: resident and non-resident data, sparse runs, LZNT1 compressed data,
+attributes that overflowed into other MFT records through `$ATTRIBUTE_LIST`, and
+directory indexes in both the resident `$INDEX_ROOT` and the allocated
+`$INDEX_ALLOCATION` form, with the sector fixups put back. Bytes past a file's
+initialized size read as zero, which is what the format says and what a database that
+preallocates its file depends on. A `--list` also names any alternate data stream it
+finds, because a stream is content the file's own size does not account for.
+
+What it does not do: it lists what the directory indexes hold, so a deleted name is not
+recovered; an 8.3 name indexed beside a long one is skipped rather than listed twice;
+and an encrypted file is listed with its recorded size and refuses to be read, since
+the volume holds no key. Only the unnamed stream is the file's content.
+
+Validated two ways. A 16 MiB volume written by `mkntfs` and populated through `ntfs-3g`
+carries a resident file, an empty one, a sparse one, a compressed one, one fragmented
+across 333 runs whose attributes had to move into other records, a file grown past what
+was written into it, one record with 61 names, a directory of 400 entries so the index
+outgrows its record, a name that needs UTF-16, and an alternate data stream; every one
+of its 475 files comes back byte for byte against hashes an independent reader recorded
+from the same image, and that fixture ships with the tool so the self-test compares
+against it. On real evidence, a 232.9 GiB Windows volume inside an FTK Imager
+acquisition: 221,851 live regular files in 9 seconds, the same set The Sleuth Kit's
+`fls` reports, each resolving to the same MFT record, and 1,339 of 1,341 sampled files
+byte-identical to `icat`. The two that differ are metadata files whose content lives
+only in named streams, where the two tools pick different streams.
+
+`tools/make_ntfs_fixture.sh` rebuilds the fixture on any Linux box with
+`ntfsprogs` and `ntfs-3g`, as an ordinary user, and refuses to finish if the image it
+wrote does not read back as what it meant to write.
+
+That comparison earned its cost twice: it found this reader returning stale bytes past
+a file's initialized size, and a second pass found the run list of a heavily fragmented
+file counted twice because its own record is named in its attribute list.
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
@@ -315,7 +357,7 @@ NTFS walker here yet.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -335,7 +377,7 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), FAT32, exFAT, ETFS, EFS and QNX IFS,
+that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, ETFS, EFS and QNX IFS,
 checks them, and removes the directory. For ETFS it also round-trips one file out of
 a synthetic image, so a broken structure offset, not just a broken constant, turns
 the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
