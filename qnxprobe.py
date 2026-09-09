@@ -1765,6 +1765,7 @@ class _ApfsBtree:
         # Reading the map itself therefore cannot go through the map.
         self.vol, self.root_block, self.physical = vol, root_block, physical
         self._leaves_cache = None
+        self._leaf_keys = []
 
     @staticmethod
     def _layout(node, node_size):
@@ -1810,6 +1811,10 @@ class _ApfsBtree:
             out = []
             self._collect_leaves(self.root_block, key_of, out, 0)
             self._leaves_cache = out
+            # The first keys are kept separately because every lookup bisects
+            # them: rebuilding that list per lookup makes the walk quadratic in
+            # the number of leaves, which is what it was until this was split out.
+            self._leaf_keys = [k for k, _b in out]
         return self._leaves_cache
 
     def _collect_leaves(self, block, key_of, out, depth):
@@ -1837,7 +1842,7 @@ class _ApfsBtree:
         # the first leaf whose first key equals the target misses whatever sits
         # at the tail of the one before it. Measured on a 400-entry directory:
         # 387 children found instead of 400.
-        i = bisect.bisect_left([k for k, _b in leaves], want) - 1
+        i = bisect.bisect_left(self._leaf_keys, want) - 1
         if i < 0:
             i = 0
         for _first, block in leaves[i:]:
