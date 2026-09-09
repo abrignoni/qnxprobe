@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT and NTFS filesystems, and QNX IFS
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT, NTFS and HFS+ filesystems, and QNX IFS
 boot images, out of raw disk images: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
@@ -247,6 +247,41 @@ of line in the Longfile tree, and walks ext through its extent trees. Both read-
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
 
+## HFS+
+
+A Mac before APFS is an HFS+ volume, and so is an older iOS device, so `--list` and
+`--extract` read one. The volume is claimed by the `H+` or `HX` signature 1024 bytes
+into the volume together with a geometry that has to make sense.
+
+What it reads: the catalog B-tree in both its index and leaf forms, forks whose
+fragments outgrew the eight extent descriptors a catalog record holds and continue in
+the extents overflow tree, symbolic links, hard links through the private directory
+the volume keeps their indirect nodes in, and files compressed with the `decmpfs`
+attribute in its zlib forms, whether the compressed data sits in the attribute or in
+the resource fork behind a block table. A `--list` names a resource fork that carries
+anything, because that is content the file's own size does not account for. HFSX, the
+case-sensitive variant, is read the same way and reported as itself.
+
+What it does not do: a file compressed with LZVN or LZFSE is listed with its recorded
+size and refuses to be read, since neither is in the standard library.
+
+Validated against The Sleuth Kit, which reads HFS+ through an entirely separate
+implementation. A 24 MiB volume written by macOS itself and populated through its own
+driver carries a fragmented file whose extents spilled into the overflow tree, a
+compressed file, a symbolic link, two names for one file, a file with a resource fork,
+a directory of 400 entries so the catalog is three levels deep, a name that needs
+UTF-16 and an empty file. All 412 of its files come back byte for byte against hashes
+`fls` and `icat` recorded from the same image, and the fixture ships with the tool so
+the self-test compares against it. `tools/make_hfsplus_fixture.sh` rebuilds it on any
+Mac, as an ordinary user, and refuses to finish if the image it wrote does not read
+back as what it meant to write.
+
+Six deliberate breaks each turn a different case red. The one that mattered was the
+B-tree descent: every entry of a directory shares a parent id, so several index entries
+carry that id with different names, and taking the last one that is not greater lands
+on the last leaf of the run. A 400-entry directory came back with 10 children until the
+comparison was strict.
+
 ## NTFS
 
 An acquisition of a Windows computer is an NTFS volume, so `--list` and `--extract`
@@ -357,7 +392,7 @@ NTFS walker here yet.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, HFS+, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -377,7 +412,7 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, ETFS, EFS and QNX IFS,
+that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, HFS+, ETFS, EFS and QNX IFS,
 checks them, and removes the directory. For ETFS it also round-trips one file out of
 a synthetic image, so a broken structure offset, not just a broken constant, turns
 the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
