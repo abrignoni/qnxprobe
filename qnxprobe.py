@@ -1331,6 +1331,7 @@ class NtfsWalker:
         """
         if not raw or len(raw) < 0x30:
             return []
+        seq = struct.unpack_from("<H", raw, 0x10)[0]
         first, flags = struct.unpack_from("<HH", raw, 0x14)
         used = struct.unpack_from("<I", raw, 0x18)[0]
         if not flags & NTFS_MFT_IN_USE:
@@ -1349,7 +1350,9 @@ class NtfsWalker:
             if attr:
                 out.append(attr)
             pos += length
-        out.append(_NtfsAttr(-1, "", flags, True))       # carries the record flags
+        marker = _NtfsAttr(-1, "", flags, True)          # carries the record flags
+        marker.data_size = seq                           # and its sequence number
+        out.append(marker)
         if follow_list:
             out.extend(self._follow_attribute_list(out, self_ref))
         return out
@@ -1451,6 +1454,17 @@ class NtfsWalker:
                 return a.flags
         return 0
 
+    def _seq(self, num):
+        """This record's sequence number, or None if the record is not in use.
+
+        NTFS bumps it every time a record is freed and handed out again, so it
+        is what tells a live directory entry from one naming a record that has
+        since become something else."""
+        for a in self._record(num):
+            if a.type == -1:
+                return a.data_size
+        return None
+
     def inode(self, num):
         return num
 
@@ -1524,6 +1538,7 @@ class NtfsWalker:
             if eflags & 0x02:                       # the last entry holds no name
                 break
             rec = ref & 0xFFFFFFFFFFFF
+            want_seq = ref >> 48
             if klen >= 0x42:
                 name_len = buf[pos + 0x50]
                 namespace = buf[pos + 0x51]
@@ -1535,7 +1550,16 @@ class NtfsWalker:
                     # one, indexed beside it. Reporting both would list every such
                     # file twice under two names. The root's index also carries an
                     # entry for the root itself, which is a loop, not a child.
-                    if (namespace != 2 and name not in (".", "..")
+                    # The top 16 bits of the reference are the generation the
+                    # entry was written for. A record that has since been freed
+                    # and reused carries a different one, and following it
+                    # attaches whatever the record became to this name: on one
+                    # Windows volume that put a 501 KB update installer, and the
+                    # directory holding it, under a browser cache folder.
+                    # A zero means the writer asked for no check.
+                    got_seq = self._seq(rec)
+                    stale = (want_seq and got_seq is not None and want_seq != got_seq)
+                    if (namespace != 2 and name not in (".", "..") and not stale
                             and (rec, name) not in seen):
                         seen.add((rec, name))
                         out.append((name, rec))
@@ -6096,6 +6120,45 @@ def self_test():
                     and fixed[1022:1024] == b"\x03\x04"
                     and _ntfs_fixup(bytes(torn), 512, NTFS_FILE) is None)
 
+        # A directory index whose entry names a record that has since been freed
+        # and handed out again. The reference carries the generation the entry
+        # was written for, in its top 16 bits, so the two can be told apart.
+        # Built by hand here, with the generation numbers written out rather
+        # than taken from the code under test.
+        def _idx_entry(rec, seq, name):
+            nm = name.encode("utf-16-le")
+            elen = 0x52 + len(nm)
+            elen += (-elen) % 8
+            e = bytearray(elen)
+            struct.pack_into("<Q", e, 0, (seq << 48) | rec)   # the file reference
+            struct.pack_into("<HHH", e, 8, elen, 0x42 + len(nm), 0)
+            struct.pack_into("<Q", e, 0x10, 5)                # parent, unused here
+            e[0x50] = len(name)
+            e[0x51] = 1                                       # a long name, not 8.3
+            e[0x52:0x52 + len(nm)] = nm
+            return bytes(e)
+
+        live = _idx_entry(70, 3, "live.txt")          # generation 3, and the record is 3
+        stale = _idx_entry(71, 9, "stale.txt")        # generation 9, the record is 4
+        last = bytearray(0x18)                        # the end marker carries no name
+        struct.pack_into("<HHH", last, 8, 0x18, 0, 0x02)
+        body = live + stale + bytes(last)
+        idx = bytearray(16) + body
+        struct.pack_into("<II", idx, 0, 16, 16 + len(body))
+
+        # The index reader is exercised as it ships, on a stub that answers only
+        # the one question it asks of a walker.
+        class _SeqOnly:
+            """Only what _index_entries asks of a walker: each record's generation."""
+            _index_entries = NtfsWalker._index_entries  # pylint: disable=protected-access
+
+            def _seq(self, num):
+                return {70: 3, 71: 4}.get(num)
+
+        found = []
+        _SeqOnly()._index_entries(bytes(idx), 0, found, set())  # pylint: disable=protected-access
+        stale_ok = found == [("live.txt", 70)]
+
         for label, cond in (
                 ("an NTFS boot sector is identified by its own geometry",
                  bool(ntfs_named) and ntfs_named[0] == "ntfs"),
@@ -6107,7 +6170,9 @@ def self_test():
                  "a sparse one", runs_ok),
                 ("an LZNT1 chunk inflates to the bytes it was made from", lz_ok),
                 ("a record's sector fixups are applied, and a torn one is "
-                 "refused", fixup_ok)):
+                 "refused", fixup_ok),
+                ("an index entry naming a record of a different generation is "
+                 "not followed", stale_ok)):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
