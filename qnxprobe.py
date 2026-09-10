@@ -4312,21 +4312,36 @@ def _zip_time(v):
     return (d.year, d.month, d.day, d.hour, d.minute, d.second)
 
 
-def collect(w, num, prefix="", depth=0, seen=None, out=None):
-    """Every regular file under this inode, as (path, inode, size, mtime)."""
+def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
+    """Every regular file under this inode, as (path, inode, size, mtime).
+
+    Pass a dict as ``times`` to also receive each path's recorded times, as the
+    filesystem stores them, from walkers that keep readings rather than instants.
+    FAT and exFAT are those: they hold a wall-clock reading and no zone, so
+    ``mtime`` above stays zero for them and the readings arrive here as text
+    instead, where nothing downstream can put a zone on them.
+    """
     if seen is None:
         seen, out = set(), []
     if depth > 64 or num in seen:
         return out
     seen.add(num)
-    for name, ino in w.listdir(num):
+    if times is not None and hasattr(w, "listdir_records"):
+        listing = w.listdir_records(num)
+    else:
+        listing = [(name, ino, None) for name, ino in w.listdir(num)]
+    for name, ino, recorded in listing:
         ent = w.entry(ino)
         if not ent:
             continue
         mode, size, mtime = ent
         path = f"{prefix}/{name}" if prefix else name
+        if times is not None and recorded:
+            kept = {k: v for k, v in recorded.items() if v}
+            if kept:
+                times[path] = kept
         if mode & S_IFDIR:
-            collect(w, ino, path, depth + 1, seen, out)
+            collect(w, ino, path, depth + 1, seen, out, times)
         elif (mode & 0o170000) == 0o100000:          # regular files only
             out.append((path, ino, size, mtime))
         else:
@@ -7100,6 +7115,31 @@ def self_test():
         struct.pack_into("<I", _fatbuf, _fat_at + 4, 0x0FFFFFFF)  # end of chain
         for _c in FAT_USED:
             struct.pack_into("<I", _fatbuf, _fat_at + _c * 4, 0x0FFFFFFF)
+        # one 8.3 entry in the root, so collect() has something to carry times
+        # for. The date and time words are written out here rather than built by
+        # the code under test, and the reading they encode is stated separately.
+        _de = _fat_at + FAT_NFATS * FAT_SPF * FAT_BPS      # cluster 2's data
+        _fatbuf[_de:_de + 11] = b"HELLO   TXT"
+        _fatbuf[_de + 11] = 0x20                           # an ordinary file
+        struct.pack_into("<H", _fatbuf, _de + 24, (2023 - 1980) << 9 | (6 << 5) | 1)
+        struct.pack_into("<H", _fatbuf, _de + 22, (12 << 11) | (30 << 5) | 15)
+        struct.pack_into("<H", _fatbuf, _de + 26, 11)      # first cluster, a used one
+        struct.pack_into("<I", _fatbuf, _de + 28, 512)     # size
+        FAT_ENTRY_WRITTEN = "2023-06-01 12:30:30"
+        # and a subdirectory holding one file, so the walk down carries the
+        # readings too rather than only reporting the root's
+        _fatbuf[_de + 32:_de + 43] = b"SUB        "
+        _fatbuf[_de + 43] = 0x10                           # a directory
+        struct.pack_into("<H", _fatbuf, _de + 32 + 26, 22) # first cluster, a used one
+        _sub = _de + (22 - 2) * FAT_BPS
+        _fatbuf[_sub:_sub + 11] = b"DEEP    TXT"
+        _fatbuf[_sub + 11] = 0x20
+        struct.pack_into("<H", _fatbuf, _sub + 24, (1999 - 1980) << 9 | (12 << 5) | 31)
+        struct.pack_into("<H", _fatbuf, _sub + 22, (23 << 11) | (59 << 5) | 29)
+        struct.pack_into("<H", _fatbuf, _sub + 26, 23)     # first cluster, a used one
+        struct.pack_into("<I", _fatbuf, _sub + 28, 64)
+        FAT_DEEP_WRITTEN = "1999-12-31 23:59:58"
+
         _fatw = Fat32Walker(io.BytesIO(bytes(_fatbuf)), 0)
         _fat_data = _fat_at + FAT_NFATS * FAT_SPF * FAT_BPS
         fat_free_ok = (_fatw.free_extents()
@@ -7177,6 +7217,20 @@ def self_test():
         # stops. Both FAT readers follow a chain by reading four bytes per
         # cluster, and past the end of the file that read comes back short, so
         # each must answer rather than raise.
+        # collect() carries the readings only when asked, and its own result is
+        # unchanged either way, because four other call sites read that tuple.
+        _times = {}
+        _with = collect(_fatw, _fatw.root, times=_times)
+        _without = collect(_fatw, _fatw.root)
+        # neither entry carries a creation time or an access date, and a reading
+        # the entry does not hold must be absent rather than present and empty
+        collect_times_ok = (_times.get("HELLO.TXT", {}).get("modified") == FAT_ENTRY_WRITTEN
+                            and _times.get("SUB/DEEP.TXT", {}).get("modified") == FAT_DEEP_WRITTEN
+                            and set(_times.get("HELLO.TXT", {})) == {"modified"}
+                            and _with == _without
+                            and all(len(e) == 4 for e in _with)
+                            and len(_with) == 2)
+
         # Cut each image so the read of the next FAT entry falls off the end.
         try:
             _cut_fat = Fat32Walker(io.BytesIO(bytes(_fatbuf)[:_fat_at + 8]), 0)
@@ -7247,7 +7301,9 @@ def self_test():
                 ("an impossible FAT date is reported as nothing rather than as "
                  "a wrong reading", stamp_junk_ok),
                 ("an exFAT UTC offset decodes both ways from its stored steps, "
-                 "and an unset one says nothing", offset_ok)):
+                 "and an unset one says nothing", offset_ok),
+                ("collect carries the recorded readings when asked, and returns "
+                 "the same tuples either way", collect_times_ok)):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
