@@ -42,7 +42,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.20"
+QNXPROBE_VERSION = "1.21"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -2654,6 +2654,8 @@ HFSP_SIG    = 0x482B          # 'H+', HFS Plus
 HFSX_SIG    = 0x4858          # 'HX', HFSX, which differs only in case handling
 HFSP_VH_OFF = 1024            # the volume header sits 1024 bytes into the volume
 HFSP_ROOT   = 2               # kHFSRootFolderID
+HFSP_ALLOC  = 6               # kHFSAllocationFileID
+HFSP_ALLOC_FORK = 112         # the allocation file's fork record in the volume header
 
 # B-tree node kinds, TN1150 "B-Trees"
 HFSP_LEAF, HFSP_INDEX, HFSP_HEADER, HFSP_MAP = -1, 0, 1, 2
@@ -3045,6 +3047,72 @@ class HfsPlusWalker:
         return None
 
     # -- the walker surface ------------------------------------------------
+    def free_extents(self, min_bytes=0):
+        """[(byte offset, length)] for the runs of space the volume says are free.
+
+        HFS+ keeps an allocation file, one bit per allocation block, set when the
+        block is in use. Its fork record sits in the volume header, so it is read
+        the same way any other fork is, and it continues into the extents
+        overflow tree if it outgrew its eight descriptors.
+
+        **The bits run most significant first**, which is the opposite of NTFS
+        and exFAT: the first bit of the bitmap is the top bit of the first byte
+        (Apple TN1150). A count of free blocks cannot tell the two orders apart,
+        because a byte holds the same number of zero bits either way. What tells
+        them apart is position, and reading this volume the wrong way round
+        reports blocks that live files occupy as free.
+
+        Offsets are into the image rather than the volume, so a caller reading
+        the whole disk can use them directly. ``min_bytes`` drops runs too short
+        to hold anything worth recovering.
+        """
+        block = self.block_size
+        if not block or not self.total_blocks:
+            return []
+        vh = read_at(self.fh, self.base + HFSP_VH_OFF, 512)
+        if len(vh) < 512:
+            return []
+        size, extents = _hfs_fork(vh, HFSP_ALLOC_FORK)
+        need = (self.total_blocks + 7) // 8
+        if sum(c for _s, c in extents) * block < min(size or need, need):
+            try:
+                extents = extents + self._overflow(HFSP_ALLOC)
+            except (ValueError, struct.error):
+                pass                             # what the header holds is all there is
+        bits = self._read_extents(extents, need, 0)
+        if not bits:
+            return []
+        total = min(len(bits) * 8, self.total_blocks)
+
+        runs, run_start, pos = [], None, 0
+        while pos < total:
+            byte = bits[pos >> 3]
+            if not (pos & 7) and pos + 8 <= total and byte in (0x00, 0xFF):
+                if byte == 0x00:                 # eight free blocks
+                    if run_start is None:
+                        run_start = pos
+                elif run_start is not None:      # eight used ones
+                    runs.append((run_start, pos - run_start))
+                    run_start = None
+                pos += 8
+                continue
+            if byte & (0x80 >> (pos & 7)):
+                if run_start is not None:
+                    runs.append((run_start, pos - run_start))
+                    run_start = None
+            elif run_start is None:
+                run_start = pos
+            pos += 1
+        if run_start is not None:
+            runs.append((run_start, total - run_start))
+
+        out = []
+        for first, n in runs:
+            length = n * block
+            if length >= min_bytes:
+                out.append((self.base + first * block, length))
+        return out
+
     def inode(self, cnid):
         return cnid
 
@@ -6398,6 +6466,56 @@ def self_test():
                    and recs[0] == (b"KEY1", b"DATA-ONE")
                    and recs[1] == (b"KEY2", b"DATA-TWO"))
 
+        # HFS+ keeps an allocation file, one bit per block, and the bits run
+        # MOST significant first, the opposite way round from NTFS and exFAT.
+        # A count of free blocks cannot tell the two orders apart, because a
+        # byte holds the same number of zero bits either way, so the fixture is
+        # built with the used blocks in one statement and the runs they leave in
+        # another, and the check is on the run POSITIONS.
+        HFS_BLOCK = 4096
+        HFS_TOTAL = 38                              # not a multiple of eight
+        HFS_USED = {0, 1, 2, 9, 20, 21, 22, 23}
+        # by hand from that set, over blocks 0 to 37: free runs are 3..8,
+        # 10..19, 24..37
+        HFS_WANT = [(3, 6), (10, 10), (24, 14)]
+        _hbits = bytearray((HFS_TOTAL + 7) // 8)
+        for _b in HFS_USED:
+            _hbits[_b >> 3] |= 0x80 >> (_b & 7)     # most significant bit first
+        _hbuf = bytearray(4 * HFS_BLOCK)
+        _hvh = bytearray(512)
+        struct.pack_into(">HH", _hvh, 0, HFSP_SIG, 4)
+        struct.pack_into(">III", _hvh, 40, HFS_BLOCK, HFS_TOTAL, len(HFS_USED))
+        struct.pack_into(">QII", _hvh, HFSP_ALLOC_FORK, len(_hbits), 0, 1)
+        struct.pack_into(">II", _hvh, HFSP_ALLOC_FORK + 16, 1, 1)   # one extent, block 1
+        _hbuf[HFSP_VH_OFF:HFSP_VH_OFF + 512] = _hvh
+        _hbuf[HFS_BLOCK:HFS_BLOCK + len(_hbits)] = _hbits
+
+        class _AllocOnly:
+            """Only what free_extents asks of an HFS+ walker."""
+            free_extents = HfsPlusWalker.free_extents    # pylint: disable=protected-access
+            _read_extents = HfsPlusWalker._read_extents  # pylint: disable=protected-access
+            base = 0
+            block_size = HFS_BLOCK
+            total_blocks = HFS_TOTAL
+
+            def __init__(self):
+                self.fh = io.BytesIO(bytes(_hbuf))
+
+            def _overflow(self, _cnid, _resource=False):
+                return []                            # the header holds the whole fork
+
+        _hgot = _AllocOnly().free_extents()
+        hfs_free_ok = _hgot == [(c * HFS_BLOCK, n * HFS_BLOCK) for c, n in HFS_WANT]
+        # the same bitmap read the other way round must NOT give this answer,
+        # which is what a free-block count alone can never establish
+        _lsb = bytearray((HFS_TOTAL + 7) // 8)
+        for _b in HFS_USED:
+            _lsb[_b >> 3] |= 1 << (_b & 7)
+        hfs_bit_order_ok = bytes(_lsb) != bytes(_hbits) and sum(
+            bin(x).count("1") for x in _lsb) == sum(bin(x).count("1") for x in _hbits)
+        hfs_free_floor_ok = (_AllocOnly().free_extents(min_bytes=11 * HFS_BLOCK)
+                             == [(24 * HFS_BLOCK, 14 * HFS_BLOCK)])
+
         for label, cond in (
                 ("an HFS+ volume header is identified by its own geometry",
                  bool(hfs_named) and hfs_named[0] == "hfs+"),
@@ -6408,7 +6526,13 @@ def self_test():
                 ("a fork record yields its size and only its used extents", fork_ok),
                 ("a catalog name decodes from UTF-16 big endian", name_ok),
                 ("a B-tree node's records are found through its offset array",
-                 node_ok)):
+                 node_ok),
+                ("the allocation file reads back as the runs of free space it "
+                 "describes, most significant bit first", hfs_free_ok),
+                ("the two bit orders hold the same number of free blocks, so a "
+                 "count cannot tell them apart", hfs_bit_order_ok),
+                ("an HFS+ free-space floor drops the short runs",
+                 hfs_free_floor_ok)):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
