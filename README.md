@@ -380,6 +380,34 @@ That comparison earned its cost twice: it found this reader returning stale byte
 a file's initialized size, and a second pass found the run list of a heavily fragmented
 file counted twice because its own record is named in its attribute list.
 
+### Deleted files on FAT32 and exFAT
+
+FAT32 and exFAT recover deleted files too, through `Fat32Walker.deleted_files()` and
+`ExfatWalker.deleted_files()` with the same `read_deleted()` reader. A FAT32 delete
+writes `0xE5` over the first byte of the directory entry and frees its clusters in the
+FAT; an exFAT delete clears the in-use bit of the entry's type byte and the file's bits
+in the Allocation Bitmap. Either way the name, first cluster, size and recorded dates
+survive, so a deleted file comes back with all of them.
+
+What neither keeps is where a fragmented file's later clusters lay: FAT32 zeroes the
+chain on delete, and exFAT keeps a chain only for a file it wrote fragmented in the
+first place. So a file that occupied one run is recovered exactly, and one whose size
+would need clusters that a later file has since taken is reported as having existed
+rather than read, because reading it would splice in bytes that now belong to something
+else. A recovered file says in `assumed_contiguous` whether its layout was taken on the
+one-run assumption or from a chain the volume still held. A deleted directory whose
+first cluster is still free and still parses as a directory is walked into, so a folder
+of photographs deleted whole comes back file by file.
+
+Validated the same way as NTFS. `tools/make_fat_deleted_fixtures.sh` builds a FAT32 and
+an exFAT image, each with a folder of two photographs and one fragmented photograph,
+created and then deleted; the self-test recovers them from the directory entries and
+matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers the same
+bytes from the same entries. The fragmented file that lands across reused space is
+refused by this reader and is the one case `icat` will read on the contiguous
+assumption; refusing it is the deliberate choice not to present bytes the entry cannot
+vouch for.
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
