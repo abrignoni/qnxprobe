@@ -334,27 +334,47 @@ initialized size read as zero, which is what the format says and what a database
 preallocates its file depends on. A `--list` also names any alternate data stream it
 finds, because a stream is content the file's own size does not account for.
 
-What it does not do: it lists what the directory indexes hold, so a deleted name is not
-recovered; an 8.3 name indexed beside a long one is skipped rather than listed twice;
-and an encrypted file is listed with its recorded size and refuses to be read, since
-the volume holds no key. Only the unnamed stream is the file's content.
+What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
+indexed beside a long one is skipped rather than listed twice, and an encrypted file is
+listed with its recorded size and refuses to be read, since the volume holds no key.
+Only the unnamed stream is the file's content.
+
+Deleted files are recovered separately, from the MFT rather than the directory index.
+`NtfsWalker.deleted_files()` yields every record that is marked free but still names a
+file: its name, size, dates, and whether the content can still be read. A file whose
+data was **resident**, small enough to sit inside the MFT record, is always recoverable
+this way, and it is the only route to one, because it never occupied a cluster a carver
+could find. A non-resident file is recoverable only while every cluster it used is still
+free; once a later file has taken one, `read_deleted()` refuses it rather than hand back
+bytes that now belong to something else, so overwritten data is never presented as the
+file. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
+records that may since have been reused, so a file whose attributes overflowed its record
+is reported as having existed rather than reconstructed from whatever now lives there.
 
 Validated two ways. A 16 MiB volume written by `mkntfs` and populated through `ntfs-3g`
 carries a resident file, an empty one, a sparse one, a compressed one, one fragmented
 across 333 runs whose attributes had to move into other records, a file grown past what
 was written into it, one record with 61 names, a directory of 400 entries so the index
-outgrows its record, a name that needs UTF-16, and an alternate data stream; every one
-of its 475 files comes back byte for byte against hashes an independent reader recorded
-from the same image, and that fixture ships with the tool so the self-test compares
-against it. On real evidence, a 232.9 GiB Windows volume inside an FTK Imager
+outgrows its record, a name that needs UTF-16, an alternate data stream, and a resident
+and a non-resident file that were created and then deleted; every one of its 475 live
+files comes back byte for byte against hashes an independent reader recorded from the
+same image, the two deleted files are recovered from the MFT and match the bytes written
+before they were deleted (which The Sleuth Kit's `icat` confirms from the same records),
+and that fixture ships with the tool so the self-test compares against it. On real evidence, a 232.9 GiB Windows volume inside an FTK Imager
 acquisition: 221,851 live regular files in 9 seconds, the same set The Sleuth Kit's
 `fls` reports, each resolving to the same MFT record, and 1,339 of 1,341 sampled files
 byte-identical to `icat`. The two that differ are metadata files whose content lives
 only in named streams, where the two tools pick different streams.
 
+On a second real image, a small NTFS volume with a screen recording deleted from it,
+`deleted_files()` finds the one deleted record `fls -d` reports and recovers its 5.8 MB
+byte-identical to `icat`.
+
 `tools/make_ntfs_fixture.sh` rebuilds the fixture on any Linux box with
 `ntfsprogs` and `ntfs-3g`, as an ordinary user, and refuses to finish if the image it
-wrote does not read back as what it meant to write.
+wrote does not read back as what it meant to write. It creates the two deleted files
+last, so nothing reuses their records or clusters, and records their hashes before
+removing them.
 
 That comparison earned its cost twice: it found this reader returning stale bytes past
 a file's initialized size, and a second pass found the run list of a heavily fragmented

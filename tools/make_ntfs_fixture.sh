@@ -142,6 +142,26 @@ sync
 fusermount3 -u "$MNT"
 ntfs-3g "$IMG" "$MNT"
 
+# 15. deleted files, created last and then removed so nothing reuses their
+#     records or clusters. A small one stays resident (its bytes live inside the
+#     MFT record, which is the only deleted content a carver can never reach),
+#     and a larger one is non-resident in free clusters. Their content is hashed
+#     before deletion, so the expected answer comes from what was written rather
+#     than from any reader. Recorded to deleted.intended as "<sha256> <name>".
+mkdir -p "$MNT/deleted"
+printf 'resident deleted file: these bytes live inside the MFT record itself, so no carver can reach them. %s\n' \
+  "$(head -c 200 /dev/zero | tr '\0' 'r')" > "$MNT/deleted/resident-note.txt"
+fill "$MNT/deleted/recording.bin" 300000 'non-resident deleted payload line, recoverable while its clusters stay free'
+sync
+: > "$OUT/deleted.intended"
+for f in resident-note.txt recording.bin; do
+  printf '%s  %s\n' "$(sha256sum "$MNT/deleted/$f" | cut -d" " -f1)" "$f" >> "$OUT/deleted.intended"
+done
+rm -f "$MNT/deleted/resident-note.txt" "$MNT/deleted/recording.bin"
+rmdir "$MNT/deleted" 2>/dev/null || true
+sync
+echo "  wrote and deleted $(wc -l < "$OUT/deleted.intended") files for recovery testing" >&2
+
 find "$MNT" -type f -printf '%P\t%s\n' | sort > "$OUT/paths.tsv"
 (cd "$MNT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$OUT/intended.sha256"
 find "$MNT" -type d -printf '%P\n' | sort > "$OUT/dirs.txt"
