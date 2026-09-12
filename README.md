@@ -92,7 +92,9 @@ read-only, finds each volume with the same partition-table and superblock code
 the report uses, and walks it with the same reader classes the extractor uses.
 Directories load when you expand them, and a selected file can be saved out on
 its own. The Kind column tells regular files from directories, symlinks and
-special entries; only regular files can be saved.
+special entries; only regular files can be saved. Created and Accessed are filled
+for NTFS, which stores all three times as instants; the other readers carry only
+Modified, so those two columns stay blank for them.
 
 The two halves are kept honest against each other by a check you can run on any
 image, with no window:

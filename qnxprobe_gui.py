@@ -179,10 +179,14 @@ def discover_volumes(fh, size):
                 vol["walker"] = q.ExtWalker(fh, base)
             elif kind == "QNX IFS boot image":
                 vol["walker"] = q.IfsWalker(fh, base)
-            elif kind in ("fat32", "exfat", "etfs", "efs", "qnx4"):
+            elif kind:
+                # Whatever walker_for() can read, the window can browse. The
+                # list of kinds used to be typed here and fell behind it: NTFS,
+                # HFS+ and APFS had walkers for months while this branch called
+                # them a filesystem the tool does not read.
                 vol["walker"] = q.walker_for(kind, fh, base, rsize)
                 if vol["walker"] is None:
-                    vol["note"] = "recognised, but no walker for this region"
+                    vol["note"] = "recognised, but no walker for this kind"
             else:
                 vol["note"] = "not a filesystem this tool reads"
         except q.IfsUnsupported as exc:
@@ -357,15 +361,23 @@ def run_window(initial_paths):
     b_save = ttk.Button(cbar, text="Save selected file...", state="disabled")
     b_save.pack(side="left", padx=(6, 0))
 
-    tree = ttk.Treeview(con, columns=("kind", "size", "mtime"), selectmode="browse")
+    # Created and Accessed fill where the walker keeps instants for them, which
+    # is NTFS through stamps(); every other reader carries only the modified
+    # time, so those two stay blank there rather than show a date nothing read.
+    tree = ttk.Treeview(con, columns=("kind", "size", "mtime", "created", "accessed"),
+                        selectmode="browse")
     tree.heading("#0", text="Name")
     tree.heading("kind", text="Kind")
     tree.heading("size", text="Size")
     tree.heading("mtime", text="Modified (UTC)")
+    tree.heading("created", text="Created (UTC)")
+    tree.heading("accessed", text="Accessed (UTC)")
     tree.column("#0", width=520, stretch=True)
     tree.column("kind", width=110, stretch=False)
     tree.column("size", width=110, anchor="e", stretch=False)
     tree.column("mtime", width=170, stretch=False)
+    tree.column("created", width=110, stretch=False)
+    tree.column("accessed", width=110, stretch=False)
     tys = ttk.Scrollbar(con, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=tys.set)
     tree.pack(side="left", fill="both", expand=True)
@@ -560,13 +572,14 @@ def run_window(initial_paths):
         for i, v in enumerate(vols):
             label = f"{v['label']}   {v['kind']}   ({v['name']})" if v["name"] else f"{v['label']}   {v['kind']}"
             iid = tree.insert("", "end", text=label,
-                              values=("volume", q.human(v["size"]), v.get("detail", "")[:60]), open=False)
+                              values=("volume", q.human(v["size"]), v.get("detail", "")[:60], "", ""),
+                              open=False)
             w = v.get("walker")
             if w is not None:
                 state["nodes"][iid] = (i, w.root, True, None)
-                tree.insert(iid, "end", text="loading...", values=("", "", ""))
+                tree.insert(iid, "end", text="loading...", values=("", "", "", "", ""))
             else:
-                tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", ""))
+                tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", "", "", ""))
         done_loading()
         if not vols:
             status["text"] = "no partition or volume found in this image"
@@ -585,7 +598,7 @@ def run_window(initial_paths):
         try:
             entries = list(w.listdir(ino))
         except Exception as exc:
-            tree.insert(iid, "end", text=f"could not list: {exc}", values=("", "", ""))
+            tree.insert(iid, "end", text=f"could not list: {exc}", values=("", "", "", "", ""))
             return
         for name, cino in entries:
             ent = w.entry(cino)
@@ -596,11 +609,16 @@ def run_window(initial_paths):
             islink = (mode & q.S_IFLNK) == q.S_IFLNK
             isreg = (mode & 0o170000) == 0o100000
             kind = "dir" if isdir else "link" if islink else "file" if isreg else "special"
+            created = accessed = 0
+            if hasattr(w, "stamps"):
+                created, _modified, accessed = w.stamps(cino)
             cid = tree.insert(iid, "end", text=name,
-                              values=(kind, "" if isdir else q.human(size), q._fmt_time(mtime)))
+                              values=(kind, "" if isdir else q.human(size), q._fmt_time(mtime),
+                                      q._fmt_time(created) if created else "",
+                                      q._fmt_time(accessed) if accessed else ""))
             state["nodes"][cid] = (vi, cino, isdir, size if isreg else None)
             if isdir:
-                tree.insert(cid, "end", text="loading...", values=("", "", ""))
+                tree.insert(cid, "end", text="loading...", values=("", "", "", "", ""))
 
     def selected(_event=None):
         node = state["nodes"].get(tree.focus())
