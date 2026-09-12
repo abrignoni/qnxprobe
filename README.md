@@ -94,7 +94,9 @@ Directories load when you expand them, and a selected file can be saved out on
 its own. The Kind column tells regular files from directories, symlinks and
 special entries; only regular files can be saved. Created and Accessed are filled
 for NTFS, which stores all three times as instants; the other readers carry only
-Modified, so those two columns stay blank for them.
+Modified, so those two columns stay blank for them. A FAT32 or exFAT file has no
+instant at all: its (UTC) columns stay blank and its readings appear in **Recorded
+(as stored)**.
 
 The two halves are kept honest against each other by a check you can run on any
 image, with no window:
@@ -383,6 +385,16 @@ removing them.
 That comparison earned its cost twice: it found this reader returning stale bytes past
 a file's initialized size, and a second pass found the run list of a heavily fragmented
 file counted twice because its own record is named in its attribute list.
+
+### FAT32 and exFAT times are readings, and are listed as such
+
+A FAT32 or exFAT file's times are a wall clock the volume stored with no zone
+(exFAT stores a UTC offset beside each one, which is shown and not applied), so a
+walker for either gives `entry()` an mtime of 0 and hands the readings out through
+`listdir_records()` instead. `--list` prints them that way, `modified 2023-06-01
+12:00:00 (as stored, no zone)`, never as an instant and never as `1970-01-01`,
+and the window's Contents pane puts them in a **Recorded (as stored)** column with
+the three (UTC) columns left blank.
 
 ### Deleted files on FAT32 and exFAT
 
