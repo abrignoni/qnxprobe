@@ -11,8 +11,8 @@ window has two halves:
                      byte what the command line prints.
 
   Contents           opens the image read-only in this process, finds each
-                     volume with qnxprobe's own primitives (parse_mbr, parse_gpt,
-                     sb_slots, check, identify_fs) and browses it through the
+                     volume through qnxprobe.volumes(), the callable form of
+                     the report's own discovery, and browses it through the
                      same walker classes the extractor uses. Directories load
                      when expanded, and one file at a time can be saved out.
 
@@ -21,9 +21,10 @@ The image is never written to. Both halves open it "rb".
     python3 qnxprobe_gui.py                    open the window
     python3 qnxprobe_gui.py image.img ...      open it with these images added
     python3 qnxprobe_gui.py --check-discovery image.img ...
-                                               no window: prove the Contents
-                                               pane's volume discovery names
-                                               the same volumes the report does
+                                               no window: prove qnxprobe.volumes(),
+                                               which the Contents pane and the
+                                               LEAPP tools read images through,
+                                               names the same volumes the report does
     python3 qnxprobe_gui.py --cli ...          run qnxprobe's own command line;
                                                this is how the window starts
                                                the tool, and it is what makes a
@@ -34,7 +35,6 @@ import os
 import sys
 import json
 import queue
-import struct
 import threading
 import subprocess
 import runpy
@@ -62,143 +62,8 @@ def run_cli(argv):
     """Run qnxprobe.py's command line with these arguments, in this process."""
     sys.argv = ["qnxprobe.py"] + list(argv)
     runpy.run_module("qnxprobe", run_name="__main__", alter_sys=False)
-S = q.SECTOR
-EXT_TYPES = (0x05, 0x0f, 0x85)                         # extended containers, as main() has them
-
-
-# ---------------------------------------------------------------------------
-# Volume discovery for the Contents pane.
-#
-# main() finds the volumes while it prints, so there is no function to call for
-# the list. This rebuilds the same list from the same primitives, in the same
-# order, with the same labels, so a volume here is a volume in the report and
-# --check-discovery proves it against the report text for any image.
-# ---------------------------------------------------------------------------
-
-def _regions(fh, size):
-    """(label, base, size) for every partition, plus bookkeeping main() keeps."""
-    regions, names = [], {}
-    containers, protective = set(), set()
-    parts = q.parse_mbr(fh)
-    if parts:
-        for idx, t, st, cnt in parts:
-            regions.append((f"MBR part {idx}", st * S, cnt * S))
-            names[st * S] = q.volume_name(idx, st)
-            if t in EXT_TYPES:
-                containers.add(f"MBR part {idx}")
-            if t == 0xEE:
-                protective.add(f"MBR part {idx}")
-        logical_idx = 4
-        for idx, t, st, cnt in parts:
-            if t not in EXT_TYPES:
-                continue
-            base, cur, n = st, st, 0
-            while cur and n < 64:
-                ebr = q.read_at(fh, cur * S, 512)
-                if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
-                    break
-                e1, e2 = ebr[446:462], ebr[462:478]
-                lt = e1[4]
-                lst, lcnt = struct.unpack("<II", e1[8:16])
-                if lcnt:
-                    astart = cur + lst
-                    regions.append((f"logical @{astart}", astart * S, lcnt * S))
-                    logical_idx += 1
-                    names[astart * S] = q.volume_name(logical_idx, astart)
-                nxt = struct.unpack("<I", e2[8:12])[0]
-                cur = (base + nxt) if nxt else 0
-                n += 1
-    gpt = q.parse_gpt(fh)
-    if gpt:
-        for idx, name, _g, first, last in gpt:
-            sz = (last - first + 1) * S
-            regions.append((f"GPT part {idx} {name[:20]}", first * S, sz))
-            names[first * S] = q.volume_name(idx, first, name)
-    if not regions:
-        regions.append(("whole image", 0, size))
-        names[0] = q.volume_name(None, 0)
-    return regions, names, containers, protective
-
-
-def _ext_label(fh, base):
-    sb = q.read_at(fh, base + q.EXT_SB_OFF, 1024)
-    lab = sb[q.EXT_F["volume_name"]:q.EXT_F["volume_name"] + 16]
-    lab = lab.split(b"\x00")[0].decode("utf-8", "replace")
-    mnt = sb[q.EXT_F["last_mounted"]:q.EXT_F["last_mounted"] + 64]
-    mnt = mnt.split(b"\x00")[0].decode("utf-8", "replace")
-    return lab or mnt.strip("/").replace("/", "_")
-
-
-def discover_volumes(fh, size):
-    """Every volume the report would list or extract, in report order.
-
-    Each entry is a dict: label, base, size, kind, name (the directory an
-    extraction uses), and either a walker or a note saying why there is none.
-    Brute-scan finds are report-only in main() too (they have no region and so
-    no base to walk), so they are not here either.
-    """
-    regions, names, containers, protective = _regions(fh, size)
-    out, qnx6_labels = [], set()
-
-    for label, base, rsize in regions:
-        best = None
-        for off, _rel in q.sb_slots(fh, base, label, regions):
-            r = q.check(fh, off)
-            if r and not r[2] and (best is None or r[1]["serial"] > best[1]["serial"]):
-                best = (off, r[1])
-        if best is None:
-            continue
-        qnx6_labels.add(label)
-        vol = dict(label=label, base=base, size=rsize, kind="qnx6",
-                   name=names.get(base) or f"lba{base // S}",
-                   detail=f"serial {best[1]['serial']:,}, "
-                          f"volumeid {best[1]['volumeid'].hex()} (as stored)")
-        try:
-            vol["walker"] = q.Qnx6Walker(fh, base, best[0] - base)
-        except Exception as exc:                        # report it, do not hide it
-            vol["note"] = f"could not walk this filesystem: {exc}"
-        out.append(vol)
-
-    for label, base, rsize in regions:
-        if label in qnx6_labels or label in protective:
-            continue
-        if label in containers:
-            out.append(dict(label=label, base=base, size=rsize, kind="extended container",
-                            name="", note="holds the logical volumes, nothing to walk"))
-            continue
-        kind, lines = q.identify_fs(fh, base, rsize)
-        stem = names.get(base) or f"lba{base // S}"
-        vol = dict(label=label, base=base, size=rsize, kind=kind or "not recognised",
-                   name=stem, detail="; ".join(lines[:2]))
-        try:
-            if kind and kind.startswith("ext"):
-                ext_name = _ext_label(fh, base)
-                suffix = q.sanitize_volume_label(ext_name) if ext_name else ""
-                if suffix and not stem.endswith(f"_{suffix}"):
-                    vol["name"] = f"{stem}_{suffix}"
-                vol["walker"] = q.ExtWalker(fh, base)
-            elif kind == "QNX IFS boot image":
-                vol["walker"] = q.IfsWalker(fh, base)
-            elif kind:
-                # Whatever walker_for() can read, the window can browse. The
-                # list of kinds used to be typed here and fell behind it: NTFS,
-                # HFS+ and APFS had walkers for months while this branch called
-                # them a filesystem the tool does not read.
-                vol["walker"] = q.walker_for(kind, fh, base, rsize)
-                if vol["walker"] is None:
-                    vol["note"] = "recognised, but no walker for this kind"
-            else:
-                vol["note"] = "not a filesystem this tool reads"
-        except q.IfsUnsupported as exc:
-            vol["note"] = f"contents not read: {exc}"
-        except Exception as exc:
-            vol["note"] = f"could not walk this filesystem: {exc}"
-        out.append(vol)
-    return out
-
-
 def check_discovery(paths):
-    """Prove discover_volumes() names what main() reports. Returns exit status.
+    """Prove qnxprobe.volumes() names what main() reports. Returns exit status.
 
     Parses the report main() prints for the two lines that name a volume and
     its kind, and requires the discovered set to equal it. A brute-scan-only
@@ -211,7 +76,7 @@ def check_discovery(paths):
     for path in paths:
         with q.open_image(path) as fh:
             size = q.image_size(fh)
-            found = {(v["label"], v["kind"]) for v in discover_volumes(fh, size)
+            found = {(v["label"], v["kind"]) for v in q.volumes(fh, size)
                      if v["kind"] != "extended container"}
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -550,7 +415,7 @@ def run_window(initial_paths):
             # picked up by poll_contents() on the main thread.
             try:
                 fh = q.open_image(path)          # one file, or a split set joined
-                q_con.put(("ok", path, fh, discover_volumes(fh, q.image_size(fh))))
+                q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
         threading.Thread(target=work, daemon=True).start()
