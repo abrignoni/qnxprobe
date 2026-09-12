@@ -246,7 +246,21 @@ python3 qnxprobe.py --extract case.zip mmcblk0.img.001        # any segment of a
 
 `--list` walks qnx6 through the same block resolution the kernel uses in
 `qnx6_block_map()`, including multi-level indirect trees and long filenames held out
-of line in the Longfile tree, and walks ext through its extent trees. Both read-only.
+of line in the Longfile tree, and walks ext through its extent trees, or through the
+classic block map of ext2 and ext3 (twelve direct pointers, then single, double and
+triple indirect blocks). Both read-only.
+
+A file is read by logical block, so a sparse file comes out at its declared size
+with zeros where its holes are, and an extent the kernel wrote as uninitialized
+reads as zeros too. That matters on an Android image: SQLite's `-shm` files and
+MMKV stores are sparse, and a reader that concatenates the allocated blocks hands
+back a shorter file with its pages in the wrong order. The two ext fixtures under
+`tests/fixtures/` hold a hole first, a hole in the middle, a trailing hole past the
+last block, a file that is nothing but hole and a 3 MiB file with data at both ends,
+built with `mke2fs -d` from one tree (`tools/make_ext_fixtures.sh`); the self-test
+requires every one to hash to what `sha256sum` recorded over that tree. A file whose
+data is inline in its inode is read when it fits the inode's 60 bytes and refused,
+by name, when the rest lives in an extended attribute this does not read.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
