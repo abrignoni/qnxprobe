@@ -337,7 +337,9 @@ finds, because a stream is content the file's own size does not account for.
 What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
 indexed beside a long one is skipped rather than listed twice, and an encrypted file is
 listed with its recorded size and refuses to be read, since the volume holds no key.
-Only the unnamed stream is the file's content.
+Only the unnamed stream is the file's content. `NtfsWalker.stamps(record)` returns
+the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
+`entry()` carries only the modified one, which is what a listing needs.
 
 Deleted files are recovered separately, from the MFT rather than the directory index.
 `NtfsWalker.deleted_files()` yields every record that is marked free but still names a
