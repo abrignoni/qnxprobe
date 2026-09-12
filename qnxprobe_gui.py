@@ -364,7 +364,10 @@ def run_window(initial_paths):
     # Created and Accessed fill where the walker keeps instants for them, which
     # is NTFS through stamps(); every other reader carries only the modified
     # time, so those two stay blank there rather than show a date nothing read.
-    tree = ttk.Treeview(con, columns=("kind", "size", "mtime", "created", "accessed"),
+    # A FAT32 or exFAT walker keeps readings rather than instants, so for it
+    # the three (UTC) columns stay blank and the readings go in the last column
+    # as stored, the way GLEAPP's gallery shows the same file.
+    tree = ttk.Treeview(con, columns=("kind", "size", "mtime", "created", "accessed", "recorded"),
                         selectmode="browse")
     tree.heading("#0", text="Name")
     tree.heading("kind", text="Kind")
@@ -372,12 +375,14 @@ def run_window(initial_paths):
     tree.heading("mtime", text="Modified (UTC)")
     tree.heading("created", text="Created (UTC)")
     tree.heading("accessed", text="Accessed (UTC)")
+    tree.heading("recorded", text="Recorded (as stored)")
     tree.column("#0", width=520, stretch=True)
     tree.column("kind", width=110, stretch=False)
     tree.column("size", width=110, anchor="e", stretch=False)
     tree.column("mtime", width=170, stretch=False)
     tree.column("created", width=110, stretch=False)
     tree.column("accessed", width=110, stretch=False)
+    tree.column("recorded", width=420, stretch=False)
     tys = ttk.Scrollbar(con, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=tys.set)
     tree.pack(side="left", fill="both", expand=True)
@@ -572,14 +577,14 @@ def run_window(initial_paths):
         for i, v in enumerate(vols):
             label = f"{v['label']}   {v['kind']}   ({v['name']})" if v["name"] else f"{v['label']}   {v['kind']}"
             iid = tree.insert("", "end", text=label,
-                              values=("volume", q.human(v["size"]), v.get("detail", "")[:60], "", ""),
+                              values=("volume", q.human(v["size"]), v.get("detail", "")[:60], "", "", ""),
                               open=False)
             w = v.get("walker")
             if w is not None:
                 state["nodes"][iid] = (i, w.root, True, None)
-                tree.insert(iid, "end", text="loading...", values=("", "", "", "", ""))
+                tree.insert(iid, "end", text="loading...", values=("", "", "", "", "", ""))
             else:
-                tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", "", "", ""))
+                tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", "", "", "", ""))
         done_loading()
         if not vols:
             status["text"] = "no partition or volume found in this image"
@@ -596,11 +601,13 @@ def run_window(initial_paths):
         vi, ino, _isdir, _ = node
         w = state["volumes"][vi]["walker"]
         try:
-            entries = list(w.listdir(ino))
+            readings = hasattr(w, "listdir_records")
+            entries = list(w.listdir_records(ino)) if readings \
+                else [(name, cino, None) for name, cino in w.listdir(ino)]
         except Exception as exc:
-            tree.insert(iid, "end", text=f"could not list: {exc}", values=("", "", "", "", ""))
+            tree.insert(iid, "end", text=f"could not list: {exc}", values=("", "", "", "", "", ""))
             return
-        for name, cino in entries:
+        for name, cino, recorded in entries:
             ent = w.entry(cino)
             if not ent:
                 continue
@@ -613,12 +620,14 @@ def run_window(initial_paths):
             if hasattr(w, "stamps"):
                 created, _modified, accessed = w.stamps(cino)
             cid = tree.insert(iid, "end", text=name,
-                              values=(kind, "" if isdir else q.human(size), q._fmt_time(mtime),
+                              values=(kind, "" if isdir else q.human(size),
+                                      "" if readings else q._fmt_time(mtime),
                                       q._fmt_time(created) if created else "",
-                                      q._fmt_time(accessed) if accessed else ""))
+                                      q._fmt_time(accessed) if accessed else "",
+                                      "; ".join(f"{k} {v}" for k, v in (recorded or {}).items() if v)))
             state["nodes"][cid] = (vi, cino, isdir, size if isreg else None)
             if isdir:
-                tree.insert(cid, "end", text="loading...", values=("", "", "", "", ""))
+                tree.insert(cid, "end", text="loading...", values=("", "", "", "", "", ""))
 
     def selected(_event=None):
         node = state["nodes"].get(tree.focus())
