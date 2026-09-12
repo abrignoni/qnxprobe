@@ -42,7 +42,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.26"
+QNXPROBE_VERSION = "1.27"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -764,6 +764,10 @@ class Qnx6Walker:
     root = QNX6_ROOT_INO
 
 
+class ExtUnreadable(Exception):
+    """An ext file this reader cannot hand back whole; the message says why."""
+
+
 class ExtWalker:
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
@@ -792,28 +796,103 @@ class ExtWalker:
             return None
         return raw
 
+    def _runs(self, raw):
+        """[(logical block, block count, physical block or None)] in logical order.
+
+        A file's content is addressed by logical block; where a run's physical
+        block is None the run is an extent the kernel wrote as uninitialized,
+        which reads as zeros, and a logical range no run covers is a hole, which
+        also reads as zeros. Returns None for a file whose data lives inline in
+        the inode. Two layouts are read:
+
+        - the extent tree (EXT4_EXTENTS_FL), each leaf carrying its own logical
+          start (ee_block) and length, with bit 15 of the length marking an
+          uninitialized extent: linux/fs/ext4/ext4_extents.h;
+        - the classic block map of ext2 and ext3, twelve direct pointers then a
+          single, double and triple indirect block, a zero pointer being a
+          hole: linux/fs/ext2/ext2.h (i_block), linux/fs/ext4/ext4.h EXT4_*_BLOCK.
+
+        Reading the extents as a flat list of physical blocks, which this did
+        before, dropped every hole: a 32 KiB SQLite shared-memory file with two
+        written pages came back as 8 KiB, and its bytes in the wrong order.
+        """
+        flags = int.from_bytes(raw[32:36], "little")
+        if flags & 0x10000000:                                 # EXT4_INLINE_DATA_FL
+            return None
+        runs = []
+        if flags & 0x80000:                                    # EXT4_EXTENTS_FL
+            def walk(buf, off, depth_left=8):
+                if depth_left <= 0 or len(buf) < off + 12:
+                    return
+                if struct.unpack_from("<H", buf, off)[0] != 0xF30A:
+                    return
+                ent = struct.unpack_from("<H", buf, off + 2)[0]
+                depth = struct.unpack_from("<H", buf, off + 6)[0]
+                for i in range(ent):
+                    o = off + 12 + i * 12
+                    if len(buf) < o + 12:
+                        return
+                    if depth == 0:
+                        lblk = struct.unpack_from("<I", buf, o)[0]
+                        raw_len = struct.unpack_from("<H", buf, o + 4)[0]
+                        st = (struct.unpack_from("<I", buf, o + 8)[0]
+                              | struct.unpack_from("<H", buf, o + 6)[0] << 32)
+                        if raw_len > 0x8000:                   # uninitialized extent
+                            runs.append((lblk, raw_len - 0x8000, None))
+                        elif raw_len:
+                            runs.append((lblk, raw_len, st))
+                    else:
+                        leaf = (struct.unpack_from("<I", buf, o + 4)[0]
+                                | struct.unpack_from("<H", buf, o + 8)[0] << 32)
+                        walk(self._blk(leaf), 0, depth_left - 1)
+            walk(raw, 40)
+            runs.sort()
+            return runs
+
+        per = self.bs // 4                                      # pointers per indirect block
+
+        def add(lblk, phys):
+            if not phys:                                        # a zero pointer is a hole
+                return
+            if runs and runs[-1][2] is not None:
+                l0, n0, p0 = runs[-1]
+                if l0 + n0 == lblk and p0 + n0 == phys:
+                    runs[-1] = (l0, n0 + 1, p0)
+                    return
+            runs.append((lblk, 1, phys))
+
+        def indirect(block, level, lbase):
+            if not block:
+                return
+            buf = self._blk(block)
+            span = per ** (level - 1)                           # logical blocks per pointer
+            for i in range(min(per, len(buf) // 4)):
+                ptr = struct.unpack_from("<I", buf, 4 * i)[0]
+                if level == 1:
+                    add(lbase + i * span, ptr)
+                elif ptr:
+                    indirect(ptr, level - 1, lbase + i * span)
+
+        for i in range(12):
+            add(i, struct.unpack_from("<I", raw, 40 + 4 * i)[0])
+        indirect(struct.unpack_from("<I", raw, 88)[0], 1, 12)
+        indirect(struct.unpack_from("<I", raw, 92)[0], 2, 12 + per)
+        indirect(struct.unpack_from("<I", raw, 96)[0], 3, 12 + per + per * per)
+        return runs
+
     def _blocks(self, raw):
-        if not (int.from_bytes(raw[32:36], "little") & 0x80000):
-            return []                                   # not extent-mapped
-        def walk(buf, off):
-            if struct.unpack_from("<H", buf, off)[0] != 0xF30A:
-                return []
-            ent = struct.unpack_from("<H", buf, off + 2)[0]
-            depth = struct.unpack_from("<H", buf, off + 6)[0]
-            out = []
-            for i in range(ent):
-                o = off + 12 + i * 12
-                if depth == 0:
-                    st = (struct.unpack_from("<I", buf, o + 8)[0]
-                          | struct.unpack_from("<H", buf, o + 6)[0] << 32)
-                    ln = struct.unpack_from("<H", buf, o + 4)[0] & 0x7FFF
-                    out += list(range(st, st + ln))
-                else:
-                    leaf = (struct.unpack_from("<I", buf, o + 4)[0]
-                            | struct.unpack_from("<H", buf, o + 8)[0] << 32)
-                    out += walk(self._blk(leaf), 0)
-            return out
-        return walk(raw, 40)
+        """The physical blocks holding a directory's entries, in logical order.
+
+        Directories have no holes, so a run that reads as zeros is skipped.
+        """
+        runs = self._runs(raw)
+        if not runs:
+            return []
+        out = []
+        for _lblk, count, phys in runs:
+            if phys is not None:
+                out.extend(range(phys, phys + count))
+        return out
 
     def listdir(self, num):
         raw = self.inode(num)
@@ -846,19 +925,58 @@ class ExtWalker:
         return mode, size, struct.unpack_from("<I", raw, 16)[0]
 
     def read_file(self, num, size):
+        """Yield the file's bytes, exactly ``size`` of them, holes and all."""
         raw = self.inode(num)
         if not raw:
             return
+        runs = self._runs(raw)
+        if runs is None:
+            # Inline data keeps the first 60 bytes in the inode's block field and
+            # the rest in the system.data extended attribute, which is not read
+            # here. A short file is whole; a longer one is refused rather than
+            # handed back cut, because a cut file parses as a smaller one.
+            if size <= 60:
+                yield raw[40:40 + size]
+                return
+            raise ExtUnreadable(f"{size:,} bytes of inline data, of which only the 60 "
+                                "in the inode are read")
         left = size
-        for b in self._blocks(raw):
+        pos = 0                                                 # next logical block to deliver
+        for lblk, count, phys in runs:
             if left <= 0:
                 return
-            buf = self._blk(b)
-            if len(buf) < self.bs:
-                buf = buf + bytes(self.bs - len(buf))
-            take = min(self.bs, left)
-            yield buf[:take]
-            left -= take
+            if lblk > pos:                                      # a hole reads as zeros
+                for chunk in self._zeros(min(lblk - pos, -(-left // self.bs)) * self.bs, left):
+                    yield chunk
+                    left -= len(chunk)
+                pos = lblk
+            skip = pos - lblk                                   # an overlapping run, never expected
+            for i in range(skip, count):
+                if left <= 0:
+                    return
+                if phys is None:
+                    buf = bytes(self.bs)
+                else:
+                    buf = self._blk(phys + i)
+                    if len(buf) < self.bs:
+                        buf = buf + bytes(self.bs - len(buf))
+                take = min(self.bs, left)
+                yield buf[:take]
+                left -= take
+                pos += 1
+        if left > 0:                                            # a trailing hole
+            for chunk in self._zeros(left, left):
+                yield chunk
+                left -= len(chunk)
+
+    @staticmethod
+    def _zeros(n, cap):
+        """Zero bytes for a hole, at most cap, in pieces that do not sit in memory at once."""
+        n = min(n, cap)
+        while n > 0:
+            piece = min(n, 1 << 20)
+            yield bytes(piece)
+            n -= piece
 
     root = 2
 
@@ -6456,6 +6574,56 @@ def _ntfs_deleted_check(image_gz, listing):
     return matched, len(want), missing, different
 
 
+def _ext_fixture_check(image_gz, listing):
+    """Walk a committed ext fixture and compare every file against the hashes
+    sha256sum recorded over the tree the image was built from.
+
+    Returns (kind, matched, expected, missing, different). The fixtures hold
+    sparse files of every shape (a hole first, a hole in the middle, a trailing
+    hole past the last block, a file that is nothing but hole, and a 3 MiB one
+    whose data sits at both ends), so a reader that drops holes or loses the
+    logical position of an extent fails here; the ext2 image reaches the same
+    files through the classic block map instead of an extent tree.
+    """
+    import gzip, hashlib, io
+    with gzip.open(image_gz, "rb") as gz:
+        img = io.BytesIO(gz.read())
+    size = img.getbuffer().nbytes
+    want = {}
+    with open(listing, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            digest, path = line.split("  ", 1)
+            want[path] = digest
+    kind = (identify_fs(img, 0, size) or (None,))[0]
+    w = walker_for(kind, img, 0, size) if kind else None
+    if w is None:
+        return kind, 0, len(want), len(want), 0
+    have = {path: (ino, sz) for path, ino, sz, _mtime in collect(w, w.root) if sz is not None}
+    matched = missing = different = 0
+    for path, digest in want.items():
+        got = have.get(path)
+        if got is None:
+            missing += 1
+            continue
+        h = hashlib.sha256()
+        read = 0
+        try:
+            for chunk in w.read_file(got[0], got[1]):
+                h.update(chunk)
+                read += len(chunk)
+        except ExtUnreadable:
+            different += 1
+            continue
+        if read == got[1] and h.hexdigest() == digest:
+            matched += 1
+        else:
+            different += 1
+    return kind, matched, len(want), missing, different
+
+
 def _ntfs_fixture_check(image_gz, listing):
     """Walk the committed NTFS fixture and compare every file against the
     hashes an independent reader recorded from the same image.
@@ -8273,6 +8441,34 @@ def self_test():
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+        # ext: sparse files and the classic block map. Both fixtures were built
+        # from one tree with mke2fs -d, so one hash list serves both, and it was
+        # written by sha256sum over that tree, not by any reader of the image.
+        ext_want = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tests", "fixtures", "ext-sparse.sha256")
+        for stem, want_kind in (("ext4-sparse", "ext4"), ("ext2-sparse", "ext2")):
+            ext_fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "tests", "fixtures", stem + ".img.gz")
+            if not (os.path.isfile(ext_fix) and os.path.isfile(ext_want)):
+                print(f"  [SKIP] the {stem} fixture is not beside this script, so the "
+                      "walk was not compared against it")
+                continue
+            try:
+                ekind, egot, ewant, emiss, ediff = _ext_fixture_check(ext_fix, ext_want)
+                ebroke = ""
+            except Exception as exc:                 # pylint: disable=broad-except
+                ekind, egot, ewant, emiss, ediff = None, 0, 0, 0, 0
+                ebroke = f"; the walk raised {type(exc).__name__}: {exc}"
+            econd = (ekind == want_kind and egot and egot == ewant and not emiss
+                     and not ediff and not ebroke)
+            if not econd:
+                ok = False
+            print(f"  [{'PASS' if econd else 'FAIL'}] every file of the {stem} fixture, "
+                  f"holes included, matches what sha256sum recorded over its source tree "
+                  f"({egot} of {ewant}, identified as {ekind}"
+                  + (f", {emiss} missing" if emiss else "")
+                  + (f", {ediff} different" if ediff else "") + ")" + ebroke)
 
         ntfs_fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "tests", "fixtures", "ntfs-fixture.img.gz")
