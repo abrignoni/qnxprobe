@@ -42,7 +42,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.25"
+QNXPROBE_VERSION = "1.26"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -5572,6 +5572,166 @@ def volume_name(part_idx, lba, label=""):
     return f"{stem}_{suffix}" if suffix else stem
 
 
+# The MBR type bytes that mark an extended partition container. main() keeps
+# the same tuple as a local; a consumer of volumes() needs it by name.
+EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
+
+
+def partition_regions(fh, size):
+    """(regions, names, containers, protective) for an image, as main() sees them.
+
+    regions is [(label, base, size)] in report order: MBR primaries, then the
+    logical volumes found by walking the EBR chain, then GPT entries, or the
+    whole image as one region when no table is present. names maps a region's
+    byte offset to the directory an extraction uses (volume_name); containers
+    holds the labels of extended partition containers, which hold the logical
+    volumes and are not themselves volumes; protective holds the 0xEE entry a
+    GPT disk carries in its MBR.
+    """
+    regions, names = [], {}
+    containers, protective = set(), set()
+    parts = parse_mbr(fh)
+    if parts:
+        for idx, t, st, cnt in parts:
+            regions.append((f"MBR part {idx}", st * SECTOR, cnt * SECTOR))
+            names[st * SECTOR] = volume_name(idx, st)
+            if t in EXT_PARTITION_TYPES:
+                containers.add(f"MBR part {idx}")
+            if t == 0xEE:
+                protective.add(f"MBR part {idx}")
+        logical_idx = 4               # logical volumes number from 5, as OSes do
+        for idx, t, st, cnt in parts:
+            if t not in EXT_PARTITION_TYPES:
+                continue
+            base, cur, n = st, st, 0
+            while cur and n < 64:
+                ebr = read_at(fh, cur * SECTOR, 512)
+                if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
+                    break
+                e1, e2 = ebr[446:462], ebr[462:478]
+                lst, lcnt = struct.unpack("<II", e1[8:16])
+                if lcnt:
+                    astart = cur + lst
+                    regions.append((f"logical @{astart}", astart * SECTOR, lcnt * SECTOR))
+                    logical_idx += 1
+                    names[astart * SECTOR] = volume_name(logical_idx, astart)
+                nxt = struct.unpack("<I", e2[8:12])[0]
+                cur = (base + nxt) if nxt else 0
+                n += 1
+    gpt = parse_gpt(fh)
+    if gpt:
+        for idx, name, _g, first, last in gpt:
+            sz = (last - first + 1) * SECTOR
+            regions.append((f"GPT part {idx} {name[:20]}", first * SECTOR, sz))
+            names[first * SECTOR] = volume_name(idx, first, name)
+    if not regions:
+        regions.append(("whole image", 0, size))
+        names[0] = volume_name(None, 0)
+    return regions, names, containers, protective
+
+
+def _ext_label(fh, base):
+    """An ext volume's label, or its last mount point when it has no label."""
+    sb = read_at(fh, base + EXT_SB_OFF, 1024)
+    lab = sb[EXT_F["volume_name"]:EXT_F["volume_name"] + 16]
+    lab = lab.split(b"\x00")[0].decode("utf-8", "replace")
+    mnt = sb[EXT_F["last_mounted"]:EXT_F["last_mounted"] + 64]
+    mnt = mnt.split(b"\x00")[0].decode("utf-8", "replace")
+    return lab or mnt.strip("/").replace("/", "_")
+
+
+def volumes(fh, size=None):
+    """Every volume main() would list or extract, in report order, as dicts.
+
+    This is the callable form of the discovery main() does while it prints.
+    The window's Contents pane and the LEAPP tools read images through it, so
+    a volume here is a volume in the report: `qnxprobe_gui.py --check-discovery
+    IMAGE` proves that against the report text for any image.
+
+    Each dict carries:
+        label       the region as the report names it ("GPT part 3 storage")
+        base, size  byte offset and byte length of the region
+        lba         base in sectors, the identity an extraction is named by
+        kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
+                    or "not recognised"
+        name        the directory the volume extracts under (volume_name)
+        detail      a short description from the identifier
+        missing_past_end
+                    bytes of the region that lie past the end of the image; a
+                    positive value means the file holds only part of this
+                    volume (a lone first segment of a split image reads so)
+        walker      an object with root, listdir, entry and read_file, when the
+                    kind is one this reads; else
+        note        why there is no walker
+
+    Brute-scan finds are report-only in main() too (they have no region and so
+    no base to walk), so they are not here either. fh is what open_image()
+    returns; size defaults to image_size(fh).
+    """
+    if size is None:
+        size = image_size(fh)
+    regions, names, containers, protective = partition_regions(fh, size)
+    missing = {start: gap for _lab, start, _rs, gap in
+               short_regions(size, regions, skip=protective)}
+    out, qnx6_labels = [], set()
+
+    for label, base, rsize in regions:
+        best = None
+        for off, _rel in sb_slots(fh, base, label, regions):
+            r = check(fh, off)
+            if r and not r[2] and (best is None or r[1]["serial"] > best[1]["serial"]):
+                best = (off, r[1])
+        if best is None:
+            continue
+        qnx6_labels.add(label)
+        vol = dict(label=label, base=base, size=rsize, lba=base // SECTOR, kind="qnx6",
+                   name=names.get(base) or f"lba{base // SECTOR}",
+                   detail=f"serial {best[1]['serial']:,}, "
+                          f"volumeid {best[1]['volumeid'].hex()} (as stored)",
+                   missing_past_end=missing.get(base, 0))
+        try:
+            vol["walker"] = Qnx6Walker(fh, base, best[0] - base)
+        except Exception as exc:                        # report it, do not hide it
+            vol["note"] = f"could not walk this filesystem: {exc}"
+        out.append(vol)
+
+    for label, base, rsize in regions:
+        if label in qnx6_labels or label in protective:
+            continue
+        if label in containers:
+            out.append(dict(label=label, base=base, size=rsize, lba=base // SECTOR,
+                            kind="extended container", name="", detail="",
+                            missing_past_end=missing.get(base, 0),
+                            note="holds the logical volumes, nothing to walk"))
+            continue
+        kind, lines = identify_fs(fh, base, rsize)
+        stem = names.get(base) or f"lba{base // SECTOR}"
+        vol = dict(label=label, base=base, size=rsize, lba=base // SECTOR,
+                   kind=kind or "not recognised", name=stem,
+                   detail="; ".join(lines[:2]), missing_past_end=missing.get(base, 0))
+        try:
+            if kind and kind.startswith("ext"):
+                ext_name = _ext_label(fh, base)
+                suffix = sanitize_volume_label(ext_name) if ext_name else ""
+                if suffix and not stem.endswith(f"_{suffix}"):
+                    vol["name"] = f"{stem}_{suffix}"
+                vol["walker"] = ExtWalker(fh, base)
+            elif kind == "QNX IFS boot image":
+                vol["walker"] = IfsWalker(fh, base)
+            elif kind:
+                vol["walker"] = walker_for(kind, fh, base, rsize)
+                if vol["walker"] is None:
+                    vol["note"] = "recognised, but no walker for this kind"
+            else:
+                vol["note"] = "not a filesystem this tool reads"
+        except IfsUnsupported as exc:
+            vol["note"] = f"contents not read: {exc}"
+        except Exception as exc:
+            vol["note"] = f"could not walk this filesystem: {exc}"
+        out.append(vol)
+    return out
+
+
 def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
          extract=None, only=None, zf=None, do_triage=False, exclude=None,
          reporter=None, manifest=None):
@@ -8223,6 +8383,52 @@ def self_test():
                 ok = False
             print(f"  [{'PASS' if nok else 'FAIL'}] an NTFS listing still prints an "
                   f"instant's date ({ndetail})")
+
+        # volumes(): the callable form of the report's discovery. The names and
+        # kinds below are written out, not read back from volume_name() or from
+        # main(), so a wrong region, a wrong kind or a missing walker each fails.
+        def _vol_view(path):
+            with open(path, "rb") as fh:
+                return [(v["kind"], v["name"], "walker" in v, v["missing_past_end"])
+                        for v in volumes(fh, os.path.getsize(path))]
+        vol_checks = (
+            ("volumes() names the qnx6 behind an MBR by its partition and LBA",
+             a, [("qnx6", "p1_lba2048", True, 0)]),
+            ("volumes() names a whole-image big-endian qnx6 lba0",
+             b, [("qnx6", "lba0", True, 0)]),
+            ("volumes() reports an unrecognised image as one region without a walker",
+             c, [("not recognised", "lba0", False, 0)]),
+            ("volumes() recognises a synthetic FAT32 boot sector",
+             fp, [("fat32", "lba0", True, 0)]),
+            ("volumes() recognises a synthetic exFAT boot sector",
+             xp, [("exfat", "lba0", True, 0)]),
+        )
+        for label, path, want in vol_checks:
+            try:
+                got = _vol_view(path)
+                vbroke = ""
+            except Exception as exc:                 # pylint: disable=broad-except
+                got, vbroke = None, f"; raised {type(exc).__name__}: {exc}"
+            cond = got == want and not vbroke
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] {label}"
+                  + ("" if cond else f"  (got {got}{vbroke})"))
+        # A region the file does not hold in full reports how much is missing:
+        # the first segment of a split image has exactly this shape.
+        try:
+            with open(cut, "rb") as fh:
+                cut_vols = volumes(fh, os.path.getsize(cut))
+            cut_cond = (len(cut_vols) == 1 and cut_vols[0]["kind"] == "qnx6"
+                        and cut_vols[0]["missing_past_end"] > 0)
+            cut_detail = (f"{cut_vols[0]['missing_past_end']:,} bytes past the end"
+                          if cut_vols else "no volume found")
+        except Exception as exc:                     # pylint: disable=broad-except
+            cut_cond, cut_detail = False, f"raised {type(exc).__name__}: {exc}"
+        if not cut_cond:
+            ok = False
+        print(f"  [{'PASS' if cut_cond else 'FAIL'}] volumes() reports a volume the "
+              f"image is too short for as missing bytes ({cut_detail})")
 
         print()
         print("  SELF-TEST PASSED. The detector reports positives and negatives"

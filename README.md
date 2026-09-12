@@ -251,6 +251,48 @@ of line in the Longfile tree, and walks ext through its extent trees. Both read-
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
 
+## Reading an image from Python
+
+Everything the command line does is reachable by importing the file, and the
+entry point is `volumes()`, the callable form of the discovery the report does
+while it prints. The window's Contents pane and the LEAPP tools read images
+through it, and `qnxprobe_gui.py --check-discovery IMAGE` proves that it names
+the same volumes the report does, on any image you give it.
+
+```python
+import qnxprobe as q
+
+segments = q.split_segments(path)          # the .001/.002 set beside a segment, or None
+image = q.open_image(path, segments)       # a plain file, a joined set, or an .E01
+for vol in q.volumes(image):
+    print(vol["name"], vol["kind"], vol["label"], vol["missing_past_end"])
+    walker = vol.get("walker")            # None when the kind is not one this reads
+    if walker is None:
+        print("   ", vol["note"])
+        continue
+    for path, ino, size, mtime in q.collect(walker, walker.root):
+        if size is None:                   # a symlink or special file
+            continue
+        for chunk in walker.read_file(ino, size):
+            ...                            # the file's bytes, streamed
+image.close()
+```
+
+Each dict names the region as the report does (`label`), gives its byte offset and
+length (`base`, `size`) and its sector (`lba`), the directory an extraction uses
+(`name`, see [What an extraction is named](#what-an-extraction-is-named-and-how-to-check-it)),
+the filesystem (`kind`, or `not recognised`, or `extended container` for the MBR
+entry that holds logical volumes) and, when the image holds only part of the
+volume, `missing_past_end`, the bytes of it that lie past the end of the file. That
+last field is how a lone first segment of a split image shows itself. FAT32 and
+exFAT walkers hand back readings rather than instants for their times, as
+described under [FAT32 and exFAT times](#fat32-and-exfat-times-are-readings-and-are-listed-as-such);
+pass a dict as `times` to `collect()` to receive them.
+
+`volumes()` reads only what identification needs. The walk and the reads happen
+when you ask for them, so a consumer that wants a few files out of a 250 GiB disk
+never touches the rest.
+
 ## APFS
 
 Every Mac since 2017 is APFS, so `--list` and `--extract` read a container. It is
