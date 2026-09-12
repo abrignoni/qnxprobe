@@ -15,7 +15,11 @@
       "file": "qnxprobe.py",
       "consumers": [
         {"repo": "abrignoni/GLEAPP", "manifest": "gleapp/vendor/vendored.json"},
-        {"repo": "abrignoni/VLEAPP", "manifest": "scripts/vendor/vendored.json"}
+        {"repo": "abrignoni/VLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/ALEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/DLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"}
       ]
     },
     {
@@ -25,7 +29,11 @@
       "consumers": [
         {"repo": "abrignoni/GLEAPP", "manifest": "gleapp/vendor/vendored.json"},
         {"repo": "abrignoni/VLEAPP", "manifest": "scripts/vendor/vendored.json"},
-        {"repo": "abrignoni/qnxprobe", "manifest": "vendored.json"}
+        {"repo": "abrignoni/qnxprobe", "manifest": "vendored.json"},
+        {"repo": "abrignoni/ALEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/DLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"}
       ]
     },
     {
