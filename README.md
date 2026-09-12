@@ -422,7 +422,7 @@ and a non-resident file that were created and then deleted; every one of its 475
 files comes back byte for byte against hashes an independent reader recorded from the
 same image, the two deleted files are recovered from the MFT and match the bytes written
 before they were deleted (which The Sleuth Kit's `icat` confirms from the same records),
-and that fixture ships with the tool so the self-test compares against it. On real evidence, a 232.9 GiB Windows volume inside an FTK Imager
+and that fixture ships with the tool so the self-test compares against it. On real evidence, a 231.9 GiB Windows volume inside a 232.9 GiB FTK Imager
 acquisition: 221,851 live regular files in 9 seconds, the same set The Sleuth Kit's
 `fls` reports, each resolving to the same MFT record, and 1,339 of 1,341 sampled files
 byte-identical to `icat`. The two that differ are metadata files whose content lives
@@ -538,11 +538,11 @@ It is never read as raw bytes: a container read that way holds no filesystem the
 walkers can see, so the run would report an empty image instead of saying it
 could not read the container.
 
-Measured on a 15-segment FTK Imager acquisition of a 232.9 GiB Windows disk: the
-segments join, the GPT and its four partitions are read, and the EFI system
-partition is walked as FAT32, in about a second. The two NTFS partitions are
-reported as not recognised, with their first bytes shown, because there is no
-NTFS walker here yet.
+Measured with 1.27 on a 15-segment FTK Imager acquisition of a 232.9 GiB Windows
+disk: the segments join, the GPT and its four partitions are read, the EFI system
+partition is identified as FAT32 and the basic data and recovery partitions as
+NTFS, all in about a second. Only the 16 MiB Microsoft reserved partition is
+reported as not recognised, with its first bytes shown.
 
 ## Options
 
@@ -555,6 +555,7 @@ NTFS walker here yet.
 | `--only TEXT` | Restrict `--list` and `--extract` to partitions whose name or label contains TEXT |
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
+| `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
@@ -568,7 +569,7 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
+that must not, across qnx6 (both endians), QNX4, ext4, ext2, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
 checks them, and removes the directory. For ETFS it also round-trips one file out of
 a synthetic image, so a broken structure offset, not just a broken constant, turns
 the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
@@ -722,8 +723,10 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
 ## What it does not do
 
-- **It reads raw images only: one file, or the numbered segments of one.** E01, AFF4,
-  AD1 and the other evidence containers are not opened; export the raw image from the
+- **It reads raw images and E01 acquisitions only.** A raw image is one file or the
+  numbered segments of one, and an E01 is read through `ewfprobe.py` (see
+  "EnCase/EWF images" above). AFF4, AD1 and the other evidence containers are not
+  decoded; such a file is read as plain raw bytes, so export the raw image from the
   imaging tool first. A segment set is joined only when it is whole from its first
   segment (see "Split images" above). A lone first segment is read as the file it is,
   and since 1.12 a run on it says `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names
