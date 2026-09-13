@@ -509,10 +509,32 @@ recorded over the source tree, and the one file large enough to reach direct and
 single-indirect node blocks matches what f2fs-tools' own `dump.f2fs` extracts. On a second
 fixture the Linux kernel driver itself wrote by mounting a volume and writing sparse files
 (`tools/make_f2fs_hole_fixture.sh`), files full of holes read back the same bytes the
-kernel read, holes as zeros. No real F2FS volume is in the test corpus yet, so the
-NAT-journal override is implemented and sourced but not exercised (a cleanly unmounted
-image has an empty journal), and the double-indirect path (reached only past about 8 GiB
-in one file) is not exercised at all.
+kernel read, holes as zeros. That kernel-written image also carries seven NAT-journal
+entries in the compact summary form, every one of them overriding an on-disk NAT entry
+that reads unallocated, so the journal path is not just exercised but load-bearing there:
+without it no file on that volume resolves. The journal in the normal (non-compact)
+summary form is read by the same rules and is not exercised by either fixture. No real
+F2FS volume is in the test corpus yet, and the double-indirect path (reached only past
+about 8 GiB in one file) is not exercised at all.
+
+A defect in 1.28 is worth knowing about: the bitmap that says which copy of each NAT
+block is current was read with bit 0 as the least significant bit of a byte, but F2FS's
+own `f2fs_test_bit` puts bit 0 at the most significant end. Every fixture had that bitmap
+all zero, so the two orders agreed and nothing showed it. On a volume whose NAT blocks
+have been rewritten, 1.28 can resolve a node id through the stale copy. Fixed in 1.29,
+where the SIT version bitmap is read the same way.
+
+Since 1.29 `F2fsWalker.free_extents()` reports the space the volume says is free, from the
+segment information table: one validity bit per block of the main area, 512 per segment,
+set by the filesystem's own `f2fs_set_bit` (bit 0 at the top of the byte, the same trap as
+above), the current copy of each SIT block chosen by the checkpoint's SIT version bitmap
+and any entry in the cold-data summary journal overriding the table. Only the main area is
+reported; the superblock, checkpoint, SIT, NAT and SSA areas are the filesystem's own. The
+self-test holds it against the checkpoint's own `valid_block_count` and against position:
+on both committed images the blocks live files and their nodes occupy equal that count
+exactly, none of them lies in a reported run, and the runs plus those blocks tile the main
+area. Read least-significant-first, the same map put 14 live blocks of one image inside
+"free" runs while the total still matched, which is why the check is positional.
 
 ## Split images
 
