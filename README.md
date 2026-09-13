@@ -519,10 +519,21 @@ about 8 GiB in one file) is not exercised at all.
 
 A defect in 1.28 is worth knowing about: the bitmap that says which copy of each NAT
 block is current was read with bit 0 as the least significant bit of a byte, but F2FS's
-own `f2fs_test_bit` puts bit 0 at the most significant end. Every fixture had that bitmap
-all zero, so the two orders agreed and nothing showed it. On a volume whose NAT blocks
-have been rewritten, 1.28 can resolve a node id through the stale copy. Fixed in 1.29,
-where the SIT version bitmap is read the same way.
+own `f2fs_test_bit` puts bit 0 at the most significant end. Every fixture then had that
+bitmap all zero, so the two orders agreed and nothing showed it. A third fixture
+(`tools/make_f2fs_free_fixture.sh`, root required) has the kernel write the volume in two
+mount sessions, which rewrites NAT block 0 and sets the bitmap's first bit. Measured on
+it: 1.28 finds no files at all, and the kernel reads 44; 1.29 reads the same 44 byte for
+byte. So the failure of the old order is an empty walk that looks like an empty volume.
+Fixed in 1.29, where the SIT version bitmap is read the same way, and that fixture's
+self-test leg refuses to pass unless the bitmap really does carry a set bit.
+
+The same fixture deletes a 1 MiB file, each of whose 256 blocks names its own index,
+before the second checkpoint, on a `nodiscard` mount so the loop device does not zero
+what it frees. All 256 blocks are still in the image and all 256 lie inside the runs
+`free_extents()` reports, which is the property a carve scoped to free space depends on.
+Both kernel-written fixtures also carry six SIT-journal entries that differ from the
+on-disk table, so that override is load-bearing for the free-space answer too.
 
 Since 1.29 `F2fsWalker.free_extents()` reports the space the volume says is free, from the
 segment information table: one validity bit per block of the main area, 512 per segment,

@@ -7367,6 +7367,31 @@ def _f2fs_free_check(image_gz):
     return kind, free_blocks, main_blocks, valid, len(named), named_in_free
 
 
+def _f2fs_marker_check(image_gz):
+    """The two properties only the kernel-written two-session fixture has.
+    Returns (nat bitmap has a set bit, marker blocks found, marker blocks in
+    free runs). The marker is a file of 256 blocks deleted before the last
+    checkpoint, each block beginning ``F2FS-FREE-MARKER-<index>-``; its bytes
+    are searched for directly, so the count is a fact about the image, and
+    every block found must lie inside a run free_extents reports."""
+    import gzip, io, re, bisect
+    with gzip.open(image_gz, "rb") as gz:
+        raw = gz.read()
+    w = F2fsWalker(io.BytesIO(raw), 0)
+    nat_len = struct.unpack_from("<I", w.ckpt, 160)[0]
+    has_bit = any(bytes(w.nat_bitmap[:nat_len]))
+    runs = w.free_extents()
+    starts = [a for a, _n in runs]
+    blocks = {m.start() // w.bs for m in re.finditer(rb"F2FS-FREE-MARKER-\d{4}-", raw)}
+    in_free = 0
+    for blk in blocks:
+        off = w.base + blk * w.bs
+        i = bisect.bisect_right(starts, off) - 1
+        if i >= 0 and runs[i][0] <= off < runs[i][0] + runs[i][1]:
+            in_free += 1
+    return has_bit, len(blocks), in_free
+
+
 def _ntfs_fixture_check(image_gz, listing):
     """Walk the committed NTFS fixture and compare every file against the
     hashes an independent reader recorded from the same image.
@@ -9368,8 +9393,43 @@ def self_test():
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
+        # The two-session fixture (tools/make_f2fs_free_fixture.sh): the kernel
+        # rewrote NAT block 0, so the checkpoint's NAT version bitmap carries a set
+        # bit and which copy is current is decided by bit order for real; the 1.28
+        # reader, little-endian there, finds no files on this volume at all. Every
+        # file must read back as the kernel read it, the bitmap must actually have
+        # a set bit (else this leg has lost its point), and all 256 blocks of the
+        # file deleted before the last checkpoint must sit in reported free space
+        # with their bytes intact.
+        f2fs_free_fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "tests", "fixtures", "f2fs-fixture-free.img.gz")
+        f2fs_free_want = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "tests", "fixtures", "f2fs-fixture.free.sha256")
+        if os.path.isfile(f2fs_free_fix) and os.path.isfile(f2fs_free_want):
+            try:
+                vk, vgot, vwant, vmiss, vdiff = _f2fs_fixture_check(f2fs_free_fix, f2fs_free_want)
+                vbit, vfound, vfree = _f2fs_marker_check(f2fs_free_fix)
+                vbroke = ""
+            except Exception as exc:                 # pylint: disable=broad-except
+                vk, vgot, vwant, vmiss, vdiff, vbit, vfound, vfree = None, 0, 0, 0, 0, False, 0, 0
+                vbroke = f"; raised {type(exc).__name__}: {exc}"
+            vcond = (vk == "f2fs" and vgot and vgot == vwant and not vmiss and not vdiff
+                     and vbit and vfound == 256 and vfree == 256 and not vbroke)
+            if not vcond:
+                ok = False
+            print(f"  [{'PASS' if vcond else 'FAIL'}] on the volume the kernel wrote twice, "
+                  f"whose NAT version bitmap {'carries a' if vbit else 'CARRIES NO'} set bit, "
+                  f"every file reads back as the kernel read it ({vgot} of {vwant}"
+                  + (f", {vmiss} missing" if vmiss else "")
+                  + (f", {vdiff} different" if vdiff else "")
+                  + f") and the deleted marker's blocks lie in free space ({vfree} of "
+                  f"{vfound} found, 256 written)" + vbroke)
+        else:
+            print("  [SKIP] the two-session F2FS fixture is not beside this script, so the "
+                  "NAT copy selection and the deleted-file control were not checked")
+
         # Then on the committed images: the checkpoint's own count, and position.
-        for stem in ("f2fs-fixture", "f2fs-fixture-holes"):
+        for stem in ("f2fs-fixture", "f2fs-fixture-holes", "f2fs-fixture-free"):
             fx = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "tests", "fixtures", stem + ".img.gz")
             if not os.path.isfile(fx):
