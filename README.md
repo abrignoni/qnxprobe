@@ -503,14 +503,16 @@ What it does not do: a file with per-file encryption (the norm on a real Android
 is shown as stored; a compressed file (LZ4/LZO/zstd clusters) is listed with its
 recorded size and not decompressed. See [What it does not do](#what-it-does-not-do).
 
-Validated against f2fs-tools' own `dump.f2fs`, an implementation separate from both this
-reader and the Linux kernel: on a fixture `mkfs.f2fs` and `sload.f2fs` wrote, every file
-inside the inode matches what `sha256sum` recorded over the source tree, and the one file
-large enough to reach direct and indirect node blocks matches what `dump.f2fs` extracts
-from the image. `tools/make_f2fs_fixture.sh` builds it. No real F2FS volume is in the test
-corpus yet, so holes (unallocated blocks that read as zeros) and the NAT-journal override
-are implemented and sourced but not exercised by that fixture, and the double-indirect
-path (reached only past about 8 GiB in one file) is not exercised at all.
+Validated against two independent readers. On a fixture `mkfs.f2fs` and `sload.f2fs` wrote
+(`tools/make_f2fs_fixture.sh`), every file inside the inode matches what `sha256sum`
+recorded over the source tree, and the one file large enough to reach direct and
+single-indirect node blocks matches what f2fs-tools' own `dump.f2fs` extracts. On a second
+fixture the Linux kernel driver itself wrote by mounting a volume and writing sparse files
+(`tools/make_f2fs_hole_fixture.sh`), files full of holes read back the same bytes the
+kernel read, holes as zeros. No real F2FS volume is in the test corpus yet, so the
+NAT-journal override is implemented and sourced but not exercised (a cleanly unmounted
+image has an empty journal), and the double-indirect path (reached only past about 8 GiB
+in one file) is not exercised at all.
 
 ## Split images
 
@@ -796,13 +798,13 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
   its content refused rather than guessed at.
 - **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
   LZO or zstd clusters is listed with its recorded size and not decompressed.
-- **F2FS is validated against a synthetic fixture, not yet against a real F2FS volume.**
-  The oracle is f2fs-tools' `dump.f2fs`, an implementation separate from both this reader
-  and the kernel, and the fixture exercises inline data and directories, the inode's own
-  pointers, and direct and single-indirect node blocks. No real F2FS volume is in the test
-  corpus, so blocks that read as holes and the NAT-journal override are implemented and
-  sourced but not exercised by the fixture, and the double-indirect path (past about 8 GiB
-  in one file) is not exercised at all.
+- **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
+  Two independent readers are the oracles: f2fs-tools' `dump.f2fs` for inline data,
+  directories, the inode's own pointers and direct and single-indirect node blocks, and
+  the Linux kernel driver itself for files full of holes. No real F2FS volume is in the
+  test corpus, so the NAT-journal override is implemented and sourced but not exercised (a
+  cleanly unmounted image has an empty journal), and the double-indirect path (past about
+  8 GiB in one file) is not exercised at all.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
   either.

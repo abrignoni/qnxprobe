@@ -9041,6 +9041,35 @@ def self_test():
                   + (f", {fmiss} missing" if fmiss else "")
                   + (f", {fdiff} different" if fdiff else "") + ")" + fbroke)
 
+        # F2FS holes, against the Linux kernel driver as a third oracle. sload.f2fs
+        # allocates every block, so this second image is built by mounting a fresh
+        # volume with the kernel and writing sparse files (a leading hole, a middle
+        # hole, a trailing hole, and one file that is all hole); the recorded hashes
+        # are what the kernel read back. See tools/make_f2fs_hole_fixture.sh.
+        f2fs_holes = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "tests", "fixtures", "f2fs-fixture-holes.img.gz")
+        f2fs_holes_want = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "tests", "fixtures", "f2fs-fixture.holes.sha256")
+        if os.path.isfile(f2fs_holes) and os.path.isfile(f2fs_holes_want):
+            try:
+                hkind, hgot, hwant, hmiss, hdiff = _f2fs_fixture_check(f2fs_holes, f2fs_holes_want)
+                hbroke = ""
+            except Exception as exc:                 # pylint: disable=broad-except
+                hkind, hgot, hwant, hmiss, hdiff = None, 0, 0, 0, 0
+                hbroke = f"; the walk raised {type(exc).__name__}: {exc}"
+            hcond = (hkind == "f2fs" and hgot and hgot == hwant and not hmiss
+                     and not hdiff and not hbroke)
+            if not hcond:
+                ok = False
+            print(f"  [{'PASS' if hcond else 'FAIL'}] every F2FS file with holes reads "
+                  f"back the bytes the Linux kernel driver read from the same image "
+                  f"({hgot} of {hwant}, identified as {hkind}"
+                  + (f", {hmiss} missing" if hmiss else "")
+                  + (f", {hdiff} different" if hdiff else "") + ")" + hbroke)
+        else:
+            print("  [SKIP] the F2FS holes fixture is not beside this script, so the "
+                  "hole path was not compared against the kernel driver")
+
         ntfs_fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "tests", "fixtures", "ntfs-fixture.img.gz")
         ntfs_want = ntfs_fix[:-len(".img.gz")] + ".sha256"
