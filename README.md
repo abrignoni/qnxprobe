@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, FAT32, exFAT, NTFS, HFS+ and APFS filesystems, and QNX IFS
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+ and APFS filesystems, and QNX IFS
 boot images, out of raw disk images: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
@@ -480,6 +480,38 @@ refused by this reader and is the one case `icat` will read on the contiguous
 assumption; refusing it is the deliberate choice not to present bytes the entry cannot
 vouch for.
 
+## F2FS
+
+F2FS is the filesystem Android uses for `/data` on most phones, so an Android
+image or a bare `userdata` partition can carry one where an older device would have
+ext4. `--list` and `--extract` read it directly. The volume is claimed by its 4-byte
+magic 1024 bytes in, together with the reserved inode numbers the format fixes (node 1,
+meta 2, root 3) and a block size and segment size it allows, rather than by the magic
+alone.
+
+What it reads: files stored inline in the inode, files addressed by the inode's own
+pointer list, and larger files reached through direct, single- and double-indirect node
+blocks; directories in both the inline and the multi-block form; and symbolic links.
+Timestamps are real UTC instants, so a `--list` shows Modified and, in the window,
+Created and Accessed. To find a file the reader resolves each node id through the Node
+Address Table, choosing the current copy of each NAT block from the active checkpoint's
+bitmap and applying any override in the checkpoint's NAT journal, exactly as the kernel
+does.
+
+What it does not do: a file with per-file encryption (the norm on a real Android
+`/data`) is listed and its content refused, since the volume holds no key, and its name
+is shown as stored; a compressed file (LZ4/LZO/zstd clusters) is listed with its
+recorded size and not decompressed. See [What it does not do](#what-it-does-not-do).
+
+Validated against f2fs-tools' own `dump.f2fs`, an implementation separate from both this
+reader and the Linux kernel: on a fixture `mkfs.f2fs` and `sload.f2fs` wrote, every file
+inside the inode matches what `sha256sum` recorded over the source tree, and the one file
+large enough to reach direct and indirect node blocks matches what `dump.f2fs` extracts
+from the image. `tools/make_f2fs_fixture.sh` builds it. No real F2FS volume is in the test
+corpus yet, so holes (unallocated blocks that read as zeros) and the NAT-journal override
+are implemented and sourced but not exercised by that fixture, and the double-indirect
+path (reached only past about 8 GiB in one file) is not exercised at all.
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
@@ -548,7 +580,7 @@ reported as not recognised, with its first bytes shown.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -569,7 +601,7 @@ python3 qnxprobe.py --self-test
 ```
 
 It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), QNX4, ext4, ext2, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
+that must not, across qnx6 (both endians), QNX4, ext4, ext2, F2FS, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
 checks them, and removes the directory. For ETFS it also round-trips one file out of
 a synthetic image, so a broken structure offset, not just a broken constant, turns
 the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
@@ -622,6 +654,26 @@ struct ext4_super_block, ext4_group_desc, ext4_inode, ext4_dir_entry_2
 The ext field offsets were derived from that header and cross-checked against its own
 `/*NN*/` offset markers, all fifteen of which agreed, with the struct totalling the
 expected 1024 bytes.
+
+F2FS, from the Linux kernel at v7.0 (commit
+`028ef9c96e96197026887c0f092424679298aae8`):
+
+```
+F2FS_SUPER_MAGIC     0xF2F52010   include/linux/f2fs_fs.h
+struct f2fs_super_block, f2fs_checkpoint, f2fs_inode, node_footer,
+  f2fs_dir_entry, f2fs_dentry_block, f2fs_nat_entry
+                                  include/linux/f2fs_fs.h
+current_nat_addr, get_node_path   fs/f2fs/node.{h,c}
+validate_checkpoint               fs/f2fs/checkpoint.c
+sanity_check_raw_super            fs/f2fs/super.c
+read_normal_summaries             fs/f2fs/segment.c   (the NAT journal)
+do_read_inode                     fs/f2fs/inode.c
+f2fs_fill_dentries                fs/f2fs/dir.c
+```
+
+The inode's address count, the direct/indirect node layout and the NAT block
+addressing are all parameterised by the superblock's block size, so a 4K-block
+and a 16K-block volume are read the same way.
 
 QNX IFS boot images, from QNX's own `dumpifs` and `sys/image.h`:
 
@@ -740,6 +792,17 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
 - **It does not decrypt.** A volume with encrypted filenames is flagged, not opened.
+  On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
+  its content refused rather than guessed at.
+- **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
+  LZO or zstd clusters is listed with its recorded size and not decompressed.
+- **F2FS is validated against a synthetic fixture, not yet against a real F2FS volume.**
+  The oracle is f2fs-tools' `dump.f2fs`, an implementation separate from both this reader
+  and the kernel, and the fixture exercises inline data and directories, the inode's own
+  pointers, and direct and single-indirect node blocks. No real F2FS volume is in the test
+  corpus, so blocks that read as holes and the NAT-journal override are implemented and
+  sourced but not exercised by the fixture, and the double-indirect path (past about 8 GiB
+  in one file) is not exercised at all.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
   either.
