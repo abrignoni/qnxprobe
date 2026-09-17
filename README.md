@@ -307,6 +307,37 @@ pass a dict as `times` to `collect()` to receive them.
 when you ask for them, so a consumer that wants a few files out of a 250 GiB disk
 never touches the rest.
 
+### Listing a whole volume
+
+`collect()` returns the regular files in tree order, which is what an extraction
+needs. Something that wants **everything**, directories included, should ask
+`walk_all()` instead, because it takes a faster route where one exists.
+
+```python
+for path, node, mode, size, mtime, recorded in q.walk_all(walker):
+    ...                                    # every file, directory, link and node
+```
+
+On NTFS it builds the listing from one sequential pass over `$MFT` rather than
+from the directory indexes, and on APFS it reads the file-system tree's leaves
+once rather than searching it per lookup. Measured on this Mac:
+
+| | tree walk | `walk_all()` |
+| --- | ---: | ---: |
+| 7.4 GB Windows E01, 156,894 entries | 6.9 s | 2.0 s |
+| 32 GB macOS E01, 625,543 entries | 147.0 s | 8.0 s |
+
+The APFS route trades memory for it, roughly 900 MB on that 625,543-entry
+volume, and a volume larger than `APFS_PRIME_MAX_RECORDS` is walked the
+ordinary way instead of held.
+
+`walk_all()` **does not promise an order**, and on NTFS it answers a slightly
+different question: it reads what each record says about itself rather than what
+each directory says is in it. The two agree on every consistent volume measured
+and differ on 4 entries of 313,652 on one acquisition of a machine that was
+running when it was imaged, where the volume's own index and records disagree.
+`NtfsWalker.listing` says which four and why. `collect()` is unchanged.
+
 ## APFS
 
 Every Mac since 2017 is APFS, so `--list` and `--extract` read a container. It is
