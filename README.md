@@ -334,9 +334,9 @@ ordinary way instead of held.
 Since 1.30. `walk_all()` **does not promise an order**, and on NTFS it answers a slightly
 different question: it reads what each record says about itself rather than what
 each directory says is in it. The two agree on every consistent volume measured
-and differ on 4 entries of 313,652 on one acquisition of a machine that was
-running when it was imaged, where the volume's own index and records disagree.
-`NtfsWalker.listing` says which four and why. `collect()` is unchanged.
+and differ on 4 entries of 313,652 on one acquisition where the volume's own
+index and records disagree, and on 3 on another. `NtfsWalker.listing` says which
+and what is known about why. `collect()` is unchanged.
 
 ## APFS
 

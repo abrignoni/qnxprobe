@@ -3034,15 +3034,16 @@ class NtfsWalker:
         neither reader is wrong. Three are files whose record names a parent
         whose sequence number matches, while that parent's index holds only a
         stale entry for the name, which _index_entries rightly refuses; a tree
-        walk reports nothing at those paths and this reports the file. The
-        fourth is a log the app had just rotated, where the index still files
+        walk reports nothing at those paths and this reports the file. In the
+        fourth the index and the record disagree on the name: the index files
         record 3057 under HxCommAlwaysOnLog_Old.etl and the record's own
-        $FILE_NAME says HxCommAlwaysOnLog.etl. All four sit in app-data
-        directories of a machine that was running when it was imaged, which is
-        where an index and its records are most likely to be caught out of
-        step. Reconciling them would mean reading the indexes, which is the
-        work this exists to avoid; the difference is reported here instead so
-        a caller knows which question the answer belongs to.
+        $FILE_NAME says HxCommAlwaysOnLog.etl. A Windows 10 acquisition shows
+        the first shape three times, all files in a Chrome profile. What put
+        these indexes and records out of step is not established: the volume's
+        own dirty flag is clear on both. Reconciling them would mean reading
+        the indexes, which is the work this exists to avoid; the difference is
+        reported here instead so a caller knows which question the answer
+        belongs to.
         """
         mft = self._data_attr(0)
         if mft is None or not mft.runs:
@@ -5879,7 +5880,7 @@ def walk_all(w):
     one that does: see ``NtfsWalker.listing``, which reads what each record
     says about itself rather than what each directory says is in it. The two
     agree on every consistent volume measured and differ on 4 entries of
-    313,652 on one acquisition of a running machine.
+    313,652 on one acquisition whose directory indexes and records disagree.
 
     A directory is decided here by the format bits of the mode rather than by
     ``mode & S_IFDIR``, which ``collect()`` uses: the latter is also true of a
