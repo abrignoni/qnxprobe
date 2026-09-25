@@ -26,6 +26,7 @@ its fields checked for internal consistency before it is reported CONFIRMED.
 Read-only throughout. Never writes to the image.
 """
 import os, re, struct, sys, datetime, json, time, uuid, zipfile, bisect, collections, itertools
+import binascii
 import array
 
 # ewfprobe is vendored beside this file (see vendored.json) so an EnCase/EWF
@@ -551,25 +552,172 @@ def parse_mbr(fh):
     return out
 
 
-def parse_gpt(fh):
-    """Parse the GPT at LBA 1. Returns list of (idx, name, type_guid, start, end)."""
-    hdr = read_at(fh, SECTOR, 92)
+# The GPT header is at LBA 1, the second logical block (UEFI 2.10 section
+# 5.3.1), so its byte offset IS the logical sector size, and every LBA in the
+# header, in the partition entries and in the protective MBR counts sectors of
+# that size. Most disks use 512. 4Kn drives and UFS LUN images use 4096, and
+# read as 512 they show no partition table at all. Only these two are probed.
+GPT_SECTOR_SIZES = (512, 4096)
+# The largest partition entry array read. The header's CRC is checked before
+# the array is, so this bounds a table that is valid but absurd, not noise.
+GPT_MAX_ARRAY_BYTES = 16 << 20
+
+
+class GptTable(list):
+    """What parse_gpt returns: [(idx, name, type_guid, first, last)] as before,
+    plus sector_size, the logical sector the header was found in, and
+    header_lba, 1 for the primary header or the last LBA when the backup was
+    read. first and last count sectors of sector_size, so a partition starts
+    at byte first * table.sector_size, which is first * SECTOR only at 512."""
+    sector_size = SECTOR
+    header_lba = 1
+
+
+def _gpt_header_problem(hdr, ss, lba):
+    """Why the header read from this LBA cannot be trusted, or "" if it can.
+
+    The checks and offsets are UEFI 2.10 section 5.3.2, Table 5.5 (GPT Header):
+    HeaderSize at 12 must be at least 92 and no larger than the logical block;
+    HeaderCRC32 at 16 is the CRC32 of HeaderSize bytes with that field set to
+    zero; MyLBA at 24 must name the block the header was read from. The same
+    checks, in the same order, are is_gpt_valid() in Linux
+    block/partitions/efi.c (v6.12, commit adc21867, lines 355 to 391). The
+    kernel also requires the usable range to lie within the disk; that check
+    is left out here on purpose, because the first segment of a split image
+    holds a table describing more than the file holds, and that has to be
+    reported as a short image (short_regions), not as a disk with no table.
+    """
+    hsize = struct.unpack_from("<I", hdr, 12)[0]
+    if not 92 <= hsize <= ss:
+        return f"HeaderSize {hsize} is not between 92 and the {ss}-byte sector"
+    want = struct.unpack_from("<I", hdr, 16)[0]
+    # binascii.crc32 is the CRC the spec names: the Ethernet polynomial seeded
+    # with ~0 and inverted at the end, which is how efi.c's efi_crc32 (lines
+    # 119 to 123) builds it from the kernel's own crc32.
+    got = binascii.crc32(hdr[:16] + b"\x00" * 4 + hdr[20:hsize]) & 0xFFFFFFFF
+    if got != want:
+        return f"HeaderCRC32 0x{want:08x} does not match the header (0x{got:08x})"
+    my_lba = struct.unpack_from("<Q", hdr, 24)[0]
+    if my_lba != lba:
+        return f"MyLBA is {my_lba}, and the header was read from LBA {lba}"
+    return ""
+
+
+def _gpt_at(fh, ss, lba):
+    """(GptTable or None, why) for a header at this LBA of ss-byte sectors.
+
+    why is None when there is no "EFI PART" signature there at all, a reason
+    when there is one and it fails a check, and "" when the table is used.
+    Entries are read per Table 5.6 (GPT Partition Entry): PartitionTypeGUID at
+    0 (all zero means the entry is unused), StartingLBA at 32, EndingLBA at 40,
+    PartitionName at 56 for 72 bytes.
+    """
+    hdr = read_at(fh, lba * ss, ss)
     if len(hdr) < 92 or hdr[0:8] != b"EFI PART":
-        return None
-    ent_lba, n_ent, ent_sz = struct.unpack_from("<QII", hdr, 72)
-    out = []
-    for i in range(min(n_ent, 256)):
-        raw = read_at(fh, ent_lba * SECTOR + i * ent_sz, ent_sz)
-        if len(raw) < 56:
-            break
+        return None, None
+    why = _gpt_header_problem(hdr, ss, lba)
+    if why:
+        return None, why
+    # Table 5.5: PartitionEntryLBA at 72, NumberOfPartitionEntries at 80,
+    # SizeOfPartitionEntry at 84 (128 x 2^n now; earlier versions of the spec
+    # allowed any multiple of 8), and at 88 the CRC32 of
+    # NumberOfPartitionEntries * SizeOfPartitionEntry bytes.
+    ent_lba, n_ent, ent_sz, arr_crc = struct.unpack_from("<QIII", hdr, 72)
+    nbytes = n_ent * ent_sz
+    if ent_sz < 128 or ent_sz % 8:
+        return None, f"SizeOfPartitionEntry {ent_sz} is not a multiple of 8 of at least 128"
+    if nbytes > GPT_MAX_ARRAY_BYTES:
+        return None, (f"the entry array would be {nbytes:,} bytes, more than "
+                      f"the {GPT_MAX_ARRAY_BYTES:,} read")
+    arr = read_at(fh, ent_lba * ss, nbytes)
+    if len(arr) < nbytes:
+        return None, f"the entry array at LBA {ent_lba} lies past the end of the file"
+    if binascii.crc32(arr) & 0xFFFFFFFF != arr_crc:
+        return None, (f"PartitionEntryArrayCRC32 0x{arr_crc:08x} does not match "
+                      f"the entry array")
+    table = GptTable()
+    table.sector_size, table.header_lba = ss, lba
+    for i in range(n_ent):
+        raw = arr[i * ent_sz:(i + 1) * ent_sz]
         tguid = raw[0:16]
         if tguid == b"\x00" * 16:
             continue
         first, last = struct.unpack_from("<QQ", raw, 32)
-        name = raw[56:ent_sz].decode("utf-16-le", "replace").rstrip("\x00").strip()
+        name = raw[56:128].decode("utf-16-le", "replace").rstrip("\x00").strip()
         g = uuid.UUID(bytes_le=tguid)
-        out.append((i + 1, name, str(g), first, last))
-    return out
+        table.append((i + 1, name, str(g), first, last))
+    return table, ""
+
+
+def _has_protective_mbr(fh):
+    """True when sector 0 ends 0x55AA and one of its four records is type 0xEE,
+    the GPT protective type (UEFI 2.10 section 5.2.2 and Table 5.4)."""
+    mbr = read_at(fh, 0, 512)
+    return (len(mbr) == 512 and mbr[510:512] == b"\x55\xaa"
+            and any(mbr[446 + 16 * i + 4] == 0xEE for i in range(4)))
+
+
+def read_gpt(fh):
+    """(table, rejected): the GPT to use, and every header that was refused.
+
+    table is a GptTable, or None when no header validates. rejected lists
+    (byte offset, reason) for every "EFI PART" signature found that failed a
+    check, so a report can say a table was there and why it was not used,
+    rather than showing a disk with no partition table.
+
+    The primary header at LBA 1 is tried at 512 and then at 4096 bytes a
+    sector; the first that validates, with an entry array matching its CRC,
+    is used. When none does, section 5.3.2 says "the backup GPT is used
+    instead and it is located on the last logical block on the disk", so that
+    block is tried at each size. The same section warns that a disk
+    reformatted to a legacy MBR can keep a stale GPT in its last block, so the
+    backup is only read when sector 0 holds a 0xEE record. Linux likewise
+    reads no GPT unless sector 0 is a protective or hybrid MBR (efi.c
+    find_valid_gpt, lines 597 to 612), and reads the backup only when forced
+    to (lines 617 to 622); util-linux sfdisk 2.41.3 reads the backup when the
+    primary is corrupt, as the spec says. Nothing is ever written back.
+    """
+    rejected = []
+    for ss in GPT_SECTOR_SIZES:
+        table, why = _gpt_at(fh, ss, 1)
+        if table is not None:
+            return table, rejected
+        if why:
+            rejected.append((ss, why))
+    if _has_protective_mbr(fh):
+        try:
+            size = image_size(fh)
+        except (OSError, AttributeError, ValueError):
+            size = None
+        for ss in GPT_SECTOR_SIZES:
+            last = (size // ss - 1) if size else 0
+            if last < 2:
+                continue
+            table, why = _gpt_at(fh, ss, last)
+            if table is not None:
+                return table, rejected
+            if why:
+                rejected.append((last * ss, why))
+    return None, rejected
+
+
+def parse_gpt(fh):
+    """The primary GPT as a GptTable of (idx, name, type_guid, first, last), or None.
+
+    first and last are in the table's own logical sectors: multiply by the
+    returned table's sector_size, not by SECTOR, to reach a byte offset.
+    """
+    return read_gpt(fh)[0]
+
+
+def disk_sector_size(fh):
+    """The logical sector size partition LBAs on this image count: the one a
+    valid GPT was found at, else 512. The legacy and protective MBR count the
+    same logical blocks (UEFI 2.10 Table 5.2, SizeInLBA "in LBA units of logical
+    blocks"; Table 5.4, the protective StartingLBA is 1, "the LBA of the GPT
+    Partition Header"), so this is the unit for both tables."""
+    gpt = parse_gpt(fh)
+    return gpt.sector_size if gpt else SECTOR
 
 
 # ---------------------------------------------------------------------------
@@ -6674,11 +6822,15 @@ def partition_regions(fh, size):
     """
     regions, names = [], {}
     containers, protective = set(), set()
+    # Read first, reported last: the sector size the GPT header was found at is
+    # the unit every LBA on this disk counts, the MBR's included.
+    gpt = parse_gpt(fh)
+    ss = gpt.sector_size if gpt else SECTOR
     parts = parse_mbr(fh)
     if parts:
         for idx, t, st, cnt in parts:
-            regions.append((f"MBR part {idx}", st * SECTOR, cnt * SECTOR))
-            names[st * SECTOR] = volume_name(idx, st)
+            regions.append((f"MBR part {idx}", st * ss, cnt * ss))
+            names[st * ss] = volume_name(idx, st)
             if t in EXT_PARTITION_TYPES:
                 containers.add(f"MBR part {idx}")
             if t == 0xEE:
@@ -6689,25 +6841,24 @@ def partition_regions(fh, size):
                 continue
             base, cur, n = st, st, 0
             while cur and n < 64:
-                ebr = read_at(fh, cur * SECTOR, 512)
+                ebr = read_at(fh, cur * ss, 512)
                 if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
                     break
                 e1, e2 = ebr[446:462], ebr[462:478]
                 lst, lcnt = struct.unpack("<II", e1[8:16])
                 if lcnt:
                     astart = cur + lst
-                    regions.append((f"logical @{astart}", astart * SECTOR, lcnt * SECTOR))
+                    regions.append((f"logical @{astart}", astart * ss, lcnt * ss))
                     logical_idx += 1
-                    names[astart * SECTOR] = volume_name(logical_idx, astart)
+                    names[astart * ss] = volume_name(logical_idx, astart)
                 nxt = struct.unpack("<I", e2[8:12])[0]
                 cur = (base + nxt) if nxt else 0
                 n += 1
-    gpt = parse_gpt(fh)
     if gpt:
         for idx, name, _g, first, last in gpt:
-            sz = (last - first + 1) * SECTOR
-            regions.append((f"GPT part {idx} {name[:20]}", first * SECTOR, sz))
-            names[first * SECTOR] = volume_name(idx, first, name)
+            sz = (last - first + 1) * ss
+            regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
+            names[first * ss] = volume_name(idx, first, name)
     if not regions:
         regions.append(("whole image", 0, size))
         names[0] = volume_name(None, 0)
@@ -6735,7 +6886,9 @@ def volumes(fh, size=None):
     Each dict carries:
         label       the region as the report names it ("GPT part 3 storage")
         base, size  byte offset and byte length of the region
-        lba         base in sectors, the identity an extraction is named by
+        lba         base in the disk's logical sectors (4096 bytes on a disk
+                    whose GPT header is at byte 4096, else 512), the identity
+                    an extraction is named by
         kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
                     or "not recognised"
         name        the directory the volume extracts under (volume_name)
@@ -6755,6 +6908,7 @@ def volumes(fh, size=None):
     if size is None:
         size = image_size(fh)
     regions, names, containers, protective = partition_regions(fh, size)
+    ss = disk_sector_size(fh)
     missing = {start: gap for _lab, start, _rs, gap in
                short_regions(size, regions, skip=protective)}
     out, qnx6_labels = [], set()
@@ -6768,8 +6922,8 @@ def volumes(fh, size=None):
         if best is None:
             continue
         qnx6_labels.add(label)
-        vol = dict(label=label, base=base, size=rsize, lba=base // SECTOR, kind="qnx6",
-                   name=names.get(base) or f"lba{base // SECTOR}",
+        vol = dict(label=label, base=base, size=rsize, lba=base // ss, kind="qnx6",
+                   name=names.get(base) or f"lba{base // ss}",
                    detail=f"serial {best[1]['serial']:,}, "
                           f"volumeid {best[1]['volumeid'].hex()} (as stored)",
                    missing_past_end=missing.get(base, 0))
@@ -6783,14 +6937,14 @@ def volumes(fh, size=None):
         if label in qnx6_labels or label in protective:
             continue
         if label in containers:
-            out.append(dict(label=label, base=base, size=rsize, lba=base // SECTOR,
+            out.append(dict(label=label, base=base, size=rsize, lba=base // ss,
                             kind="extended container", name="", detail="",
                             missing_past_end=missing.get(base, 0),
                             note="holds the logical volumes, nothing to walk"))
             continue
         kind, lines = identify_fs(fh, base, rsize)
-        stem = names.get(base) or f"lba{base // SECTOR}"
-        vol = dict(label=label, base=base, size=rsize, lba=base // SECTOR,
+        stem = names.get(base) or f"lba{base // ss}"
+        vol = dict(label=label, base=base, size=rsize, lba=base // ss,
                    kind=kind or "not recognised", name=stem,
                    detail="; ".join(lines[:2]), missing_past_end=missing.get(base, 0))
         try:
@@ -6854,6 +7008,12 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
     containers, protective = set(), set()
     vol_names = {}                    # byte offset -> canonical extract name
     with image as fh:
+        # The GPT is read before the MBR is reported, because the sector size
+        # its header was found at is the unit of every LBA on this disk,
+        # the MBR's included (disk_sector_size).
+        gpt, gpt_rejected = read_gpt(fh)
+        ss = gpt.sector_size if gpt else SECTOR
+        image_rec["sector_bytes"] = ss
         parts = parse_mbr(fh)
         if parts is None:
             print("  MBR      none (no 0x55AA signature at offset 510, or "
@@ -6864,10 +7024,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                   + ("  (0xEE = GPT protective)" if gpt_prot else ""))
             for idx, t, st, cnt in parts:
                 tag = f"   <- {MBR_QNX_TYPES[t]}" if t in MBR_QNX_TYPES else ""
-                print(f"    {idx}  type 0x{t:02x}  LBA {st:<12,} {human(cnt*SECTOR):>10}{tag}")
-                regions.append((f"MBR part {idx}", st * SECTOR))
-                sized_regions.append((f"MBR part {idx}", st * SECTOR, cnt * SECTOR))
-                vol_names[st * SECTOR] = volume_name(idx, st)
+                print(f"    {idx}  type 0x{t:02x}  LBA {st:<12,} {human(cnt*ss):>10}{tag}")
+                regions.append((f"MBR part {idx}", st * ss))
+                sized_regions.append((f"MBR part {idx}", st * ss, cnt * ss))
+                vol_names[st * ss] = volume_name(idx, st)
                 if t in (0x05, 0x0f, 0x85):
                     containers.add(f"MBR part {idx}")
                 if t == 0xEE:
@@ -6882,7 +7042,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 continue
             base, cur, n = st, st, 0
             while cur and n < 64:
-                ebr = read_at(fh, cur * SECTOR, 512)
+                ebr = read_at(fh, cur * ss, 512)
                 if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
                     break
                 e1 = ebr[446:462]; e2 = ebr[462:478]
@@ -6891,25 +7051,31 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     astart = cur + lst
                     tag = f"   <- {MBR_QNX_TYPES[lt]}" if lt in MBR_QNX_TYPES else ""
                     print(f"      logical  type 0x{lt:02x}  LBA {astart:<12,}"
-                          f" {human(lcnt*SECTOR):>10}{tag}")
-                    regions.append((f"logical @{astart}", astart * SECTOR))
-                    sized_regions.append((f"logical @{astart}", astart * SECTOR,
-                                          lcnt * SECTOR))
+                          f" {human(lcnt*ss):>10}{tag}")
+                    regions.append((f"logical @{astart}", astart * ss))
+                    sized_regions.append((f"logical @{astart}", astart * ss,
+                                          lcnt * ss))
                     logical_idx += 1
-                    vol_names[astart * SECTOR] = volume_name(logical_idx, astart)
+                    vol_names[astart * ss] = volume_name(logical_idx, astart)
                 nxt = struct.unpack("<I", e2[8:12])[0]
                 cur = (base + nxt) if nxt else 0
                 n += 1
 
-        gpt = parse_gpt(fh)
+        for at, why in gpt_rejected:
+            # A header that fails its own checks is not used, and saying so
+            # keeps "not trusted" from reading as "no partition table".
+            print(f"\n  GPT      header signature at byte {at:,} NOT USED: {why}")
         if gpt:
-            print(f"\n  GPT      valid, {len(gpt)} partition entries")
+            print(f"\n  GPT      valid, {len(gpt)} partition entries"
+                  + (f", {ss}-byte logical sectors" if ss != SECTOR else "")
+                  + (f", from the backup header at LBA {gpt.header_lba:,}"
+                     if gpt.header_lba != 1 else ""))
             for idx, name, g, first, last in gpt:
-                sz = (last - first + 1) * SECTOR
+                sz = (last - first + 1) * ss
                 print(f"    {idx:>3}  {name[:26]:<26} {human(sz):>10}  LBA {first:,}")
-                regions.append((f"GPT part {idx} {name[:20]}", first * SECTOR))
-                sized_regions.append((f"GPT part {idx} {name[:20]}", first * SECTOR, sz))
-                vol_names[first * SECTOR] = volume_name(idx, first, name)
+                regions.append((f"GPT part {idx} {name[:20]}", first * ss))
+                sized_regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
+                vol_names[first * ss] = volume_name(idx, first, name)
 
         # No partition table at all (a whole-disk filesystem, or a bare region
         # such as an ETFS flash dump) means no regions were recorded. Treat the
@@ -7110,7 +7276,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     print(f"        could not walk this filesystem: {exc}")
 
             if zf is not None and base is not None and wanted:
-                vol = vol_names.get(base) or f"lba{base // SECTOR}"
+                vol = vol_names.get(base) or f"lba{base // ss}"
                 print(f"\n      EXTRACTING to {extract}  as {vol}/")
                 try:
                     w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
@@ -7124,7 +7290,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         rsize = next((r[2] for r in sized_regions if r[1] == base), None)
                         manifest.append({
                             "volume": vol, **image_rec,
-                            "lba": base // SECTOR, "offset_bytes": base,
+                            "lba": base // ss, "offset_bytes": base,
                             "partition_size_bytes": rsize,
                             "filesystem": "qnx6",
                             "volume_id_as_stored": sb["volumeid"].hex(),
@@ -7205,7 +7371,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     except Exception as exc:
                         print(f"        could not walk this filesystem: {exc}")
                 if zf is not None and kind and kind.startswith("ext") and wanted:
-                    stem = vol_names.get(b) or f"lba{b // SECTOR}"
+                    stem = vol_names.get(b) or f"lba{b // ss}"
                     suffix = sanitize_volume_label(ext_name) if ext_name else ""
                     vol = (f"{stem}_{suffix}"
                            if suffix and not stem.endswith(f"_{suffix}") else stem)
@@ -7222,7 +7388,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)
                             manifest.append({
                                 "volume": vol, **image_rec,
-                                "lba": b // SECTOR, "offset_bytes": b,
+                                "lba": b // ss, "offset_bytes": b,
                                 "partition_size_bytes": sz,
                                 "filesystem": kind,
                                 "uuid": _u[EXT_F["uuid"]:EXT_F["uuid"] + 16].hex(),
@@ -7255,7 +7421,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         except Exception as exc:
                             print(f"        could not walk this filesystem: {exc}")
                     if zf is not None:
-                        vol = vol_names.get(b) or f"lba{b // SECTOR}"
+                        vol = vol_names.get(b) or f"lba{b // ss}"
                         print(f"        EXTRACTING to {extract}  as {vol}/")
                         try:
                             w = walker_for(kind, fh, b, sz)
@@ -7268,7 +7434,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
-                                    "lba": b // SECTOR, "offset_bytes": b,
+                                    "lba": b // ss, "offset_bytes": b,
                                     "partition_size_bytes": sz, "filesystem": kind,
                                     "files": f_, "bytes": wr,
                                     "symlinks_or_special_skipped": sk,
@@ -7310,7 +7476,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             except Exception as exc:
                                 print(f"        could not walk this filesystem: {exc}")
                         if zf is not None:
-                            vol = vol_names.get(b) or f"lba{b // SECTOR}"
+                            vol = vol_names.get(b) or f"lba{b // ss}"
                             print(f"        EXTRACTING to {extract}  as {vol}/")
                             try:
                                 ents = collect(w, w.root)
@@ -7322,7 +7488,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 if manifest is not None:
                                     manifest.append({
                                         "volume": vol, **image_rec,
-                                        "lba": b // SECTOR, "offset_bytes": b,
+                                        "lba": b // ss, "offset_bytes": b,
                                         "partition_size_bytes": sz,
                                         "filesystem": "qnx_ifs",
                                         "compression": w.compress,
@@ -7929,6 +8095,63 @@ def _tree_walk_for_check(w):
                     yield item
 
     return walk(w.root, "", 0)
+
+
+def _gpt_test_image(ss, volume, first_lba, name, type_guid):
+    """A whole disk image with one GPT partition holding ``volume``, for the
+    self-test: a protective MBR at LBA 0, the primary header at LBA 1 and its
+    entry array from LBA 2, the partition at ``first_lba``, and the backup array
+    and header at the end, every LBA counting ``ss``-byte sectors.
+
+    The layout is UEFI 2.10 section 5.2.3 (Table 5.4, the protective MBR
+    record) and section 5.3.2 (Table 5.5, the header; Table 5.6, an entry).
+    The offsets are written out here rather than shared with read_gpt(), so the
+    reader is checked against the table as the spec gives it. Its output was
+    also read by The Sleuth Kit's mmls (-b 4096) and util-linux sfdisk
+    (--sector-size 4096), which placed the partition where this says it is.
+    """
+    n_ent, ent_sz = 128, 128
+    arr_lbas = -(-n_ent * ent_sz // ss)
+    part_lbas = -(-len(volume) // ss)
+    last_lba = first_lba + part_lbas - 1
+    total = last_lba + 1 + arr_lbas + 1          # then the backup array and header
+    img = bytearray(total * ss)
+
+    # Table 5.4: type 0xEE from LBA 1 for the rest of the disk
+    rec = bytearray(16)
+    rec[1:4] = b"\x00\x02\x00"                    # StartingCHS 0x000200
+    rec[4] = 0xEE
+    rec[5:8] = b"\xff\xff\xff"
+    struct.pack_into("<II", rec, 8, 1, min(total - 1, 0xFFFFFFFF))
+    img[446:462] = rec
+    img[510:512] = b"\x55\xaa"
+
+    ent = bytearray(ent_sz)
+    ent[0:16] = uuid.UUID(type_guid).bytes_le
+    ent[16:32] = uuid.UUID("5a6b7c8d-0000-4000-8000-00000000c0de").bytes_le
+    struct.pack_into("<QQQ", ent, 32, first_lba, last_lba, 0)
+    ent[56:56 + 2 * len(name)] = name.encode("utf-16-le")
+    arr = bytes(ent) + bytes(ent_sz * (n_ent - 1))
+
+    def header(my_lba, alt_lba, arr_lba):
+        h = bytearray(92)
+        h[0:8] = b"EFI PART"
+        struct.pack_into("<III", h, 8, 0x00010000, 92, 0)
+        struct.pack_into("<QQQQ", h, 24, my_lba, alt_lba,
+                         2 + arr_lbas, total - 2 - arr_lbas)
+        h[56:72] = uuid.UUID("0d15c0de-0000-4000-8000-000000000001").bytes_le
+        struct.pack_into("<QIII", h, 72, arr_lba, n_ent, ent_sz,
+                         binascii.crc32(arr) & 0xFFFFFFFF)
+        struct.pack_into("<I", h, 16, binascii.crc32(bytes(h)) & 0xFFFFFFFF)
+        return bytes(h)
+
+    img[ss:ss + 92] = header(1, total - 1, 2)
+    img[2 * ss:2 * ss + len(arr)] = arr
+    img[first_lba * ss:first_lba * ss + len(volume)] = volume
+    back_arr = total - 1 - arr_lbas
+    img[back_arr * ss:back_arr * ss + len(arr)] = arr
+    img[(total - 1) * ss:(total - 1) * ss + 92] = header(total - 1, 1, back_arr)
+    return img
 
 
 def _walk_all_agreement(image_gz, break_it=None):
@@ -9669,6 +9892,169 @@ def self_test():
                   + (f", {emiss} missing" if emiss else "")
                   + (f", {ediff} different" if ediff else "") + ")" + ebroke)
 
+        # GPT at 512 and 4096 bytes a sector. A 4Kn drive or a UFS LUN image
+        # keeps its GPT header at byte 4096 and counts every LBA in 4096-byte
+        # sectors; read as 512 it shows no partition table at all. The same
+        # ext4 fixture goes into a GPT built for each size and has to be found
+        # at the byte its entry names, identified, and walked with every file
+        # matching what sha256sum recorded over its source tree.
+        #
+        # 0xCBF43926 is the check value the CRC RevEng catalogue gives for
+        # CRC-32/ISO-HDLC over "123456789". It is written out so that a wrong
+        # CRC shared by _gpt_test_image and read_gpt cannot pass the rest.
+        crc_ok = binascii.crc32(b"123456789") == 0xCBF43926
+        if not crc_ok:
+            ok = False
+        print(f"  [{'PASS' if crc_ok else 'FAIL'}] the GPT CRC is CRC-32/ISO-HDLC "
+              "(check value 0xCBF43926)")
+        gpt_fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "tests", "fixtures", "ext4-sparse.img.gz")
+        if not (os.path.isfile(gpt_fix) and os.path.isfile(ext_want)):
+            print("  [SKIP] the ext4-sparse fixture is not beside this script, so the "
+                  "4096-byte-sector GPT was not built")
+        else:
+            import hashlib
+            with gzip.open(gpt_fix, "rb") as gz:
+                gvol = gz.read()
+            gwant = {}
+            with open(ext_want, encoding="utf-8") as lf:
+                for line in lf:
+                    line = line.rstrip("\n")
+                    if line and not line.startswith("#"):
+                        digest, path = line.split("  ", 1)
+                        gwant[path] = digest
+            LINUX_FS = "0fc63daf-8483-4772-8e79-3d69d8477de4"   # Linux filesystem data
+
+            def gpt_walk(img_bytes):
+                """(table, rejected, [GPT volumes], files matching the list)."""
+                gfh = io.BytesIO(bytes(img_bytes))
+                gtab, grej = read_gpt(gfh)
+                gvols = [v for v in volumes(gfh, len(img_bytes))
+                         if v["label"].startswith("GPT part")]
+                matched = 0
+                for v in gvols:
+                    w = v.get("walker")
+                    if w is None:
+                        continue
+                    for path, ino, sz, _mt in collect(w, w.root):
+                        if sz is None or path not in gwant:
+                            continue
+                        h = hashlib.sha256()
+                        for chunk in w.read_file(ino, sz):
+                            h.update(chunk)
+                        matched += h.hexdigest() == gwant[path]
+                return gtab, grej, gvols, matched
+
+            # sector size, first LBA, last LBA and the partition's byte offset,
+            # written out rather than computed from the builder
+            for gss, gfirst, glast, gbase in ((4096, 300, 6443, 1228800),
+                                              (512, 2048, 51199, 1048576)):
+                gimg = _gpt_test_image(gss, gvol, gfirst, "sparse", LINUX_FS)
+                try:
+                    gtab, grej, gvols, gmatch = gpt_walk(gimg)
+                    gregs = partition_regions(io.BytesIO(bytes(gimg)), len(gimg))[0]
+                    gcond = (gtab == [(1, "sparse", LINUX_FS, gfirst, glast)]
+                             and gtab.sector_size == gss and gtab.header_lba == 1
+                             and not grej and len(gvols) == 1
+                             and gvols[0]["base"] == gbase
+                             and gvols[0]["size"] == len(gvol)
+                             and gvols[0]["kind"] == "ext4"
+                             and gvols[0]["lba"] == gfirst
+                             and gvols[0]["name"].startswith(f"p1_lba{gfirst}_")
+                             and gmatch == len(gwant)
+                             # the protective MBR record counts the same sectors
+                             and gregs[0][:2] == ("MBR part 1", gss))
+                    gdetail = (f"at byte {gvols[0]['base']:,}, {gmatch} of "
+                               f"{len(gwant)} files match" if gvols else "no volume")
+                except Exception as exc:             # pylint: disable=broad-except
+                    gcond, gdetail = False, f"raised {type(exc).__name__}: {exc}"
+                if not gcond:
+                    ok = False
+                print(f"  [{'PASS' if gcond else 'FAIL'}] a GPT of {gss}-byte sectors "
+                      f"puts the ext4 fixture at LBA {gfirst}, byte {gbase:,}, and it "
+                      f"walks ({gdetail})")
+
+            g4k = _gpt_test_image(4096, gvol, 300, "sparse", LINUX_FS)
+            # the fixture really needs the 4096 probe: at 512 there is no header
+            at512 = _gpt_at(io.BytesIO(bytes(g4k)), 512, 1)
+            n4k = len(g4k) // 4096
+            back = (n4k - 1) * 4096
+
+            def spoiled(*cuts, mbr_type=None, my_lba=None):
+                """A copy of the 4096-byte image with bytes flipped at each offset,
+                the protective record's type changed, or the primary's MyLBA
+                rewritten with its CRC recomputed so only MyLBA is wrong."""
+                bad = bytearray(g4k)
+                for at in cuts:
+                    bad[at] ^= 0xFF
+                if mbr_type is not None:
+                    bad[446 + 4] = mbr_type
+                if my_lba is not None:
+                    struct.pack_into("<Q", bad, 4096 + 24, my_lba)
+                    struct.pack_into("<I", bad, 4096 + 16, 0)
+                    struct.pack_into("<I", bad, 4096 + 16, binascii.crc32(
+                        bytes(bad[4096:4096 + 92])) & 0xFFFFFFFF)
+                return bad
+
+            def refused_as(bad, want_lba, *reasons):
+                """The table read from want_lba (None: no table at all), with every
+                reason named among the refusals, and the fixture still at byte
+                1,228,800 whenever a table is used."""
+                gtab, grej, gvols, gmatch = gpt_walk(bad)
+                said = " / ".join(why for _at, why in grej)
+                if want_lba is None:
+                    good = gtab is None and not gvols
+                else:
+                    good = (gtab is not None and gtab.header_lba == want_lba
+                            and gtab.sector_size == 4096 and len(gvols) == 1
+                            and gvols[0]["base"] == 1228800 and gmatch == len(gwant))
+                return good and all(r in said for r in reasons), said
+
+            cases = [
+                ("read as 512-byte sectors the 4096 image has no header at LBA 1",
+                 at512 == (None, None), ""),
+            ]
+            for label, bad, want_lba, reasons in (
+                    ("a primary header that fails its CRC is not used, and the "
+                     "backup at the last LBA is", spoiled(4096 + 40), n4k - 1,
+                     ("HeaderCRC32",)),
+                    ("a primary entry array that fails its CRC is not used, and the "
+                     "backup is", spoiled(2 * 4096 + 60), n4k - 1,
+                     ("PartitionEntryArrayCRC32",)),
+                    ("a primary header whose MyLBA is not 1 is not used",
+                     spoiled(my_lba=2), n4k - 1, ("MyLBA is 2",)),
+                    ("with both headers spoiled there is no table",
+                     spoiled(4096 + 40, back + 40), None,
+                     ("HeaderCRC32",)),
+                    ("without a 0xEE record in sector 0 the backup is not read, "
+                     "since it may be a stale GPT", spoiled(4096 + 40, mbr_type=0x83),
+                     None, ("HeaderCRC32",))):
+                try:
+                    good, said = refused_as(bad, want_lba, *reasons)
+                except Exception as exc:             # pylint: disable=broad-except
+                    good, said = False, f"raised {type(exc).__name__}: {exc}"
+                cases.append((label, good, said))
+            # The first segment of a split image: the primary validates, the
+            # partition runs past the end of the file, and that is reported as
+            # missing bytes, not as a disk with no partition table.
+            try:
+                g4k_cut = bytes(g4k[:2 << 20])
+                cvols = [v for v in volumes(io.BytesIO(g4k_cut), len(g4k_cut))
+                         if v["label"].startswith("GPT part")]
+                cgood = (len(cvols) == 1 and cvols[0]["base"] == 1228800
+                         and cvols[0]["missing_past_end"] == 1228800 + len(gvol) - len(g4k_cut))
+                csaid = (f"{cvols[0]['missing_past_end']:,} bytes past the end"
+                         if cvols else "no GPT volume")
+            except Exception as exc:                 # pylint: disable=broad-except
+                cgood, csaid = False, f"raised {type(exc).__name__}: {exc}"
+            cases.append(("a 4096 GPT cut short still names its partition, reaching "
+                          "past the end of the file", cgood, csaid))
+            for label, cond, said in cases:
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] {label}"
+                      + (f" ({said})" if said else ""))
+
         # F2FS detection rejects the negatives: an all-zero region, the right
         # magic with a wrong reserved inode number, and the right magic with an
         # impossible block size. Each must return None, so a chance 4-byte match
@@ -10393,7 +10779,7 @@ what it checks, and where the constants come from:
   partition and retries at +0 if the magic is wrong. Little endian is tried
   first, then big endian. This tool does the same, for the whole image, for
   every MBR primary, every logical volume in the extended chain, and every
-  GPT partition.
+  GPT partition, on disks of 512-byte or 4096-byte sectors.
 
   A bare 4-byte magic match is not a finding: expect roughly one by chance
   per 256 MiB scanned. Every candidate is parsed as a superblock and its

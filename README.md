@@ -201,10 +201,13 @@ lba0                       no partition table: a whole-disk filesystem or bare r
 
 The LBA is the identity. It is a physical fact about the image that any partition
 tool reproduces, and two volumes cannot share one, so names cannot collide. A
-label is only ever a suffix.
+label is only ever a suffix. An LBA counts the disk's own logical sectors: 512
+bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as on
+4Kn drives and UFS LUN images, so `p1_lba300` on such a disk begins at byte
+1,228,800.
 
-The zip also carries `volumes.json`: per volume, the LBA, byte offset, partition
-size, filesystem type, the recorded volume id or UUID, and what was extracted,
+The zip also carries `volumes.json`: per volume, the LBA and the sector size it
+counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image) and, on a
 volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count.
@@ -293,7 +296,8 @@ image.close()
 ```
 
 Each dict names the region as the report does (`label`), gives its byte offset and
-length (`base`, `size`) and its sector (`lba`), the directory an extraction uses
+length (`base`, `size`) and its sector (`lba`, in the disk's logical sectors), the
+directory an extraction uses
 (`name`, see [What an extraction is named](#what-an-extraction-is-named-and-how-to-check-it)),
 the filesystem (`kind`, or `not recognised`, or `extended container` for the MBR
 entry that holds logical volumes) and, when the image holds only part of the
@@ -807,6 +811,23 @@ test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table o
 The self-test builds an image of this shape and requires both superblock copies to be
 found and the volume to be listed.
 
+The GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
+so its byte offset is the logical sector size: 512 on most disks, 4096 on 4Kn drives
+and UFS LUN images, and both are tried. A header is used only when it passes the four
+checks the spec lists in section 5.3.2: the `EFI PART` signature, HeaderCRC32 over
+HeaderSize bytes with that field set to zero, MyLBA naming the block it was read from,
+and the CRC32 of the partition entry array, with the offsets from Table 5.5 and the
+entry fields from Table 5.6. When the primary fails, the backup header in the last
+logical block is read, as that section says to, but only when sector 0 holds a
+protective `0xEE` record, because the same section warns that a disk reformatted to a
+legacy MBR can keep a stale GPT there. The report names every header it did not use
+and why, and says when the backup was the one read. On a 4096-byte disk the MBR's LBAs
+are counted in 4096-byte sectors too: Table 5.4 starts the protective record at LBA 1,
+"the LBA of the GPT Partition Header". The self-test builds a GPT at each size around
+the ext4 fixture and requires the volume at the byte its entry names. Those images read
+the same in The Sleuth Kit's `mmls -b 4096` and in util-linux `sfdisk --sector-size
+4096`, and a GPT that `sfdisk` wrote with 4096-byte sectors is read as `sfdisk` wrote it.
+
 The QNX4 reader was validated by round-trip against the Linux kernel driver
 itself: a fixture populated with nested directories, a multi-extent file, a
 long name, a symlink, an empty file and distinct modes, owners and mtimes was
@@ -852,6 +873,10 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
   the report and in `volumes.json` (`extends_past_image_by_bytes`), and stores a file
   whose blocks lie past the cut under a name ending `.SHORT-<here>-of-<size>-bytes`,
   counted as `short` rather than as extracted.
+- **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
+  a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
+  sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
+  a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
   Becker HBCIFS container are recognised and reported but not decompressed, because no
