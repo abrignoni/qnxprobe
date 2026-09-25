@@ -33,9 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 3.14 for compression.zstd, which zstd-compressed SquashFS and UBIFS need;
+      # the executables carry the standard library they were built with.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Check the tag matches QNXPROBE_VERSION
         if: startsWith(github.ref, 'refs/tags/v')
@@ -117,6 +119,32 @@ jobs:
           lines = [l for l in r.stdout.splitlines() if l.strip()]
           assert len(lines) == 24 and all(l.startswith("OK") for l in lines), lines
           print("all executables ran on", os.environ.get("RUNNER_OS"), os.environ.get("RUNNER_ARCH"))
+
+      - name: Check the command line executable reads zstd
+        shell: python
+        run: |
+          # qnxprobe imports compression.zstd only when a volume needs it, so this
+          # proves PyInstaller bundled it. The frozen self-test cannot: the
+          # committed fixtures are not beside the executable, so it skips every
+          # flash image check.
+          import gzip, hashlib, os, shutil, subprocess, zipfile
+          ext = ".exe" if os.name == "nt" else ""
+          cli = os.path.join("dist", "qnxprobe" + ext)
+          with gzip.open("tests/fixtures/squashfs-zstd.img.gz") as src, open("zstd.img", "wb") as dst:
+              shutil.copyfileobj(src, dst)
+          r = subprocess.run([cli, "--extract", "zstd.zip", "zstd.img"], capture_output=True, text=True)
+          print(r.stdout[-500:]); assert r.returncode == 0, r.stderr[-2000:]
+          assert "no zstd" not in r.stdout, "this build does not carry compression.zstd"
+          want = {}
+          with open("tests/fixtures/squashfs.src.sha256", encoding="utf-8") as fh:
+              for line in fh:
+                  digest, path = line.rstrip("\n").split("  ", 1)
+                  want["lba0/" + path] = digest
+          with zipfile.ZipFile("zstd.zip") as z:
+              got = {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist() if n in want}
+          match = sum(1 for n, d in want.items() if got.get(n) == d)
+          print(f"{match} of {len(want)} files from the zstd SquashFS match their source hashes")
+          assert match == len(want) == 612
 
       - name: Check the window starts and stays up
         shell: python

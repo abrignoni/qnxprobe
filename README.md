@@ -65,7 +65,9 @@ Python 3, and nothing else. No packages, no install step.
 
 Reading zstd-compressed SquashFS or UBIFS needs Python 3.14 or later, whose standard
 library adds `compression.zstd`. On an older Python those files are named and reported as
-not read (see [What it does not do](#what-it-does-not-do)).
+not read (see [What it does not do](#what-it-does-not-do)). The
+[executables](#executables) carry their own Python 3.14, so they read zstd wherever they
+run; those published with v1.31 and v1.32 were built on 3.12 and do not.
 
 Run and self-tested on 3.10, 3.12 and 3.14. It uses no syntax newer than 3.8 and
 parses cleanly under 3.8 and 3.9, but it has not been run there.
@@ -130,10 +132,12 @@ the Contents pane, in the window exactly as on the command line.
 
 For a machine with no Python, the repository's GitHub Actions workflow
 (`.github/workflows/build-executables.yml`) builds both files into standalone
-executables with PyInstaller, `qnxprobe` for the command line and `qnxprobe_gui`
-for the window, on six targets: Windows x64 and arm64, macOS on Apple silicon and
-Intel, and Linux x64 and arm64. Each build runs the self-test, the discovery check
-and a window liveness check on its own runner before it is packaged with
+executables with PyInstaller on Python 3.14, `qnxprobe` for the command line and
+`qnxprobe_gui` for the window, on six targets: Windows x64 and arm64, macOS on Apple
+silicon and Intel, and Linux x64 and arm64. Each build runs the self-test, the discovery
+check, a check that the command line executable extracts every file of the zstd SquashFS
+fixture with the bytes it was built from, and a window liveness check on its own runner
+before it is packaged with
 `SHA256SUMS.txt` and a README. The executables are not code signed; the README
 inside each archive says what Windows SmartScreen and macOS Gatekeeper will ask.
 They are published on the release for a `v*` tag and are otherwise available as
@@ -1196,9 +1200,10 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too, and in UBIFS each file whose data
-  is zstd-compressed is named and refused. The published executables are built on Python
-  3.12, so they do not read zstd. JFFS2's rubin, dynrubin and copy compressors are reported
-  and not read, and LZO-RLE is refused.
+  is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
+  were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
+  JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is
+  refused.
 - **Older and unusual flash layouts are not walked.** SquashFS 1.x to 3.x (and its
   big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
   YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
