@@ -477,7 +477,7 @@ def run_window(initial_paths):
             if not ent:
                 continue
             mode, size, mtime = ent
-            isdir = bool(mode & q.S_IFDIR)
+            isdir = (mode & 0o170000) == q.S_IFDIR     # a block device shares the S_IFDIR bit
             islink = (mode & q.S_IFLNK) == q.S_IFLNK
             isreg = (mode & 0o170000) == 0o100000
             kind = "dir" if isdir else "link" if islink else "file" if isreg else "special"
