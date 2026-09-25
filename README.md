@@ -597,8 +597,8 @@ area. Read least-significant-first, the same map put 14 live blocks of one image
 
 ## Linux flash filesystems
 
-Embedded Linux keeps its filesystems on flash, and four formats cover most of what turns
-up: SquashFS for a read-only system image, JFFS2 on NOR flash, UBI with UBIFS on NAND,
+Since 1.31. Embedded Linux keeps its filesystems on flash, and four formats cover most
+of what turns up: SquashFS for a read-only system image, JFFS2 on NOR flash, UBI with UBIFS on NAND,
 and YAFFS on older NAND. `--list` and `--extract` read all four, on their own or inside a
 raw flash dump (see [Raw flash dumps and NAND spare bytes](#raw-flash-dumps-and-nand-spare-bytes)).
 Each reader follows the kernel code (for YAFFS, Aleph One's own code) that reads the
@@ -1032,7 +1032,7 @@ test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table o
 The self-test builds an image of this shape and requires both superblock copies to be
 found and the volume to be listed.
 
-The GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
+Since 1.31 the GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
 so its byte offset is the logical sector size: 512 on most disks, 4096 on 4Kn drives
 and UFS LUN images, and both are tried. A header is used only when it passes the four
 checks the spec lists in section 5.3.2: the `EFI PART` signature, HeaderCRC32 over
