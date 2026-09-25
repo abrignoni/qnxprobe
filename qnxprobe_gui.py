@@ -441,6 +441,8 @@ def run_window(initial_paths):
         state.update(fh=fh, volumes=vols, image_path=path)
         for i, v in enumerate(vols):
             label = f"{v['label']}   {v['kind']}   ({v['name']})" if v["name"] else f"{v['label']}   {v['kind']}"
+            if v.get("walker") is not None and v.get("note"):
+                label += f"   [{v['note']}]"     # a walked volume that cannot be read here
             iid = tree.insert("", "end", text=label,
                               values=("volume", q.human(v["size"]), v.get("detail", "")[:60], "", "", ""),
                               open=False)
