@@ -1,7 +1,8 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+ and APFS filesystems, and QNX IFS
-boot images, out of raw disk images: identify each by its own on-disk structure
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+ and APFS filesystems,
+the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
+images, out of raw disk images and flash dumps: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
 
@@ -46,6 +47,14 @@ decompresses to exactly the size its header records and the image checksum
 balances). See [What it does not do](#what-it-does-not-do) for the compression
 methods it recognises but does not yet read.
 
+It also reads the filesystems embedded Linux keeps on flash: SquashFS, JFFS2, UBI and the
+UBIFS inside it, and YAFFS1 and YAFFS2. They are what routers, cameras, drones and Linux
+head units tend to carry, often as a chip dump with no partition table and sometimes with
+the NAND spare bytes still between the pages. Each is found by its own headers inside such
+a dump and read the way the Linux kernel (for YAFFS, Aleph One's own code) reads it. LZO
+and LZ4, which the standard library lacks, are carried as small pure-Python decoders. See
+[Linux flash filesystems](#linux-flash-filesystems).
+
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image. A second, optional file, `qnxprobe_gui.py`, puts a
 window over it (see [The window](#the-window)); it is standard library too.
@@ -53,6 +62,10 @@ window over it (see [The window](#the-window)); it is standard library too.
 ## Requirements
 
 Python 3, and nothing else. No packages, no install step.
+
+Reading zstd-compressed SquashFS or UBIFS needs Python 3.14 or later, whose standard
+library adds `compression.zstd`. On an older Python those files are named and reported as
+not read (see [What it does not do](#what-it-does-not-do)).
 
 Run and self-tested on 3.10, 3.12 and 3.14. It uses no syntax newer than 3.8 and
 parses cleanly under 3.8 and 3.9, but it has not been run there.
@@ -578,6 +591,162 @@ exactly, none of them lies in a reported run, and the runs plus those blocks til
 area. Read least-significant-first, the same map put 14 live blocks of one image inside
 "free" runs while the total still matched, which is why the check is positional.
 
+## Linux flash filesystems
+
+Embedded Linux keeps its filesystems on flash, and four formats cover most of what turns
+up: SquashFS for a read-only system image, JFFS2 on NOR flash, UBI with UBIFS on NAND,
+and YAFFS on older NAND. `--list` and `--extract` read all four, on their own or inside a
+raw flash dump (see [Raw flash dumps and NAND spare bytes](#raw-flash-dumps-and-nand-spare-bytes)).
+Each reader follows the kernel code (for YAFFS, Aleph One's own code) that reads the
+format, cited line by line in the source and under
+[Where the constants come from](#where-the-constants-come-from).
+
+Every fixture was written by the format's own tools (squashfs-tools 4.7.5, mtd-utils
+2.3.0, and Aleph One's yaffs2 built from source) from a source tree chosen for its shapes,
+and every reader is held against oracles it never touches: `sha256sum` over the source
+tree for the content of every file, and the tree's own `stat` listing (for SquashFS,
+`unsquashfs -lln`) for the type, permissions, size and modification time of every entry.
+The scripts that build them are in `tools/`. None of these readers has yet been run
+against flash from a real device; see [What it does not do](#what-it-does-not-do).
+
+### SquashFS
+
+A read-only, compressed filesystem, and the usual root filesystem of a router or a camera.
+Version 4.0 is read. The 1.x to 3.x layouts, and their big-endian `sqsh` form, are
+recognised and reported but not walked. A volume is claimed only when its superblock
+passes the checks the kernel makes before it mounts one (a block size that agrees with its
+own log, a compression id the format defines) and its root inode reads back as a
+directory.
+
+Every compressor mksquashfs offers is read: gzip, xz (including a BCJ filter), the legacy
+lzma format, LZO, LZ4 and, on Python 3.14 or later, zstd. Files split into blocks, files
+that end in a shared fragment, and holes are read; symlinks, hard links, device nodes and
+FIFOs are listed. Extended attributes are not reported.
+
+Validated on eight images, one per compressor plus an uncompressed one and one with 4 KiB
+blocks: 612 of 612 files match `sha256sum` over the source tree, and 621 of 621 entries
+agree with `unsquashfs -lln` on every image. The tree includes random bytes that the
+4 KiB-block image stores uncompressed because they did not shrink, a file shaped to reach
+an LZ decoder's rarer instructions, a directory of 600 entries (more than one directory
+header and metadata block) and a 255-byte name.
+
+### JFFS2
+
+A log-structured filesystem with no superblock: the filesystem is whatever nodes the
+region holds. It is claimed when the first node in the region's first 64 KiB, with only
+erased flash (0xFF) before it, has a header CRC that holds, and a scan of the region finds
+inode or directory nodes. Both byte orders are read.
+
+Every node is scanned and its header CRC checked. A node the filesystem has marked
+obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
+`check_node_data` does, so an older copy of that data shows through where one exists; the
+report counts the nodes dropped, and a name whose inode is left with no readable node is
+not listed, and counted too. For
+each name the newest version wins and a newer entry with inode 0 unlinks it; each file
+takes its mode, owner and times from its newest inode node and is cut to that node's size.
+The none, zero, rtime, zlib and LZO compressors are read; rubin, dynrubin and copy are
+reported and not read. Erase block summary nodes are stepped over.
+
+Validated on six images from `mkfs.jffs2` (both byte orders, zlib, LZO, rtime, none, and
+one run through `sumtool`): 310 of 310 files and 317 of 317 entries match, and the two
+device nodes carry the type and permissions the device table gave them. (`mkfs.jffs2`
+stamps device nodes, and so `/dev`, with the time it ran, so their times are not compared.)
+`mkfs.jffs2`
+writes each node once, so none of these images carries history: the rules that choose
+between versions of a name or of a file's data are sourced from the kernel, not exercised.
+
+### UBI and UBIFS
+
+UBI is the volume layer raw NAND runs under: each eraseblock carries an erase counter
+header, and a mapped one a second header naming the volume and logical block it holds.
+The reader finds the eraseblock size from the distance between those headers, rebuilds
+each volume from its blocks (of two copies of one block the higher sequence number wins,
+unless it is a copy whose data CRC fails), and reads the volume table. A volume holding
+UBIFS or SquashFS is listed as a folder named after the volume; any other volume, a kernel
+image for example, as a single file holding its bytes. UBI records no time for a volume,
+so none is shown for such a file.
+
+UBIFS is read from its committed index, found through the master node, and then the
+journal written since the last commit is replayed over it the way the kernel's
+`replay.c` does: newer inode and data nodes in sequence order, an inode whose link count
+reaches zero removed, a directory entry with inode 0 removing its name, and a truncation
+dropping the blocks past the new size. LZO, zlib (raw deflate, as the kernel writes it),
+uncompressed data and, on Python 3.14 or later, zstd are read, and a block the index does
+not hold is a hole. A bare UBIFS image, as `mkfs.ubifs` writes it before `ubinize` wraps
+it, is read too.
+
+Validated on a bare `mkfs.ubifs` image and on five `ubinize` images (NAND with LZO, zlib,
+zstd and no compression, and NOR), each with three volumes: the UBIFS volume matches 410 of
+410 files and 416 of 416 entries, a static volume holding SquashFS matches 6 of 6 files,
+and a static raw volume spanning two eraseblocks matches its hash. `mkfs.ubifs` commits
+everything to the index and `ubinize` writes each block once, so the journal is empty and
+no block has a second copy in any of them: journal replay and the choice between copies
+are sourced from the kernel, not exercised.
+
+### YAFFS1 and YAFFS2
+
+NAND filesystems with no superblock: every page carries its tags in its spare bytes, and
+the filesystem is rebuilt from the tags. The page size, spare size and where in the spare
+the tags sit are recorded nowhere, and differ with the NAND controller, so they are found
+by trying eleven common page and spare sizes (512+16 to 16384+1280) and, for YAFFS2,
+every tag offset in the spare and both byte orders. A layout is accepted only when at least 90% of the used
+spares hold plausible tags and at least 90% of the pages those tags call object headers
+parse as object headers.
+
+YAFFS2 is read the way its own scan reads it: blocks newest first, the newest object
+header and the newest copy of each data page winning, data past a shrink or past the
+newest header's size ignored, and a file's size taken from its newest header or from data
+written after it, whichever is further. YAFFS1 orders two copies of a page by their 2-bit
+serial number and takes a file's size from where its furthest live page ends. `lost+found`
+is always listed, as YAFFS lists it; when the flash holds no header for it or for the root,
+no time is shown for them, since YAFFS makes them at mount time.
+
+Validated two ways. Aleph One's own image makers wrote four images (YAFFS2 little endian,
+YAFFS2 with big-endian headers, YAFFS2 with its tags two bytes into the spare, and YAFFS1):
+158 of 158 files and 164 of 164 entries match on each. And YAFFS's own code, run in user
+space over a file standing in for NAND (`tools/yaffs_history.c`), wrote three images with
+history: overwrites, a shrink and a regrow, holes, deletion, a rename, a hard link whose
+first name was removed, enough churn for garbage collection to run, and a file flushed and
+never closed, with no unmount at the end. The YAFFS1 images end in power cuts, one of them
+leaving two live copies of a page with different bytes that only their serial numbers
+order. The oracle for those is YAFFS's own code mounting a copy read-only and reading every
+file back: 48 of 48, 49 of 49 and 2 of 2 files match, and every entry agrees.
+
+### Raw flash dumps and NAND spare bytes
+
+A dump read off a flash chip has no partition table (the kernel learns the flash layout
+from the device tree or its command line, which the dump does not carry), and usually a
+bootloader at offset 0. So when an image has no partition table and nothing is recognised
+at its start, qnxprobe looks for SquashFS, UBI and JFFS2 at every 4 KiB boundary of an
+image up to 8 GiB, checks each candidate the way identification does, and reports each one
+it finds as its own volume, under `FLASH` in the report:
+
+```
+  FLASH    no partition table and nothing recognised at offset 0; 2 flash filesystem(s) found by their own headers
+    @0x140000 squashfs       36.0 KiB  at byte 1,310,720
+    @0x150000 jffs2           2.7 MiB  at byte 1,376,256
+```
+
+A SquashFS volume ends where its superblock says; UBI runs over the following eraseblocks
+that carry the same image sequence number, or are erased; JFFS2 records no size, so it runs to the next volume
+found or the end of the image. YAFFS has no header to search for, so it is read only when
+it fills the image or a partition.
+
+A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
+data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise, so
+when such a region does not read cleanly, qnxprobe tries the common page and spare sizes,
+reads the region with the spare stripped, and says so in the report:
+
+```
+        NAND         a raw dump: 2048-byte pages each followed by 64 spare bytes, read with the spare stripped
+```
+
+Validated on dumps built from the fixtures, not captured from a chip: a 4 MiB NOR layout
+with 1.25 MiB of bytes no filesystem claims, then the SquashFS and JFFS2 images at 64 KiB
+boundaries, where both are found at their offsets and every entry is read; and the UBI and
+JFFS2 images with 64 spare bytes after every 2 KiB page, where the geometry is found and
+every file matches. An image recognised at offset 0 is never searched further.
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
@@ -837,6 +1006,62 @@ the page geometry divides evenly and the `.filetable` carries its fixed reserved
 at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
 u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
+SquashFS, JFFS2, UBI and UBIFS, from the Linux kernel at v7.0 (commit
+`028ef9c96e96197026887c0f092424679298aae8`):
+
+```
+SQUASHFS_MAGIC  0x73717368 ("hsqs")     include/uapi/linux/magic.h:20
+struct squashfs_super_block             fs/squashfs/squashfs_fs.h:241
+inode, directory, fragment layouts      fs/squashfs/squashfs_fs.h:270-424
+metadata block 8 KiB, bit 15 stored     fs/squashfs/squashfs_fs.h:19,106
+data block, bit 24 stored               fs/squashfs/squashfs_fs.h:113
+JFFS2_MAGIC_BITMASK 0x1985, old 0x1984  include/uapi/linux/jffs2.h:24-25
+JFFS2 compressor ids                    include/uapi/linux/jffs2.h:41-48
+struct jffs2_unknown_node, raw_dirent,  include/uapi/linux/jffs2.h:102,111,135
+  raw_inode
+UBI_EC_HDR_MAGIC "UBI#", VID "UBI!"     drivers/mtd/ubi/ubi-media.h:29,31
+struct ubi_ec_hdr, ubi_vid_hdr          drivers/mtd/ubi/ubi-media.h:147,268
+UBI_CRC32_INIT 0xFFFFFFFF               drivers/mtd/ubi/ubi-media.h:26
+layout volume 0x7FFFEFFF                drivers/mtd/ubi/ubi-media.h:294,298
+struct ubi_vtbl_record (172 bytes)      drivers/mtd/ubi/ubi-media.h:355
+UBIFS_NODE_MAGIC 0x06101831             fs/ubifs/ubifs-media.h:25
+superblock, master and log LEBs         fs/ubifs/ubifs-media.h:227-231
+key: block or hash bits 29              fs/ubifs/ubifs-media.h:199
+```
+
+How each reader chooses among versions and copies is taken from the code that makes the
+choice, and cited beside the Python that follows it: `fs/jffs2/readinode.c`
+(`check_node_data`, `read_direntry`, `jffs2_do_read_inode_internal`) for JFFS2,
+`drivers/mtd/ubi/attach.c` (`ubi_compare_lebs`) for UBI, and `fs/ubifs/replay.c`
+(`apply_replay_entry`, `inode_still_linked`, `trun_remove_range`) for the UBIFS journal.
+
+LZO and LZ4 are not in the standard library, so both are carried as pure-Python decoders.
+LZO1X is written from the kernel's `Documentation/staging/lzo.rst` and
+`lib/lzo/lzo1x_decompress_safe.c` at the same commit, and LZ4 from
+`doc/lz4_Block_format.md` in lz4 at v1.10.0 (commit
+`ebb370ca83af193212df4dcbadcc5d87bc0de2f0`). Every fixture compressed with them reads back
+byte for byte, and each source tree carries a file shaped to reach the decoders' rarer
+instructions. LZO-RLE, the second LZO bitstream, which zram writes and none of these
+filesystems does, is refused rather than decoded. The kernel does not read SquashFS's
+legacy lzma format, so that one follows squashfs-tools' own `lzma_xz_wrapper.c` at commit
+`708c59ae80853b0845017c33b42e56061cc546cd`.
+
+YAFFS1 and YAFFS2, from Aleph One's
+[yaffs2](https://github.com/Aleph-One-Ltd/yaffs2) at commit
+`474b3acb927d27b2305618aaf24456b9d33fe91b`. The object header's field offsets were printed
+with `offsetof()` from that tree's own headers rather than counted by hand:
+
+```
+object ids: root 1 .. summary 0x10      core/yaffs_guts.h:94-100
+sequence numbers 0x1000..0xefffff00     core/yaffs_guts.h:123-124
+struct yaffs_spare (YAFFS1 tags)        core/yaffs_guts.h:225
+struct yaffs_obj_hdr (512 bytes)        core/yaffs_guts.h:330
+YAFFS2 packed tags and their ECC        core/yaffs_packedtags2.c
+YAFFS2 scan                             core/yaffs_yaffs2.c yaffs2_scan_chunk
+YAFFS1 tags and deletion                core/yaffs_tagscompat.c, core/yaffs_yaffs1.c
+root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
+```
+
 `--help` prints this same sourcing, so it travels with the tool.
 
 ## What it does not do
@@ -883,6 +1108,33 @@ u-boot, boot_fs or ext partitions of the two vehicle images tested.
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
   an image that dropped it will not divide into pages and will be reported as not
   recognised rather than misread.
+- **The Linux flash filesystems are validated against images their own tools wrote, not
+  yet against flash from a real device.** squashfs-tools and mtd-utils write each image in
+  one pass, so none of their images carries history: JFFS2's choice between versions of a
+  name or of a file's data, UBI's choice between two copies of a block and UBIFS journal
+  replay are implemented and sourced from the kernel, but not exercised. YAFFS is the
+  exception: its history fixtures were written, and read back, by YAFFS's own code.
+- **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
+  (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
+  listed, since its directory tables are compressed too, and in UBIFS each file whose data
+  is zstd-compressed is named and refused. The published executables are built on Python
+  3.12, so they do not read zstd. JFFS2's rubin, dynrubin and copy compressors are reported
+  and not read, and LZO-RLE is refused.
+- **Older and unusual flash layouts are not walked.** SquashFS 1.x to 3.x (and its
+  big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
+  YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
+  recognised at all.
+- **Deleted data on flash is not recovered.** Each flash reader returns the filesystem's
+  current state, the way the filesystem itself reads it. Older versions still on the flash
+  (JFFS2's obsolete nodes, YAFFS's superseded pages, UBI's old copies of a block) are used
+  only where the filesystem itself would use them.
+- **Encrypted and authenticated UBIFS.** Encryption is not undone: a file fscrypt marks as
+  encrypted has its content refused rather than returned, and encrypted names are not
+  decrypted. The hashes of an authenticated volume are not checked. Neither case is in the
+  fixtures. Extended attributes are not reported on any of the flash filesystems.
+- **A raw flash dump is searched only for SquashFS, UBI and JFFS2**, only when it has no
+  partition table and nothing is recognised at offset 0, and only up to 8 GiB. Its spare
+  bytes are stripped only for UBI and JFFS2, and only for the common page and spare sizes.
 
 ## License
 
