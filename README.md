@@ -601,13 +601,17 @@ Each reader follows the kernel code (for YAFFS, Aleph One's own code) that reads
 format, cited line by line in the source and under
 [Where the constants come from](#where-the-constants-come-from).
 
-Every fixture was written by the format's own tools (squashfs-tools 4.7.5, mtd-utils
-2.3.0, and Aleph One's yaffs2 built from source) from a source tree chosen for its shapes,
-and every reader is held against oracles it never touches: `sha256sum` over the source
-tree for the content of every file, and the tree's own `stat` listing (for SquashFS,
-`unsquashfs -lln`) for the type, permissions, size and modification time of every entry.
-The scripts that build them are in `tools/`. None of these readers has yet been run
-against flash from a real device; see [What it does not do](#what-it-does-not-do).
+The fixtures come in two kinds. Most were written by the format's own tools
+(squashfs-tools 4.7.5, mtd-utils 2.3.0, and Aleph One's yaffs2 built from source) from a
+source tree chosen for its shapes, and each reader is held against oracles it never
+touches: `sha256sum` over the source tree for the content of every file, and the tree's
+own `stat` listing (for SquashFS, `unsquashfs -lln`) for the type, permissions, size and
+modification time of every entry. Those tools write an image in one pass, so they leave no
+history. The others carry history: the Linux kernel's own JFFS2, UBI and UBIFS drivers
+(kernel 7.0.0), and YAFFS's own code, wrote them through a series of overwrites, deletions
+and renames, and read them back, and that reading is the oracle. The scripts that build
+them all are in `tools/`. None of these readers has yet been run against flash from a
+real device; see [What it does not do](#what-it-does-not-do).
 
 ### SquashFS
 
@@ -633,9 +637,9 @@ header and metadata block) and a 255-byte name.
 ### JFFS2
 
 A log-structured filesystem with no superblock: the filesystem is whatever nodes the
-region holds. It is claimed when the first node in the region's first 64 KiB, with only
-erased flash (0xFF) before it, has a header CRC that holds, and a scan of the region finds
-inode or directory nodes. Both byte orders are read.
+region holds. It is claimed when the region's first bytes that are not erased flash
+(0xFF) open a node whose header CRC holds, and a scan of the region finds inode or
+directory nodes. Both byte orders are read.
 
 Every node is scanned and its header CRC checked. A node the filesystem has marked
 obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
@@ -651,9 +655,15 @@ Validated on six images from `mkfs.jffs2` (both byte orders, zlib, LZO, rtime, n
 one run through `sumtool`): 310 of 310 files and 317 of 317 entries match, and the two
 device nodes carry the type and permissions the device table gave them. (`mkfs.jffs2`
 stamps device nodes, and so `/dev`, with the time it ran, so their times are not compared.)
-`mkfs.jffs2`
-writes each node once, so none of these images carries history: the rules that choose
-between versions of a name or of a file's data are sourced from the kernel, not exercised.
+
+`mkfs.jffs2` writes each node once, so those images carry no history. Two more do, written
+by the Linux kernel's JFFS2 driver through the history described under
+[Kernel-written history](#kernel-written-history) below: one on NOR flash, where the kernel
+marks each node it supersedes obsolete (154 on the committed image), and one on NAND
+taken with `nanddump --oob`, where it cannot, so older nodes stay valid and only their
+version numbers say which is current (24 directory entry nodes for 13 linked names, none
+marked). The self-test prints these counts and fails if the history is gone.
+Both match what the kernel reads back from them, 10 of 10 files and 13 of 13 entries.
 
 ### UBI and UBIFS
 
@@ -679,9 +689,24 @@ Validated on a bare `mkfs.ubifs` image and on five `ubinize` images (NAND with L
 zstd and no compression, and NOR), each with three volumes: the UBIFS volume matches 410 of
 410 files and 416 of 416 entries, a static volume holding SquashFS matches 6 of 6 files,
 and a static raw volume spanning two eraseblocks matches its hash. `mkfs.ubifs` commits
-everything to the index and `ubinize` writes each block once, so the journal is empty and
-no block has a second copy in any of them: journal replay and the choice between copies
-are sourced from the kernel, not exercised.
+everything to the index and `ubinize` writes each block once, so in those images the
+journal is empty and no block has a second copy.
+
+A third image carries both. The Linux kernel's UBI and UBIFS drivers wrote it on simulated
+NAND through the history described below, and it was taken with `nanddump --oob` while
+UBIFS was still mounted, so the journal nodes written since the last commit (269 on the
+committed image) have to be replayed over the index. Among them are a truncation, deletions, renames and a file created
+with no name (`O_TMPFILE`), written, given an extended attribute and then linked in, which
+leaves an inode record with no links after the file's data. Its static volume was written
+twice, and the first version's two eraseblocks were put back into free eraseblocks from a
+dump taken between the writes, the state a power cut during the rewrite leaves, so each of
+its blocks has an older copy on the flash. The UBIFS volume matches what the kernel reads
+back, 11 of 11 files and 14 of 14 entries, and the static volume the kernel's choice of its
+second version. The report names the older copies:
+
+```
+        note         2 eraseblock(s): an older copy of a block, not the one read
+```
 
 ### YAFFS1 and YAFFS2
 
@@ -728,24 +753,51 @@ it finds as its own volume, under `FLASH` in the report:
 ```
 
 A SquashFS volume ends where its superblock says; UBI runs over the following eraseblocks
-that carry the same image sequence number, or are erased; JFFS2 records no size, so it runs to the next volume
-found or the end of the image. YAFFS has no header to search for, so it is read only when
-it fills the image or a partition.
+that carry the same image sequence number, or are erased; JFFS2 records no size, so it
+runs to the next volume found or the end of the image. YAFFS has no header to search for,
+so it is read only when it fills the image or a partition.
 
 A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
-data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise, so
-when such a region does not read cleanly, qnxprobe tries the common page and spare sizes,
-reads the region with the spare stripped, and says so in the report:
+data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise that
+does not look like noise: the spare holds error-correction bytes and, on NAND, JFFS2's own
+clean markers, and a UBI header in a 512-byte subpage sits inside the first page where the
+spare cannot disturb it. So qnxprobe tries the common page and spare sizes, reading the
+region with the spare stripped, when a UBI volume table does not read or no JFFS2 node
+opens the region, and says so in the report:
 
 ```
         NAND         a raw dump: 2048-byte pages each followed by 64 spare bytes, read with the spare stripped
 ```
 
-Validated on dumps built from the fixtures, not captured from a chip: a 4 MiB NOR layout
-with 1.25 MiB of bytes no filesystem claims, then the SquashFS and JFFS2 images at 64 KiB
-boundaries, where both are found at their offsets and every entry is read; and the UBI and
-JFFS2 images with 64 spare bytes after every 2 KiB page, where the geometry is found and
-every file matches. An image recognised at offset 0 is never searched further.
+Validated two ways. On dumps built from the fixtures: a 4 MiB NOR layout with 1.25 MiB of
+bytes no filesystem claims, then the SquashFS and JFFS2 images at 64 KiB boundaries, where
+both are found at their offsets and every entry is read, and the UBI and JFFS2 images with
+64 spare bytes after every 2 KiB page, where the geometry is found and every file matches.
+And on the two kernel-written NAND images, each a `nanddump --oob` of one partition of the
+kernel's simulated NAND chip (`nandsim`), where the geometry is found and every file
+matches the kernel's reading. The first run on those two images read the files of neither: the UBI
+dump mapped through its subpage headers and the JFFS2 dump opened with spare bytes, the
+two cases the paragraph above now handles, and neither had shown on the dumps built from
+fixtures. An image recognised at offset 0 is never searched further.
+
+### Kernel-written history
+
+`tools/make_kernel_flash_fixtures.sh` (Linux, root) builds the three kernel-written images.
+It first writes and deletes more data than the volume holds, so garbage collection runs
+and UBIFS commits, then makes the history: data overwritten in the middle and appended, a
+shrink followed by data written past the old end, a truncate that grows, a file written
+only far from its start, one file rewritten forty times, a deleted file and directory, a
+rename across directories, a rename over an existing name, a hard link whose first name is
+removed, a symlink, a permission change, and on UBIFS the unnamed file above. Every step
+is fsynced, and nothing after the first phase calls `sync()`, which on UBIFS runs a commit.
+The kernel then reads each image back: the NOR image through a copy mounted read-only, the
+NAND ones after being written back to an erased partition or mounted read-only again, and
+a second dump shows the kernel read the bytes that are committed (for UBI, only the two
+stale eraseblocks changed, erased by the kernel as older copies).
+
+These images are what make the history rules testable: a deliberate change to any of them
+(newest version or name first, journal replay, truncation, name deletion, keeping a
+relinked inode, the newest copy of a UBI block) turns the self-test red.
 
 ## Split images
 
@@ -1108,12 +1160,14 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
   an image that dropped it will not divide into pages and will be reported as not
   recognised rather than misread.
-- **The Linux flash filesystems are validated against images their own tools wrote, not
-  yet against flash from a real device.** squashfs-tools and mtd-utils write each image in
-  one pass, so none of their images carries history: JFFS2's choice between versions of a
-  name or of a file's data, UBI's choice between two copies of a block and UBIFS journal
-  replay are implemented and sourced from the kernel, but not exercised. YAFFS is the
-  exception: its history fixtures were written, and read back, by YAFFS's own code.
+- **The Linux flash filesystems are validated against images their own tools and the
+  Linux kernel wrote, not yet against flash from a real device.** The NAND images come
+  from the kernel's simulated chip (`nandsim`), not from hardware, and the older copies in
+  the UBI image were put there from an earlier dump rather than left by a real power cut.
+  UBI's fallback to an older copy when a moved block's data CRC fails is implemented and
+  sourced but not exercised. YAFFS2's skipping of block summary chunks is exercised (the
+  YAFFS2 history image holds 24) but decides nothing there: those chunks reach no listing
+  either way.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too, and in UBIFS each file whose data
@@ -1135,6 +1189,8 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 - **A raw flash dump is searched only for SquashFS, UBI and JFFS2**, only when it has no
   partition table and nothing is recognised at offset 0, and only up to 8 GiB. Its spare
   bytes are stripped only for UBI and JFFS2, and only for the common page and spare sizes.
+  NAND dumps with spare bytes were tested as dumps of one partition each; a filesystem
+  that starts further into such a dump has not been tested.
 
 ## License
 

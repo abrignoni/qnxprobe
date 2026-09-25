@@ -6419,39 +6419,83 @@ class Jffs2Walker:
             yield bytes(view[i:i + (1 << 20)])
 
 
+JFFS2_LEAD_MAX = 64 << 20      # how much erased flash may come before the first node
+
+
+def _jffs2_first_node(fh, base, size):
+    """(endian, magic) of the node a JFFS2 region opens with, or None.
+
+    The region may open with erased flash (0xFF): after garbage collection whole
+    eraseblocks at the start can be empty. The first byte that is not 0xFF must
+    begin a 4-byte aligned node magic whose header CRC holds."""
+    pos, limit = 0, min(size, JFFS2_LEAD_MAX)
+    while pos < limit:
+        chunk = read_at(fh, base + pos, min(65536, limit - pos))
+        if not chunk:
+            return None
+        rest = chunk.lstrip(b"\xff")
+        if rest:
+            pos += len(chunk) - len(rest)
+            break
+        pos += len(chunk)
+    else:
+        return None
+    pos -= pos % 4
+    head = read_at(fh, base + pos, 12)
+    for m, e in ((b"\x85\x19", "<"), (b"\x19\x85", ">"), (b"\x84\x19", "<"), (b"\x19\x84", ">")):
+        j = head.find(m)
+        if j < 0 or j % 4 or len(head) - j < 12 or head[:j].strip(b"\xff"):
+            continue
+        magic, ntype, totlen, hcrc = struct.unpack_from(e + "HHII", head, j)
+        chk = struct.pack(e + "HHI", magic, ntype | JFFS2_ACCURATE, totlen)
+        if _kcrc32(chk) == hcrc:
+            return e, magic
+    return None
+
+
 def identify_jffs2(fh, base, size=None):
     """Return ("jffs2", lines) when the region starts with JFFS2 nodes.
 
-    JFFS2 has no superblock, so the test is structural: the first 4-byte
-    aligned magic in the region's first 64 KiB, with nothing but erased flash
-    (0xFF) before it, must open a node whose header CRC holds, and a scan of
-    the whole region must find inode or directory nodes. The old 0x1984 magic (the first JFFS2 layout) is reported, not
-    walked.
+    JFFS2 has no superblock, so the test is structural: the region's first
+    bytes that are not erased flash (0xFF) must open a 4-byte aligned node whose
+    header CRC holds, and a scan of the whole region must find inode or
+    directory nodes. The old 0x1984 magic (the first JFFS2 layout) is reported,
+    not walked.
+
+    A raw NAND dump holds each page's spare bytes after its data, and on NAND
+    JFFS2 keeps its clean markers there, so the spare is not 0xFF and the test
+    fails on the dump as taken. Each common NAND geometry is then tried with
+    the spare stripped, and the one that reads the most inode and directory
+    nodes, then the fewest damaged ones, is kept.
     """
-    head = read_at(fh, base, 65536)
-    for m, e in ((b"\x85\x19", "<"), (b"\x19\x85", ">"), (b"\x84\x19", "<"), (b"\x19\x84", ">")):
-        j = head.find(m)
-        while 0 <= j and j % 4:
-            j = head.find(m, j + 1)
-        if j < 0 or j + 12 > len(head):
-            continue
-        if head[:j].strip(b"\xff"):
-            continue                    # only erased flash may come before it
-        magic, ntype, totlen, hcrc = struct.unpack_from(e + "HHII", head, j)
-        chk = struct.pack(e + "HHI", magic, ntype | JFFS2_ACCURATE, totlen)
-        if _kcrc32(chk) != hcrc:
-            continue
-        if magic == JFFS2_OLD_MAGIC:
-            return "jffs2", ["layout       the pre-release 0x1984 magic; reported, not walked"]
-        break
-    else:
-        return None
     if size is None:
         size = image_size(fh) - base
-    try:
-        w = Jffs2Walker(fh, base, size, endian=e)
-    except Jffs2Unreadable:
-        return None
+    found = _jffs2_first_node(fh, base, size)
+    if found is not None:
+        e, magic = found
+        if magic == JFFS2_OLD_MAGIC:
+            return "jffs2", ["layout       the pre-release 0x1984 magic; reported, not walked"]
+        try:
+            w = Jffs2Walker(fh, base, size, endian=e)
+        except Jffs2Unreadable:
+            return None
+    else:
+        best = None
+        for page, spare, view in nand_views(fh, base, size):
+            f = _jffs2_first_node(view, 0, view.size)
+            if f is None or f[1] == JFFS2_OLD_MAGIC:
+                continue
+            try:
+                trial = Jffs2Walker(view, 0, view.size, endian=f[0], nand_fallback=False)
+            except Jffs2Unreadable:
+                continue
+            rank = (trial.stats["inode"] + trial.stats["dirent"], -trial.stats["bad"])
+            if best is None or rank > best[0]:
+                trial.nand = (page, spare)
+                best = (rank, trial)
+        if best is None:
+            return None
+        w = best[1]
     _remember_walker(fh, base, size, "jffs2", w)
     s = w.stats
     if not (s["inode"] or s["dirent"]):
@@ -6612,11 +6656,15 @@ class UbiImage:
         self.map = {}
         for key, vids in cands.items():
             vids.sort(key=lambda v: v["sqnum"], reverse=True)
-            for v in vids:
+            for i, v in enumerate(vids):
                 if v["copy_flag"] and not self._data_ok(v):
                     self.stats["copy with a bad data CRC, older copy used"] += 1
                     continue
                 self.map[key] = v
+                # An older copy still on the flash (left by a rewrite or a move
+                # that was cut short) holds that block's earlier contents.
+                if len(vids) - i - 1:
+                    self.stats["an older copy of a block, not the one read"] += len(vids) - i - 1
                 break
         self.volumes = self._volume_table()
 
@@ -6625,7 +6673,9 @@ class UbiImage:
         return len(data) == vid["data_size"] and _ubi_crc(data) == vid["data_crc"]
 
     def _volume_table(self):
-        """The volume table from whichever layout volume copy reads."""
+        """The volume table from whichever layout volume copy reads, with
+        vtbl_ok saying whether one did."""
+        self.vtbl_ok = True
         for lnum in (0, 1):
             vid = self.map.get((UBI_LAYOUT_VOL, lnum))
             if vid is None:
@@ -6648,6 +6698,7 @@ class UbiImage:
             if ok:
                 return vols
         # No readable table: offer every volume id that has mapped LEBs.
+        self.vtbl_ok = False
         ids = sorted({k[0] for k in self.map if k[0] < UBI_LAYOUT_VOL})
         return [dict(id=i, name=f"vol{i}", type=0, reserved=0, data_pad=0,
                      update_marker=0, flags=0) for i in ids]
@@ -6717,16 +6768,19 @@ class UbiWalker:
         if size is None:
             size = image_size(fh) - base
         self.ubi, self.nand = UbiImage(fh, base, size), None
-        # On a raw NAND dump the spare bytes after each page push every VID
-        # header off its offset, so nothing maps; each common NAND geometry is
-        # then tried with the spare stripped.
-        if not self.ubi.stats["mapped"]:
+        # On a raw NAND dump the spare bytes after each page shift everything
+        # past an eraseblock's first page. The EC and VID headers may still read
+        # (a VID header in a 512-byte subpage lies inside the first page), but
+        # the volume table, whose data starts at a later page, cannot. When it
+        # does not read, each common NAND geometry is tried with the spare
+        # stripped, and the first whose volume table reads is kept.
+        if not self.ubi.vtbl_ok:
             for page, spare, view in nand_views(fh, base, size):
                 try:
                     trial = UbiImage(view, 0, view.size)
                 except UbiUnreadable:
                     continue
-                if trial.stats["mapped"]:
+                if trial.vtbl_ok:
                     self.ubi, self.nand = trial, (page, spare)
                     break
         self.inner = []                        # (volume, view, walker or None, note)
@@ -10305,7 +10359,7 @@ def _flash_listing(path, style):
 
 
 def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix="",
-                         loose_times=(), corrupt=None):
+                         loose_times=(), corrupt=None, allow_extra=()):
     """Read a committed flash filesystem fixture through identify_fs() and
     walker_for(), and hold it against its oracle lists. Returns a dict:
 
@@ -10316,6 +10370,9 @@ def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix=""
                   file type and permission bits, size (not for directories,
                   whose sizes the formats record differently or not at all),
                   modification time (to the minute for "lln"), symlink target
+      extra       entries the reader lists under `prefix` that `listing` does
+                  not have (a deleted or renamed-away name still showing),
+                  other than those named in `allow_extra`
       corrupt     (needle, xor) flips one byte of the decompressed image at the
                   first occurrence of `needle` before it is read: the control
                   that shows the content check can report a difference.
@@ -10334,7 +10391,7 @@ def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix=""
     size = len(raw)
     kind = (identify_fs(img, 0, size) or (None,))[0]
     w = walker_for(kind, img, 0, size) if kind else None
-    res = dict(kind=kind, files=[0, 0, 0, 0], entries=[0, 0, []])
+    res = dict(kind=kind, files=[0, 0, 0, 0], entries=[0, 0, []], extra=[])
     if w is None:
         return res
     got = {p: (node, mode, sz, mt) for p, node, mode, sz, mt, _r in walk_all(w)}
@@ -10388,6 +10445,9 @@ def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix=""
                     ent[2].append(f"{path or '/'}: {why}")
             else:
                 ent[0] += 1
+        res["extra"] = sorted(p[len(prefix):] for p in got
+                              if p.startswith(prefix) and p[len(prefix):] not in exp
+                              and p[len(prefix):] not in allow_extra)
     return res
 
 
@@ -12547,7 +12607,27 @@ def self_test():
                 "yaffs1cut.history.stat", "stat", "", ("lost+found",),
                 "YAFFS1 power cut in a rewrite: two live copies with different bytes that "
                 "only their serial numbers order, against YAFFS's own read-back")]
-        for stem, want_kind, hashes, listing, style, prefix, loose, label in sq + jf + ub + ya:
+        # And images the Linux kernel's own drivers wrote with history and read
+        # back (tools/make_kernel_flash_fixtures.sh): JFFS2 on NOR, where the
+        # kernel marks superseded nodes obsolete, JFFS2 on NAND, where it cannot
+        # and only version numbers order them, and UBIFS in UBI imaged while
+        # mounted, so the history since the last commit is in the journal. The
+        # two NAND images were taken with nanddump --oob.
+        kh = [("jffs2-nor-history", "jffs2", "jffs2-nor.history.sha256",
+               "jffs2-nor.history.stat", "stat", "", (),
+               "JFFS2 on NOR written with history by the Linux kernel, against the "
+               "kernel's own read-back"),
+              ("jffs2-nand-history", "jffs2", "jffs2-nand.history.sha256",
+               "jffs2-nand.history.stat", "stat", "", (),
+               "JFFS2 on NAND written with history by the Linux kernel and taken with "
+               "nanddump --oob, against the kernel's own read-back"),
+              ("ubi-nand-history", "ubi", "ubi-nand.history.sha256", "ubi-nand.history.stat",
+               "stat", "rootfs_data/", (),
+               "UBIFS written with history by the Linux kernel and taken with nanddump "
+               "--oob while mounted, against the kernel's own read-back"),
+              ("ubi-nand-history", "ubi", "ubi-nand.history.kernel.sha256", None, "stat", "",
+               (), "a static UBI volume the kernel wrote with ubiupdatevol, from the same image")]
+        for stem, want_kind, hashes, listing, style, prefix, loose, label in sq + jf + ub + ya + kh:
             img = os.path.join(fx, stem + ".img.gz")
             if not (os.path.isfile(img) and os.path.isfile(os.path.join(fx, hashes))):
                 print(f"  [SKIP] {stem} is not beside this script, so {label} was not checked")
@@ -12556,17 +12636,23 @@ def self_test():
                     and (not stem.startswith("ubi-") or prefix == "rootfs_data/")):
                 print(f"  [SKIP] {label}: this Python has no zstd (3.14 adds compression.zstd)")
                 continue
+            # Names the reader lists that the source tree cannot: device nodes
+            # mkfs.jffs2 made from its device table, and the lost+found YAFFS
+            # lists on every volume.
+            allow = (("dev/null", "dev/sda") if stem.startswith("jffs2-le-") or stem == "jffs2-be-zlib"
+                     else ("lost+found",) if stem in ("yaffs1", "yaffs2-le", "yaffs2-be", "yaffs2-oob2")
+                     else ())
             try:
                 r = _flash_fixture_check(img, os.path.join(fx, hashes),
                                          os.path.join(fx, listing) if listing else None,
-                                         style, prefix, loose)
+                                         style, prefix, loose, allow_extra=allow)
                 broke = ""
             except Exception as exc:                 # pylint: disable=broad-except
-                r = dict(kind=None, files=[0, 0, 0, 0], entries=[0, 0, []])
+                r = dict(kind=None, files=[0, 0, 0, 0], entries=[0, 0, []], extra=[])
                 broke = f"; raised {type(exc).__name__}: {exc}"
             (got, want, miss, diff), (eok, ewant, ebad) = r["files"], r["entries"]
             cond = (r["kind"] == want_kind and want and got == want and eok == ewant
-                    and not broke)
+                    and not r["extra"] and not broke)
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}: {got} of {want} files match "
@@ -12574,7 +12660,39 @@ def self_test():
                                  if listing else "")
                   + f" (identified as {r['kind']}"
                   + (f", {miss} missing" if miss else "") + (f", {diff} different" if diff else "")
-                  + ")" + ("; " + "; ".join(ebad) if ebad else "") + broke)
+                  + ")" + ("; " + "; ".join(ebad) if ebad else "")
+                  + (f"; listed but not in {listing}: " + ", ".join(r["extra"][:3])
+                     if r["extra"] else "") + broke)
+
+        # The kernel-written images are only worth having while they carry the
+        # history they exist to test: superseded JFFS2 nodes marked obsolete on
+        # NOR and left valid on NAND (more directory entry nodes than linked
+        # names, none obsolete), a UBIFS journal with nodes to replay, and in
+        # UBI the two older copies of the static volume's blocks.
+        khist = [os.path.join(fx, f"{n}-history.img.gz") for n in ("jffs2-nor", "jffs2-nand", "ubi-nand")]
+        if all(os.path.isfile(f) for f in khist):
+            import gzip as _gz, io as _io
+            kw = []
+            for f, kind in zip(khist, ("jffs2", "jffs2", "ubi")):
+                kimg = _io.BytesIO(_gz.open(f, "rb").read())
+                kw.append(walker_for(kind, kimg, 0, len(kimg.getvalue())))
+            nor_s, nand_w, ubi_w = kw[0].stats, kw[1], kw[2]
+            nand_live = sum(1 for ents in nand_w.dirents.values() for v in ents.values() if v[1])
+            ubifs = [w for _v, _vw, w, k in ubi_w.inner if k == "ubifs"]
+            replayed = ubifs[0].stats["journal nodes replayed"] if ubifs else 0
+            older = ubi_w.ubi.stats["an older copy of a block, not the one read"]
+            hcond = (nor_s["obsolete"] > 0 and nand_w.nand == (2048, 64)
+                     and nand_w.stats["obsolete"] == 0 and nand_w.stats["dirent"] > nand_live
+                     and ubi_w.nand == (2048, 64) and replayed > 0 and older == 2)
+            if not hcond:
+                ok = False
+            print(f"  [{'PASS' if hcond else 'FAIL'}] the kernel-written images carry history: "
+                  f"JFFS2 on NOR has {nor_s['obsolete']} nodes marked obsolete, JFFS2 on NAND "
+                  f"{nand_w.stats['dirent']} directory entry nodes for {nand_live} linked names "
+                  f"with {nand_w.stats['obsolete']} obsolete, UBIFS {replayed} journal nodes "
+                  f"to replay, and UBI {older} older copies of the static volume's blocks; both "
+                  f"NAND dumps read as {nand_w.nand} and {ubi_w.nand} pages with the spare "
+                  f"stripped")
 
         # JFFS2 device nodes come from a devtable, so the devtable is their
         # oracle: a character and a block device, with its permissions.
@@ -13234,11 +13352,13 @@ what it checks, and where the constants come from:
   Each flash reader is validated against images the format's own tools wrote
   (squashfs-tools 4.7.5, mtd-utils 2.3.0, yaffs2's image makers) and against
   oracles it never touches: sha256sum and stat over the source tree, and
-  unsquashfs -lln. YAFFS is also validated against images YAFFS's own code
-  wrote with history (overwrites, deletion, garbage collection, power cuts)
-  and then read back. The one-pass tools write no history, so JFFS2 version
-  choice, UBI copy choice and UBIFS journal replay are sourced, not exercised.
-  None has yet been run against flash from a real device.
+  unsquashfs -lln. Those tools leave no history, so JFFS2, UBI and UBIFS are
+  also validated against images the Linux kernel's own drivers wrote with
+  history (overwrites, deletion, renames, truncation, garbage collection, a
+  UBIFS journal not yet committed, older copies of UBI blocks) and read back,
+  and YAFFS against images YAFFS's own code wrote and read back the same way.
+  The NAND ones come from the kernel's simulated chip (nandsim), taken with
+  nanddump --oob. None has yet been run against flash from a real device.
 
   A flash dump with no partition table and nothing recognised at offset 0 is
   searched at every 4 KiB boundary for SquashFS, UBI and JFFS2, each reported
