@@ -1199,7 +1199,9 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   either way.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
-  listed, since its directory tables are compressed too, and in UBIFS each file whose data
+  listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
+  the reason as the volume's note, so the report, the window and a LEAPP run log say why
+  it lists nothing. In UBIFS each file whose data
   is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
   were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
   JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is
