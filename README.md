@@ -557,9 +557,16 @@ further changes that break a rule here, one at a time.
 
 `tools/make_ntfs_streams_fixture.sh` rebuilds that fixture on Linux, and refuses to finish
 unless what it wrote, what `ntfs-3g` reads back, and what `fls`, `istat` and `icat` find all
-agree. No Windows-written change journal is in it, because `ntfs-3g` does not keep one:
-reading `$J` from a Windows volume has so far been checked against that fixture's shape
-only, not against a journal Windows wrote.
+agree. No Windows-written change journal is in it, because `ntfs-3g` does not keep one.
+
+On a 1,006 MiB volume Windows wrote, `ntfs-cloud.bin.gz` in the dissect.ntfs test data (at
+fox-it/dissect.ntfs `7f021dd1182eb6f9b6a2dbd19cf2e29143ea654d`, not committed here), all
+seven streams that store anything are listed, `$Extend/$UsnJrnl:$J` (21,376 bytes),
+`$UsnJrnl:$Max`, `$Secure:$SDS`, `$UpCase:$Info`, `$RmMetadata/$Repair:$Config`,
+`$TxfLog/$Tops:$T` and a stream the OneDrive client left on its folder, and each is
+byte-identical to `icat`'s reading; `$BadClus:$Bad` is left out. That journal is young
+enough to have no hole at its front, so the front-hole rule is still checked against the
+fixture's shape only.
 
 ### FAT32 and exFAT times are readings, and are listed as such
 
