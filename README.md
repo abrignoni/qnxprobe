@@ -618,8 +618,9 @@ modification time of every entry. Those tools write an image in one pass, so the
 history. The others carry history: the Linux kernel's own JFFS2, UBI and UBIFS drivers
 (kernel 7.0.0), and YAFFS's own code, wrote them through a series of overwrites, deletions
 and renames, and read them back, and that reading is the oracle. The scripts that build
-them all are in `tools/`. None of these readers has yet been run against flash from a
-real device; see [What it does not do](#what-it-does-not-do).
+them all are in `tools/`. Two of the readers have since been run against flash from a real
+device as well: YAFFS2 against an Android phone and UBIFS against a camera, both below.
+SquashFS and JFFS2 have not; see [What it does not do](#what-it-does-not-do).
 
 ### SquashFS
 
@@ -1273,14 +1274,17 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
   an image that dropped it will not divide into pages and will be reported as not
   recognised rather than misread.
-- **The Linux flash filesystems are validated against images their own tools and the
-  Linux kernel wrote, not yet against flash from a real device.** The NAND images come
-  from the kernel's simulated chip (`nandsim`), not from hardware, and the older copies in
-  the UBI image were put there from an earlier dump rather than left by a real power cut.
-  UBI's fallback to an older copy when a moved block's data CRC fails is implemented and
-  sourced but not exercised. YAFFS2's skipping of block summary chunks is exercised (the
-  YAFFS2 history image holds 24) but decides nothing there: those chunks reach no listing
-  either way.
+- **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
+  were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
+  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
+  and UBIFS have been: an Android phone under
+  [YAFFS1 and YAFFS2](#yaffs1-and-yaffs2), and that phone and a Foscam R2 camera under
+  [Deleted files on YAFFS2, JFFS2 and UBIFS](#deleted-files-on-yaffs2-jffs2-and-ubifs).
+  The older copies in the UBI fixture were put there from an earlier dump rather than left
+  by a real power cut, and UBI's fallback to an older copy when a moved block's data CRC
+  fails is implemented and sourced but not exercised. YAFFS2's skipping of block summary
+  chunks is exercised (the YAFFS2 history image holds 24) but decides nothing there: those
+  chunks reach no listing either way.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
