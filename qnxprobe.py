@@ -43,7 +43,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.34"
+QNXPROBE_VERSION = "1.35"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -7577,7 +7577,51 @@ def _yaffs_header(data, e):
                 shrink=shrink not in (0, 0xFFFFFFFF))
 
 
-def yaffs_layout(fh, base, size, sample=256):
+def _yaffs_tag_trials(chunk, spare):
+    """(version, tag offset, byte order, decoder) for every tag placement a
+    geometry allows: YAFFS1 tags on 512+16, and YAFFS2 packed tags at every
+    offset in the spare in both byte orders."""
+    trials = []
+    if (chunk, spare) == (512, 16):
+        trials.append((1, 0, "<", lambda s: _yaffs1_tags(s)))
+    for off in range(0, spare - 15):
+        for e in ("<", ">"):
+            trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e)))
+    return trials
+
+
+def _yaffs_tags_fit(decode, used):
+    """True when the decoder finds plausible tags on at least 90% of the
+    first 16 used pages; it gives up as soon as that is out of reach."""
+    first = used[:16]
+    allowed = len(first) - 0.9 * len(first)
+    misses = 0
+    for _d, s in first:
+        if not decode(s):
+            misses += 1
+            if misses > allowed:
+                return False
+    return True
+
+
+def _yaffs_pages(fh, base, size, chunk, spare, n, windows):
+    """(data, spare) for the used pages of `windows` runs of n pages spread
+    evenly over the region, the first at its start and the last at its end."""
+    page = chunk + spare
+    total = size // page
+    if windows <= 1 or total <= n * windows:
+        spans = [(0, min(n, total) if windows <= 1 else total)]
+    else:
+        spans = [((total - n) * i // (windows - 1), n) for i in range(windows)]
+    used = []
+    for first, count in spans:
+        raw = read_at(fh, base + first * page, count * page)
+        used += [(raw[i * page:i * page + chunk], raw[i * page + chunk:(i + 1) * page])
+                 for i in range(len(raw) // page)]
+    return [(d, s) for d, s in used if s != b"\xff" * spare]
+
+
+def yaffs_layout(fh, base, size, sample=256, windows=16):
     """(version, chunk, spare, tag offset, tag byte order, header byte order)
     for a YAFFS image at base, or None.
 
@@ -7591,31 +7635,53 @@ def yaffs_layout(fh, base, size, sample=256):
     tag ECC line parities hold, then the one explaining the most headers, wins.
     The tag and header byte orders are decided apart: upstream mkyaffs2image's
     "convert" swaps its headers and, at the pinned commit, not its tags
-    (utils/mkyaffs2image.c little_to_big_endian is compiled out)."""
+    (utils/mkyaffs2image.c little_to_big_endian is compiled out).
+
+    YAFFS writes to whichever block garbage collection freed, and its scan
+    orders blocks by sequence number, not by place, so the start of a real
+    partition can hold only data chunks, or only erased blocks. On the DFRWS
+    2011 Case 2 /cache partition the first object header is at page 3,968.
+    When the first pages hold tags that fit but no header, or too few used
+    pages, the same test is run again over `windows` runs spread across the
+    whole region. Those runs cover the same stretch of bytes for every
+    geometry (`sample` pages of 2048+64 each), so a geometry that is a
+    multiple of the real one (8192+256 over 2048+64 pages) cannot see more
+    headers than the real one does; sampling more pages from the start alone
+    let exactly that alias win on the Case 2 partition."""
+    best, hint = _yaffs_layout_in(
+        fh, base, size, lambda chunk, spare: min(sample, size // (chunk + spare)), 1)
+    if best is None and hint:
+        span = sample * (2048 + 64)
+        best, _hint = _yaffs_layout_in(
+            fh, base, size, lambda chunk, spare: max(8, span // (chunk + spare)), windows)
+    return best
+
+
+def _yaffs_layout_in(fh, base, size, pages_for, windows):
+    """The best layout over the sampled pages, and whether the pages hinted
+    at YAFFS without settling it (see yaffs_layout)."""
     best = None
+    hint = False
     for chunk, spare in YAFFS_GEOMETRIES:
-        page = chunk + spare
-        n = min(sample, size // page)
+        n = pages_for(chunk, spare)
         if n < 8:
             continue
-        raw = read_at(fh, base, n * page)
-        used = [(raw[i * page:i * page + chunk], raw[i * page + chunk:(i + 1) * page])
-                for i in range(len(raw) // page)]
-        used = [(d, s) for d, s in used if s != b"\xff" * spare]
+        used = _yaffs_pages(fh, base, size, chunk, spare, n, windows)
         if len(used) < 8:
+            # Erased flash: nothing to decide from here, but more of the
+            # region may hold YAFFS.
+            hint = hint or n * (chunk + spare) < size
             continue
-        # A geometry with no page shaped like an object header cannot be YAFFS;
-        # checking that first keeps the tag search off regions that are not.
+        trials = _yaffs_tag_trials(chunk, spare)
+        # A geometry with no page shaped like an object header cannot be YAFFS
+        # on these pages; checking that first keeps the tag search off regions
+        # that are not. Tags that fit anyway say the headers may lie further on.
         if not any(_yaffs_header(d, he) for d, _s in used for he in ("<", ">")):
+            if not hint and any(_yaffs_tags_fit(dec, used) for _v, _o, _e, dec in trials):
+                hint = True
             continue
-        trials = []
-        if (chunk, spare) == (512, 16):
-            trials.append((1, 0, "<", lambda s: _yaffs1_tags(s)))
-        for off in range(0, spare - 15):
-            for e in ("<", ">"):
-                trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e)))
         for version, off, e, decode in trials:
-            if sum(1 for _d, s in used[:16] if decode(s)) < 0.9 * min(16, len(used)):
+            if not _yaffs_tags_fit(decode, used):
                 continue                   # most tag offsets fail on the first pages
             good = claimed = eccs = 0
             parsed = {"<": 0, ">": 0}
@@ -7633,11 +7699,13 @@ def yaffs_layout(fh, base, size, sample=256):
             hdr_e = max(parsed, key=parsed.get)
             if not (good >= 8 and good >= 0.9 * len(used) and claimed
                     and parsed[hdr_e] >= 0.9 * claimed):
+                if good >= 0.9 * len(used) and not claimed:
+                    hint = True
                 continue
             rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / len(used))
             if best is None or rank > best[0]:
                 best = (rank, (version, chunk, spare, off, e, hdr_e))
-    return best[1] if best else None
+    return (best[1] if best else None), hint
 
 
 class YaffsWalker:
@@ -10548,7 +10616,7 @@ def _flash_listing(path, style):
 
 
 def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix="",
-                         loose_times=(), corrupt=None, allow_extra=()):
+                         loose_times=(), corrupt=None, allow_extra=(), front=None):
     """Read a committed flash filesystem fixture through identify_fs() and
     walker_for(), and hold it against its oracle lists. Returns a dict:
 
@@ -10565,6 +10633,10 @@ def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix=""
       corrupt     (needle, xor) flips one byte of the decompressed image at the
                   first occurrence of `needle` before it is read: the control
                   that shows the content check can report a difference.
+      front       (block bytes, block numbers) moves those blocks, in that
+                  order, to the start of the image before it is read. YAFFS2
+                  orders blocks by sequence number, not by place, so the
+                  image still holds the same filesystem.
 
     `loose_times` names entries whose time is not on the flash (a directory
     the reader's own writer invents at mount time) and so is not compared.
@@ -10572,6 +10644,11 @@ def _flash_fixture_check(image_gz, hashes, listing=None, style="stat", prefix=""
     import gzip, hashlib, io as _io
     with gzip.open(image_gz, "rb") as gz:
         raw = bytearray(gz.read())
+    if front is not None:
+        bsize, first = front
+        blocks = [bytes(raw[i:i + bsize]) for i in range(0, len(raw), bsize)]
+        raw = bytearray(b"".join([blocks[i] for i in first]
+                                 + [b for i, b in enumerate(blocks) if i not in first]))
     if corrupt is not None:
         at = raw.find(corrupt[0])
         if at >= 0:
@@ -13125,6 +13202,28 @@ def self_test():
                   + ")" + ("; " + "; ".join(ebad) if ebad else "")
                   + (f"; listed but not in {listing}: " + ", ".join(r["extra"][:3])
                      if r["extra"] else "") + broke)
+
+        # YAFFS writes wherever garbage collection freed a block, so a real
+        # partition can open on blocks holding only data chunks, or only
+        # erased pages (the DFRWS 2011 Case 2 /cache partition: first object
+        # header at page 3,968). The history image with such blocks moved to
+        # its start holds the same filesystem, as YAFFS's own core reads it,
+        # and must still be found and read.
+        hist = os.path.join(fx, "yaffs2-history.img.gz")
+        if os.path.isfile(hist):
+            for first, what in (((1, 23, 25, 27, 28), "five blocks of data chunks and no header"),
+                                ((8, 9, 10, 14, 15, 17, 19), "seven erased blocks")):
+                r = _flash_fixture_check(hist, os.path.join(fx, "yaffs2.history.sha256"),
+                                         os.path.join(fx, "yaffs2.history.stat"), "stat", "",
+                                         ("lost+found",), front=(64 * 2112, first))
+                (got, want, miss, diff), (eok, ewant, ebad) = r["files"], r["entries"]
+                cond = (r["kind"] == "yaffs2" and want and got == want and eok == ewant
+                        and not r["extra"])
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS2 history image opening on {what}: "
+                      f"{got} of {want} files match, {eok} of {ewant} entries agree "
+                      f"(identified as {r['kind']})")
 
         # The kernel-written images are only worth having while they carry the
         # history they exist to test: superseded JFFS2 nodes marked obsolete on

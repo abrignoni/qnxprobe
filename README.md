@@ -724,7 +724,11 @@ the tags sit are recorded nowhere, and differ with the NAND controller, so they 
 by trying eleven common page and spare sizes (512+16 to 16384+1280) and, for YAFFS2,
 every tag offset in the spare and both byte orders. A layout is accepted only when at least 90% of the used
 spares hold plausible tags and at least 90% of the pages those tags call object headers
-parse as object headers.
+parse as object headers. The first 256 pages are tried first. YAFFS writes wherever
+garbage collection freed a block, so a partition can open on blocks holding only data
+pages or only erased ones; when the first pages hold tags that fit but no object header,
+or almost nothing but erased pages, the same test runs again over sixteen stretches spread
+across the whole region, each the same number of bytes for every page size tried.
 
 YAFFS2 is read the way its own scan reads it: blocks newest first, the newest object
 header and the newest copy of each data page winning, data past a shrink or past the
@@ -744,6 +748,18 @@ never closed, with no unmount at the end. The YAFFS1 images end in power cuts, o
 leaving two live copies of a page with different bytes that only their serial numbers
 order. The oracle for those is YAFFS's own code mounting a copy read-only and reading every
 file back: 48 of 48, 49 of 49 and 2 of 2 files match, and every entry agrees.
+
+A real device dump confirms it: Case 2 of the DFRWS 2011 Forensics Challenge, the flash of
+an Android phone taken with `nanddump`, spare bytes included (2048-byte pages, 64-byte
+spare, tags two bytes in). Its /system, /data and /cache partitions were read by qnxprobe
+and by YAFFS's own code (the same core, pinned at the same commit, reading the dump
+read-only with its tags two bytes into the spare). Both list the same 661, 2,422 and 22
+entries, and all 565, 1,876 and 20 files have the same bytes. Modes and times agree on
+every entry but three: the time of `lost+found` on /system, which the flash does not hold,
+and a socket and a FIFO on /data, whose stored modes carry their type, which qnxprobe
+reports and YAFFS's direct interface drops. Directory sizes were not compared (YAFFS
+reports 2048, qnxprobe 0). The /cache partition's first object header is at page 3,968,
+which is what the wider search above is for; before 1.35 it was not recognised.
 
 ### Raw flash dumps and NAND spare bytes
 
