@@ -449,7 +449,8 @@ finds, because a stream is content the file's own size does not account for.
 What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
 indexed beside a long one is skipped rather than listed twice, and an encrypted file is
 listed with its recorded size and refuses to be read, since the volume holds no key.
-Only the unnamed stream is the file's content. `NtfsWalker.stamps(record)` returns
+Only the unnamed stream is the file's content; the named ones are read separately, as
+[Alternate data streams](#alternate-data-streams) describes. `NtfsWalker.stamps(record)` returns
 the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
 `entry()` carries only the modified one, which is what a listing needs.
 
@@ -493,6 +494,72 @@ removing them.
 That comparison earned its cost twice: it found this reader returning stale bytes past
 a file's initialized size, and a second pass found the run list of a heavily fragmented
 file counted twice because its own record is named in its attribute list.
+
+### Alternate data streams
+
+Since 1.37. A file on NTFS can carry named streams beside its content, and some of what an
+examiner wants most lives in one: `Zone.Identifier`, the Mark of the Web, says where a
+download came from; `$Extend/$UsnJrnl:$J` is the change journal, a record of files created,
+renamed and deleted; `$Secure:$SDS` holds the volume's security descriptors. The metadata
+files whose content is in their unnamed stream (`$MFT`, `$LogFile`, `$Boot` and the rest)
+were always listed and read like any file. `$UsnJrnl` and `$Secure`, whose content is only
+in named streams, were listed as empty files, and nothing read a stream.
+
+Each stream has a node of its own, an `NtfsStreamRef` of the record and the stream's name,
+and `read_file()`, `entry()` and `stamps()` take it. So a caller that lists entries and
+hands each node back to read it, as the LEAPP tools' raw image reader does, reads a stream
+with no new call:
+
+```python
+for path, node, mode, size, mtime, recorded in walker.listing(streams=True):
+    if isinstance(node, q.NtfsStreamRef):          # "Downloads/setup.exe:Zone.Identifier"
+        data = b"".join(walker.read_file(node, size))
+```
+
+Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()`, `--extract`
+and the window's Contents pane are as they were, because a caller that asked for a folder's
+files and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser
+expecting a shortcut. `listing(streams=True)` names each stream `path:stream`, as Windows
+does, straight after its file, with the file's modified time (NTFS keeps no dates per
+stream); a stream on the root directory is `:stream`. A caller walking the tree instead asks
+`streams(record)` for each entry. `--list` names every stream beside its file at its
+recorded size, as it did, and now once each: before 1.37 a stream whose run list had
+outgrown its record, which `$J` on a volume of any age has, was printed once per record,
+all but the first at 0 B.
+
+Two rules about holes decide what a stream is read as, and both come from metadata files
+whose recorded size is not what they hold:
+
+- **A hole at the front of a stream is not read.** Windows frees the front of `$J` as the
+  journal grows and leaves a hole there, so its recorded size runs to gigabytes and all but
+  its last few megabytes read as zeros. A stream is read from its first stored cluster
+  instead, and its listed size is what that read returns. A USN journal parser loses
+  nothing, because every record carries its own offset in the stream as its USN, and
+  `front_hole(node)` gives the bytes skipped for anything else that needs the offset.
+- **A stream that is all hole is not listed.** `$BadClus:$Bad` is recorded as the size of
+  the whole volume and a healthy disk stores none of it. A stream of no bytes is listed,
+  since it was created empty and its being there can be the evidence.
+
+A hole after the first stored cluster is content and reads as zeros, as in a file.
+
+Validated against a second NTFS fixture, `tests/fixtures/ntfs-streams.img.gz`, written by
+`mkntfs` and `ntfs-3g` with a stream of every shape above: two `Zone.Identifier` streams, a
+`$J` with a 1 MiB hole at its front and 1.8 MB of records scattered over 365 runs whose
+run list overflows into a second MFT record, a `$Max` beside it, a stream sized and never written,
+one with a hole in the middle, an empty one, one on a directory and one on the root, two
+compressed ones (one after a hole), one on a file with two names, twelve on one file so
+that five move to other records, and one whose name needs UTF-16. The self-test lists all
+28 that store anything, and each matches the bytes The Sleuth Kit's `icat` reads from the
+same stream, from the first stored cluster that `istat` names. `$BadClus:$Bad` and the
+stream sized and never written are the two left out. The same check turns red when the
+front hole is read, when a stream that stores nothing is listed, and under each of nine
+further changes that break a rule here, one at a time.
+
+`tools/make_ntfs_streams_fixture.sh` rebuilds that fixture on Linux, and refuses to finish
+unless what it wrote, what `ntfs-3g` reads back, and what `fls`, `istat` and `icat` find all
+agree. No Windows-written change journal is in it, because `ntfs-3g` does not keep one:
+reading `$J` from a Windows volume has so far been checked against that fixture's shape
+only, not against a journal Windows wrote.
 
 ### FAT32 and exFAT times are readings, and are listed as such
 
