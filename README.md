@@ -761,6 +761,74 @@ reports and YAFFS's direct interface drops. Directory sizes were not compared (Y
 reports 2048, qnxprobe 0). The /cache partition's first object header is at page 3,968,
 which is what the wider search above is for; before 1.35 it was not recognised.
 
+### Deleted files on YAFFS2, JFFS2 and UBIFS
+
+None of these filesystems rewrites anything in place. A change goes to a new page or node,
+and the old one stays on the flash until garbage collection erases its block, so a deleted
+file's last name, size and content often outlive the deletion. `recover_deleted()` on a
+YAFFS2, JFFS2, UBIFS or UBI walker yields a `FlashDeletedFile` for each one, and
+`read_deleted()` reads it:
+
+```python
+kind = qnxprobe.identify_fs(fh, 0, size)[0]           # "yaffs2", "jffs2", "ubi", ...
+w = qnxprobe.walker_for(kind, fh, 0, size)
+for e in w.recover_deleted():
+    print(e.parent_path, e.name, e.size, e.recoverable, e.reason, e.note)
+    if e.recoverable:
+        data = b"".join(w.read_deleted(e))
+```
+
+The method has its own name rather than `deleted_files()`, because a caller that handles
+`deleted_files()` for NTFS, FAT32 and exFAT reads fields (`record`, `first_cluster`) these
+records do not have.
+
+- **YAFFS2** deletes a file by writing a header that files it under its unlinked or
+  deleted directory. Each object's headers are cut at every such header, so when YAFFS
+  reuses an object id for a later file, the earlier file still comes back. The file is
+  rebuilt from the chunks written before its deletion, through the same rules as the live
+  scan. When YAFFS deletes a file still in its folder, it first resizes it to 0, writing a
+  header there with size 0 (`yaffs_del_file`); that header is taken as the deletion's, and
+  the file is rebuilt as the header before it describes it. A file truncated to 0 just
+  before it was deleted leaves the same header, and the flash cannot tell the two apart, so
+  a file with content recovered that way says so in `note`. YAFFS1 is not recovered: its pages are ordered only by a 2-bit serial number,
+  which cannot say which copy a deleted file last held.
+- **JFFS2** deletes a name with a directory entry pointing at inode 0 and frees the
+  inode's nodes without erasing them. On NOR it clears one bit in each node header (the
+  node's own CRCs were computed with that bit set, so it is set again before they are
+  checked); on NAND it cannot, and the nodes stay valid. A deleted file is rebuilt from all
+  of its nodes, oldest version first, and named from the newest entry that pointed at it.
+  JFFS2 writes holes as nodes too, so a range no node covers is missing, not a hole.
+- **UBIFS** deletes a file with an inode node of link count 0 and an entry pointing at
+  inode 0. Every node carries a sequence number that orders all writes on the volume, so a
+  deleted inode's data and truncation nodes are replayed in that order up to its deletion,
+  as the journal is. Only the LEBs the volume maps now are read, not an older copy of a LEB
+  UBI still holds.
+
+A file is `recoverable` only when every page, byte or block its size needs is still on the
+flash. Otherwise `missing` counts the gap and `read_deleted()` refuses it: an erased block
+and a hole that was never written look the same, and reading the file would put zeros
+where its content was. A file whose name was erased comes back with an empty `name`.
+
+Validated three ways. On the history fixtures above, the files the writers deleted come back
+with the bytes the writers gave them: `deleted.txt` and the last churn file on YAFFS2,
+`gone.txt` and the replaced `target.txt` on JFFS2 NOR, JFFS2 NAND and UBIFS. Files garbage
+collection partly erased are refused (11 on YAFFS2, 3 on NOR, 24 on UBIFS). Seven changes
+that each break one rule all turn the self-test red.
+
+On a real dump, the /data partition of DFRWS 2011 Case 2 (an Android phone, nanddump with
+spare): 1,945 deleted files, 1,924 of them complete, 1,001 of those SQLite `-journal`
+files. YAFFS reuses object ids: id 2539 alone held 114 of those deleted files. As a
+second reader, YAFFS's own core read copies of the dump with everything written from a
+file's deletion onward erased, so that the file was live again. On 150 files sampled at
+random from those with content, 149 match byte for byte: 24 at their path and 125 under
+`lost+found`, where YAFFS files an object whose folder's newer header the rollback erased.
+The one that differs, a 3-byte property file, had its replacement renamed onto its name two
+writes before it was deleted, so the rolled-back path already held the replacement.
+
+On the Foscam R2 camera dump used in the UBIFT case study (DFRWS EU 2024), the root
+volume gives 26 deleted files and the configuration volume 10, all complete, every block
+decompressing to the size its node records. No second reader was run on those.
+
 ### Raw flash dumps and NAND spare bytes
 
 A dump read off a flash chip has no partition table (the kernel learns the flash layout
@@ -1226,10 +1294,11 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
   YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
   recognised at all.
-- **Deleted data on flash is not recovered.** Each flash reader returns the filesystem's
-  current state, the way the filesystem itself reads it. Older versions still on the flash
-  (JFFS2's obsolete nodes, YAFFS's superseded pages, UBI's old copies of a block) are used
-  only where the filesystem itself would use them.
+- **Older versions of live files on flash are not listed.** Each flash reader returns the
+  filesystem's current state, the way the filesystem itself reads it, and deleted files
+  come from `recover_deleted()` (above). The earlier contents of a file that still exists
+  (JFFS2's superseded nodes, YAFFS's superseded pages, UBIFS's older data nodes, UBI's old
+  copies of a block) are not returned, and neither is deleted YAFFS1 data.
 - **Encrypted and authenticated UBIFS.** Encryption is not undone: a file fscrypt marks as
   encrypted has its content refused rather than returned, and encrypted names are not
   decrypted. The hashes of an authenticated volume are not checked. Neither case is in the
