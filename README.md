@@ -647,10 +647,14 @@ folder for a deleted file, they agree on 32 and differ on 6.
 
 **On an image QNX wrote.** qnxmount's committed test image was made on QNX by `mkefs` and
 the `devf-ram` driver, and its build script removes one file after copying it and
-overwrites 10 blocks of 1 KiB inside another. `tools/check_efs_reference_image.py` fetches
-that image by hash and checks all of it: the 31 live entries equal the tar QNX made, the
-removed file comes back by name with the bytes of its copy, and the superseded extents of
-the overwritten file hold 10,240 bytes that are not what the file holds there now.
+overwrites 10 blocks of 1 KiB inside another. That image and the tar QNX made of the
+mounted tree are kept here as `tests/fixtures/efs-qnx.img.gz` and `efs-qnx.tar.gz`, from
+qnxmount at commit `11c8a7f9ee9b945d584263743f6ea8524e8776d2` (Apache-2.0, see
+[LICENSE-qnxmount](LICENSE-qnxmount)); the image is gzipped and otherwise unchanged. The
+self-test checks all of it: the 31 live entries equal the tar, the removed file comes back
+by name with the bytes of its copy, and the superseded extents of the overwritten file
+hold 10,240 bytes that are not what the file holds there now. A control sets the removed
+file's extent header to free, and the check has to fail.
 
 **Fixtures.** No free tool writes EFS, so `tools/make_efs_fixtures.py` writes the two
 fixtures, one per byte order, from one model and records what it wrote. Run with
@@ -2270,3 +2274,7 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Two test fixtures, `tests/fixtures/efs-qnx.img.gz` and `tests/fixtures/efs-qnx.tar.gz`, are
+from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
+and stay under its Apache-2.0 licence. See [LICENSE-qnxmount](LICENSE-qnxmount).

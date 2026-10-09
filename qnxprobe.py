@@ -15352,6 +15352,85 @@ def _efs_fixture_check(raw, known, order):
     return problems, n_live, n_del
 
 
+def _efs_qnx_image_check(raw, tar_gz):
+    """Read the EFS image QNX itself wrote and hold it against its own record.
+
+    tests/fixtures/efs-qnx.img.gz is test_image.bin from
+    NetherlandsForensicInstitute/qnxmount (Apache-2.0, LICENSE-qnxmount) at
+    commit 11c8a7f9ee9b945d584263743f6ea8524e8776d2, gzipped here and otherwise
+    unchanged (SHA-256 0b0dc3a5...f92b3 unpacked); efs-qnx.tar.gz is its
+    test_image.tar.gz as committed. mkefs formatted the image, the devf-ram
+    flash driver mounted it, and tests/qnx_efs/test_data/make_test_fs.sh wrote
+    to it, then archived the mounted tree with tar. So nothing expected here
+    comes from this reader:
+
+    * every live entry's kind, permission bits, mtime, and content or link
+      target has to be the tar's;
+    * the script wrote 16 random bytes to this_file_is_removed, copied it to
+      this_file_is_a_copy and removed it, so recover_deleted() has to return a
+      deleted file of that name whose bytes are the copy's;
+    * the script rewrote 10 blocks of 1 KiB at block 5 of this_file_is_large,
+      so that file's superseded extents have to hold 10,240 bytes that are not
+      what the file holds there now;
+    * recover_deleted() has to return nothing else, and unaccounted() no
+      programmed byte.
+
+    Returns (problems, live entries, bytes of the removed file, superseded
+    bytes)."""
+    import io, tarfile
+    want = {}
+    with tarfile.open(tar_gz) as tf:
+        for m in tf.getmembers():
+            kind = (S_IFDIR if m.isdir() else S_IFLNK if m.issym() else 0o010000 if m.isfifo()
+                    else S_IFREG)
+            body = (tf.extractfile(m).read() if m.isfile()
+                    else m.linkname.encode() if m.issym() else None)
+            want[m.name.strip("/")] = (kind, m.mode & 0o7777, m.mtime, body)
+    vols = volumes(io.BytesIO(raw), len(raw))
+    if [v["kind"] for v in vols] != ["efs"] or "walker" not in vols[0]:
+        return [f"volumes() gave {[(v['kind'], v.get('note')) for v in vols]}"], 0, 0, 0
+    w = vols[0]["walker"]
+    got, stack, problems = {}, [(w.root, "")], []
+    while stack:
+        node, path = stack.pop()
+        for name, child in w.listdir(node):
+            mode, size, mtime = w.entry(child)
+            cpath = f"{path}/{name}" if path else name
+            body = (b"".join(w.read_file(child, size))
+                    if mode & S_IFMT in (S_IFREG, S_IFLNK) else None)
+            got[cpath] = (mode & S_IFMT, mode & 0o7777, mtime, body)
+            if mode & S_IFMT == S_IFDIR:
+                stack.append((child, cpath))
+    if got != want:
+        problems.append("the live tree is not the tar's: "
+                        f"{sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))}")
+    entries = list(w.recover_deleted())
+    removed = [e for e in entries if e.name == "this_file_is_removed"
+               and e.note.startswith("a deleted file")]
+    copy = got.get("this_file_is_a_copy", (0, 0, 0, None))[3]
+    n_removed = 0
+    if (len(removed) != 1 or not removed[0].recoverable or not copy
+            or b"".join(w.read_deleted(removed[0])) != copy):
+        problems.append("this_file_is_removed did not come back with its copy's bytes")
+    else:
+        n_removed = removed[0].size
+    large = got.get("this_file_is_large", (0, 0, 0, b""))[3] or b""
+    old = [e for e in entries if e.name == "this_file_is_large"]
+    old_bytes = b"".join(b"".join(w.read_deleted(e)) for e in old)
+    states = {state for e in old for _off, _n, state in w.deleted_extents(e)}
+    if (len(old_bytes) != 10 * 1024 or states != {"allocated, superseded"}
+            or old_bytes == large[5 * 1024:15 * 1024]):
+        problems.append(f"this_file_is_large: {len(old_bytes)} superseded bytes in "
+                        f"{len(old)} entries, states {sorted(states)}")
+    other = [e for e in entries if e not in removed and e not in old]
+    if other:
+        problems.append(f"{len(other)} entries the script's history does not account for")
+    stray = w.unaccounted()[1]
+    if stray:
+        problems.append(f"{stray} bytes that are not 0xFF lie where no extent is")
+    return problems, len(got), n_removed, len(old_bytes)
+
+
 def self_test():
     """Prove the detector reports BOTH ways before you trust a run.
 
@@ -15709,6 +15788,43 @@ def self_test():
             print(f"  [{mark}] EFS controls: a zeroed unit_index moves the partition, a "
                   f"changed byte of a deleted extent is caught, and a header set to "
                   f"free leaves its {length} bytes unaccounted for ({stray})")
+
+        # And EFS as QNX wrote it: qnxmount's committed test image, with a
+        # removed file and an overwrite in its history (_efs_qnx_image_check).
+        # The control cuts the removed file's directory entry loose from its
+        # data by setting its first extent's header to free, which has to cost
+        # the deleted file.
+        qnx_img = os.path.join(efs_fx, "efs-qnx.img.gz")
+        qnx_tar = os.path.join(efs_fx, "efs-qnx.tar.gz")
+        if not (os.path.isfile(qnx_img) and os.path.isfile(qnx_tar)):
+            print("  [SKIP] the QNX-written EFS image is not beside this script, so the "
+                  "reader was not held against a filesystem QNX wrote")
+        else:
+            import gzip
+            with gzip.open(qnx_img, "rb") as gz:
+                qnx_raw = gz.read()
+            problems, n_live, n_removed, n_old = _efs_qnx_image_check(qnx_raw, qnx_tar)
+            mark = "PASS" if not problems else "FAIL"
+            if problems:
+                ok = False
+                for line in problems:
+                    print("      " + line)
+            print(f"  [{mark}] EFS written by QNX: {n_live} live entries as QNX's own tar has "
+                  f"them, the removed file's {n_removed} bytes equal its copy's, and "
+                  f"{n_old:,} superseded bytes of the overwritten file")
+            qw = EfsWalker(io.BytesIO(qnx_raw), 0, len(qnx_raw))
+            gone = next(e for e in qw.recover_deleted() if e.name == "this_file_is_removed")
+            ext = gone._plan[0]                      # pylint: disable=protected-access
+            head = ext["u"] * qw.unit_size + qw.unit_size - EFS_EXTHDR * (ext["i"] + 1)
+            cut = bytearray(qnx_raw)
+            struct.pack_into(qw.e + "I", cut, head, ext["s0"] | EFS_FREE)
+            cut_problems = _efs_qnx_image_check(bytes(cut), qnx_tar)[0]
+            cond = any("this_file_is_removed" in line for line in cut_problems)
+            mark = "PASS" if cond else "FAIL"
+            if not cond:
+                ok = False
+            print(f"  [{mark}] EFS written by QNX, control: with its extent's header set to "
+                  "free the removed file no longer comes back, and the check says so")
 
         # QNX IFS. The UCL decompressor and the imagefs layout are proven byte
         # for byte against real Ford Sync G4 images; these legs are the both-ways
