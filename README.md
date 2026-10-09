@@ -392,6 +392,30 @@ and differ on 4 entries of 313,652 on one acquisition where the volume's own
 index and records disagree, and on 3 on another. `NtfsWalker.listing` says which
 and what is known about why. `collect()` is unchanged.
 
+## FAT32 and exFAT: a cluster chain shorter than the size
+
+A FAT32 or exFAT directory entry records a file's size, and the allocation table records
+which clusters hold it. Nothing makes the two agree, and a volume can hold a file whose
+chain ends before its size is covered. `read_file()` then returns only what the chain
+reaches, which is fewer bytes than the size.
+
+Since 1.59 `chain_shortfall(walker, node)` answers
+`(clusters in the chain, clusters the size needs)` for such a file and `None` otherwise. A
+caller whose read came back short, with nothing lost past the end of the image, can use it
+to tell a volume that contradicts itself from a reader that went wrong. `None` means the
+chain covers the size, or the file is an exFAT single run (NoFatChain) with no chain to
+follow, or the walker is not FAT32 or exFAT. It does not mean the file is whole. The
+extraction log names this case instead of saying the rest of the file lies past the end
+of the image.
+
+Measured on one exFAT volume with two FATs: 6 of its 31 FAT-chained files had a chain
+shorter than their size, in both FATs alike, and none of its 7,209 single-run files did.
+Why that volume is in that state is not established. FAT32 is exercised by the self-test
+only.
+
+Also since 1.59, an empty exFAT file reads as no bytes. Until then `ExfatWalker.read_file()`
+returned one cluster of the volume's own bytes for a file of size zero.
+
 ## QNX6 free space
 
 Since 1.58 `Qnx6Walker.free_extents()` reports the space a qnx6 volume says is free, as
