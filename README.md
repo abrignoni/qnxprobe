@@ -19,7 +19,10 @@ It also reads QNX's two flash filesystems, ETFS and EFS, the kind a head unit
 keeps its manufacturing and configuration data on. Both are typically imaged bare
 with no partition table, so they arrive as the whole image and are read at LBA 0.
 ETFS has no superblock at all, so it is rebuilt by replaying the transaction
-records in each page's spare area; EFS is found by its `QSSL_F3S` boot record.
+records in each page's spare area; EFS is found by its `QSSL_F3S` boot record,
+in either byte order, and since 1.60 wherever its partitions sit in a raw flash
+image, with the deleted and superseded data they still hold (see "QNX EFS in a
+raw flash image" below).
 Their byte layouts are transcribed from the Kaitai specs in
 [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0), whose ETFS spec is itself sourced to QNX's `fs/etfs.h` and whose EFS
@@ -530,6 +533,139 @@ reporting free space.
 
 From Python the same writer is `write_unallocated(fh, size, volumes(fh, size), out_dir,
 image_name)`.
+
+## QNX EFS in a raw flash image: either byte order, and deleted data
+
+Since 1.60.
+
+**Finding the partitions.** A NOR dump from a telematics unit holds its EFS partitions one
+after another behind the boot code, with no table. Each partition has one boot record
+(`QSSL_F3S`), the text of header 2 of the unit that holds logical unit 1. Wear levelling
+moves that unit, so the record is often not in the partition's first unit. Its
+`unit_index` field is the physical index of the unit holding it, so the partition starts
+`unit_index` units before that unit. `efs_partitions(fh, size)` returns every partition
+placed that way, and the flash search described under "Raw flash dumps" now includes
+them, so `volumes()` and the report list each one as its own volume.
+
+A signature counts as a boot record only when the unit it sits in opens with a `unit_info`
+of the same byte order and that unit's header 2 points at the record. The string also
+occurs elsewhere on the flash images measured below, in 1 to 8 places per image, and
+those are not taken.
+
+Until 1.60 the record was looked for in a partition's first four units and read
+little-endian only, and nothing searched a flash image for EFS. The images below came
+back as not recognised.
+
+**Byte order.** `f3s_unit_info_t` carries an endian byte, `L` or `B`, and the partition is
+stored in that order throughout. Both are read. qnxmount reads little-endian only, so no
+reference reader stands behind the big-endian reading. It is the same code with the other
+byte order, checked on a fixture written in both orders and on the four big-endian images
+below, where every extent table parsed and the accounting check held.
+
+**Deleted and superseded data.** EFS marks an extent deleted in its header, and on every
+image measured the text was still in place behind it. An extent that was overwritten has
+its supersede pointer set to the extent that replaced it. A directory entry is an extent
+too, so a deleted file's name, mode and times can stay on the flash the same way. `EfsWalker.recover_deleted()` lists what is left:
+
+```python
+for vol in qnxprobe.volumes(fh, size):
+    if vol["kind"] != "efs" or "walker" not in vol:
+        continue
+    w = vol["walker"]
+    for e in w.recover_deleted():
+        print(e.parent_path, e.name, e.size, e.recoverable, e.reason, e.note)
+        if e.recoverable:
+            data = b"".join(w.read_deleted(e))
+            where = w.deleted_extents(e)      # [(offset in the image, length, state)]
+```
+
+Three kinds of entry come back, and `note` says which:
+
+- **A deleted file.** A directory entry no live directory reaches, naming a file whose
+  extent chain still reads from its first pointer to its end. The content is the chain in
+  its current version, read the way a live file is read.
+- **A deleted file that does not read whole.** A pointer in its chain no longer resolves,
+  or the chain runs into a free header, a live file's extents or another deleted file's.
+  The name is reported, `recoverable` is False and `reason` says which.
+- **A run of deleted or superseded extents** that no entry above took, chained by their
+  next pointers. It carries the name of the file a directory entry still leads to it from,
+  live or deleted, when exactly one does. Otherwise the name is empty. These are pieces:
+  an earlier version of part of a file, or what is left of a file whose directory entry is
+  gone.
+
+Every deleted or superseded file extent that has text is in exactly one entry. The state in
+`deleted_extents()` is the header's condition, `deleted` or `allocated`, followed by
+`, superseded` when its supersede pointer is set.
+
+What the entries do not say:
+
+- **Size.** The directory records none. `size` is the bytes the entry's extents hold.
+- **Ownership.** An extent pointer is a logical unit and a header index. Nothing in it says
+  whether that unit was rewritten since the pointer was written, so a name is what the
+  directory data leads to, not proof.
+- **Folder, most of the time.** `parent_path` is given only when a live directory's own
+  chain of entries still reaches the file's directory entry. Following a deleted entry's
+  next pointer forward into a live directory was tried and dropped: with it, the folder
+  differed from the one the acquisition's own extracted files sit in for 60 of 84 deleted
+  files on one image.
+
+**The accounting check.** `EfsWalker.unaccounted()` returns the bytes of the partition that
+are neither an extent header nor the text of an extent whose header is not free, and how
+many of those bytes are not 0xFF. Erased flash reads 0xFF, so the second number is 0 when
+the extent table accounts for everything written.
+
+**Measured on six flash images** from GM OnStar telematics units (LG, Gen9 and Gen10),
+corpus keys `xtrmp_item020`, `027`, `030`, `031` (64 MiB, big-endian) and `xtrmp_item081`,
+`115` (128 MiB, little-endian). All units are 128 KiB:
+
+| | 020 | 027 | 030 | 031 | 081 | 115 |
+|---|---|---|---|---|---|---|
+| EFS partitions found and walked | 10 | 12 | 12 | 10 | 8 | 8 |
+| of them, boot record not in the first unit | 2 | 3 | 2 | 2 | 4 | 4 |
+| units | 445 | 467 | 460 | 445 | 968 | 968 |
+| live files | 2,761 | 2,762 | 3,295 | 2,655 | 3,463 | 3,431 |
+| deleted files recovered | 123 | 371 | 560 | 301 | 1,528 | 1,771 |
+| deleted files named, not recoverable | 17 | 8 | 5 | 3 | 57 | 46 |
+| extent runs with a name | 117 | 197 | 524 | 33 | 185 | 84 |
+| extent runs with none | 219 | 325 | 1,431 | 173 | 1,270 | 1,319 |
+| deleted or superseded file extents listed | 8,703 | 5,096 | 10,779 | 4,148 | 7,718 | 5,422 |
+| the same, counted by a separate reader | 8,703 | 5,096 | 10,779 | 4,148 | 7,718 | 5,422 |
+| unaccounted bytes that are not 0xFF | 0 | 0 | 0 | 0 | 0 | 0 |
+
+The separate reader is a research script that parses the extent tables with no directory
+walk. Its set of extents and the set `recover_deleted()` lists are identical on all six,
+and no extent is listed twice. Of the runs with no name, 2, 37, 4, 0, 0 and 0 are ones
+that more than one file's directory entries lead to.
+
+Each acquisition also carries the files its own tool extracted, many of them marked as
+deleted copies. Across the six there are 527 distinct file contents in those sets. 485 are
+reproduced byte for byte: 108 by a live file, 390 by a deleted-file entry, 20 by an extent
+run (some by more than one). 479 of the 485 come back under the name the tool gave them.
+The other 42 are not reproduced. 17 of them have a size that is a multiple of 65,535
+bytes, the most one extent holds. Why any of the 42 differ is not established. Where both give a
+folder for a deleted file, they agree on 32 and differ on 6.
+
+**On an image QNX wrote.** qnxmount's committed test image was made on QNX by `mkefs` and
+the `devf-ram` driver, and its build script removes one file after copying it and
+overwrites 10 blocks of 1 KiB inside another. `tools/check_efs_reference_image.py` fetches
+that image by hash and checks all of it: the 31 live entries equal the tar QNX made, the
+removed file comes back by name with the bytes of its copy, and the superseded extents of
+the overwritten file hold 10,240 bytes that are not what the file holds there now.
+
+**Fixtures.** No free tool writes EFS, so `tools/make_efs_fixtures.py` writes the two
+fixtures, one per byte order, from one model and records what it wrote. Run with
+`--oracle`, it has qnxmount read the little-endian one, and every live file comes back as
+written. The big-endian fixture and the deleted data have no reference reading. The
+self-test reads both fixtures and breaks three things to show the checks can fail.
+
+**Not established, or not built.**
+
+- What `status[1]` and `status[2]` of an extent header record. Only `status[0]` is read,
+  and `status[1]` of header 1 to tell a spare unit, as qnxmount does.
+- A partition whose first unit has no `unit_info` is found by `efs_partitions()` but not
+  opened. None of the 60 partitions measured is like that.
+- A partition that runs past the end of the image is not reported.
+- Free space is not reported for EFS.
 
 ## APFS
 
@@ -1412,7 +1548,8 @@ from the device tree or its command line, which the dump does not carry), and us
 bootloader at offset 0. So when an image has no partition table and nothing is recognised
 at its start, qnxprobe looks for SquashFS, UBI and JFFS2 at every 4 KiB boundary of an
 image up to 8 GiB, checks each candidate the way identification does, and reports each one
-it finds as its own volume, under `FLASH` in the report. Since 1.51 the same pass also looks
+it finds as its own volume, under `FLASH` in the report. Since 1.60 it also finds QNX EFS
+partitions there, by their boot records at any offset. Since 1.51 the same pass also looks
 for ext2, ext3 and ext4, because an eMMC image from an embedded device can hold its
 partitions with no table the image carries (the kernel can take the layout from its
 command line instead, `blkdevparts=` in
@@ -1918,6 +2055,18 @@ the page geometry divides evenly and the `.filetable` carries its fixed reserved
 at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
 u-boot, boot_fs or ext partitions of the two vehicle images tested.
 
+The EFS layouts are read from qnxmount at commit
+`11c8a7f9ee9b945d584263743f6ea8524e8776d2`. The extent status bits (condition mask 0x70
+with free 0x70, allocated 0x30, deleted 0x10 and bad 0x00; NO_NEXT 0x02, NO_SUPER 0x04,
+LAST 0x80; type mask 0x300 with file 0x300, directory 0x200, system 0x100), the header
+index of the boot record (2) and the endian byte of `f3s_unit_info_t` are from the header
+that spec pins,
+[fs/f3s_spec.h](https://github.com/RunZeJustin/qnx660/blob/47c4158e3993d7536170b649e6c1e09552318fb4/target/qnx6/usr/include/fs/f3s_spec.h#L114-L129)
+(lines 114 to 129, line 94 for the boot index, 189 for the endian byte and 214 for
+`unit_index`). The header's one-line comments are
+all it says about what a deleted or superseded extent means. What such an extent still
+holds was measured, as "QNX EFS in a raw flash image" above describes.
+
 SquashFS, JFFS2, UBI and UBIFS, from the Linux kernel at v7.0 (commit
 `028ef9c96e96197026887c0f092424679298aae8`):
 
@@ -2071,9 +2220,10 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   independent implementation, but no confirmed real QNX4 volume exists in the
   test corpus; the one candidate partition (a Ford Sync G4 slot named
   `boot_fs`) turned out to carry a `RAW0` container, not QNX4.
-- **ETFS and EFS are validated against qnxmount's synthetic test images, not yet
-  against a real vehicle extraction.** No confirmed ETFS or EFS volume was available to
-  test on. ETFS in particular keeps its transaction metadata in the NAND spare/out-of-band
+- **ETFS is validated against qnxmount's synthetic test images, not yet against a real
+  vehicle extraction.** No confirmed ETFS volume was available to test on. EFS has been
+  measured on six vehicle flash images since 1.60 (see "QNX EFS in a raw flash image").
+  ETFS keeps its transaction metadata in the NAND spare/out-of-band
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
   an image that dropped it will not divide into pages and will be reported as not
   recognised rather than misread.
@@ -2105,7 +2255,8 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   filesystem's current state, the way the filesystem itself reads it, and deleted files
   come from `recover_deleted()` (above). The earlier contents of a file that still exists
   (JFFS2's superseded nodes, YAFFS's superseded pages, UBIFS's older data nodes, UBI's old
-  copies of a block) are not returned, and neither is deleted YAFFS1 data.
+  copies of a block) are not returned, and neither is deleted YAFFS1 data. EFS is the
+  exception: its `recover_deleted()` lists superseded extents too.
 - **Encrypted and authenticated UBIFS.** Encryption is not undone: a file fscrypt marks as
   encrypted has its content refused rather than returned, and encrypted names are not
   decrypted. The hashes of an authenticated volume are not checked. Neither case is in the
