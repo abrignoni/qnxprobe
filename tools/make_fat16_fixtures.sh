@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build the two FAT16 images the self-test reads.
+# Build the FAT16 and FAT12 images the self-test reads.
 #
 #   fat16-fixture   a FAT16 volume as macOS formats one: 512-byte sectors.
+#   fat12-fixture   a FAT12 volume as macOS formats one.
 #   tfat16-fixture  a FAT16 volume with 2,048-byte sectors and 8,192-byte
 #                   clusters whose files all sit under a root folder named
 #                   __TFAT_HIDDEN_ROOT_DIR__, with the type string "TFAT16  ".
@@ -91,4 +92,5 @@ open(p,"wb").write(bytes(b))' "$img.dmg"
 }
 
 build 16m "-F 16"            FAT16FIX  fat16-fixture  ""
+build 4m  "-F 12"            FAT12FIX  fat12-fixture  ""
 build 40m "-F 16 -c 16 -r 4 -e 512 -a 24" TFAT16FIX tfat16-fixture "__TFAT_HIDDEN_ROOT_DIR__"

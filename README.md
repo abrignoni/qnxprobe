@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, exFAT, NTFS, HFS+ and APFS filesystems,
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+ and APFS filesystems,
 the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
 images, out of raw disk images and flash dumps: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
@@ -419,16 +419,21 @@ only.
 Also since 1.59, an empty exFAT file reads as no bytes. Until then `ExfatWalker.read_file()`
 returned one cluster of the volume's own bytes for a file of size zero.
 
-## FAT16 and transaction-safe FAT (TFAT)
+## FAT16, FAT12 and transaction-safe FAT (TFAT)
 
-Since 1.62. A FAT16 volume is read through `Fat16Walker`, with the same listing, reading,
-`deleted_files()`, `free_extents()` and `chain_shortfall()` calls as FAT32. It is recognised
-by the `FAT16   ` type string at offset 54 of the boot sector, the `0x55AA` signature, and a
-BPB whose cluster count is in FAT16's range: 4,085 to 65,524, the count Microsoft's FAT
-specification types a volume by. Three things differ from FAT32, all from that
-specification: a table entry is 16 bits, the root directory is a fixed run of
-`BPB_RootEntCnt` entries ahead of cluster 2, and a directory entry has no high word for its
-first cluster. FAT12 is not read.
+Since 1.62. A FAT16 volume is read through `Fat16Walker` and a FAT12 volume through
+`Fat12Walker`, with the same listing, reading, `deleted_files()`, `free_extents()` and
+`chain_shortfall()` calls as FAT32. Either is recognised by a `FAT16   ` or `FAT12   ` type
+string at offset 54 of the boot sector, the `0x55AA` signature, and a BPB a cluster count
+can be computed from. Which of the two it is comes from that count and not from the
+string, because Microsoft's FAT specification types a volume by its count of clusters and
+nothing else: fewer than 4,085 is FAT12, and 4,085 to 65,524 is FAT16. A volume whose
+string and count disagree is read by its count, and the report says both.
+
+Three things differ from FAT32, all from that specification: a table entry is 16 bits, or
+12 bits packed two to every three bytes on FAT12; the root directory is a fixed run of
+`BPB_RootEntCnt` entries ahead of cluster 2; and a directory entry has no high word for its
+first cluster.
 
 Windows CE's transaction-safe FAT writes `TFAT16  ` or `TFAT32  ` where FAT writes its type
 string. Until 1.62 such a volume was reported as not recognised. It is now read as the
@@ -460,17 +465,21 @@ file the tool had not extracted, a file of zero length. No volume in that set ha
 that differ, so that case is exercised by the self-test only, on a fixture whose second
 table was altered.
 
-`tools/make_fat16_fixtures.sh` builds the two committed fixtures with macOS. One is a
-FAT16 volume as macOS formats it. The other has 2,048-byte sectors, its files under a
-`__TFAT_HIDDEN_ROOT_DIR__` folder, and the `TFAT16  ` type string: macOS wrote its tables,
-directories and file data, and the script then rewrote the boot sector's counts in
-2,048-byte units and its type string, because macOS will not mount a FAT volume with
-sectors larger than the device's. It stands in for the layout, not for Windows CE's
-driver. The self-test reads every live file of both against hashes taken from the mounted
-volume, recovers the files deleted before unmounting against hashes taken before
-deletion, and shows that the same volume read as FAT32 lists none of its files. At build
-time The Sleuth Kit listed the same live and deleted files on both, and `icat` returned
-the same bytes for every live file and every recoverable deleted one.
+`tools/make_fat16_fixtures.sh` builds the three committed fixtures with macOS. Two are a
+FAT16 and a FAT12 volume as macOS formats them. The third has 2,048-byte sectors, its
+files under a `__TFAT_HIDDEN_ROOT_DIR__` folder, and the `TFAT16  ` type string: macOS
+wrote its tables, directories and file data, and the script then rewrote the boot sector's
+counts in 2,048-byte units and its type string, because macOS will not mount a FAT volume
+with sectors larger than the device's. It stands in for the layout, not for Windows CE's
+driver. The self-test reads every live file of all three against hashes taken from the
+mounted volume and recovers the files deleted before unmounting against hashes taken
+before deletion. Its controls: the FAT16 volume read as FAT32 lists none of its files, and
+the FAT12 volume read with a 16-bit table returns 3 of its 8 files. At build time The
+Sleuth Kit listed the same live and deleted files on all three, and `icat` returned the
+same bytes for every live file and every recoverable deleted one.
+
+FAT12 has been read on that one macOS-written fixture only. No FAT12 volume from a device
+has been run through it.
 
 ## QNX6 free space
 
@@ -536,7 +545,7 @@ measured are little endian.
 ## Writing free space to files
 
 Since 1.58 `--unallocated DIR` copies out the free space of every volume whose filesystem
-says what is free: qnx6, F2FS, FAT32, FAT16 (since 1.62), exFAT, NTFS, HFS+ and APFS.
+says what is free: qnx6, F2FS, FAT32, FAT16 and FAT12 (since 1.62), exFAT, NTFS, HFS+ and APFS.
 
 ```
 python3 qnxprobe.py --unallocated free_space --only dps_mfg mmcblk0.img
