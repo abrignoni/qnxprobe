@@ -1152,6 +1152,101 @@ refused by this reader and is the one case `icat` will read on the contiguous
 assumption; refusing it is the deliberate choice not to present bytes the entry cannot
 vouch for.
 
+### exFAT: orphan directory entries
+
+Since 1.61. An exFAT volume can hold directory clusters that the Allocation Bitmap marks
+in use and that the directory tree no longer reaches. The file entry sets in such a
+cluster are still marked in use and still carry a valid checksum, and the files they name
+can still be allocated too. A listing does not show them, because it follows the tree, and
+`deleted_files()` does not either, because it reads the entries marked deleted in live
+directories.
+
+`ExfatWalker.recover_deleted()` lists them and `read_deleted()` reads one:
+
+```python
+w = qnxprobe.ExfatWalker(fh, base)
+for e in w.recover_deleted():                 # FlashDeletedFile, kind "exfat"
+    print(e.parent_path, e.name, e.size, e.times["modified"], e.recoverable, e.reason)
+    if e.recoverable:
+        data = b"".join(w.read_deleted(e))
+```
+
+The method keeps the name the flash readers use so a caller handles one interface. The
+name is not a finding: nothing in an orphan entry says its file was deleted. Each record
+says what it is in `note`, and none of them is ever added to the live listing.
+
+- **What counts as reached.** The root directory's chain, every directory's clusters,
+  every file's clusters (the run its size needs when NoFatChain is set, else its whole
+  chain in the first FAT), both allocation bitmaps and the up-case table. The tree is
+  walked once per walker, the first time `recover_deleted()` is called.
+- **What is searched.** Every allocated cluster outside that set, for a `0x85` File entry
+  followed by its `0xC0` stream extension and `0xC1` name entries, with the checksum the
+  File entry records. A set that runs off the end of its cluster is completed from the
+  cluster the first FAT links next, or the one after it, and the checksum decides.
+- **Directories are walked down.** The clusters an orphan directory entry names are read
+  as its directory when they are allocated and unreached, so a file under it has
+  `parent_path` set to the directory names that lead to it. A file whose entry sits in a
+  cluster no orphan directory entry names has a `parent_path` of `None`: nothing on the
+  volume says what that directory was called. `parent` is the cluster the entry set is in
+  and `ident` the file's first cluster.
+- **When a file is recoverable.** Its size is not zero and every cluster it names is
+  allocated and unreached: the run when NoFatChain is set, else a chain in the first FAT
+  that runs to an end-of-chain mark and covers the size. Otherwise `reason` says what
+  failed, and `read_deleted()` refuses it. A cluster a live file holds is never read as
+  the orphan's.
+- **Times are readings.** `mtime` and `mode` are `None`. `times` holds the stored readings
+  and UTC offset fields as `listdir_records()` gives them, for the reason under
+  [FAT32 and exFAT times](#fat32-and-exfat-times-are-readings-and-are-listed-as-such).
+- **Copies are one record.** Entry sets that are byte for byte the same in several
+  clusters come back once, and `note` gives the count. When two different entries name
+  the same cluster both stay recoverable and `note` says the bytes may be another file's,
+  because the volume does not say which wrote last.
+
+It does not search free clusters, does not follow the second FAT, does not list entries
+marked deleted, and does not list the orphan directories themselves. Why a volume holds
+such clusters is not established here.
+
+Measured on four exFAT partition images, corpus keys `xtrmp_item014` and `xtrmp_item016`,
+all with 4,096-byte clusters and two FATs:
+
+| | item016 p2 | item016 p3 | item014 p2 | item014 p3 |
+|---|---:|---:|---:|---:|
+| allocated clusters | 174,593 | 8,368 | 164,081 | 7,584 |
+| allocated and not reached | 60,345 | 6,507 | 1,139 | 0 |
+| of those, clusters holding entry sets | 349 | 2 | 18 | 0 |
+| orphan file entries | 2,858 | 14 | 198 | 0 |
+| recoverable | 2,455 | 2 | 97 | 0 |
+| recoverable bytes | 125,969,784 | 13,328 | 285,706 | 0 |
+| recoverable with a `parent_path` | 1,481 | 0 | 0 | 0 |
+| not recoverable: same first cluster and size as a live file | 345 | 2 | 93 | 0 |
+| not recoverable: names a live file's or directory's clusters | 5 | 3 | 4 | 0 |
+| not recoverable: names free clusters | 42 | 2 | 2 | 0 |
+| not recoverable: fewer clusters than the size needs | 4 | 4 | 0 | 0 |
+| not recoverable: empty | 7 | 1 | 2 | 0 |
+
+Every recoverable file read back at its recorded size. On item016 p2, 608 entries were in
+more than one cluster, 3 recoverable ones carry the shared-cluster note, and the 2,455
+recoverable files hold 1,947 distinct contents. One of them is 17,408 bytes with a
+`.sqlite` name; it opens as SQLite and `PRAGMA integrity_check` answers `ok`. Listing took
+under half a second per image on the machine that measured it. The images had been read
+before, so that is not the time of a cold read.
+
+A second count, written without this reader's search code, agrees on the allocated and
+unreached clusters of all four images and finds every entry set that lies inside one
+cluster: 2,833, 14, 197 and 0. The reader lists all of those and 25, 0, 1 and 0 more. Those
+are taken to be the sets it completes across a cluster boundary, which was not checked set
+by set.
+
+No reference reading exists for these volumes, so beyond that one SQLite file it is not
+established that the bytes returned are each file's content. The known data is the
+self-test's: it builds a volume with a live tree and unlinked directory clusters, writes
+each set's checksum from the specification's formula and not with the reader's function,
+and requires the names, directory paths and bytes back. It also requires a refusal for a
+file that names a live file's cluster, a free cluster or a short chain, and nothing for a
+deleted entry, a bad checksum, or a valid entry set placed in the up-case table, in a live
+file's content or in a free cluster. The reader's checksum is held against a driver's on
+the committed exFAT fixture, which macOS wrote: all 4 of its in-use file entries match.
+
 ## BitLocker
 
 Since 1.43 a BitLocker volume is recognised by its own header and, given a key, read
@@ -1496,7 +1591,8 @@ for e in w.recover_deleted():
 
 The method has its own name rather than `deleted_files()`, because a caller that handles
 `deleted_files()` for NTFS, FAT32 and exFAT reads fields (`record`, `first_cluster`) these
-records do not have.
+records do not have. Since 1.61 `ExfatWalker` has a `recover_deleted()` too, for
+[orphan directory entries](#exfat-orphan-directory-entries).
 
 - **YAFFS2** deletes a file by writing a header that files it under its unlinked or
   deleted directory. Each object's headers are cut at every such header, so when YAFFS
