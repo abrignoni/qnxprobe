@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.64"
+QNXPROBE_VERSION = "1.65"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -13728,6 +13728,10 @@ def _lvm_self_checks():
                 "one run on one physical volume",
                 not any("rimage" in ln or "rmeta" in ln for ln in lines)
                 and not any("rimage" in f[0] or "rmeta" in f[0] for f in found)))
+    pv_notes = [v.get("note", "") for v in volumes(io.BytesIO(disk), len(disk)) if v["kind"] == "lvm2 pv"]
+    out.append(("each physical volume's note in volumes() names the volumes not read and why",
+                len(pv_notes) == 2 and all(f"{lv}, " in n for n in pv_notes for lv in sorted(declined))
+                and all("striped across 2" in n and "a raid1 segment" in n for n in pv_notes)))
     out.append(("both physical volumes name the volume group and both of its physical volumes",
                 sum("2 of them in this image" in ln for ln in lines) == 2))
 
@@ -14607,8 +14611,13 @@ def volumes(fh, size=None):
             elif kind == "QNX IFS boot image":
                 vol["walker"] = IfsWalker(fh, base)
             elif kind == "lvm2 pv":
+                # The logical volumes not read are said here too, where a caller
+                # that prints only the note (the LEAPP run log) will show them.
+                skipped = [ln[len("logical volume "):].replace(": not read (", " (", 1) for ln in lines
+                           if ln.startswith("logical volume ") and ": not read (" in ln]
                 vol["note"] = ("an LVM2 physical volume: each logical volume read from it "
-                               "is listed as a volume of its own")
+                               "is listed as a volume of its own"
+                               + ("; not read: " + "; ".join(skipped) if skipped else ""))
             elif kind:
                 vol["walker"] = walker_for(kind, fh, base, rsize)
                 if vol["walker"] is None:

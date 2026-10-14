@@ -1875,7 +1875,8 @@ is not used; the other volumes of the image are unaffected. lvm2's configuration
 read as lvm2 writes it; single-quoted strings, floating-point, hexadecimal and octal
 (leading-zero) numbers, which lvm2 accepts but does not write, are refused.
 
-Not read, and named in the physical volume's report with the reason: a logical volume
+Not read, and named in the physical volume's report with the reason (since 1.65 also in its
+`note` in `volumes()`, which a LEAPP run log prints): a logical volume
 whose extents are split into separate runs (extended into a gap, or across physical
 volumes), a striped or RAID volume, one on a physical volume that is not in the image,
 and one on extents of something that is not a physical volume of the group (a move in
