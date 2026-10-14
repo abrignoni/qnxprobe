@@ -1,0 +1,156 @@
+{
+ "written_by": "cryptsetup 2.8.4 flags: UDEV BLKID KEYRING FIPS KERNEL_CAPI HW_OPAL ",
+ "passphrases": [
+  "correct horse battery staple",
+  "second keyslot passphrase"
+ ],
+ "images": {
+  "luks2-argon2id": {
+   "luks2_metadata": {
+    "keyslots": {
+     "0": {
+      "type": "luks2",
+      "key_size": 64,
+      "af": {
+       "type": "luks1",
+       "stripes": 4000,
+       "hash": "sha256"
+      },
+      "area": {
+       "type": "raw",
+       "offset": "32768",
+       "size": "258048",
+       "encryption": "aes-xts-plain64",
+       "key_size": 64
+      },
+      "kdf": {
+       "type": "argon2id",
+       "time": 4,
+       "memory": 8192,
+       "cpus": 1,
+       "salt": "NpiaxpxC7D9pAtyqHYOfvi//5ylze/+ZTmV/MKwntoc="
+      }
+     },
+     "1": {
+      "type": "luks2",
+      "key_size": 64,
+      "af": {
+       "type": "luks1",
+       "stripes": 4000,
+       "hash": "sha256"
+      },
+      "area": {
+       "type": "raw",
+       "offset": "290816",
+       "size": "258048",
+       "encryption": "aes-xts-plain64",
+       "key_size": 64
+      },
+      "kdf": {
+       "type": "argon2id",
+       "time": 4,
+       "memory": 8192,
+       "cpus": 1,
+       "salt": "jk6VbmrVMZ50Roet/PgHXdKiNoeOFMa7EZdu4T2MY6I="
+      }
+     }
+    },
+    "tokens": {},
+    "segments": {
+     "0": {
+      "type": "crypt",
+      "offset": "2097152",
+      "size": "dynamic",
+      "iv_tweak": "0",
+      "encryption": "aes-xts-plain64",
+      "sector_size": 4096
+     }
+    },
+    "digests": {
+     "0": {
+      "type": "pbkdf2",
+      "keyslots": [
+       "0",
+       "1"
+      ],
+      "segments": [
+       "0"
+      ],
+      "hash": "sha256",
+      "iterations": 1000,
+      "salt": "dDVvKtUppA7p6D5M0TZTLKz6LIjI72Fy8WJ7qeUXPJE=",
+      "digest": "fblJbM7HuPDHKnaNQKSpcY3Le4C1J7vDRWEutyb33aY="
+     }
+    },
+    "config": {
+     "json_size": "12288",
+     "keyslots_size": "1048576"
+    }
+   }
+  },
+  "luks2-pbkdf2": {
+   "luks2_metadata": {
+    "keyslots": {
+     "0": {
+      "type": "luks2",
+      "key_size": 32,
+      "af": {
+       "type": "luks1",
+       "stripes": 4000,
+       "hash": "sha256"
+      },
+      "area": {
+       "type": "raw",
+       "offset": "32768",
+       "size": "131072",
+       "encryption": "aes-xts-plain64",
+       "key_size": 32
+      },
+      "kdf": {
+       "type": "pbkdf2",
+       "hash": "sha256",
+       "iterations": 1000,
+       "salt": "cWOS8dUr3dHk4QTryqz8LEF1Su77F4adfAI+QJfJRQY="
+      }
+     }
+    },
+    "tokens": {},
+    "segments": {
+     "0": {
+      "type": "crypt",
+      "offset": "2097152",
+      "size": "dynamic",
+      "iv_tweak": "0",
+      "encryption": "aes-xts-plain64",
+      "sector_size": 4096
+     }
+    },
+    "digests": {
+     "0": {
+      "type": "pbkdf2",
+      "keyslots": [
+       "0"
+      ],
+      "segments": [
+       "0"
+      ],
+      "hash": "sha256",
+      "iterations": 1000,
+      "salt": "9zJo3oQY/UqNsuEVgAE+c8GOJmUAVTz1ed55nh3/tuo=",
+      "digest": "nYx95dKAHJ1t9jeIbK9Y0qM6T5ZRD0hPScRHwLBCDso="
+     }
+    },
+    "config": {
+     "json_size": "12288",
+     "keyslots_size": "1048576"
+    }
+   }
+  },
+  "luks1-xts": {
+   "luksDump": "LUKS header information for /tmp/tmp.PBHb1yBDEq/luks1-xts.img\n\nVersion:       \t1\nCipher name:   \taes\nCipher mode:   \txts-plain64\nHash spec:     \tsha256\nPayload offset:\t4096\nMK bits:       \t512\nMK digest:     \tac 4e 67 c6 1e 08 37 d2 36 f1 f9 fb ff ed 65 90 bf a6 3e ae \nMK salt:       \t85 41 44 b5 dd 34 a4 35 c7 bd 3d 9a 65 02 5c 0a \n               \t0c 56 4d a9 a3 d7 c4 97 a6 23 98 3e 0e 78 5e 21 \nMK iterations: \t1000\nUUID:          \t24c5f84f-1962-430d-bfb0-e0be5e686f1d\n\nKey Slot 0: ENABLED\n\tIterations:         \t1000\n\tSalt:               \t09 a0 8d 94 3d 78 7d 59 8e 5b 26 a8 4a 72 32 29 \n\t                      \t12 7d 40 54 46 ef 52 f4 3b d3 40 ab 6a 1b 90 d9 \n\tKey material offset:\t8\n\tAF stripes:            \t4000\nKey Slot 1: DISABLED\nKey Slot 2: DISABLED\nKey Slot 3: DISABLED\nKey Slot 4: DISABLED\nKey Slot 5: DISABLED\nKey Slot 6: DISABLED\nKey Slot 7: DISABLED\n"
+  },
+  "luks1-cbc": {
+   "luksDump": "LUKS header information for /tmp/tmp.PBHb1yBDEq/luks1-cbc.img\n\nVersion:       \t1\nCipher name:   \taes\nCipher mode:   \tcbc-essiv:sha256\nHash spec:     \tsha1\nPayload offset:\t4096\nMK bits:       \t256\nMK digest:     \tff db 2a 99 53 57 7b d0 2b 0c cb 63 87 d8 ca 91 3f e8 ac d4 \nMK salt:       \tfc 76 da fb d1 cc 01 dc f3 76 40 e3 57 10 25 a0 \n               \t12 6c 09 2d f3 8d 2f 67 59 6c 03 bd 9f 03 b1 98 \nMK iterations: \t1000\nUUID:          \t34c4a36b-7bed-40a9-baeb-aab082fff2cf\n\nKey Slot 0: ENABLED\n\tIterations:         \t1000\n\tSalt:               \t83 98 07 10 74 a4 37 22 4b b9 ba 6b b0 cd 6e 7f \n\t                      \t38 ba 19 77 f5 50 78 1e da 74 7c 67 eb 58 d8 75 \n\tKey material offset:\t8\n\tAF stripes:            \t4000\nKey Slot 1: DISABLED\nKey Slot 2: DISABLED\nKey Slot 3: DISABLED\nKey Slot 4: DISABLED\nKey Slot 5: DISABLED\nKey Slot 6: DISABLED\nKey Slot 7: DISABLED\n"
+  }
+ }
+}

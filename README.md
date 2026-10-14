@@ -1406,6 +1406,60 @@ their 25 files, and the one being decrypted was not recognised as NTFS at all. T
 volumes are kept outside this repository; `tools/make_bitlocker_fixtures.py` builds the
 small ones the self-test reads.
 
+## LUKS
+
+Since 1.67. A LUKS1 or LUKS2 container is reported as `luks`, with its version, cipher,
+key size, where its data starts and its keyslots. Given a passphrase (`--password-file`,
+`--password-env`, or `unlock_luks()` from Python, which tries each one on each keyslot),
+its data is read decrypted in place, as a region of its own labelled
+`LUKS <where the container is>` and named `luks_lba<first sector of the data>`, so the
+filesystem or LVM2 physical volume inside is identified, listed, walked and extracted
+like any other, also when the container is inside a logical volume that is one run of
+extents. Without a passphrase that opens it, the container is listed as locked and says
+so; a header that does not read, or that names a cipher, a feature or a cost this does
+not take, is listed as not read and says why, before any passphrase is asked for, and
+costs the image nothing else. Apply `unlock_luks()` before `lvm_image()`, so a physical
+volume inside a container is seen, and after `unlock_bitlocker()` and `unlock_apfs()`; a
+BitLocker or APFS volume inside a LUKS container is therefore not opened. A passphrase
+is text: key files and binary key material are not taken, and `--password-file` takes
+its first line.
+
+The layouts are cryptsetup's (docs/on-disk-format.pdf for LUKS1, on-disk-format-luks2.pdf
+for LUKS2). A passphrase opens a keyslot through its key derivation (PBKDF2 with the
+hashes hashlib has; Argon2i and Argon2id with the argon2-cffi package, which is needed
+only for those), the key decrypts the keyslot's material, the material is merged from its
+anti-forensic stripes into the master key, and the master key counts as right only when
+its PBKDF2 digest matches the one a digest stores for that keyslot. A keyslot's key is
+derived at the length its area names (luks2_keyslot_luks2.c), which need not be the
+volume key's. A LUKS2 header is stored twice; each copy's checksum and the place it
+records for itself are checked, the second copy is looked for at cryptsetup's fixed
+offsets too when the first does not give its size, and of the copies that pass, the one
+with the higher sequence id is read. Costs past cryptsetup's own limits (Argon2 memory
+over 4 GiB, and iteration and stripe counts no benchmark gives) are refused, not run. The data is decrypted sector by sector with AES in XTS (plain64, plain) or CBC
+(essiv, plain64, plain), each sector's IV its number from the start of the data in
+512-byte units, also when a LUKS2 segment's sectors are 4096 bytes, plus the segment's
+`iv_tweak`. XTS-plain64 and CBC-ESSIV are exercised by the fixtures; XTS-plain,
+CBC-plain64 and CBC-plain, and a non-zero `iv_tweak`, are checked only on constructed
+input (the 32-bit wrap of plain, and the tweak's shift). AES needs the pycryptodome
+package, as BitLocker does.
+
+The fixtures were written by cryptsetup 2.8.4 (`tools/make_luks_fixtures.sh`): LUKS2 with
+Argon2id and two keyslots, LUKS2 with PBKDF2-SHA256, both AES-XTS with 4096-byte sectors,
+and LUKS1 with AES-XTS and with AES-CBC-ESSIV:SHA256, each holding ext4 with a file
+whose every 4 KiB block names its own number. The keyslot space no slot uses, which
+cryptsetup fills with random bytes, is zeroed so the images compress
+(`tools/luks_zero_unused.py`), and cryptsetup then opens each with its passphrases and
+refuses a wrong one. `--self-test` checks each header against cryptsetup's own
+`luksDump`, every file against sha256sum over the source tree, the second keyslot's
+passphrase, a wrong passphrase, a LUKS2 header copy that fails its checksum and one with a
+higher sequence id, a copy that records another place, both copies damaged, an unknown
+version, crafted metadata (a missing field, keyslots that are not an object, a size that
+is not a number, dm-integrity, a serpent cipher, an Argon2 memory cost of 4 TiB), a
+digest limited to one keyslot, a keyslot key shorter than the volume key, a container
+written inside a logical volume, and, as a control, that counting a 4096-byte sector's
+IV in 4096-byte units would have decrypted every sector after the first wrongly. Not
+exercised: a LUKS container on a real disk image.
+
 ## F2FS
 
 F2FS is the filesystem Android uses for `/data` on most phones, so an Android
@@ -1903,10 +1957,21 @@ is not used; the other volumes of the image are unaffected. lvm2's configuration
 read as lvm2 writes it; single-quoted strings, floating-point, hexadecimal and octal
 (leading-zero) numbers, which lvm2 accepts but does not write, are refused.
 
+Since 1.67, a RAID1 volume, and an old-style mirror, is read from the first of its copies
+whose extents are all in the image: lvm2 lists a raid1 segment's copies under `raids`
+(raid.c) and a mirror's under `mirrors` (mirrored.c), each a hidden logical volume
+holding the volume's data from its start. Which copies are in sync is kept in the RAID
+metadata, which is not read, so a copy that fell out of sync is read as it is; a
+segment with a `data_offset`, which lvm2 writes while a reshape moves the data, is not
+read. On the fixture the two copies hold the same bytes, the files read from the first
+match their source, and with the first copy's physical volume missing the second is read.
+The old-style mirror is read by the same code but no fixture holds one.
+
 Not read, and named in the physical volume's report with the reason (since 1.65 also in its
-`note` in `volumes()`, which a LEAPP run log prints): a RAID volume, one with a run on a
-physical volume that is not in the image, and one on extents of something that is not a
-physical volume of the group (a move in progress). Mirrored (old style), thin, cache, VDO and snapshot volumes are refused by
+`note` in `volumes()`, which a LEAPP run log prints): a RAID volume other than RAID1, one
+with a run on a physical volume that is not in the image, and one on extents of something
+that is not a physical volume of the group (a move in progress). Thin, cache, VDO and
+snapshot volumes are refused by
 their segment type too, but no fixture holds one, so that path is unexercised; a
 snapshot is to be named by the volume lvm2 lists for it (`cow_store`), which is checked
 on a constructed segment, not on a real snapshot. lvm2's hidden internal volumes
@@ -2471,10 +2536,15 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
-- **LVM2: linear and striped logical volumes are read.** A mirrored, RAID, thin, cache,
-  VDO or snapshot volume, or one with a run on a physical volume missing from the image,
-  is named in the report with why and not read (see "LVM2" above). LUKS is not read at all: a LUKS volume, under LVM or inside it,
-  shows as not recognised.
+- **LVM2: linear, striped, RAID1 and mirror logical volumes are read.** A RAID volume of
+  another level, a thin, cache, VDO or snapshot volume, or one with a run on a physical
+  volume missing from the image, is named in the report with why and not read (see
+  "LVM2" above).
+- **LUKS: AES only, and only what a passphrase opens.** A LUKS container with another
+  cipher, with dm-integrity, with a keyslot that is not of the luks2 type, or being
+  re-encrypted is named and not read (see "LUKS" above). A detached LUKS2 header is not
+  read: the data it describes carries no header to find. A LUKS container inside a
+  logical volume read through a map is not opened, and its note says so.
 - **Overlay compression with LZX is recognised but not read.** A file compressed with
   `compact /exe:lzx` is listed with its recorded size and refused by name; the three
   XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
