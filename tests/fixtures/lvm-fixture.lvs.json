@@ -1,0 +1,194 @@
+{
+ "pvs": {
+  "report": [
+   {
+    "pv": [
+     {
+      "pv_name": "/dev/loop17p1",
+      "pv_uuid": "iM0A2n-DgL9-B3BZ-mJaw-A10u-8HaM-cy1jb3",
+      "pe_start": "1048576B",
+      "vg_name": "fixvg"
+     },
+     {
+      "pv_name": "/dev/loop17p2",
+      "pv_uuid": "F51p3L-ASG4-1hgy-Qs7l-Qh43-08pt-z1S1Wq",
+      "pe_start": "1048576B",
+      "vg_name": "fixvg"
+     }
+    ]
+   }
+  ],
+  "log": []
+ },
+ "segments": {
+  "report": [
+   {
+    "seg": [
+     {
+      "vg_name": "fixvg",
+      "lv_name": "data",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "3",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:6-8",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "data",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "3",
+      "seg_size_pe": "3",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:11-13",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "gap",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "2",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:9-10",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "grow",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "4",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:16-19",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "mirror",
+      "lv_attr": "rwi-a-r---",
+      "seg_start_pe": "0",
+      "seg_size_pe": "2",
+      "segtype": "raid1",
+      "stripes": "2",
+      "seg_pe_ranges": "mirror_rimage_0:0-1 mirror_rimage_1:0-1",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "[mirror_rimage_0]",
+      "lv_attr": "iwi-aor---",
+      "seg_start_pe": "0",
+      "seg_size_pe": "2",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:21-22",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "[mirror_rimage_1]",
+      "lv_attr": "iwi-aor---",
+      "seg_start_pe": "0",
+      "seg_size_pe": "2",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p2:7-8",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "[mirror_rmeta_0]",
+      "lv_attr": "ewi-aor---",
+      "seg_start_pe": "0",
+      "seg_size_pe": "1",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:20-20",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "[mirror_rmeta_1]",
+      "lv_attr": "ewi-aor---",
+      "seg_start_pe": "0",
+      "seg_size_pe": "1",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p2:6-6",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "onb",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "4",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p2:0-3",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "root",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "6",
+      "segtype": "linear",
+      "stripes": "1",
+      "seg_pe_ranges": "/dev/loop17p1:0-5",
+      "vg_extent_size": "1048576B"
+     },
+     {
+      "vg_name": "fixvg",
+      "lv_name": "striped",
+      "lv_attr": "-wi-a-----",
+      "seg_start_pe": "0",
+      "seg_size_pe": "4",
+      "segtype": "striped",
+      "stripes": "2",
+      "seg_pe_ranges": "/dev/loop17p1:14-15 /dev/loop17p2:4-5",
+      "vg_extent_size": "1048576B"
+     }
+    ]
+   }
+  ],
+  "log": []
+ },
+ "parts": {
+  "partitiontable": {
+   "label": "gpt",
+   "id": "71AC0F21-23C2-4BA2-8B19-920B07C9440A",
+   "device": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img",
+   "unit": "sectors",
+   "firstlba": 34,
+   "lastlba": 131038,
+   "sectorsize": 512,
+   "partitions": [
+    {
+     "node": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img1",
+     "start": 2048,
+     "size": 49152,
+     "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
+     "uuid": "4D2C47F2-5D5F-4CD0-A4B2-903F911B0056",
+     "name": "lvm-a"
+    },
+    {
+     "node": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img2",
+     "start": 51200,
+     "size": 40960,
+     "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
+     "uuid": "F64DFFC8-C0F0-47F0-A250-DCA660DAF233",
+     "name": "lvm-b"
+    }
+   ]
+  }
+ },
+ "loop": "/dev/loop17"
+}
