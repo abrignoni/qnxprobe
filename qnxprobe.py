@@ -13671,7 +13671,10 @@ def _lvm_self_checks():
                                                 "lvm-wholedisk.pvs.json")}
     absent = [n for n, p in paths.items() if not os.path.isfile(p)]
     if absent:
-        return [(f"the LVM fixtures are beside this script ({', '.join(absent)} absent)", False)]
+        # A frozen executable has no fixtures beside it: say so, as the other
+        # fixture checks do, rather than fail.
+        return [(f"the LVM fixtures are not beside this script ({', '.join(absent)}), so the "
+                 "LVM2 reader was not checked against them", None)]
     out = []
     with gzip.open(paths["lvm-fixture.img.gz"], "rb") as gz:
         disk = gz.read()
@@ -20180,6 +20183,9 @@ def self_test():
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks = [(f"the LVM2 checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
+            if cond is None:
+                print(f"  [SKIP] {label}")
+                continue
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
