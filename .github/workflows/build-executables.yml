@@ -61,6 +61,8 @@ jobs:
           # the vendored ewfprobe decrypts encrypted Apple disk images and AD-encrypted
           # FTK Imager acquisitions with it
           python -m pip install --only-binary=:all: pycryptodome
+          # argon2-cffi derives a LUKS2 keyslot's Argon2 key (the self-test opens one)
+          python -m pip install --only-binary=:all: argon2-cffi
 
       - name: Check the vendored reader still matches what was vendored
         run: python tools/check_vendored.py

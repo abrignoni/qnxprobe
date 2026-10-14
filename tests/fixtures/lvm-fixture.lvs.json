@@ -5,13 +5,13 @@
     "pv": [
      {
       "pv_name": "/dev/loop14p1",
-      "pv_uuid": "vHJnFc-7ON3-CH1n-4dMw-iVaY-P8Af-CEs2Yc",
+      "pv_uuid": "U7c2je-et75-kdoZ-iCI0-gGxd-pje8-2Y4COH",
       "pe_start": "1048576B",
       "vg_name": "fixvg"
      },
      {
       "pv_name": "/dev/loop14p2",
-      "pv_uuid": "d4UDfq-bAms-zThT-vwJM-34K0-UZUD-F5rcdw",
+      "pv_uuid": "UWh6jW-dijH-XDQe-M389-KXVp-RHmS-q023Hg",
       "pe_start": "1048576B",
       "vg_name": "fixvg"
      }
@@ -164,27 +164,27 @@
  "parts": {
   "partitiontable": {
    "label": "gpt",
-   "id": "C222FC58-679C-46AD-B7DB-071735E04982",
-   "device": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img",
+   "id": "381A622A-DC3F-4692-A3F0-B7A8F4D953E8",
+   "device": "/tmp/tmp.oazWtaLZvB/lvm-fixture.img",
    "unit": "sectors",
    "firstlba": 34,
    "lastlba": 131038,
    "sectorsize": 512,
    "partitions": [
     {
-     "node": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img1",
+     "node": "/tmp/tmp.oazWtaLZvB/lvm-fixture.img1",
      "start": 2048,
      "size": 49152,
      "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
-     "uuid": "1526476E-2DB9-4653-B7BB-19F6F4D89D3B",
+     "uuid": "EE703478-7630-437A-B8FE-D5EF89D2B61C",
      "name": "lvm-a"
     },
     {
-     "node": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img2",
+     "node": "/tmp/tmp.oazWtaLZvB/lvm-fixture.img2",
      "start": 51200,
      "size": 40960,
      "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
-     "uuid": "BBE40D31-BAE2-408F-A19C-A3ACDE2A4F6A",
+     "uuid": "7BAC27AA-1CE7-4346-930D-764094A8DF8C",
      "name": "lvm-b"
     }
    ]

@@ -18,7 +18,7 @@
 #            tree/striped, a file that crosses both stripes many times
 #   grow     2 MiB then +2 MiB straight after it, on partition 1
 #   mirror   2 MiB, raid1 across both partitions, whose image and metadata legs are
-#            hidden internal volumes
+#            hidden internal volumes, ext4 holding tree/mirror
 # lvm-wholedisk.img, 16 MiB, no partition table, the whole disk one PV whose extents start
 # 3 MiB in (--dataalignment 3m, so pe_start differs from the 1 MiB extent size), volume
 # group wholevg with one linear volume, root, ext4 holding tree/root.
@@ -34,7 +34,7 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir -p "$work/tree/root/etc" "$work/tree/root/var/log" "$work/tree/onb/docs" "$work/tree/data" "$work/tree/striped"
+mkdir -p "$work/tree/root/etc" "$work/tree/root/var/log" "$work/tree/onb/docs" "$work/tree/data" "$work/tree/striped" "$work/tree/mirror"
 python3 - "$work/tree" <<'PY'
 import os, random, sys
 os.chdir(sys.argv[1])
@@ -60,6 +60,7 @@ def blocks(n, tag):
 open('data/runs.bin', 'wb').write(blocks(1100, 'data'))      # 4.3 MiB of a 6 MiB volume in two runs
 open('striped/stripes.bin', 'wb').write(blocks(700, 'striped'))  # 2.7 MiB of a 4 MiB volume on two stripes
 open('data/note.txt', 'w').write('this volume is two runs of extents with another volume between them\n')
+open('mirror/legs.bin', 'wb').write(blocks(300, 'mirror'))   # 1.2 MiB of a 2 MiB RAID1 volume
 PY
 (cd "$work/tree" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sed 's|  \./|  |') > "$out/lvm-fixture.sha256"
 
@@ -86,6 +87,10 @@ mkfs.ext4 -q -L rootfix -d "$work/tree/root" /dev/fixvg/root
 mkfs.ext4 -q -L onbfix -d "$work/tree/onb" /dev/fixvg/onb
 mkfs.ext4 -q -L datafix -d "$work/tree/data" /dev/fixvg/data
 mkfs.ext4 -q -L stripefix -d "$work/tree/striped" /dev/fixvg/striped
+mkfs.ext4 -q -L mirrorfix -d "$work/tree/mirror" /dev/fixvg/mirror
+# both legs hold every write once the volume is in sync; wait for it, so the legs
+# the fixture keeps are copies of each other
+for _ in $(seq 1 60); do [ "$(lvs "${L[@]}" --noheadings -o sync_percent fixvg/mirror | tr -d ' ')" = 100.00 ] && break; sleep 0.5; done
 {
   echo '{"pvs":'
   pvs "${L[@]}" --reportformat json --units b -o pv_name,pv_uuid,pe_start,vg_name
