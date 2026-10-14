@@ -2,7 +2,8 @@
 
 Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+ and APFS filesystems,
 the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
-images, out of raw disk images and flash dumps: identify each by its own on-disk structure
+images, out of raw disk images and flash dumps, including the linear logical volumes of an
+LVM2 physical volume: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
 
@@ -1846,6 +1847,60 @@ These images are what make the history rules testable: a deliberate change to an
 (newest version or name first, journal replay, truncation, name deletion, keeping a
 relinked inode, the newest copy of a UBI block) turns the self-test red.
 
+## LVM2
+
+Since 1.64. An LVM2 physical volume, a partition or a whole disk that carries lvm2's
+label, is reported as `lvm2 pv`, and each of its logical volumes that is linear and lies
+in one run of extents on one physical volume in the image is listed as a volume of its
+own, labelled `LVM <volume group>/<logical volume>` and named
+`lvm_lba<first sector>_<group>_<volume>`, the sector counted in the disk's sector size as
+the partition names are (checked with a 4096-byte sector size given; no 4Kn image with
+LVM was run). Such a volume is a byte range of the image like a partition, so
+it is identified, listed, walked and extracted at its true offset, and its free space is
+written out where that filesystem's reader reports free space (the ext reader does not).
+
+The layout follows lvm2's own code (lvmteam/lvm2 at tag v2_03_43). A label is taken as
+lvm2 takes it: `LABELONE` in one of the first four sectors, naming that sector and
+passing its checksum, of type `LVM2 001`; one that fails is passed over and the next
+sector tried. Then the pv_header, each metadata area's header (its checksum checked),
+and the committed metadata text (its checksum checked), which wraps past the end of its
+area back to just after the header. A copy lvm2 marks ignored is not used. When the
+volume group spans several physical volumes, the copy with the highest `seqno` decides,
+and a copy whose checksum fails is named in the report and the others are used. A
+label with no good metadata area behind it counts only when a volume group read from
+another physical volume names it, so a stray label does not hide the filesystem in a
+region. Metadata text that does not parse, or that parses with a value of the wrong
+kind where lvm2 writes a number, a section, a string or a list, is reported and that copy
+is not used; the other volumes of the image are unaffected. lvm2's configuration syntax is
+read as lvm2 writes it; single-quoted strings, floating-point, hexadecimal and octal
+(leading-zero) numbers, which lvm2 accepts but does not write, are refused.
+
+Not read, and named in the physical volume's report with the reason: a logical volume
+whose extents are split into separate runs (extended into a gap, or across physical
+volumes), a striped or RAID volume, one on a physical volume that is not in the image,
+and one on extents of something that is not a physical volume of the group (a move in
+progress). Mirrored (old style), thin, cache, VDO and snapshot volumes are refused by
+their segment type too, but no fixture holds one, so that path is unexercised; a
+snapshot is to be named by the volume lvm2 lists for it (`cow_store`), which is checked
+on a constructed segment, not on a real snapshot. lvm2's hidden internal volumes
+(a RAID volume's image and metadata legs, a pool's data) are not listed. A volume
+group's unallocated extents are not written out as free space.
+
+The fixtures were written by lvm2 itself (`tools/make_lvm_fixtures.sh`, lvm2 2.03.31 on
+Linux): a GPT disk with two physical volumes holding a contiguous volume, a volume split
+by another, one on the second physical volume, a striped and a RAID1 volume, and a disk
+that is one whole physical volume whose extents start 3 MiB in while they are 1 MiB
+long. `--self-test` checks the volumes read against lvm2's own report (`lvs`, `pvs`)
+saved beside them, every file against sha256sum over the source trees, and the inputs
+lvm2 would refuse or that were damaged or crafted after it wrote them: a moved label, a
+failed checksum on a label, a metadata header and the text, an older copy on either
+physical volume, an ignored copy, wrapped text, unterminated and deeply nested text,
+values of the wrong kind, and a second partition carrying the same physical volume id. On
+the public image of The Open University's "Defaced web server (Ubuntu 22.04)"
+simulation (https://doi.org/10.21954/ou.rd.26038669.v1), whose root filesystem is in a
+logical volume, 1.63 reported that partition only as not recognised; 1.64 reads the
+logical volume as ext4 and walks its 93,747 entries.
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
@@ -2383,6 +2438,11 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
+- **LVM2: only linear logical volumes in one run are read.** A volume split into
+  separate runs of extents, striped, mirrored, RAID, thin, cache, VDO or a snapshot, or
+  on a physical volume missing from the image, is named in the report with why and not
+  read (see "LVM2" above). LUKS is not read at all: a LUKS volume, under LVM or inside it,
+  shows as not recognised.
 - **Overlay compression with LZX is recognised but not read.** A file compressed with
   `compact /exe:lzx` is listed with its recorded size and refused by name; the three
   XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
