@@ -13760,8 +13760,10 @@ def _lvm_self_checks():
                         bool(wantf) and gotf == wantf))
 
     # The report main() prints names each logical volume read, with its kind.
+    import shutil
     import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
+    tmp = tempfile.mkdtemp(prefix="qnxprobe-lvm-")       # the form the CI fixture step replaces
+    try:
         path = os.path.join(tmp, "lvm-fixture.img")
         with open(path, "wb") as f:
             f.write(disk)
@@ -13769,6 +13771,8 @@ def _lvm_self_checks():
         with contextlib.redirect_stdout(buf):
             main(path)
         text = buf.getvalue()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     out.append(("the report lists each logical volume read, identified as ext4 where it is",
                 all(f"{lab}   " in text for lab, _b, _n in want)
                 and "LVM fixvg/root   6.0 MiB   ->  ext4" in text
