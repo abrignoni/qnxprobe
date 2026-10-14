@@ -4,14 +4,14 @@
    {
     "pv": [
      {
-      "pv_name": "/dev/loop17p1",
-      "pv_uuid": "iM0A2n-DgL9-B3BZ-mJaw-A10u-8HaM-cy1jb3",
+      "pv_name": "/dev/loop14p1",
+      "pv_uuid": "vHJnFc-7ON3-CH1n-4dMw-iVaY-P8Af-CEs2Yc",
       "pe_start": "1048576B",
       "vg_name": "fixvg"
      },
      {
-      "pv_name": "/dev/loop17p2",
-      "pv_uuid": "F51p3L-ASG4-1hgy-Qs7l-Qh43-08pt-z1S1Wq",
+      "pv_name": "/dev/loop14p2",
+      "pv_uuid": "d4UDfq-bAms-zThT-vwJM-34K0-UZUD-F5rcdw",
       "pe_start": "1048576B",
       "vg_name": "fixvg"
      }
@@ -32,7 +32,7 @@
       "seg_size_pe": "3",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:6-8",
+      "seg_pe_ranges": "/dev/loop14p1:6-8",
       "vg_extent_size": "1048576B"
      },
      {
@@ -43,7 +43,7 @@
       "seg_size_pe": "3",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:11-13",
+      "seg_pe_ranges": "/dev/loop14p1:11-13",
       "vg_extent_size": "1048576B"
      },
      {
@@ -54,7 +54,7 @@
       "seg_size_pe": "2",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:9-10",
+      "seg_pe_ranges": "/dev/loop14p1:9-10",
       "vg_extent_size": "1048576B"
      },
      {
@@ -65,7 +65,7 @@
       "seg_size_pe": "4",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:16-19",
+      "seg_pe_ranges": "/dev/loop14p1:16-19",
       "vg_extent_size": "1048576B"
      },
      {
@@ -87,7 +87,7 @@
       "seg_size_pe": "2",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:21-22",
+      "seg_pe_ranges": "/dev/loop14p1:21-22",
       "vg_extent_size": "1048576B"
      },
      {
@@ -98,7 +98,7 @@
       "seg_size_pe": "2",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p2:7-8",
+      "seg_pe_ranges": "/dev/loop14p2:7-8",
       "vg_extent_size": "1048576B"
      },
      {
@@ -109,7 +109,7 @@
       "seg_size_pe": "1",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:20-20",
+      "seg_pe_ranges": "/dev/loop14p1:20-20",
       "vg_extent_size": "1048576B"
      },
      {
@@ -120,7 +120,7 @@
       "seg_size_pe": "1",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p2:6-6",
+      "seg_pe_ranges": "/dev/loop14p2:6-6",
       "vg_extent_size": "1048576B"
      },
      {
@@ -131,7 +131,7 @@
       "seg_size_pe": "4",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p2:0-3",
+      "seg_pe_ranges": "/dev/loop14p2:0-3",
       "vg_extent_size": "1048576B"
      },
      {
@@ -142,7 +142,7 @@
       "seg_size_pe": "6",
       "segtype": "linear",
       "stripes": "1",
-      "seg_pe_ranges": "/dev/loop17p1:0-5",
+      "seg_pe_ranges": "/dev/loop14p1:0-5",
       "vg_extent_size": "1048576B"
      },
      {
@@ -153,7 +153,7 @@
       "seg_size_pe": "4",
       "segtype": "striped",
       "stripes": "2",
-      "seg_pe_ranges": "/dev/loop17p1:14-15 /dev/loop17p2:4-5",
+      "seg_pe_ranges": "/dev/loop14p1:14-15 /dev/loop14p2:4-5",
       "vg_extent_size": "1048576B"
      }
     ]
@@ -164,31 +164,31 @@
  "parts": {
   "partitiontable": {
    "label": "gpt",
-   "id": "71AC0F21-23C2-4BA2-8B19-920B07C9440A",
-   "device": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img",
+   "id": "C222FC58-679C-46AD-B7DB-071735E04982",
+   "device": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img",
    "unit": "sectors",
    "firstlba": 34,
    "lastlba": 131038,
    "sectorsize": 512,
    "partitions": [
     {
-     "node": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img1",
+     "node": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img1",
      "start": 2048,
      "size": 49152,
      "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
-     "uuid": "4D2C47F2-5D5F-4CD0-A4B2-903F911B0056",
+     "uuid": "1526476E-2DB9-4653-B7BB-19F6F4D89D3B",
      "name": "lvm-a"
     },
     {
-     "node": "/tmp/tmp.ObBe0yrrNF/lvm-fixture.img2",
+     "node": "/tmp/tmp.A6nx1Zbi8o/lvm-fixture.img2",
      "start": 51200,
      "size": 40960,
      "type": "E6D6D379-F507-44C2-A23C-238F2A3DF928",
-     "uuid": "F64DFFC8-C0F0-47F0-A250-DCA660DAF233",
+     "uuid": "BBE40D31-BAE2-408F-A19C-A3ACDE2A4F6A",
      "name": "lvm-b"
     }
    ]
   }
  },
- "loop": "/dev/loop17"
+ "loop": "/dev/loop14"
 }

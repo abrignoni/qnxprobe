@@ -10,10 +10,12 @@
 #
 # lvm-fixture.img, 64 MiB, GPT with two LVM partitions, volume group fixvg, 1 MiB extents:
 #   root     6 MiB, linear, one run on partition 1, ext4 holding tree/root
-#   data     3 MiB then +3 MiB after gap was made, so two runs with gap between them
+#   data     3 MiB then +3 MiB after gap was made, so two runs with gap between them,
+#            ext4 holding tree/data, a file that crosses both runs
 #   gap      2 MiB, linear, between data's two runs
 #   onb      4 MiB, linear, on partition 2, ext4 holding tree/onb
-#   striped  4 MiB, striped across both partitions
+#   striped  4 MiB, striped across both partitions in 64 KiB stripes, ext4 holding
+#            tree/striped, a file that crosses both stripes many times
 #   grow     2 MiB then +2 MiB straight after it, on partition 1
 #   mirror   2 MiB, raid1 across both partitions, whose image and metadata legs are
 #            hidden internal volumes
@@ -32,7 +34,7 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir -p "$work/tree/root/etc" "$work/tree/root/var/log" "$work/tree/onb/docs"
+mkdir -p "$work/tree/root/etc" "$work/tree/root/var/log" "$work/tree/onb/docs" "$work/tree/data" "$work/tree/striped"
 python3 - "$work/tree" <<'PY'
 import os, random, sys
 os.chdir(sys.argv[1])
@@ -44,6 +46,20 @@ open('root/var/log/syslog', 'wb').write(blob(200 * 1024 + 7))
 open('root/hello.txt', 'w').write('hello from a logical volume\n')
 open('onb/docs/notes.txt', 'w').write('this volume lives on the second physical volume\n')
 open('onb/docs/data.bin', 'wb').write(blob(700 * 1024 + 3))
+# Files that cross every run and every stripe: each 4 KiB block names its own
+# number, so a block read from the wrong place cannot match, and the rest of
+# the block repeats a digest of that number, so the image still compresses.
+import hashlib
+def blocks(n, tag):
+    out = bytearray()
+    for i in range(n):
+        head = f"{tag} block {i:08d}\n".encode()
+        fill = hashlib.sha256(f"{tag}{i}".encode()).hexdigest().encode() * 64
+        out += (head + fill)[:4096]
+    return bytes(out)
+open('data/runs.bin', 'wb').write(blocks(1100, 'data'))      # 4.3 MiB of a 6 MiB volume in two runs
+open('striped/stripes.bin', 'wb').write(blocks(700, 'striped'))  # 2.7 MiB of a 4 MiB volume on two stripes
+open('data/note.txt', 'w').write('this volume is two runs of extents with another volume between them\n')
 PY
 (cd "$work/tree" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sed 's|  \./|  |') > "$out/lvm-fixture.sha256"
 
@@ -68,7 +84,8 @@ lvcreate "${L[@]}" -q -y -W n -Z n --type raid1 -m 1 -L 2M -n mirror fixvg "$a" 
 udevadm settle
 mkfs.ext4 -q -L rootfix -d "$work/tree/root" /dev/fixvg/root
 mkfs.ext4 -q -L onbfix -d "$work/tree/onb" /dev/fixvg/onb
-mkfs.ext4 -q -L datafix /dev/fixvg/data
+mkfs.ext4 -q -L datafix -d "$work/tree/data" /dev/fixvg/data
+mkfs.ext4 -q -L stripefix -d "$work/tree/striped" /dev/fixvg/striped
 {
   echo '{"pvs":'
   pvs "${L[@]}" --reportformat json --units b -o pv_name,pv_uuid,pe_start,vg_name
