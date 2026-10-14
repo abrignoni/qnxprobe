@@ -2,8 +2,8 @@
 
 Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+ and APFS filesystems,
 the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
-images, out of raw disk images and flash dumps, including the linear logical volumes of an
-LVM2 physical volume: identify each by its own on-disk structure
+images, out of raw disk images and flash dumps, including the linear and striped logical
+volumes of an LVM2 physical volume: identify each by its own on-disk structure
 rather than trusting a partition type byte, list, and extract to a zip with a
 provenance manifest. No mounting, no admin rights, standard library only.
 
@@ -1859,6 +1859,34 @@ LVM was run). Such a volume is a byte range of the image like a partition, so
 it is identified, listed, walked and extracted at its true offset, and its free space is
 written out where that filesystem's reader reports free space (the ext reader does not).
 
+Since 1.66, a logical volume whose extents are split into separate runs (extended into a
+gap, or across physical volumes) or striped, its every run on a physical volume in the
+image, is read too, through a map of where each of its bytes lies, as lvm2's linear and
+striped segment types lay them out (`lvm_image()`, `LvmMap`). The volume is placed past
+everything the image can describe, its end and the end of every region its tables name,
+and never below 2^60 bytes, so every reader works on it unchanged while a read of the disk,
+even of a partition a partial image's table names past the file, never lands there;
+`image_size()` stays the image's own. A placed base is valid only through the handle
+`lvm_image()` returns. Its place is not reported as an offset: in `volumes()` its `lba`
+is `None` and `lvm_map` gives each run,
+the report prints its first four runs, its record in
+`volumes.json` has `offset_bytes` and `lba` null and an `lvm_map` list with each
+segment's offset in the volume, length, the image offset of each run and the stripe
+size, `unallocated.json` carries the same map, and free space found in it is written at
+the image offsets it lies at. `volumes()` and `main()` apply `lvm_image()` themselves; a
+caller that builds its own volume list from the identifiers applies it to its image
+first, after `unlock_bitlocker()` and `unlock_apfs()`, whose wrappers read only up to
+the image's own size. A BitLocker or APFS volume inside a mapped logical volume is not
+opened.
+
+Free space, since 1.66: an LVM2 physical volume's extents that no logical volume holds,
+hidden ones included and both sides of a move in progress (lvm2 keeps a pvmove's
+extents under a mirror segment), are its free space for `--unallocated` and
+`write_unallocated()`, each run at its own offset; the label and metadata before the
+first extent, and any space past the last, are not included. On the Ubuntu image below
+that is one run of about 898 GiB: its one logical volume holds 100 GiB of a 998 GiB
+volume group.
+
 The layout follows lvm2's own code (lvmteam/lvm2 at tag v2_03_43). A label is taken as
 lvm2 takes it: `LABELONE` in one of the first four sectors, naming that sector and
 passing its checksum, of type `LVM2 001`; one that fails is passed over and the next
@@ -1876,27 +1904,31 @@ read as lvm2 writes it; single-quoted strings, floating-point, hexadecimal and o
 (leading-zero) numbers, which lvm2 accepts but does not write, are refused.
 
 Not read, and named in the physical volume's report with the reason (since 1.65 also in its
-`note` in `volumes()`, which a LEAPP run log prints): a logical volume
-whose extents are split into separate runs (extended into a gap, or across physical
-volumes), a striped or RAID volume, one on a physical volume that is not in the image,
-and one on extents of something that is not a physical volume of the group (a move in
-progress). Mirrored (old style), thin, cache, VDO and snapshot volumes are refused by
+`note` in `volumes()`, which a LEAPP run log prints): a RAID volume, one with a run on a
+physical volume that is not in the image, and one on extents of something that is not a
+physical volume of the group (a move in progress). Mirrored (old style), thin, cache, VDO and snapshot volumes are refused by
 their segment type too, but no fixture holds one, so that path is unexercised; a
 snapshot is to be named by the volume lvm2 lists for it (`cow_store`), which is checked
 on a constructed segment, not on a real snapshot. lvm2's hidden internal volumes
-(a RAID volume's image and metadata legs, a pool's data) are not listed. A volume
-group's unallocated extents are not written out as free space.
+(a RAID volume's image and metadata legs, a pool's data) are not listed.
 
 The fixtures were written by lvm2 itself (`tools/make_lvm_fixtures.sh`, lvm2 2.03.31 on
 Linux): a GPT disk with two physical volumes holding a contiguous volume, a volume split
-by another, one on the second physical volume, a striped and a RAID1 volume, and a disk
+by another and holding a file that crosses both of its runs, one on the second physical
+volume, a striped volume holding a file that crosses its 64 KiB stripes many times, a
+RAID1 volume, and a disk
 that is one whole physical volume whose extents start 3 MiB in while they are 1 MiB
 long. `--self-test` checks the volumes read against lvm2's own report (`lvs`, `pvs`)
-saved beside them, every file against sha256sum over the source trees, and the inputs
+saved beside them, the runs each map covers against the extents that report gives,
+every file against sha256sum over the source trees (each 4 KiB block of the files that
+cross runs and stripes names its own number), the unallocated extents written against
+the ones the report leaves free, and the inputs
 lvm2 would refuse or that were damaged or crafted after it wrote them: a moved label, a
 failed checksum on a label, a metadata header and the text, an older copy on either
 physical volume, an ignored copy, wrapped text, unterminated and deeply nested text,
-values of the wrong kind, and a second partition carrying the same physical volume id. On
+values of the wrong kind, a second partition carrying the same physical volume id, a
+partial image whose table names a partition past the file, an image cut short, and a
+constructed pvmove in progress. On
 the public image of The Open University's "Defaced web server (Ubuntu 22.04)"
 simulation (https://doi.org/10.21954/ou.rd.26038669.v1), whose root filesystem is in a
 logical volume, 1.63 reported that partition only as not recognised; 1.64 reads the
@@ -2439,10 +2471,9 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
-- **LVM2: only linear logical volumes in one run are read.** A volume split into
-  separate runs of extents, striped, mirrored, RAID, thin, cache, VDO or a snapshot, or
-  on a physical volume missing from the image, is named in the report with why and not
-  read (see "LVM2" above). LUKS is not read at all: a LUKS volume, under LVM or inside it,
+- **LVM2: linear and striped logical volumes are read.** A mirrored, RAID, thin, cache,
+  VDO or snapshot volume, or one with a run on a physical volume missing from the image,
+  is named in the report with why and not read (see "LVM2" above). LUKS is not read at all: a LUKS volume, under LVM or inside it,
   shows as not recognised.
 - **Overlay compression with LZX is recognised but not read.** A file compressed with
   `compact /exe:lzx` is listed with its recorded size and refused by name; the three
