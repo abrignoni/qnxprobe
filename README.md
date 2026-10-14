@@ -1047,6 +1047,28 @@ byte-identical to `icat`'s reading; `$BadClus:$Bad` is left out. That journal is
 enough to have no hole at its front, so the front-hole rule is still checked against the
 fixture's shape only.
 
+
+### Directory indexes
+
+Since 1.63. `NtfsWalker.directory_index(record)` gives `[("$I30", node, size)]` for a
+directory whose file name index has grown into an `$INDEX_ALLOCATION` attribute, and `[]`
+for any other record. The node is an `NtfsStreamRef`, so `read_file()`, `entry()` and
+`stamps()` take it as they take a stream's.
+
+What is read is the attribute as the volume stores it: one index block after another,
+each `idx_size` bytes and starting `INDX`, with the update sequence array of each block
+not applied. The space past a block's last entry can still hold entries NTFS has since
+removed, and that is what this is for. `listdir()` is what lists a directory.
+
+The index is not an alternate data stream. `streams()`, `listing(streams=True)` and
+`--list` do not show it, and nothing that already reads a volume changes: a caller has
+to ask for it.
+
+The self-test reads the index allocation of the five directories of
+`tests/fixtures/ntfs-fixture.img.gz` that have one, and checks that the blocks, fixed up,
+hold with each directory's index root exactly the entries `listdir()` gives. It has not
+been compared with another tool's reading of the same blocks.
+
 ### What a file stores, cloud placeholders and overlay compression
 
 Since 1.56. The size a file records and the bytes a volume holds for it are different
