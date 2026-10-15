@@ -1,6 +1,6 @@
 # qnxprobe
 
-Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+ and APFS filesystems,
+Read QNX6, QNX4, ETFS, EFS, ext2/3/4, Btrfs, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, APFS and XFS filesystems,
 the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
 images, out of raw disk images and flash dumps, including the linear and striped logical
 volumes of an LVM2 physical volume: identify each by its own on-disk structure
@@ -70,6 +70,10 @@ and LZ4, which the standard library lacks, are carried as small pure-Python deco
 libnvram store found on the chip is handed over as a one-file volume holding its bytes (see
 [Raw flash dumps and NAND spare bytes](#raw-flash-dumps-and-nand-spare-bytes)).
 
+It also reads XFS, the default filesystem of Red Hat Enterprise Linux and common on Linux
+servers and storage appliances: version 4 and version 5 (with CRCs), every directory
+format and both forms of extent map. See [XFS](#xfs).
+
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image. A second, optional file, `qnxprobe_gui.py`, puts a
 window over it (see [The window](#the-window)); it is standard library too.
@@ -78,7 +82,7 @@ window over it (see [The window](#the-window)); it is standard library too.
 
 Python 3, and nothing else. No packages, no install step.
 
-Reading zstd-compressed SquashFS or UBIFS needs Python 3.14 or later, whose standard
+Reading zstd-compressed SquashFS, UBIFS or Btrfs needs Python 3.14 or later, whose standard
 library adds `compression.zstd`. On an older Python those files are named and reported as
 not read (see [What it does not do](#what-it-does-not-do)). The
 [executables](#executables) carry their own Python 3.14, so they read zstd wherever they
@@ -123,7 +127,7 @@ the report uses, and walks it with the same reader classes the extractor uses.
 Directories load when you expand them, and a selected file can be saved out on
 its own. The Kind column tells regular files from directories, symlinks and
 special entries; only regular files can be saved. Created and Accessed are filled
-for NTFS, which stores all three times as instants; the other readers carry only
+for NTFS and ReFS, which store all three times as instants; the other readers carry only
 Modified, so those two columns stay blank for them. A FAT32 or exFAT file has no
 instant at all: its (UTC) columns stay blank and its readings appear in **Recorded
 (as stored)**.
@@ -317,6 +321,17 @@ the end of the image is still stored, under a name ending
 is given on every volume, not only on one the partition table already shows is cut.
 A file larger than 32 MiB is held in a temporary file while it is read, so extraction
 needs that file's size free in the system's temporary folder.
+
+Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
+`..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
+backslash, colon or control character are written escaped as `%XX`, so no member can
+land outside the folder it is extracted into, start at a root, or be cut short by a
+NUL. Ordinary names are kept exactly as stored. Each renamed member is logged as
+`RENAMED <volume>/<name as stored> stored as <member>`. Damage a reader recorded while
+walking a volume (a structure that failed its check, a record it could not resolve) is
+printed under `--list` as `DAMAGE`, counted on the extraction line as `DAMAGED`, with
+the first five shown, and kept in `volumes.json` as `damage_recorded` and
+`damage_first` (up to 50).
 
 ## Reading an image from Python
 
@@ -546,7 +561,8 @@ measured are little endian.
 ## Writing free space to files
 
 Since 1.58 `--unallocated DIR` copies out the free space of every volume whose filesystem
-says what is free: qnx6, F2FS, FAT32, FAT16 and FAT12 (since 1.62), exFAT, NTFS, HFS+ and APFS.
+says what is free: qnx6, F2FS, FAT32, FAT16 and FAT12 (since 1.62), exFAT, NTFS, HFS+, APFS,
+XFS and Btrfs.
 
 ```
 python3 qnxprobe.py --unallocated free_space --only dps_mfg mmcblk0.img
@@ -867,6 +883,124 @@ reading: the object map's own tree points at blocks while the file-system tree p
 at virtual ids, so reading the first through the second walks whatever happens to sit
 at that offset; and a run of records can begin part way through the leaf before the
 first one whose key matches, so starting at the matching leaf lost 13 of 400 children.
+
+## Btrfs
+
+`--list`, `--extract` and `--unallocated` read Btrfs directly, without mounting. A
+volume is claimed only when three things hold: the `_BHRfS_M` magic is in the
+superblock 64 KiB in, a superblock copy's checksum holds, and the chunk tree root block
+that superblock names is a block of this filesystem (its checksum holds, and it records
+its own address and the superblock's filesystem id). The magic alone is not enough, and
+neither is a whole superblock copied where its filesystem is not: both fall through to
+the identifiers after Btrfs. An image cut short before the chunk tree is still named
+Btrfs, with the reason it cannot be walked. Btrfs is tested before ext, the more specific
+test first, as everywhere else in the identifier; mkfs.btrfs 6.17.1 and mke2fs 1.47.2
+each clear the other's signature when they format (measured), so the order decides
+something only on an image written by older tools.
+
+What it reads: the superblock, the chunk tree that maps logical addresses to the device,
+the root tree, and every file tree reachable from the top-level subvolume (id 5). A
+device without the magic at 64 KiB is not Btrfs, as btrfs-progs' own format notes say,
+so its mirror copies are not looked at. A primary whose checksum holds is used, as a
+normal mount uses it, even when a mirror records a later generation. When the primary
+fails, the mirrors at 64 MiB and 256 GiB are tried the way `btrfs` does when told to
+recover: the good copy with the highest generation is taken, every copy used must carry
+the fsid of the first good one, and the note says a mirror was read. Directories are read
+from their `DIR_INDEX` items, as the kernel's readdir reads them. Files are read from
+their inline, regular and preallocated extents, with holes (both the hole items older
+volumes write and the ranges a `NO_HOLES` volume leaves without an item) and
+preallocated ranges read as zeros, and with zlib, LZO and zstd extents decompressed.
+Hard links are one file under several names, and the names the inode records for itself
+(`INODE_REF` and, for a file with many names in one directory, `INODE_EXTREF`) are read
+by `links()`.
+
+Subvolumes and snapshots are **directories**, where the top-level tree links them, the
+way the kernel and `btrfs restore -s` present them. A link the root tree has no matching
+`ROOT_REF` for (a snapshot's view of a subvolume nested in the subvolume it copied) is
+an empty directory, as the kernel shows it; no disk records a time for that directory,
+so it is listed with time 0. A subvolume's directory entry for itself is not followed.
+When the default subvolume is not the top level, the note says which id it is: it is
+still listed where the top level links it.
+
+Every tree block is checked before it is used: its checksum, the address it records for
+itself, its filesystem id, the structure the kernel's tree checker requires (keys in
+order, items packed inside the block, a node's pointer count and pointers), and, on
+every read whether the block was read before or not, the level, generation and first key
+its parent records for it. Each tree's root block is held to the generation the
+superblock or its `ROOT_ITEM` records. All four checksum types are read: crc32c and
+xxhash64 are carried as pure Python, sha256 and blake2b come from `hashlib`. Metadata is
+kept twice on a single device by default (DUP), so a block whose first copy fails is
+read from the second, and the walker's `damage` list records the repair. A block whose
+every copy fails is recorded there too, and the walk goes on without it. Items are held
+to the sizes and rules the kernel's tree checker sets for them: an inode item is 160
+bytes and its size no larger than the largest file Btrfs allows; an inline extent is at
+file offset 0 and, uncompressed, holds exactly the bytes it records; a regular extent's
+sizes and offsets fall on sector boundaries; a compressed extent holds 1 byte to 128 KiB
+stored and decompressed, which also bounds what a damaged stream can make it
+decompress. An item that breaks one of these makes its file unreadable, by name, and is
+recorded. A directory entry whose inode is missing or unreadable is still listed, as
+readdir lists it, with the file type its entry records, no permission bits, size 0 and
+time 0, and recorded; reading it then fails, by name.
+
+On one device of a multi-device volume, everything with a copy on that device is read
+(SINGLE chunks placed there, DUP, and RAID1, RAID1C3 and RAID1C4 through the device's
+own copy). RAID0, RAID10, RAID5 and RAID6 chunks are refused by name: their data is
+striped across devices, so one image does not hold it. The note says how many devices
+the volume has and which one this is. One member of a two-device RAID1 volume is in the
+fixtures, but it holds only metadata, because `mkfs.btrfs --rootdir` fills only a single
+device; reading data through a RAID1 chunk is checked with chunks set by hand, and
+RAID1C3 and RAID1C4 are not in the fixtures.
+
+Free space (`free_extents()`, so `--unallocated`) is two things: the device's space no
+chunk is allocated on, from 1 MiB (below which btrfs allocates nothing) to its end, and,
+inside each block group, the ranges no `EXTENT_ITEM` or `METADATA_ITEM` of the extent
+tree covers, at every copy on the device. The superblock copies are left out. On each
+of the seven `mkfs.btrfs` fixtures below, the free space found from the extent tree is
+exactly what the volume's own free space tree records. On one of them, no free run
+overlaps a file's data, and the unallocated total is what the superblock's device item
+leaves. On the kernel-written fixture, every 64 KiB block of the two files deleted
+before it was unmounted is inside the free space reported.
+
+A log tree (changes `fsync`'d after the last commit, which the kernel replays at the
+next mount) is not replayed. The volume reads as of its last commit, and the note says a
+log tree is present.
+
+Validated against images `mkfs.btrfs --rootdir` (btrfs-progs 6.17.1) wrote from one
+source tree, once per compression (none, zlib, zstd, LZO) and once per other checksum
+(xxhash64, sha256, blake2b), each read back first by btrfs-progs' own `btrfs restore`
+and passed by `btrfs check` (`tools/make_btrfs_fixtures.sh`). On each, all 572 files
+match the sha256 recorded over the source, and all 586 entries match the source's own
+`lstat()` for type, permission bits, size, modification time and symlink target. The
+tree holds inline files, files of many extents, compressible and random data, 400 files
+in one directory, a 255-byte name, names in Greek, Japanese and emoji, four kinds of
+symlink, hard links (one file has 151 names, so its extended refs are read), a FIFO and
+a subvolume. `mkfs.btrfs --rootdir` writes 0 nanoseconds and no creation time, and the
+self-test checks that they read so.
+
+Four more images. An ext4 volume converted by `btrfs-convert`, whose saved
+`ext2_saved/image` (mostly holes) reads back with the sha256 the ext4 image had before
+conversion. The second device of a two-device RAID1 volume, read through its own
+copies. Two that the Linux kernel wrote on a mounted volume
+(`tools/make_btrfs_root_fixtures.sh`, which needs root): `btrfs-live` holds a sparse
+file, a preallocated file written in its middle, a punched hole, a reflinked copy partly
+overwritten, a file of 40 small extents, zlib, LZO and zstd files each overwritten in
+their middle (so read from an offset into a compressed extent), a subvolume with a
+nested one, a read-write and a read-only snapshot of it (whose views of the nested
+subvolume are the empty directories the kernel shows), a default subvolume other than
+the top level, and two deleted files. All 17 of its files match the sha256 taken through
+the mount, and all 27 entries match `lstat()` through the mount to the nanosecond.
+`btrfs-logtree` was copied after an `fsync` and before the next commit: the note says its
+log tree is present, the file committed before it is listed, and the file only the log
+holds is not.
+
+The self-test also breaks one rule at a time in copies of these images, each in memory
+with its checksum rewritten so the break reaches the check under test: a node that
+points at itself, a generation, a first key and a filesystem id that do not match, a
+leaf that claims more items than fit, a directory entry whose inode is missing, a
+changed `DIR_ITEM` name, a subvolume entry for itself, a `ROOT_REF` too short for its
+name, an inline extent with the wrong size, an inode size past the largest file, broken
+superblocks, LZO segments with sector padding, zlib streams with a wrong adler32 and
+compressed extents past 128 KiB. Each is recorded or refused as described above.
 
 ## HFS+
 
@@ -1331,6 +1465,207 @@ file that names a live file's cluster, a free cluster or a short chain, and noth
 deleted entry, a bad checksum, or a valid entry set placed in the up-case table, in a live
 file's content or in a free cluster. The reader's checksum is held against a driver's on
 the committed exFAT fixture, which macOS wrote: all 4 of its in-use file entries match.
+
+## ReFS
+
+ReFS is Microsoft's Resilient File System. Windows 11 formats it as a Dev Drive, and Windows
+Server uses it for data volumes. `--list` and `--extract` read ReFS 3.x directly. A volume is
+claimed by `ReFS` at byte 3 of its boot sector together with `FSRS` at byte 0x10, and the
+report gives the version the boot sector records, the label, and the checkpoint it read:
+
+```
+    GPT part 2 Basic data partition   50.0 GiB   ->  refs
+        version      ReFS 3.14 (boot sector)
+        bytes/sector 512   sectors/cluster 8   cluster 4,096 bytes
+        volume       49.9 GiB (104,726,528 sectors)
+        serial       b0d61ca3d61c6c3a
+        label        REFSRICH
+        checkpoint   clock 37 at cluster 1,570,928, written as ReFS 3.14
+        log          no record follows the checkpoint
+```
+
+Microsoft publishes no specification of ReFS, so the reader follows two public
+descriptions, and every field it uses was checked against volumes Windows wrote:
+
+- xbqt/forefst, commit `d4d5fd28942eb14ebe11d90f4eb9342f5e3d7b92`, the pages under
+  `docs/structures/` and `docs/concepts/` (GPL-3.0; read, no code taken)
+- libyal/libfsrefs, commit `77e1b7ba68cf225ec888a61e9784fb9a93a0156f`,
+  `documentation/Resilient File System (ReFS).asciidoc` by Joachim Metz (GFDL 1.3)
+- Microsoft's [MS-FSCC] 2.1.2.4 and 2.1.2.5 for the symbolic link and mount point data
+
+The comment above `RefsWalker` in `qnxprobe.py` names the page each structure comes from.
+
+What it reads: of the three superblock copies, the one with the highest clock whose own
+checksum holds; the newer of the two checkpoints (a tie is reported); the container table
+that turns the virtual cluster numbers everything else uses into real ones; the object
+table; and each directory's B+ tree. The superblock and checkpoint carry their own
+checksums. Every B+ tree page is checked against the checksum its parent's reference
+records for it, and that checksum has to be of the kind the volume uses: the one the boot
+sector's selector (0x2A) names, CRC-64/NVME or SHA-256, or for a volume whose selector is 0
+the one its checkpoint's reference size implies. A reference carrying no checksum or
+another kind is refused. A page that does not match is named in `RefsWalker.damage` and
+its rows are left out, rather than read from bytes that are not what was written; the rest
+of the volume is still listed. A walk reads each page at most once, so references that
+point back up a tree cannot make it loop. `damage` keeps the first 1,000 problems and
+`damage_count` counts all of them.
+
+What it treats as damage rather than reads past, each because none of the six volumes
+measured shows it: a container whose first cluster is not a multiple of its size, that
+reaches past the volume or overlaps another; a run crossing the end of its container; two
+extents over one cluster of a file; extents reaching past the stream's allocation; a file
+not marked sparse with clusters no extent covers (they read as zeros, and are reported); a
+directory named in two places or naming the root; and a stream larger than the 35 PB
+Microsoft gives as ReFS's largest file. A file whose record does not check out is still
+listed, with the size and time its name row holds, and reading it fails with the reason.
+
+A file's content is read from its record when ReFS keeps it inline (small files) and from
+its extents otherwise, including an extent map that has grown into child pages. Holes in a
+sparse file, and runs ReFS reserved or allocated but had not written, read as zeros, as
+forefst describes. On forefst's sample volumes 32 such runs sit over clusters that are not
+zero; among what is there are copies of the generating script's file header in the middle
+of a file and, in one case, a B+ tree page, neither of which belongs in the file. A file with stream
+snapshots (`refsutil streamsnapshot`) keeps in its live stream only what changed since its
+last snapshot; the rest is read from the most recent snapshot that holds it, as the driver
+does. A file that was moved or
+given a second name keeps its record in the folder it was created in, and the reader
+follows it there. Each name of a hard-linked file lists the one record, and
+`RefsWalker.link_count(node)` gives the number of names. Symbolic links and junctions are
+listed as links with `readlink()` giving their target, and are not followed. Alternate data
+streams are listed by `named_streams(node)` and read through `stream_ref(node, name)`,
+including a stream on a directory.
+
+ReFS keeps four times per file, as NTFS does. `stamps(node)` gives created, modified and
+accessed in Unix seconds, like `NtfsWalker.stamps`; `filetimes(node)` gives all four
+FILETIMEs as stored, with the change time, to the 100 ns. A file's times come from its own
+record. The name row of a moved or linked file keeps a copy that ReFS refreshes only when
+that name is opened, so it can be older, and two names of one file can disagree; the record
+is the one ReFS updates at once (forefst `concepts/hard_links.md`). A directory's times
+come from its own record except the change time, which is taken from its name row in its
+parent: forefst measured that copy, not the record's, against what PowerShell reports
+(`attributes/STANDARD_INFORMATION.md`). On the Windows fixture here the two copies never
+differ, so that rule rests on forefst's measurement. `file_id(node)` gives the two halves of
+the 128-bit file id Windows reports. `allocation(node)` answers with the same keys as on
+NTFS; for a file held in extents `stored` is the stream's own allocation (which counts
+reserved runs) plus any clusters a snapshotted file reads from its snapshots, and it equals
+the allocation Windows reported for every such file on the fixture and forefst's for every
+one on its four sample volumes.
+
+### The log is not replayed
+
+ReFS writes each change to its metadata log first and folds it into a checkpoint later.
+Windows replays the log when it mounts the volume. This reader does not: it shows the volume
+as of its newest checkpoint, and says how many log records follow that checkpoint. On a
+volume Windows detached cleanly the count is zero. The first test volume was detached
+seconds after its files were written, and its checkpoint predates every one of them:
+
+```
+        checkpoint   clock 20 at cluster 1,570,928, written as ReFS 3.14
+        log          16 metadata log records follow the newest checkpoint. Windows applies
+                     them when it mounts the volume; this reader does not, so it shows the
+                     volume as of that checkpoint, and what changed after it is missing or
+                     older here
+```
+
+Its root lists empty here, which is what its checkpoint holds; the six files Windows hashed
+on that volume while it was mounted are in the log only. If you see this line, image the volume as it is and do not mount it first:
+a mount replays the log and writes a new checkpoint, and the log records are evidence of their
+own. The reader counts them and decodes none of them.
+
+### What it refuses, and what no fixture exercises
+
+Refused, with the reason in the error or the report:
+
+- ReFS 1.x and 2.x, which keep their metadata in another layout, and any version past
+  3.14, which no source describes. The volume is identified and its version reported;
+  nothing is listed.
+- An encrypted file's content (the EFS attribute is set: what is on disk is ciphertext).
+- Data in a container marked compressed. forefst (`concepts/compression.md`) says ReFS
+  compresses by container, marked by bit 0x800 of a flags word loaded from the container
+  table row; that it is the row's flags field (+0x14) is inferred, and no sample with
+  compressed data was to hand, so such data is refused rather than returned compressed.
+  The report names the volume's compression policy when it is set.
+- A stream record laid out other than as ReFS 3.14 writes it. forefst gives the record written
+  by ReFS 3.4 to 3.10 another summary size, and on 3.4 its size fields four bytes later; no
+  such volume was to hand.
+- A large alternate data stream when more than one extent record matches it. ReFS keeps such
+  a stream's extents in a separate record that does not name the stream; forefst ties the two
+  by size, and the reader also requires the allocation to agree and refuses a tie.
+
+Handled from the descriptions but not exercised by any real volume: the backup superblocks
+and the second copies of the container and object tables (read only when the first fails
+its checksum), volumes upgraded from an older ReFS, and the direct form of the checkpoint's
+root list. Per-cluster data checksums, which a volume with integrity streams keeps, are not
+verified while reading; the self-test checks what is read against them (below).
+
+Not done: deleted files are not recovered, free space is not reported (so `--unallocated`
+skips ReFS), and the change journal is not read.
+
+### Checked against what Windows wrote, and against forefst
+
+`tools/make_refs_fixtures.ps1` builds a ReFS 3.14 Dev Drive in a VHDX on Windows 11 build
+26200 and records, from the mounted volume, every entry's type, size, allocation, link
+count, attributes, four FILETIMEs, file id and link target, the SHA-256 of every file and
+stream, and the paths it created and then deleted. On that volume the reader walks all
+2,620 entries Windows listed, each with its type, size, four FILETIMEs, file id and link
+target as Windows reported them, and for each file its link count, attributes and, for a
+file held in extents, its allocation. It reads all 2,544 files
+and the 3 streams back to Windows's hashes, lists none of the 17 deleted paths, and
+`--extract` writes 2,547 files (the 2,544 plus 3 Windows keeps under `System Volume
+Information`) whose hashes match, with the 5 links skipped.
+
+A 50 GB volume cannot be committed, so `tools/make_refs_fixture.py` keeps only the bytes
+the reader reads, each at its own offset: `tests/fixtures/refs-fixture.bin.gz` (516,202
+bytes) and `tests/fixtures/refs-dirty.bin.gz` (14,918 bytes), with what Windows reported in
+`tests/fixtures/refs-fixture.known.tsv.gz` (126,522 bytes). The content of the 4 files holding
+more than 256 KiB of random bytes is left out by name, and their records kept. Every entry, time, id,
+link, stream and every shipped file's content reads the same from these as from the VHDX
+files. The first test volume's log held the machine security identifier of the Windows
+computer that wrote it in 2 records; its three machine numbers are replaced with 1-2-3 and
+those records' check values recomputed, which the tool prints.
+
+The self-test runs nineteen ReFS checks on these. Ten use the volumes as Windows wrote them,
+or broken on purpose: the listing and every field above, the hashes, the streams, the
+deleted paths, the 16 log records, one letter of one name changed in a directory page
+(reported, that page's rows left out), a boot sector saying 2.x (refused), and a byte
+changed in a log record (the count stops before it). Nine check one rule each on the
+fixture or on records the self-test builds: `stamps()` in Unix seconds; an unwritten run
+and bytes past the valid length reading as zeros; container arithmetic, a run crossing a
+container, a compressed container and containers that cannot be where the table says; a
+directory's change time from its name row; a snapshot not listed as a stream, and snapshots
+read newest first; short snapshot rows, overlapping extents, a 2^60-byte stream, an
+encrypted file, a gap in a file not marked sparse and extents past the allocation; a page
+named twice in one table, a cached page asked for under another digest or checksum kind, and
+the damage cap; directory rows naming the root or a directory named elsewhere; and versions
+3.15 and 9.99, the superblock clock and a checkpoint tie. Each of 26 deliberate changes to
+the reader, one per rule, fails at least one of these with forefst's volumes absent.
+
+forefst publishes four sample volumes with its own output for each (GPL-3.0; nothing from
+them is in this repository). Where they are mounted, at `/Volumes/Corpus/Data for
+DLEAPP/Public_Test_Images/forefst-ReFS` or the folder `QNXPROBE_REFS_SAMPLES` names, the
+self-test runs ten more checks on them, comparing each with forefst's inventory entry by
+entry, and skips them otherwise:
+
+| Corpus key | Volume | What it adds |
+|---|---|---|
+| `forefst_refs314_64k_sha256` | `wininsiderrefs8gtest2` | 64 KiB clusters, SHA-256 metadata checksums (Insider build 29574) |
+| `forefst_refs314_specials` | `win11refs2tspecials` | hard links, symbolic links, streams, file tables grown into child pages |
+| `forefst_refs314_snapshots` | `win11refs2tsnapshots` | stream snapshots, a stream held in extents |
+| `forefst_refs314_usn` | `win11refstestmftecmd` | integrity streams, an extent map in child pages (a 226 MB file) |
+
+On all four, every entry forefst lists is walked and nothing else (894, 1,550, 304 and
+1,744), with forefst's type, size, file id, home directory, link count, allocation, link target
+and stream names for each, no page failing its checksum and no log record after the
+checkpoint. The times agree on every directory and on every file except moved or linked
+files whose name row differs from their record: forefst prints the name row's copy, which
+holds exactly forefst's values on every one (44, 58, 1 and 174 names, files and symbolic
+links, which are 37, 30, 1 and 98 distinct files by file id), and the
+reader prints the record's. forefst lists the two names of one such file with different
+times, which one record cannot hold. On the integrity volume, what the reader returns for
+3,000 clusters of files with integrity streams matches the CRC32-C ReFS stored for each
+cluster, the 226 MB file among them (all 111,338 such clusters on that volume matched when
+checked in full, outside the self-test). On the snapshot volume `test.txt` reads `abc\r\n`,
+the live version forefst's `snapshots_versioning.md` gives for it. Its live stream holds no
+cluster of its own, so read without its snapshots it would have been five zeros.
 
 ## BitLocker
 
@@ -1999,6 +2334,191 @@ simulation (https://doi.org/10.21954/ou.rd.26038669.v1), whose root filesystem i
 logical volume, 1.63 reported that partition only as not recognised; 1.64 reads the
 logical volume as ext4 and walks its 93,747 entries.
 
+## XFS
+
+XFS is the default filesystem of Red Hat Enterprise Linux and its rebuilds, and common on
+Linux servers, NAS units and storage appliances. `--list`, `--extract` and
+`--unallocated` read it directly, no mounting. A volume is claimed only once its
+superblock is verified: the `XFSB` magic, a geometry that holds as the kernel requires it,
+and on v5 a superblock CRC that holds. A v4 superblock has no CRC, so its root inode must
+also read as a directory. A superblock that fails any of these is not claimed, and the
+other filesystems get their turn at the region.
+
+What it reads:
+
+- version 5 volumes (metadata CRCs) and version 4 volumes (no CRCs), which `mkfs.xfs`
+  6.18 still makes with `-m crc=0` while warning that v4 is deprecated;
+- version 2 and version 3 inodes (version 1 too, by the source; no v1 inode was made to
+  test), found from the inode number alone: allocation group, block, slot;
+- timestamps as UTC instants to the nanosecond, both the classic signed 32-bit seconds
+  (so dates before 1970 read right) and the `bigtime` 64-bit nanosecond counter that runs
+  to 2486; the creation time of a v5 inode is kept too (`XfsWalker.inode_info`);
+- data forks held inline, as a list of extents, or as a B+tree of extents, with the
+  32-bit or the `nrext64` 64-bit extent counters; holes read as zeros and so does an
+  extent allocated but never written (`unwritten`);
+- directories in all five forms: shortform (in the inode), block, leaf, node, and node or
+  leaf with a B+tree extent map, with and without the file type byte (`ftype`), and
+  directory blocks larger than the filesystem block;
+- symbolic links held inline and in blocks of their own; hard links, which list as one
+  inode under each name; FIFOs, listed and not extracted (device nodes the same way, by
+  the source: making one needs root, and none was made);
+- free space, from each allocation group's free-space B+tree by block number.
+
+The extended attributes themselves are not read. A file that has them is read correctly:
+the attribute fork's size is taken off the data fork's, as the format requires.
+
+### What is checked, and what happens when a check fails
+
+What the kernel checks before it uses a structure is checked here:
+
+- the superblock: its geometry, and on v5 its CRC;
+- each inode, in the kernel's order (`xfs_dinode_verify`): the magic, then on v5 the CRC,
+  its own inode number and the volume's uuid, then a size within the format's largest, a
+  mode that is a file type, the fork offset, and an extent count its fork can hold;
+- every block number an extent or a B+tree pointer names: inside an allocation group,
+  before that group's end (the last group ends where the volume does), clear of the
+  group's own headers, and an extent not crossing into the next group;
+- each extent B+tree block: magic, level, record count, a height no greater than the
+  volume allows, and on v5 its CRC, its own disk address, its owner and the uuid;
+- each directory data block, and each leaf and node block when the index is read: on
+  v5 the CRC, its own disk address, its owner and the uuid; each entry's tag; a shortform
+  directory's count of 8-byte inode numbers;
+- each remote symlink block on v5: the CRC, the offset, length, owner, uuid and disk
+  address its header records; only the blocks the target needs are read;
+- each AGF and free-space B+tree block, for free space.
+
+The log's records are not checked against their CRCs: only the head, the tail and the
+unmount flag are read (see below).
+
+What fails is not used, and is counted:
+
+- an inode that fails reads as absent and the rest of the volume still lists;
+- a directory block that fails is skipped and the rest of the directory still lists;
+- a file whose extent map or symlink block fails is not handed back at all, so it is
+  counted as failed in an extraction, never written cut short;
+- a volume larger than the region it sits in says its end is missing; a structure past
+  the end is counted as damage, and file data past it reads short, so an extraction
+  names the file `.SHORT` rather than passing it as whole. In a region shorter than the
+  image (a partition followed by another), nothing past the region is read as the
+  volume's.
+
+The count and the first damaged structure appear in the volume's note.
+
+**The log is not replayed.** Whether it is clean is decided the way `xfs_db` and
+`xfs_logprint` decide it (libxlog `xlog_is_dirty`): find the log's head by the cycle
+numbers stamped in it, and its tail from the last record before the head. A dirty log is
+reported in the volume's lines and its note, and the volume is read as it is stored: what
+was still only in the log is not there. The head is found by the kernel's first pass only;
+its later passes step back over a write torn at the moment of a crash, which this does
+not, so on such a log the head named here can be later than the kernel's. An external log
+is reported as such, its state not known.
+
+### What is refused, and why
+
+- **Incompatible features outside the ones it reads** are refused by name, or by bit when
+  the bit has no name. Read: `ftype`, sparse inode chunks, meta uuid, `bigtime`,
+  needsrepair (read, and reported), `nrext64`, exchange range, parent pointers and the
+  metadata directory. Refused: the zoned realtime allocator and its zone gaps, and any
+  unknown bit, which the kernel refuses too. Unknown read-only-compatible bits are named
+  and the volume is still read, as the kernel will still mount it read only.
+- **Realtime files.** A file whose blocks are on the realtime device is listed, and its
+  read is refused with the reason: that device is a separate one this does not read.
+- **Superblock versions 1 to 3**, which no current kernel mounts, and a v4 volume without
+  version 2 directories or unwritten extents, which the kernel will not mount either.
+- **A metadata B+tree data fork** (`meta_btree`, used by realtime metadata inodes) is
+  not read; no such inode is reachable from the root of the tree.
+
+A file whose recorded size is within the format's largest but far past the data it maps
+is read as the sparse file it says it is: the bytes past its last extent read as zeros,
+however many. A forged size of 2^56 bytes on one 26-byte file was tested; it is not
+counted as damage, and extracting it would try to write it whole.
+
+### Free space
+
+`free_extents()` reports each allocation group's free extents from its free-space B+tree
+by block number. The few blocks on each group's free list (AGFL), held back for the
+B+trees' own growth, are not in that tree and are not reported. Nothing is reported for a
+volume unless every group's AGF and every tree block pass their checks and the free
+blocks each tree records add up to its AGF's own count, the comparison `xfs_repair`
+makes.
+
+### Checked against
+
+`mkfs.xfs` 6.18 wrote three fixtures from a source tree on Ubuntu 26.04
+(`tools/make_xfs_fixtures.sh`, no root needed: `mkfs.xfs -p` copies a directory into the
+image, keeping holes, hard links and every mtime). Two more were written through the
+kernel on a mounted volume by `tools/make_xfs_root_fixtures.sh`, run as root. The listing
+and the sha256 of every file were taken from the source tree (for the two mounted ones,
+read back through the mounted filesystem), and `xfs_db`, `xfs_logprint` and
+`xfs_repair -n` read each image independently.
+
+| Fixture | Made with | Size (gzip) | What it carries |
+| --- | --- | --- | --- |
+| `xfs-v5` | defaults, 300 MiB | 682 KiB | v5 with bigtime and nrext64, 4,953 entries; block, leaf and node directories and a node directory with a B+tree extent map; a file with a 60-extent B+tree map; holes; times before 1970 and after 2038 |
+| `xfs-v4` | `-m crc=0 -n ftype=0,size=16384 -b size=1024`, 64 MiB | 332 KiB | v4, no ftype, 1 KiB blocks and 16 KiB directory blocks, 5,352 entries; a leaf directory, and a leaf and a node directory each with a B+tree extent map |
+| `xfs-v5-4kn` | `-s size=4096 -m metadir=1,bigtime=0 -i size=1024,nrext64=0`, 64 MiB | 83 KiB | 4 KiB sectors, the metadata directory, classic times and 32-bit extent counts on v5, 146 entries |
+| `xfs-mounted` | defaults, 300 MiB, written by the kernel | 1,214 KiB | 529 entries; two files grown a block at a time to 657 extents each, so a B+tree root in the inode over three leaf blocks; a 657-extent reflinked copy sharing those extents; unwritten extents from `fallocate` either side of a written one; a node directory with a B+tree extent map after 1,500 of its 2,000 entries were removed; a file whose 60 attributes are in blocks of their own |
+| `xfs-dirty` | `xfs-mounted`, mounted again, files added, then shut down | 1,281 KiB | a dirty log (head 31,936, tail 31,919 by `xfs_logprint`); the files added did not reach the tree on disk |
+
+On all five the self-test finds every entry by path with its type and permission bits,
+size, mtime to the nanosecond and symlink target, every regular file with its sha256,
+hard links as one inode, each test directory in the format `xfs_db` gives it (and its
+entry count equal to its own hash index's, less `.` and `..`), every recorded file's and
+directory's extent map with the number of extents `xfs_db` maps, the free extents equal
+to `xfs_db`'s less the free-list blocks it also lists (not on `xfs-dirty`, whose free-space
+trees on disk may predate its log), and the log state, head and tail `xfs_logprint`
+reports. On the v5 fixtures it also finds every inode's creation time at or before its
+change time. On `xfs-v5`, `--extract` wrote 4,920 files whose sha256 all match the source
+tree.
+
+Other paths are proved on a fixture patched in memory by the self-test, each with any
+other check that would see the change made to hold (a CRC rewritten, say), so that only
+the check under test can catch it: an extent flagged unwritten; an inode without its
+magic, one that fails its CRC, and one counting more extents than its fork holds; a
+realtime file; a dirty log (the unmount record's flag cleared); refused feature bits; a
+superblock whose CRC fails; a shortform directory with 8-byte inode numbers, and one whose
+header miscounts them; a directory block that fails its CRC, one that names another
+owner, another volume or another disk address, and an entry whose tag is wrong; an
+extent B+tree block that fails its CRC, and a root taller than the volume allows; an
+extent crossing its group's end, one on a group's headers, and a last group shortened by
+the superblock; remote symlink headers naming another offset, length, owner or block, and
+one mapped to 2,000 blocks; a volume cut to half its size, and one in a region shorter
+than the image; and a v4 superblock pasted onto a region with no XFS root inode behind it.
+Each of these checks was shown to fail when the line of the reader it guards was changed.
+
+The layout is sourced from xfsprogs v6.18.0 (commit
+8b892adad226bb9fef4009c4cba4dbc25b70b011); no xfsprogs code was copied, as xfsprogs is
+GPL:
+
+```
+superblock, struct xfs_dsb                   libxfs/xfs_format.h:193
+feature bits                                 libxfs/xfs_format.h:35-87, 373-416
+AGF, at sector 1 of each group               libxfs/xfs_format.h:517, 610
+inode core, struct xfs_dinode                libxfs/xfs_format.h:901
+data fork size and place                     libxfs/xfs_format.h:1093-1121
+classic and bigtime timestamps               libxfs/xfs_format.h:780-857
+inode number to AG, block, slot              libxfs/xfs_format.h:1270-1289
+filesystem block number to AG and block      libxfs/xfs_format.h:702-707
+bmap record, root and block layout           libxfs/xfs_format.h:1843-1910, 1928-1982
+                                             libxfs/xfs_bmap_btree.c:77, 747, 782
+remote symlink header and read               libxfs/xfs_format.h:1502
+                                             libxfs/xfs_symlink_remote.c:86, 236
+free-space record and block                  libxfs/xfs_format.h:1543
+                                             libxfs/xfs_alloc_btree.c:563
+directory blocks, entries, leaves, tail      libxfs/xfs_da_format.h:214-540
+the data, leaf and free spaces, 32 GiB each  libxfs/xfs_da_format.h:292-294, 418, 483
+directory entry walk and sizes               libxfs/xfs_dir2_data.c:96, 1231
+                                             libxfs/xfs_dir2_priv.h:200
+                                             libxfs/xfs_dir2_sf.c:41-140
+directory format and geometry                libxfs/xfs_dir2.c:132-162, 264
+inode checks                                 libxfs/xfs_inode_buf.c:175, 586
+superblock checks                            libxfs/xfs_sb.c:82, 192, 475, 1072
+CRC32C rule                                  libxfs/xfs_cksum.h
+log head, tail and clean state               libxfs/xfs_log_format.h:26-128
+                                             libxlog/xfs_log_recover.c:178, 400, 671
+                                             libxlog/util.c:46
+```
+
 ## Split images
 
 FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
@@ -2179,7 +2699,7 @@ reported as not recognised, with its first bytes shown.
 
 | Option | What it does |
 | --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS boot images) |
+| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, Btrfs, F2FS, FAT32, exFAT, NTFS, ReFS, HFS+, APFS, XFS, ETFS, EFS and QNX IFS boot images) |
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
@@ -2404,6 +2924,32 @@ that spec pins,
 all it says about what a deleted or superseded extent means. What such an extent still
 holds was measured, as "QNX EFS in a raw flash image" above describes.
 
+Btrfs, from btrfs-progs at v6.17.1 (commit `06981428c08f78f019a2f4956407fd84b495e21e`),
+and the kernel's `fs/btrfs` at v7.0 (commit `028ef9c96e96197026887c0f092424679298aae8`)
+where only the kernel settles a rule. The full list, with lines, is in the comment above
+`BtrfsWalker`; the main ones:
+
+```
+struct btrfs_super_block, BTRFS_MAGIC   kernel-shared/uapi/btrfs_tree.h:668-726, 14
+superblock at 64 KiB, mirrors           kernel-shared/ctree.h:72-73, disk-io.h:148-156
+checksum types and sizes                btrfs_tree.h:381-384, kernel-shared/ctree.c:49-55
+how each checksum is computed           crypto/hash.c:32-81, kernel-shared/disk-io.c:165-216
+header, item, key pointer               btrfs_tree.h:482-497, 549-580
+chunk item, stripe, profile bits        btrfs_tree.h:629-663, 1154-1185
+logical to physical                     kernel-shared/volumes.c:2093-2313, 2577-2666
+root, inode, dir and ref items          btrfs_tree.h:853-982
+file extent item, compression types     btrfs_tree.h:1063-1119, kernel-shared/compression.h:108-111
+reading a file's extents                cmds/restore.c:292-471, 617-760
+LZO framing in an extent                linux fs/btrfs/lzo.c:24-59, 429-546
+zlib with or without its header         linux fs/btrfs/zlib.c:351-384
+subvolume link needs a ROOT_REF         linux fs/btrfs/inode.c:5811-5875, 6008-6040, 6096-6102
+superblock copy chosen                  kernel-shared/disk-io.c:1933-2017
+tree block and item checks              linux fs/btrfs/tree-checker.c:207-341, 1126-1215,
+                                          2018-2234, 2302-2355
+compressed extent bounds, 128 KiB       linux fs/btrfs/compression.h:34-40
+largest file                            linux fs/btrfs/super.c:963 (MAX_LFS_FILESIZE)
+```
+
 SquashFS, JFFS2, UBI and UBIFS, from the Linux kernel at v7.0 (commit
 `028ef9c96e96197026887c0f092424679298aae8`):
 
@@ -2498,7 +3044,51 @@ The algorithm numbers, the chunk table of the `WofCompressedData` stream and the
 of the decoder's reads are checked against files Windows wrote and Windows's own hashes
 of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
 
-`--help` prints this same sourcing, so it travels with the tool.
+ReFS, from xbqt/forefst at `d4d5fd28942eb14ebe11d90f4eb9342f5e3d7b92` (`docs/`), libyal/libfsrefs
+at `77e1b7ba68cf225ec888a61e9784fb9a93a0156f` (`documentation/`) and Microsoft:
+
+```
+boot sector: "ReFS" at 3, "FSRS" at 0x10, sectors 0x18,
+bytes/sector 0x20, sectors/cluster 0x24, version 0x28/0x29   libfsrefs "The volume header",
+                                                             forefst structures/vbr.md
+superblock at cluster 30, checkpoint list at 0x70,
+self checksum over one cluster, descriptor zeroed            forefst structures/supb.md
+checkpoint clock 0x60, log position 0x70, flags 0x78,
+roots at 0x94 or through it when flag 0x200 is set           forefst structures/chkp.md
+page reference: four cluster slots, checksum kind 0x22,
+digest offset 0x23, length 0x24                              libfsrefs "Metadata block reference",
+                                                             forefst structures/page_references.md
+node header (level 0x0C, key index 0x10 to 0x20, count 0x14)
+and row (size, key, flags, value)                            libfsrefs "Node header", "Node record",
+                                                             forefst structures/btree_node.md
+container table: clusters per container 0x18, first
+cluster 16 bytes before the value's end                      forefst structures/container_table.md
+virtual cluster: container is the number shifted by the
+bit length of the clusters per container                     forefst concepts/virtual_addressing.md
+object table key, page reference at value 0x20               forefst structures/object_table.md
+name rows (0x30, key flag 1 or 2), split records (0x40),
+record times 0x28 to 0x40, attributes 0x48, size 0x58        forefst structures/directory_entries.md
+$DATA sizes 0x30 to 0x48, 24-byte extent records, maps in
+child pages, unwritten and hole runs read as zeros           forefst structures/extent_descriptors.md
+live stream read through its snapshots, newest first         forefst concepts/snapshots_versioning.md
+a file's times from its record, not a name row               forefst concepts/hard_links.md
+a directory's change time from its name row                  forefst attributes/STANDARD_INFORMATION.md
+named streams (0xB0), inline content, extents tied by size   forefst attributes/NAMED_DATA.md
+CRC-64/NVME, CRC32-C, the CRC64 sentinel                     forefst concepts/checksum_architecture.md
+log control page, record position and check value           forefst structures/mlog.md
+volume label, object 0x500 row 0x510                         forefst structures/volume_info.md
+symbolic link and mount point data                           [MS-FSCC] 2.1.2.4, 2.1.2.5
+```
+
+Measured on the volumes and not taken from either description: the log's control pages as
+the fourth and fifth u64 of row 1 of the logfile information table (object 0x9; they are
+where forefst's own report finds them, and 0x30 and 0x31 on four of the six volumes), a
+record's id within its directory at 0x80 (it equals the low half of the file id Windows
+reports, for every file), a directory's other three times in its own record, and the link
+count as the number of names a record lists.
+
+`--help` prints this same sourcing, so it travels with the tool. (The ReFS lines above are
+in this README only for now.)
 
 ## What it does not do
 
@@ -2549,6 +3139,9 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   `compact /exe:lzx` is listed with its recorded size and refused by name; the three
   XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
   on the volume and is refused too, rather than written out as zeros.
+- **ReFS: the newest checkpoint, without the log.** Changes still only in the metadata
+  log are counted and reported, not applied; deleted files and free space are not read; ReFS
+  1.x and 2.x are identified and refused. See [ReFS](#refs).
 - **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
   LZO or zstd clusters is listed with its recorded size and not decompressed.
 - **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
@@ -2584,6 +3177,18 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
   fails is implemented and sourced but not exercised. YAFFS2's skipping of block summary
   chunks is exercised (the YAFFS2 history image holds 24) but decides nothing there: those
   chunks reach no listing either way.
+- **Btrfs: one device, committed state, metadata checksums.** Striped chunks (RAID0,
+  RAID10, RAID5, RAID6) are refused by name, and on one device of several only what has a
+  copy there is read. A log tree is not replayed. Encrypted or otherwise encoded extents
+  (the format says a reader that does not understand them must treat them as incompatible)
+  and extent tree v2 are refused.
+  Tree blocks are checked against their checksums; file data is not checked against the
+  checksum tree, so a changed data block reads back changed. Deleted files are not listed
+  (the space they held is reported free), extended attributes are not reported, and zstd
+  needs Python 3.14. An inode size is refused only past the largest file Btrfs allows
+  (2^63 - 1 bytes); a size below that and far past the data is read as the hole it is.
+  This reader has been run only on the fixtures named under Btrfs above, none of them
+  from a real device.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
