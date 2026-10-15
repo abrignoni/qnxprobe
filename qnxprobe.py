@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.67"
+QNXPROBE_VERSION = "1.68"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -11545,6 +11545,43 @@ class ProgressEmitter:
         self.stream.flush()
 
 
+# Characters a zip member name must not carry as they are: a backslash or a colon
+# that an extracting tool on Windows reads as a separator or a stream, and
+# control characters (NUL ends the name early in some tools).
+_ZIP_UNSAFE = set(range(0x20)) | {0x7F, ord("\\"), ord(":")}
+
+
+def _zip_safe_component(part):
+    """One path component as a zip member may hold it: '.', '..' and an empty
+    component (a '/' that was part of a stored name, or a leading one) are
+    written escaped, and so is any character in _ZIP_UNSAFE, as %XX of its
+    UTF-8 bytes. A '%' is escaped too, but only in a component that needs other
+    escaping, so ordinary names stay exactly as stored."""
+    if part in ("", ".", ".."):
+        return {"": "%2F", ".": "%2E", "..": "%2E%2E"}[part]
+    if not any(ord(c) in _ZIP_UNSAFE for c in part):
+        return part
+    return "".join("".join(f"%{b:02X}" for b in c.encode("utf-8"))
+                   if ord(c) in _ZIP_UNSAFE or c == "%" else c for c in part)
+
+
+def zip_member_name(volume, path):
+    """The zip member name for a file at ``path`` (components joined by '/') in
+    ``volume``: every component made safe by _zip_safe_component, so no member
+    can climb out of the folder it is extracted into, start at a root, or be cut
+    short, whatever names the filesystem stored."""
+    return "/".join([_zip_safe_component(volume)]
+                    + [_zip_safe_component(c) for c in path.split("/")])
+
+
+def damage_lines(w, limit=5):
+    """(count, first ``limit`` entries as text) of what a walker recorded as
+    damage while it was read: an unreadable record, a structure that failed its
+    check, a name it could not resolve. Walkers without such a list give (0, [])."""
+    damage = getattr(w, "damage", None) or []
+    return len(damage), [str(d)[:240] for d in list(damage)[:limit]]
+
+
 def extract_to_zip(zf, w, volume, entries, log, progress=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
@@ -11553,6 +11590,11 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None):
     total_files, total_bytes). The totals are exact rather than estimated:
     entries is already the full list for this volume, so both are known before
     the first file is written.
+
+    Member names come from zip_member_name(): a stored name that would climb out
+    of the extraction folder ('..'), start at a root, carry a backslash, a colon
+    or a control character is written escaped, and logged as RENAMED with the
+    name as stored.
 
     A file whose blocks lie past the end of the image is a SHORT read: read_at()
     answers a seek past the end of the file with empty bytes, so the walker
@@ -11575,7 +11617,10 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None):
     total_bytes = sum(size for _, _, size, _ in entries if size is not None)
     files = written = skipped = failed = short = 0
     for path, ino, size, mtime in entries:
-        arc = f"{volume}/{path}"
+        arc = zip_member_name(volume, path)
+        if arc != f"{volume}/{path}":
+            log.append(f"        RENAMED {volume}/{path!r} stored as {arc}: the stored name "
+                       f"carries characters a zip member cannot hold safely")
         if size is None:
             skipped += 1
             continue
@@ -11756,6 +11801,4114 @@ def identify_ifs(fh, base):
     return lines
 
 
+# ---------------------------------------------------------------------------
+# XFS.
+#
+# XFS is the default filesystem of Red Hat Enterprise Linux and its rebuilds,
+# and common on Linux servers, NAS units and storage appliances. It is read here
+# directly, no mounting, and read only.
+#
+# The layout is sourced from xfsprogs v6.18.0 (commit
+# 8b892adad226bb9fef4009c4cba4dbc25b70b011), the same release as the mkfs.xfs
+# that wrote the fixtures. Line numbers below are at that commit:
+#   libxfs/xfs_format.h    struct xfs_dsb (193), feature bits (35-87, 373-416),
+#                          struct xfs_agf (517) and its sector (610), struct
+#                          xfs_dinode (901), fork sizes (1093-1121), timestamps
+#                          and the bigtime epoch (780-857), inode numbers
+#                          (1270-1289), fsblock numbers (702-707), remote symlink
+#                          header (1502), allocation btree records (1543), bmap
+#                          records and roots (1843-1910), btree block headers
+#                          (1928-1982)
+#   libxfs/xfs_da_format.h directory blocks: shortform (214), data block header
+#                          and entries (332-375), leaf (423-470), block tail
+#                          (540), the three 32 GiB spaces (292-294, 418, 483)
+#   libxfs/xfs_cksum.h     the CRC32C rule for every checksummed structure
+#   libxfs/xfs_bmap_btree.c  xfs_bmbt_disk_get_all (77), xfs_bmdr_maxrecs (782),
+#                          xfs_bmbt_maxrecs (747)
+#   libxfs/xfs_dir2_sf.c   xfs_dir2_sf_entsize (41), xfs_dir2_sf_get_ino (72)
+#   libxfs/xfs_dir2_priv.h xfs_dir2_data_entsize (200)
+#   libxfs/xfs_dir2_data.c __xfs_dir3_data_check (96), xfs_dir3_data_end_offset (1231)
+#   libxfs/xfs_dir2.c      the directory geometry (132-162), xfs_dir2_format (264)
+#   libxfs/xfs_inode_buf.c xfs_inode_from_disk (175), xfs_dinode_verify (586)
+#   libxfs/xfs_symlink_remote.c  xfs_symlink_verify (86), xfs_symlink_remote_read (236)
+#   libxfs/xfs_alloc_btree.c xfs_allocbt_maxrecs (563)
+#   libxfs/xfs_sb.c        xfs_sb_good_version (82), xfs_validate_sb_read (192),
+#                          xfs_validate_sb_common (475), xfs_sb_read_verify (1072)
+#   libxfs/xfs_log_format.h, libxlog/xfs_log_recover.c and libxlog/util.c for
+#                          whether the log is clean (xlog_is_dirty, util.c:46)
+# No xfsprogs code was copied; qnxprobe is MIT and xfsprogs is GPL. xfs_db and
+# xfs_repair are used only as independent oracles for the fixtures.
+#
+# A file is found from its inode number alone: the number names the allocation
+# group, the block in it and the slot in the block. Its data fork then holds the
+# content inline (directories and symlinks only), a list of extents, or the root
+# of a B+tree of extents. A directory larger than its inode keeps its entries in
+# data blocks in the first 32 GiB of its own address space, with hash-ordered
+# leaf blocks after 32 GiB and free-space blocks after 64 GiB. Listing needs only
+# the data blocks, whatever the format; the leaf blocks are read to cross-check
+# the count.
+# ---------------------------------------------------------------------------
+XFS_SB_MAGIC = b"XFSB"
+XFS_DINODE_MAGIC = b"IN"
+XFS_NULL_INO = 0xFFFFFFFFFFFFFFFF
+XFS_MAXINUMBER = (1 << 56) - 1                  # xfs_format.h:1298
+# sb_versionnum bits (xfs_format.h:35-48) and sb_features2 (74-87)
+XFS_SB_VERSION_NUMBITS = 0x000F
+XFS_SB_VERSION_SHAREDBIT = 0x0200
+XFS_SB_VERSION_SECTORBIT = 0x0800
+XFS_SB_VERSION_EXTFLGBIT = 0x1000
+XFS_SB_VERSION_DIRV2BIT = 0x2000
+XFS_SB_VERSION_MOREBITSBIT = 0x8000
+XFS_SB_VERSION2_FTYPE = 0x0200
+XFS_SB_VERSION2_OKBITS = 0x0002 | 0x0008 | 0x0080 | 0x0200
+# v5 feature bits (xfs_format.h:373-416, 425)
+XFS_RO_COMPAT = {0x1: "finobt", 0x2: "rmapbt", 0x4: "reflink", 0x8: "inobtcnt"}
+XFS_INCOMPAT = {0x001: "ftype", 0x002: "sparse inodes", 0x004: "meta uuid",
+                0x008: "bigtime", 0x010: "needsrepair", 0x020: "nrext64",
+                0x040: "exchange range", 0x080: "parent pointers",
+                0x100: "metadata directory", 0x200: "zoned realtime",
+                0x400: "zone gaps"}
+XFS_LOG_INCOMPAT = {0x1: "log xattrs"}
+# The incompatible features this reader follows. Each changes something it
+# reads (ftype, bigtime, nrext64), changes only what it does not read (sparse
+# inode chunks change how inodes are allocated, not where a number puts one;
+# exchange range and parent pointers add log items and attributes; the metadata
+# directory moves quota and realtime inodes out of the root tree), or is a flag
+# it reports (meta uuid, needsrepair). The zoned realtime allocator and its zone
+# gaps are refused: they belong to a realtime section this reader does not read.
+XFS_INCOMPAT_READ = 0x001 | 0x002 | 0x004 | 0x008 | 0x010 | 0x020 | 0x040 | 0x080 | 0x100
+XFS_INCOMPAT_FTYPE, XFS_INCOMPAT_META_UUID = 0x001, 0x004
+XFS_INCOMPAT_NEEDSREPAIR, XFS_INCOMPAT_NREXT64 = 0x010, 0x020
+# di_flags, di_flags2 and di_format (xfs_format.h:1012-1017, 1145-1238)
+XFS_DIFLAG_REALTIME = 0x1
+XFS_DIFLAG2_BIGTIME, XFS_DIFLAG2_NREXT64 = 0x8, 0x10
+XFS_FMT_DEV, XFS_FMT_LOCAL, XFS_FMT_EXTENTS, XFS_FMT_BTREE = 0, 1, 2, 3
+XFS_FMT_NAMES = {0: "dev", 1: "local", 2: "extents", 3: "btree", 4: "uuid", 5: "meta_btree"}
+XFS_BIGTIME_EPOCH_OFFSET = 1 << 31              # xfs_format.h:845
+# btree block magics (xfs_format.h:1535-1538, 1837-1838)
+XFS_BMAP_MAGIC, XFS_BMAP_CRC_MAGIC = b"BMAP", b"BMA3"
+XFS_ABTB_MAGIC, XFS_ABTB_CRC_MAGIC = b"ABTB", b"AB3B"
+XFS_AGF_MAGIC = b"XAGF"
+XFS_SYMLINK_MAGIC = b"XSLM"
+XFS_SYMLINK_HDR = 56                            # struct xfs_dsymlink_hdr
+# directory blocks (xfs_da_format.h)
+XFS_DIR_DATA_MAGICS = {b"XD2B": "block", b"XDB3": "block", b"XD2D": "data", b"XDD3": "data"}
+XFS_DIR_LEAF_MAGICS = (0xD2F1, 0xD2FF, 0x3DF1, 0x3DFF)    # leaf1 and leafn, v2 and v3
+XFS_DIR2_DATA_FREE_TAG = 0xFFFF
+XFS_DIR2_SPACE_BYTES = 1 << 35                   # XFS_DIR2_SPACE_SIZE, 32 GiB
+XFS_DA_NODE_MAGICS = (0xFEBE, 0x3EBE)            # xfs_da_format.h:16, 36
+XFS_MAX_FILEOFF = (1 << 54) - 1 + (1 << 21) - 1  # xfs_format.h:1869
+XFS_SYMLINK_MAXLEN = 1024                        # xfs_format.h:1515
+# the file types a mode may carry (xfs_mode_to_ftype, xfs_dir2.c:43)
+XFS_MODE_FORMATS = (0o100000, 0o040000, 0o020000, 0o060000, 0o010000, 0o140000, 0o120000)
+# the log (xfs_log_format.h:26, 105, 128)
+XLOG_HEADER_MAGIC = 0xFEEDBABE
+XLOG_UNMOUNT_TRANS = 0x20
+XLOG_HEADER_CYCLE_SIZE = 32 * 1024
+XLOG_BBSIZE = 512
+
+_CRC32C_TABLE = []
+
+
+def xfs_crc32c(data, crc=0xFFFFFFFF):
+    """CRC32C (Castagnoli, reflected polynomial 0x82F63B78) over data, with no
+    final inversion, which is how xfs_cksum.h chains it."""
+    if not _CRC32C_TABLE:
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+            _CRC32C_TABLE.append(c)
+    t = _CRC32C_TABLE
+    for b in data:
+        crc = t[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+def xfs_cksum_ok(buf, off):
+    """True when the le32 at ``off`` is the XFS checksum of buf: CRC32C seeded
+    with ~0 over the whole buffer with that field read as zero, then inverted
+    (xfs_cksum.h xfs_start_cksum_safe, xfs_end_cksum, xfs_verify_cksum)."""
+    if len(buf) < off + 4:
+        return False
+    crc = xfs_crc32c(buf[:off])
+    crc = xfs_crc32c(b"\0\0\0\0", crc)
+    crc = xfs_crc32c(buf[off + 4:], crc)
+    return struct.unpack_from("<I", buf, off)[0] == (~crc & 0xFFFFFFFF)
+
+
+class XfsUnreadable(Exception):
+    """An XFS volume or file this reader will not hand back; the message says why."""
+
+
+def _xfs_zeros(n):
+    """n zero bytes for a hole, in pieces that do not sit in memory at once."""
+    while n > 0:
+        piece = min(n, 1 << 20)
+        yield bytes(piece)
+        n -= piece
+
+
+def _xfs_sb(raw):
+    """The superblock fields this reader uses, by name (struct xfs_dsb, xfs_format.h:193)."""
+    g = lambda fmt, off: struct.unpack_from(">" + fmt, raw, off)[0]
+    return dict(
+        blocksize=g("I", 4), dblocks=g("Q", 8), rblocks=g("Q", 16), uuid=raw[32:48],
+        logstart=g("Q", 48), rootino=g("Q", 56), agblocks=g("I", 84), agcount=g("I", 88),
+        logblocks=g("I", 96), versionnum=g("H", 100), sectsize=g("H", 102),
+        inodesize=g("H", 104), inopblock=g("H", 106),
+        fname=raw[108:120].split(b"\0")[0].decode("utf-8", "replace"),
+        blocklog=raw[120], sectlog=raw[121], inodelog=raw[122], inopblog=raw[123],
+        agblklog=raw[124], inprogress=raw[126], icount=g("Q", 128), ifree=g("Q", 136),
+        fdblocks=g("Q", 144), dirblklog=raw[192], features2=g("I", 200),
+        compat=g("I", 208), ro_compat=g("I", 212), incompat=g("I", 216),
+        log_incompat=g("I", 220), crc=g("I", 224), meta_uuid=raw[248:264])
+
+
+def _xfs_sb_geometry(sb):
+    """The superblock geometry fields that do not hold as the kernel requires
+    them (xfs_validate_sb_common, xfs_sb.c:475), as text, or [] when all do."""
+    bs, ss, isz = sb["blocksize"], sb["sectsize"], sb["inodesize"]
+    bad = []
+    if not (512 <= bs <= 65536) or bs != 1 << sb["blocklog"]:
+        bad.append(f"block size {bs}")
+    if not (512 <= ss <= 32768) or ss != 1 << sb["sectlog"]:
+        bad.append(f"sector size {ss}")
+    if not (256 <= isz <= 2048) or isz != 1 << sb["inodelog"] or sb["inopblock"] != bs // max(isz, 1) \
+            or sb["blocklog"] - sb["inodelog"] != sb["inopblog"]:
+        bad.append(f"inode size {isz}")
+    ag = sb["agblocks"]
+    if not ag or not sb["agcount"] or sb["agblklog"] != (ag - 1).bit_length() \
+            or -(-sb["dblocks"] // ag) != sb["agcount"]:
+        bad.append(f"{sb['agcount']} allocation groups of {ag} blocks for {sb['dblocks']} blocks")
+    if sb["dirblklog"] + sb["blocklog"] > 16:
+        bad.append(f"directory block log {sb['dirblklog']}")
+    return bad
+
+
+def _xfs_sb_refusal(sb, raw):
+    """Why this superblock is not one to walk, or None. The checks are the
+    geometry the kernel insists on (xfs_validate_sb_common, xfs_sb.c:475), the
+    versions it accepts (xfs_sb_good_version, xfs_sb.c:82), the CRC it requires
+    of a v5 primary superblock (xfs_sb_read_verify, xfs_sb.c:1072) and the
+    incompatible features it refuses (xfs_validate_sb_read, xfs_sb.c:192)."""
+    ver = sb["versionnum"] & XFS_SB_VERSION_NUMBITS
+    if ver not in (4, 5):
+        return f"superblock version {ver}; only versions 4 and 5 are read, as the kernel reads only those"
+    if ver == 5 and not xfs_cksum_ok(raw[:sb["sectsize"]], 224):
+        return "the superblock CRC does not hold, and the kernel will not mount a v5 volume on that"
+    bad = _xfs_sb_geometry(sb)
+    if bad:
+        return "the superblock geometry does not hold: " + ", ".join(bad)
+    if ver == 4:
+        vn = sb["versionnum"]
+        if vn & XFS_SB_VERSION_SHAREDBIT or (vn & XFS_SB_VERSION_MOREBITSBIT
+                                             and sb["features2"] & ~XFS_SB_VERSION2_OKBITS):
+            return f"v4 feature bits the kernel does not know (versionnum 0x{vn:04x}, features2 0x{sb['features2']:x})"
+        if not vn & XFS_SB_VERSION_DIRV2BIT or not vn & XFS_SB_VERSION_EXTFLGBIT:
+            return "a v4 volume without version 2 directories or unwritten extents, which the kernel does not mount"
+        return None
+    not_read = sb["incompat"] & ~XFS_INCOMPAT_READ
+    if not_read:
+        names = [XFS_INCOMPAT.get(1 << k, f"unknown bit 0x{1 << k:x}") for k in range(32) if not_read >> k & 1]
+        return "incompatible features not read here: " + ", ".join(names)
+    return None
+
+
+def _xfs_features(sb):
+    """The feature names the superblock carries, for the report."""
+    if sb["versionnum"] & XFS_SB_VERSION_NUMBITS != 5:
+        ftype = sb["versionnum"] & XFS_SB_VERSION_MOREBITSBIT and sb["features2"] & XFS_SB_VERSION2_FTYPE
+        return ["ftype"] if ftype else []
+    out = [n for b, n in XFS_INCOMPAT.items() if sb["incompat"] & b]
+    out += [n for b, n in XFS_RO_COMPAT.items() if sb["ro_compat"] & b]
+    out += [f"unknown read-only-compatible bit 0x{1 << k:x}" for k in range(32)
+            if sb["ro_compat"] >> k & 1 and (1 << k) not in XFS_RO_COMPAT]
+    out += [n for b, n in XFS_LOG_INCOMPAT.items() if sb["log_incompat"] & b]
+    return out
+
+
+def _xfs_log_state(fh, base, sb):
+    """(state, detail, head, tail) for the internal log: state is "clean",
+    "dirty", "external" or "unknown", head and tail are 512-byte log block
+    numbers (None when not found).
+
+    This follows xlog_is_dirty (libxlog/util.c:46): find the head of the log
+    (xlog_find_head, xfs_log_recover.c:400) and its tail (xlog_find_tail, 671),
+    and the log is dirty when they differ. The head is found the way
+    xlog_find_head finds it first, by the cycle number stamped in each 512-byte
+    block (xlog_get_cycle, xfs_log_format.h:62) and a binary search for where it
+    drops (xlog_find_cycle_start, 178). The passes the kernel then makes to step
+    back over a torn write at the head (xlog_find_verify_cycle and
+    xlog_find_verify_log_record) are not made, so on a log cut mid-write the
+    head found here can be later than the kernel's. The tail is the block after
+    the last record when that record is an unmount record alone, else the tail
+    the last record names.
+    """
+    if sb["logstart"] == 0:
+        return "external", "the log is on a separate device, not in this image", None, None
+    bs, agblk = sb["blocksize"], sb["agblocks"]
+    fsb = sb["logstart"]
+    start = base + ((fsb >> sb["agblklog"]) * agblk + (fsb & ((1 << sb["agblklog"]) - 1))) * bs
+    nbb = sb["logblocks"] * bs // XLOG_BBSIZE
+    if nbb < 2:
+        return "unknown", "the log is too small to hold a record", None, None
+
+    def blk(i, n=1):
+        b = read_at(fh, start + i * XLOG_BBSIZE, n * XLOG_BBSIZE)
+        if len(b) < n * XLOG_BBSIZE:
+            raise XfsUnreadable("the log lies past the end of the image")
+        return b
+
+    def cycle(i):
+        w0, w1 = struct.unpack_from(">II", blk(i), 0)
+        return w1 if w0 == XLOG_HEADER_MAGIC else w0
+
+    def cycle_start(first, last, want):
+        mid = (first + last) // 2
+        while mid not in (first, last):
+            if cycle(mid) == want:
+                last = mid
+            else:
+                first = mid
+            mid = (first + last) // 2
+        return last
+
+    try:
+        first, last = cycle(0), cycle(nbb - 1)
+        if last == 0:                                   # xlog_find_zeroed
+            if first == 0:
+                return "clean", "the log has never been written", 0, 0
+            if first != 1:
+                return ("unknown", "the log is neither written through nor zeroed past its first cycle",
+                        None, None)
+            head = cycle_start(0, nbb - 1, 0)
+        elif first == last:
+            head = 0                                    # the head wrapped to the start
+        else:
+            head = cycle_start(0, nbb - 1, last)
+        # xlog_find_tail: the last record header before the head
+        found = None
+        order = itertools.chain(range(head - 1, -1, -1), range(nbb - 1, head - 1, -1))
+        for n, i in enumerate(order):
+            if n > 8192:                                # 4 MiB, far more than one record
+                return "unknown", "no log record header within 4 MiB before the head", head, None
+            if struct.unpack_from(">I", blk(i), 0)[0] == XLOG_HEADER_MAGIC:
+                found = i
+                break
+        if found is None:
+            return "unknown", "no log record header found", head, None
+        h = blk(found)
+        version, h_len = struct.unpack_from(">II", h, 8)
+        tail_lsn = struct.unpack_from(">Q", h, 24)[0]
+        num_logops = struct.unpack_from(">I", h, 40)[0]
+        h_size = struct.unpack_from(">I", h, 320)[0]
+        hblks = -(-h_size // XLOG_HEADER_CYCLE_SIZE) if version & 2 and h_size > XLOG_HEADER_CYCLE_SIZE else 1
+        after = (found + hblks + -(-h_len // XLOG_BBSIZE)) % nbb
+        tail = tail_lsn & 0xFFFFFFFF
+        if head == after and num_logops == 1:
+            op = blk((found + hblks) % nbb)
+            if op[9] & XLOG_UNMOUNT_TRANS:
+                tail = after
+    except XfsUnreadable as exc:
+        return "unknown", str(exc), None, None
+    if head == tail:
+        return "clean", f"head and tail at log block {head}", head, tail
+    return "dirty", f"head at log block {head}, tail at {tail}", head, tail
+
+
+def _xfs_root_is_dir(fh, base, sb):
+    """True when the root inode the superblock names reads as a directory inode
+    (inode magic, a version the volume allows, a directory mode). A v4
+    superblock has no CRC, so this is what stands in for one before the volume
+    is claimed."""
+    ino = sb["rootino"]
+    agino_log = sb["inopblog"] + sb["agblklog"]
+    agno, agino = ino >> agino_log, ino & ((1 << agino_log) - 1)
+    agbno, slot = agino >> sb["inopblog"], agino & ((1 << sb["inopblog"]) - 1)
+    if not ino or agno >= sb["agcount"] or agbno >= sb["agblocks"]:
+        return False
+    raw = read_at(fh, base + (agno * sb["agblocks"] + agbno) * sb["blocksize"]
+                  + slot * sb["inodesize"], 8)
+    return (len(raw) == 8 and raw[:2] == XFS_DINODE_MAGIC and raw[4] in (1, 2, 3)
+            and struct.unpack_from(">H", raw, 2)[0] & S_IFMT == S_IFDIR)
+
+
+def identify_xfs(fh, base, size=None):
+    """Return ("xfs", lines) for an XFS volume at base, else None.
+
+    The magic and a block size that agrees with its own base-2 logarithm
+    (sb_blocklog) make a candidate. It is claimed only once it is verified: the
+    superblock geometry holds as the kernel requires it (xfs_validate_sb_common,
+    xfs_sb.c:475), and on v5 the superblock CRC holds (xfs_sb_read_verify,
+    xfs_sb.c:1072). A v4 superblock has no CRC, so its root inode must also read
+    as a directory. A candidate that fails is not claimed, and the identifiers
+    after this one get their turn. A verified volume this reader will not walk
+    (an incompatible feature, say) is still named XFS, with the reason.
+    """
+    head = read_at(fh, base, 512)
+    if len(head) < 512 or head[:4] != XFS_SB_MAGIC:
+        return None
+    bs, blocklog = struct.unpack_from(">I", head, 4)[0], head[120]
+    if not (512 <= bs <= 65536) or bs != 1 << blocklog:
+        return None
+    sectsize = struct.unpack_from(">H", head, 102)[0]
+    raw = read_at(fh, base, max(512, min(sectsize, 32768)))
+    sb = _xfs_sb(raw)
+    ver = sb["versionnum"] & XFS_SB_VERSION_NUMBITS
+    if ver not in (4, 5) or _xfs_sb_geometry(sb):
+        return None
+    if ver == 5 and not xfs_cksum_ok(raw[:sectsize], 224):
+        return None
+    if ver == 4 and not _xfs_root_is_dir(fh, base, sb):
+        return None
+    total = sb["dblocks"] * bs
+    used = total - sb["fdblocks"] * bs
+    feats = _xfs_features(sb)
+    lines = [
+        f"label        {sb['fname'] or '(none)'}",
+        f"uuid         {sb['uuid'].hex()}",
+        f"version      {ver}" + ("   metadata CRCs" if ver == 5 else "   no metadata CRCs"),
+        f"features     {', '.join(feats) or '(none)'}",
+        f"geometry     {bs:,}-byte blocks, {sb['agcount']} allocation groups of "
+        f"{sb['agblocks']:,} blocks, {sb['inodesize']}-byte inodes, {sectsize}-byte sectors",
+        (f"used         {human(used)} of {human(total)} ({100.0 * used / total:.1f}%), "
+         "by the superblock's free count" if total and 0 <= used <= total else "used         unknown"),
+        f"inodes       {sb['icount']:,} allocated, {sb['ifree']:,} of them free",
+    ]
+    if size is not None and total > size:
+        lines.append(f"INCOMPLETE   the volume is {human(total)} but its region holds "
+                     f"{human(size)}: its end is missing")
+    if sb["rblocks"]:
+        lines.append(f"realtime     a realtime section of {sb['rblocks']:,} blocks, on its own "
+                     "device; its files are listed but not read")
+    why = _xfs_sb_refusal(sb, raw)
+    if why is None:
+        try:
+            state, detail = _xfs_log_state(fh, base, sb)[:2]
+        except (struct.error, ValueError) as exc:
+            state, detail = "unknown", str(exc)
+        lines.append(f"log          {state}: {detail}" + (
+            "; it was not replayed, so the volume is read as it is stored" if state == "dirty" else ""))
+        if ver == 5 and sb["incompat"] & XFS_INCOMPAT_NEEDSREPAIR:
+            lines.append("state        flagged as needing xfs_repair before the kernel will mount it")
+        if sb["inprogress"]:
+            lines.append("state        mkfs had not finished writing it (sb_inprogress)")
+    else:
+        lines.append(f"walk         not possible: {why}")
+    return "xfs", lines
+
+
+class XfsWalker:
+    """List and read an XFS volume. A node is an inode number, which is what a
+    directory entry records, so a hard link is one node reached by two names.
+
+    What the kernel checks before it uses a structure is checked here: the CRC,
+    block number, owner and uuid of every v5 metadata block, the inode core and
+    its forks (xfs_dinode_verify), and that every block number points inside the
+    volume and not at an AG's own headers (xfs_verify_fsbext). What fails is not
+    used, and is counted in ``damage`` (shown in ``note``): an inode that fails
+    reads as absent, a directory block that fails is skipped and the rest of the
+    directory still listed, and a file whose extent map or symlink block fails
+    raises rather than come back cut.
+
+    ``size`` is the byte length of the region the volume sits in. When the
+    volume says it is larger, the note says its end is missing, a structure
+    past the end is counted as damage, and file data past it reads short.
+    """
+
+    def __init__(self, fh, base, size=None):
+        self.fh, self.base = fh, base
+        head = read_at(fh, base, 512)
+        if len(head) < 512 or head[:4] != XFS_SB_MAGIC:
+            raise XfsUnreadable("no XFS superblock")
+        ss = struct.unpack_from(">H", head, 102)[0]
+        raw = read_at(fh, base, max(512, min(ss, 32768)))
+        sb = _xfs_sb(raw)
+        why = _xfs_sb_refusal(sb, raw)
+        if why:
+            raise XfsUnreadable(why)
+        self.sb = sb
+        self.v5 = sb["versionnum"] & XFS_SB_VERSION_NUMBITS == 5
+        self.bs, self.blocklog = sb["blocksize"], sb["blocklog"]
+        self.dblocks = sb["dblocks"]
+        self.agblocks, self.agblklog, self.agcount = sb["agblocks"], sb["agblklog"], sb["agcount"]
+        self.isz, self.inopblog = sb["inodesize"], sb["inopblog"]
+        self.agino_log = sb["inopblog"] + sb["agblklog"]       # xfs_ialloc.c:2987
+        self.sectsize = sb["sectsize"]
+        # the AGFL's block: blocks up to it hold the AG headers (XFS_AGFL_BLOCK,
+        # xfs_format.h:689), which no extent may point at (xfs_types.c:24)
+        self.agfl_block = 3 * self.sectsize // self.bs
+        self.ftype = bool(sb["incompat"] & XFS_INCOMPAT_FTYPE) if self.v5 else bool(
+            sb["versionnum"] & XFS_SB_VERSION_MOREBITSBIT and sb["features2"] & XFS_SB_VERSION2_FTYPE)
+        # the uuid stamped in checksummed metadata (xfs_dinode_verify, xfs_symlink_verify)
+        self.meta_uuid = sb["meta_uuid"] if self.v5 and sb["incompat"] & XFS_INCOMPAT_META_UUID \
+            else sb["uuid"]
+        self.core = 176 if self.v5 else 100                     # xfs_dinode_size()
+        self.litino = self.isz - self.core                      # XFS_LITINO
+        # directory geometry (xfs_dir2.c:132-162)
+        self.dir_fsbcount = 1 << sb["dirblklog"]
+        self.dir_blksize = self.bs << sb["dirblklog"]
+        self.data_entry_offset = 64 if self.v5 else 16
+        self.leafblk = XFS_DIR2_SPACE_BYTES >> self.blocklog
+        self.freeblk = 2 * XFS_DIR2_SPACE_BYTES >> self.blocklog
+        # the largest file size and extent B+tree height the format allows
+        self.max_size = min((1 << 63) - 1, XFS_MAX_FILEOFF << self.blocklog)
+        self.large_extents = bool(self.v5 and sb["incompat"] & XFS_INCOMPAT_NREXT64)
+        self.bmbt_hdr = 72 if self.v5 else 24
+        self.bm_maxlevels = self._bm_maxlevels()
+        self.root = sb["rootino"]
+        self.damage = []
+        self._damage_seen = set()
+        self._inodes = collections.OrderedDict()
+        self.end = base + size if size is not None else None
+        self.log_state = _xfs_log_state(fh, base, sb)
+        state, detail = self.log_state[:2]
+        notes = []
+        vol = self.dblocks * self.bs
+        if size is not None and vol > size:
+            notes.append(f"the volume is {human(vol)} but its region holds {human(size)}: its end "
+                         "is missing, so what was stored past that is counted as damaged or read short")
+        if state == "dirty":
+            notes.append(f"the log is dirty ({detail}): what it holds was not replayed, "
+                         "so the volume is read as it is stored")
+        if self.v5 and sb["incompat"] & XFS_INCOMPAT_NEEDSREPAIR:
+            notes.append("the volume is flagged as needing xfs_repair")
+        if sb["rblocks"]:
+            notes.append("files on its realtime device are listed but not read")
+        self._static_note = "; ".join(notes)
+
+    def _bm_maxlevels(self):
+        """The tallest data-fork extent B+tree the volume can hold, computed as
+        xfs_bmap_compute_maxlevels does (xfs_bmap.c:50): the most extents a fork
+        may count (xfs_format.h:1062-1064), blocks half full, a root of three
+        records (MINDBTPTRS)."""
+        maxleafents = (1 << 48) - 1 if self.large_extents else (1 << 31) - 1
+        per = (self.bs - self.bmbt_hdr) // 16           # xfs_bmbt_maxrecs, leaf and node alike
+        minrecs = max(per // 2, 1)
+        maxblocks = -(-maxleafents // minrecs)
+        level = 1
+        while maxblocks > 1:
+            maxblocks = 1 if maxblocks <= 3 else -(-maxblocks // minrecs)
+            level += 1
+        return level
+
+    @property
+    def note(self):
+        """A missing end, a dirty log, a needsrepair flag, a realtime section,
+        and any structure that failed its check so far, or None."""
+        parts = [self._static_note] if self._static_note else []
+        if self.damage:
+            parts.append(f"{len(self.damage)} damaged structure(s) skipped, first: {self.damage[0]}")
+        return "; ".join(parts) or None
+
+    def _damaged(self, what):
+        if what not in self._damage_seen and len(self.damage) < 1000:
+            self._damage_seen.add(what)
+            self.damage.append(what)
+
+    # -- addressing --------------------------------------------------------
+    def ag_length(self, agno):
+        """Blocks in AG ``agno``: agblocks, except the last, which ends where
+        the volume does (__xfs_ag_block_count, xfs_ag.c:136)."""
+        return self.agblocks if agno < self.agcount - 1 else self.dblocks - agno * self.agblocks
+
+    def _fsb_ok(self, fsb):
+        """Whether ``fsb`` is a block an extent or btree pointer may name: in an
+        AG of the volume, before that AG's end, and past its headers
+        (xfs_verify_fsbno and xfs_verify_agno_agbno, xfs_types.c:24-52)."""
+        agno, agbno = fsb >> self.agblklog, fsb & ((1 << self.agblklog) - 1)
+        return agno < self.agcount and self.agfl_block < agbno < self.ag_length(agno)
+
+    def _ext_ok(self, fsb, count):
+        """xfs_verify_fsbext (xfs_types.c:60): both ends valid, in one AG."""
+        last = fsb + count - 1
+        return (count > 0 and self._fsb_ok(fsb) and self._fsb_ok(last)
+                and fsb >> self.agblklog == last >> self.agblklog)
+
+    def _fsb_off(self, fsb):
+        """Byte offset in the image of filesystem block ``fsb``, which is an
+        AG number above agblklog bits of block-in-AG (XFS_FSB_TO_AGNO,
+        XFS_FSB_TO_AGBNO, xfs_format.h:702-707); None when it is not a block
+        an extent may name."""
+        if not self._fsb_ok(fsb):
+            return None
+        agno, agbno = fsb >> self.agblklog, fsb & ((1 << self.agblklog) - 1)
+        return self.base + (agno * self.agblocks + agbno) * self.bs
+
+    def _meta(self, off, n, what):
+        """n bytes of metadata at ``off``, or None, counted as damage, when any
+        of them lie past the end of the volume's region or of the image."""
+        if self.end is not None and off + n > self.end:
+            self._damaged(f"{what} lies past the end of the volume's region")
+            return None
+        buf = read_at(self.fh, off, n)
+        if len(buf) < n:
+            self._damaged(f"{what} lies past the end of the image")
+            return None
+        return buf
+
+    def _data(self, off, n):
+        """n bytes of file data at ``off``. What lies past the region's end is
+        not read, since it belongs to whatever follows the region, and is zeros
+        here, counted in EOF_SHORTFALL as a read past the image's end is, so an
+        extraction names the file short rather than whole."""
+        if self.end is not None and off + n > self.end:
+            keep = max(0, self.end - off)
+            buf = read_at(self.fh, off, keep) if keep else b""
+            EOF_SHORTFALL["bytes"] += n - len(buf)
+            return buf + bytes(n - len(buf))
+        buf = read_at(self.fh, off, n)
+        if len(buf) < n:
+            buf += bytes(n - len(buf))
+        return buf
+
+    # -- inodes ------------------------------------------------------------
+    def inode_offset(self, ino):
+        """Byte offset in the image of inode ``ino``, or None when the number
+        is out of range. The number is the AG, then the block in the AG, then
+        the slot in the block (XFS_INO_TO_AGNO, XFS_INO_TO_AGBNO and
+        XFS_INO_TO_OFFSET, xfs_format.h:1277-1285)."""
+        agno = ino >> self.agino_log
+        agino = ino & ((1 << self.agino_log) - 1)
+        agbno, slot = agino >> self.inopblog, agino & ((1 << self.inopblog) - 1)
+        if not ino or agno >= self.agcount or not self.agfl_block < agbno < self.ag_length(agno):
+            return None
+        return self.base + (agno * self.agblocks + agbno) * self.bs + slot * self.isz
+
+    def inode(self, ino):
+        """The inode's fields as a dict, or None, counted as damage, when it
+        cannot be used: its number out of range, the inode past the end of the
+        region, or a check of xfs_dinode_verify (xfs_inode_buf.c:586) that
+        fails, in the kernel's order: the magic, then on v5 the CRC, inode
+        number and uuid, then the size, mode, fork offset and forks."""
+        hit = self._inodes.get(ino)
+        if hit is not None:
+            self._inodes.move_to_end(ino)
+            return hit
+        off = self.inode_offset(ino)
+        if off is None:
+            self._damaged(f"inode {ino} is outside the volume")
+            return None
+        raw = self._meta(off, self.isz, f"inode {ino}")
+        if raw is None:
+            return None
+        why = self._dinode_problem(ino, raw)
+        if why:
+            self._damaged(f"inode {ino} {why}")
+            return None
+        version = raw[4]
+        flags2 = struct.unpack_from(">Q", raw, 120)[0] if version == 3 else 0
+        big = flags2 & XFS_DIFLAG2_NREXT64
+        d = dict(
+            ino=ino, mode=struct.unpack_from(">H", raw, 2)[0], version=version, format=raw[5],
+            nlink=(struct.unpack_from(">H", raw, 6)[0] if version == 1
+                   else struct.unpack_from(">I", raw, 16)[0]),
+            uid=struct.unpack_from(">I", raw, 8)[0], gid=struct.unpack_from(">I", raw, 12)[0],
+            size=struct.unpack_from(">Q", raw, 56)[0], nblocks=struct.unpack_from(">Q", raw, 64)[0],
+            nextents=(struct.unpack_from(">Q", raw, 24)[0] if big
+                      else struct.unpack_from(">I", raw, 76)[0]),
+            forkoff=raw[82], flags=struct.unpack_from(">H", raw, 90)[0], flags2=flags2)
+        bigtime = flags2 & XFS_DIFLAG2_BIGTIME
+        for name, at in (("atime", 32), ("mtime", 40), ("ctime", 48), ("crtime", 144)):
+            if name == "crtime" and version != 3:
+                d[name] = None
+            elif bigtime:                               # ns since 1901-12-13 (xfs_format.h:845-857)
+                v = struct.unpack_from(">Q", raw, at)[0]
+                d[name] = (v // 10**9 - XFS_BIGTIME_EPOCH_OFFSET) * 10**9 + v % 10**9
+            else:                                       # signed seconds, nanoseconds
+                sec, nsec = struct.unpack_from(">iI", raw, at)
+                d[name] = sec * 10**9 + nsec
+        dsize = d["forkoff"] << 3 if d["forkoff"] else self.litino      # XFS_DFORK_DSIZE
+        d["fork"] = raw[self.core:self.core + dsize]
+        self._inodes[ino] = d
+        while len(self._inodes) > 4096:
+            self._inodes.popitem(last=False)
+        return d
+
+    def _dinode_problem(self, ino, raw):
+        """What xfs_dinode_verify (xfs_inode_buf.c:586) would reject this inode
+        for, or None. A free inode (mode 0) is not rejected here."""
+        if raw[:2] != XFS_DINODE_MAGIC:
+            return "has no inode magic"
+        version = raw[4]
+        if self.v5:
+            if version != 3:
+                return f"is version {version} on a v5 volume"
+            if not xfs_cksum_ok(raw, 100):
+                return "fails its CRC"
+            if struct.unpack_from(">Q", raw, 152)[0] != ino or raw[160:176] != self.meta_uuid:
+                return "names another inode or volume"
+        elif version not in (1, 2):
+            return f"is version {version} on a v4 volume"
+        mode, = struct.unpack_from(">H", raw, 2)
+        size, = struct.unpack_from(">Q", raw, 56)
+        if size > self.max_size:                        # bit 63 (xfs_inode_buf.c:635), XFS_MAX_FILEOFF
+            return f"records a size of {size:,} bytes, past the largest the format allows"
+        if not mode:
+            return None
+        fmt_bits = mode & S_IFMT
+        if fmt_bits not in XFS_MODE_FORMATS:          # xfs_mode_to_ftype (xfs_inode_buf.c:639)
+            return f"has mode {mode:o}, which is no file type"
+        forkoff, fmt = raw[82], raw[5]
+        flags2 = struct.unpack_from(">Q", raw, 120)[0] if version == 3 else 0
+        big = flags2 & XFS_DIFLAG2_NREXT64
+        nextents = (struct.unpack_from(">Q", raw, 24)[0] if big
+                    else struct.unpack_from(">I", raw, 76)[0])
+        if fmt_bits in (S_IFREG, S_IFDIR, S_IFLNK):
+            # xfs_dinode_verify_forkoff (xfs_inode_buf.c:476)
+            if forkoff and forkoff >= self.litino >> 3:
+                return f"has a fork offset of {forkoff << 3} bytes, past its literal area"
+            dsize = forkoff << 3 if forkoff else self.litino
+            # xfs_dinode_verify_fork (xfs_inode_buf.c:369)
+            if fmt == XFS_FMT_LOCAL:
+                if fmt_bits == S_IFREG:
+                    return "is a regular file stored in its inode, which XFS does not write"
+                if nextents:
+                    return f"is stored in its inode but counts {nextents} extents"
+                if size > dsize:
+                    return f"is stored in its inode but records {size} bytes, more than fit"
+            elif fmt == XFS_FMT_EXTENTS:
+                if nextents > dsize // 16:
+                    return f"counts {nextents:,} extents in a fork that holds {dsize // 16}"
+                if fmt_bits == S_IFDIR and size and size <= dsize:
+                    return "is a directory small enough for its inode but not stored there"
+            elif fmt == XFS_FMT_BTREE:
+                if nextents > ((1 << 48) - 1 if big else (1 << 31) - 1):
+                    return f"counts {nextents:,} extents, more than a fork may"
+            else:
+                return f"has data fork format {XFS_FMT_NAMES.get(fmt, fmt)}, which a "\
+                       f"{'directory' if fmt_bits == S_IFDIR else 'file'} cannot have"
+        return None
+
+    def entry(self, ino):
+        d = self.inode(ino)
+        if d is None:
+            return None
+        if not d["mode"]:
+            self._damaged(f"inode {ino} is named by a directory but is free")
+            return None
+        return d["mode"], d["size"], d["mtime"] // 10**9
+
+    def inode_info(self, ino):
+        """Every time in nanoseconds (crtime None before v5), the link count and
+        the data fork format, for a caller that wants more than entry()."""
+        d = self.inode(ino)
+        if d is None:
+            return None
+        return {k: d[k] for k in ("ino", "mode", "size", "nlink", "uid", "gid", "atime",
+                                  "mtime", "ctime", "crtime", "nextents")} | {
+            "format": XFS_FMT_NAMES.get(d["format"], str(d["format"])),
+            "realtime": bool(d["flags"] & XFS_DIFLAG_REALTIME)}
+
+    # -- block maps --------------------------------------------------------
+    def _extents(self, d):
+        """[(file block, fs block, count, unwritten)] sorted by file block, from
+        an extents or B+tree data fork; None for a fork held inline. A record is
+        two be64 words: bit 63 of the first the unwritten flag, then 54 bits of
+        file offset, 52 of start block and 21 of length (xfs_bmbt_disk_get_all,
+        xfs_bmap_btree.c:77). Each extent must lie within the largest file offset
+        and, on the data device, inside one AG and clear of its headers
+        (xfs_bmap_validate_extent_raw, xfs_bmap.c:6081); two extents may not map
+        the same file block. One that fails is counted and raises."""
+        fmt = d["format"]
+        if fmt == XFS_FMT_EXTENTS:
+            recs = [d["fork"][i * 16:i * 16 + 16] for i in range(d["nextents"])]
+        elif fmt == XFS_FMT_BTREE:
+            recs = self._bmbt_records(d)
+        elif fmt == XFS_FMT_LOCAL:
+            return None
+        else:
+            raise XfsUnreadable(f"data fork format {XFS_FMT_NAMES.get(fmt, fmt)} is not read")
+        rt = d["flags"] & XFS_DIFLAG_REALTIME
+        out = []
+        for r in recs:
+            l0, l1 = struct.unpack(">QQ", r)
+            count = l1 & ((1 << 21) - 1)
+            start = ((l0 & 0x1FF) << 43) | (l1 >> 21)
+            off = (l0 & ((1 << 63) - 1)) >> 9
+            if not count or off + count - 1 > XFS_MAX_FILEOFF or (not rt and not self._ext_ok(start, count)):
+                what = f"inode {d['ino']}: extent of {count} blocks at block {start} for file block {off}"
+                self._damaged(what + " lies outside its AG or the volume")
+                raise XfsUnreadable(what + " lies outside its AG or the volume")
+            out.append((off, start, count, bool(l0 >> 63)))
+        out.sort()
+        for a, b in zip(out, out[1:]):
+            if a[0] + a[2] > b[0]:
+                self._damaged(f"inode {d['ino']}: two extents map file block {b[0]}")
+                raise XfsUnreadable(f"inode {d['ino']}: two extents map file block {b[0]}")
+        return out
+
+    def _bmbt_records(self, d):
+        """The leaf records of a B+tree data fork, left to right. The root sits in
+        the inode as a short header, keys, then pointers placed after room for as
+        many keys as the fork holds (xfs_bmdr_maxrecs, xfs_bmap_btree.c:782);
+        each block below has a long btree header (xfs_format.h:1940), and on v5
+        its CRC, owner, block number and uuid must hold. No tree is taller than
+        the volume allows (xfs_bmbt_verify, xfs_bmap_btree.c:423), and the walk
+        keeps its own stack, so a forged deep chain cannot exhaust Python's."""
+        ino = d["ino"]
+        fork = d["fork"]
+        level, numrecs = struct.unpack_from(">HH", fork, 0)
+        maxrecs = (len(fork) - 4) // 16
+        if not 0 < level < self.bm_maxlevels or not 0 < numrecs <= maxrecs:
+            self._damaged(f"inode {ino}: an extent B+tree root of level {level} with {numrecs} records")
+            raise XfsUnreadable(f"inode {ino}: B+tree root of level {level} with {numrecs} records, "
+                                f"where the volume allows at most {self.bm_maxlevels} levels")
+        hdr = self.bmbt_hdr
+        magic = XFS_BMAP_CRC_MAGIC if self.v5 else XFS_BMAP_MAGIC
+        mx = (self.bs - hdr) // 16                      # xfs_bmbt_maxrecs, xfs_bmap_btree.c:747
+        out, seen = [], set()
+        todo = [(struct.unpack_from(">Q", fork, 4 + maxrecs * 8 + i * 8)[0], level - 1)
+                for i in reversed(range(numrecs))]
+
+        def bad(fsb, why):
+            self._damaged(f"inode {ino}: extent B+tree block {fsb} {why}")
+            return XfsUnreadable(f"inode {ino}: extent B+tree block {fsb} {why}")
+
+        while todo:
+            fsb, want_level = todo.pop()
+            if fsb in seen:
+                raise bad(fsb, "is reached twice")
+            seen.add(fsb)
+            off = self._fsb_off(fsb)
+            if off is None:
+                raise bad(fsb, "is outside its AG or the volume")
+            blk = self._meta(off, self.bs, f"inode {ino}: extent B+tree block {fsb}")
+            if blk is None:
+                raise XfsUnreadable(f"inode {ino}: extent B+tree block {fsb} is past the end")
+            lvl, n = struct.unpack_from(">HH", blk, 4)
+            if blk[:4] != magic or lvl != want_level:
+                raise bad(fsb, "is not the B+tree block expected there")
+            if self.v5:
+                if not xfs_cksum_ok(blk, 64):
+                    raise bad(fsb, "fails its CRC")
+                blkno, = struct.unpack_from(">Q", blk, 24)
+                owner, = struct.unpack_from(">Q", blk, 56)
+                if blkno != (off - self.base) // 512 or owner != ino or blk[40:56] != self.meta_uuid:
+                    raise bad(fsb, "names another block, inode or volume")
+            if n > mx:
+                raise bad(fsb, f"counts {n} records, more than fit")
+            if lvl == 0:
+                out.extend(blk[hdr + i * 16:hdr + i * 16 + 16] for i in range(n))
+            else:
+                todo.extend((struct.unpack_from(">Q", blk, hdr + mx * 8 + i * 8)[0], lvl - 1)
+                            for i in reversed(range(n)))
+        return out
+
+    # -- file data ---------------------------------------------------------
+    def read_file(self, ino, size):
+        """Yield the file's bytes, exactly ``size`` of them. A hole, and an
+        extent allocated but never written (the unwritten flag), read as zeros."""
+        d = self.inode(ino)
+        if d is None:
+            raise XfsUnreadable(f"inode {ino} cannot be read")
+        if d["flags"] & XFS_DIFLAG_REALTIME:
+            raise XfsUnreadable("a realtime file: its blocks are on the realtime device, "
+                                "which is not read")
+        runs = self._extents(d)
+        if runs is None:
+            # xfs_dinode_verify_fork (xfs_inode_buf.c:369) allows no local regular file
+            raise XfsUnreadable("a regular file whose data is in its inode, which XFS does not write")
+        bs, left, pos = self.bs, size, 0                # pos is the next file block to deliver
+        for lblk, pblk, count, unwritten in runs:
+            if left <= 0:
+                return
+            if lblk > pos:
+                gap = min((lblk - pos) * bs, left)
+                for chunk in _xfs_zeros(gap):
+                    yield chunk
+                left -= gap
+                pos = lblk
+            if left <= 0:
+                return
+            if unwritten:
+                n = min(count * bs, left)
+                for chunk in _xfs_zeros(n):
+                    yield chunk
+                left -= n
+                pos += count
+                continue
+            off = self._fsb_off(pblk)
+            todo = count
+            while todo and left > 0:
+                n = min(todo, 256)                      # 1 MiB at 4 KiB blocks
+                buf = self._data(off, n * bs)
+                take = min(len(buf), left)
+                yield buf[:take]
+                left -= take
+                off += n * bs
+                todo -= n
+                pos += n
+        if left > 0:                                    # a trailing hole
+            for chunk in _xfs_zeros(left):
+                yield chunk
+
+    def readlink(self, ino):
+        """The symlink target. Inline in the inode when it fits, else in blocks of
+        its own: the kernel maps only the blocks the target needs
+        (xfs_symlink_blocks) and reads each mapped extent as one buffer, with a
+        header on v5 whose CRC, offset, length, owner, uuid and block number must
+        hold (xfs_symlink_remote_read, xfs_symlink_remote.c:236, and
+        xfs_symlink_verify, 86)."""
+        d = self.inode(ino)
+        if d is None:
+            raise XfsUnreadable(f"inode {ino} cannot be read")
+        size = d["size"]
+        if not 0 < size <= XFS_SYMLINK_MAXLEN:
+            raise XfsUnreadable(f"symlink {ino} records a target of {size} bytes")
+        if d["format"] == XFS_FMT_LOCAL:
+            return bytes(d["fork"][:size]).decode("utf-8", "surrogateescape")
+        hdr = XFS_SYMLINK_HDR if self.v5 else 0
+        fsblocks = -(-size // (self.bs - hdr))           # xfs_symlink_blocks
+        out, offset = bytearray(), 0
+        for lblk, pblk, count, _unw in self._extents(d) or []:
+            if lblk >= fsblocks or offset >= size:
+                break
+            count = min(count, fsblocks - lblk)
+            off = self._fsb_off(pblk)
+            buf = self._meta(off, count * self.bs, f"symlink {ino}: block {pblk}")
+            if buf is None:
+                raise XfsUnreadable(f"symlink {ino}: block {pblk} is past the end")
+            take = min(len(buf) - hdr, size - offset)
+            if self.v5:
+                sl_off, sl_bytes = struct.unpack_from(">II", buf, 4)
+                owner, blkno = struct.unpack_from(">QQ", buf, 32)
+                if buf[:4] != XFS_SYMLINK_MAGIC or not xfs_cksum_ok(buf, 12) or \
+                        (sl_off, sl_bytes, owner) != (offset, take, ino) or buf[16:32] != self.meta_uuid \
+                        or blkno != (off - self.base) // 512:
+                    self._damaged(f"symlink {ino}: its block fails its header or CRC check")
+                    raise XfsUnreadable(f"symlink {ino}: its block fails its header or CRC check")
+                buf = buf[hdr:]
+            out += buf[:take]
+            offset += take
+        if offset != size:
+            raise XfsUnreadable(f"symlink {ino}: {offset} of {size} target bytes found")
+        return bytes(out).decode("utf-8", "surrogateescape")
+
+    # -- directories -------------------------------------------------------
+    def _dir_blocks(self, d, lo, hi):
+        """[(directory block number, disk address, bytes)] for every whole
+        directory block mapped between file blocks lo and hi. A directory block
+        is dir_fsbcount filesystem blocks, which need not be contiguous on disk;
+        its disk address (512-byte units, as v5 headers record it) is that of
+        its first."""
+        runs = self._extents(d) or []
+        mapped = {}
+        for lblk, pblk, count, unwritten in runs:
+            if lblk + count <= lo or lblk >= hi or unwritten:
+                continue
+            for k in range(max(lblk, lo), min(lblk + count, hi)):
+                mapped[k] = pblk + (k - lblk)
+        out = []
+        for db in sorted({k // self.dir_fsbcount for k in mapped}):
+            parts = []
+            for k in range(db * self.dir_fsbcount, (db + 1) * self.dir_fsbcount):
+                off = self._fsb_off(mapped[k]) if k in mapped else None
+                buf = self._meta(off, self.bs, f"directory {d['ino']}: block {db}") if off is not None else None
+                if buf is None:
+                    parts = None
+                    break
+                parts.append(buf)
+            if parts is None:
+                self._damaged(f"directory {d['ino']}: block {db} is not wholly mapped and readable")
+                continue
+            daddr = (self._fsb_off(mapped[db * self.dir_fsbcount]) - self.base) // 512
+            out.append((db, daddr, b"".join(parts)))
+        return out
+
+    def _v3_header_ok(self, ino, db, daddr, buf, crc_off, blkno_at, uuid_at, owner_at, what):
+        """The v5 header of a directory block: its CRC, its own disk address,
+        the volume's uuid and the owning inode (xfs_dir3_data_verify,
+        xfs_dir2_data.c:310, and xfs_dir3_data_header_check, 417;
+        xfs_da3_blkinfo_verify, xfs_da_btree.c:194; the leaf and node header
+        checks, xfs_dir2_leaf.c:210, xfs_da_btree.c:252)."""
+        if not xfs_cksum_ok(buf, crc_off):
+            self._damaged(f"directory {ino}: {what} {db} fails its CRC")
+            return False
+        blkno, = struct.unpack_from(">Q", buf, blkno_at)
+        owner, = struct.unpack_from(">Q", buf, owner_at)
+        if blkno != daddr or buf[uuid_at:uuid_at + 16] != self.meta_uuid or owner != ino:
+            self._damaged(f"directory {ino}: {what} {db} records block {blkno} of inode {owner}, "
+                          f"not block {daddr} of inode {ino} on this volume")
+            return False
+        return True
+
+    def _dir_entries(self, ino):
+        """[(name bytes, inode, ftype or None)] of a directory, "." and ".."
+        left out, or None when it is not a readable directory."""
+        d = self.inode(ino)
+        if d is None or d["mode"] & S_IFMT != S_IFDIR:
+            return None
+        if d["format"] == XFS_FMT_LOCAL:
+            return self._sf_entries(d)
+        try:
+            blocks = self._dir_blocks(d, 0, self.leafblk)
+        except XfsUnreadable as exc:
+            self._damaged(f"directory {ino}: {exc}")
+            return []
+        out = []
+        for db, daddr, buf in blocks:
+            out.extend(self._data_block_entries(ino, db, daddr, buf))
+        return out
+
+    def _sf_entries(self, d):
+        """A shortform directory: a header with the entry count, whether inode
+        numbers are 8 bytes, and the parent, then entries of name length, a
+        2-byte offset, the name, the file type (ftype only) and the inode number
+        (xfs_da_format.h:214, xfs_dir2_sf.c:41-140)."""
+        fork, size = d["fork"], d["size"]
+        if size > len(fork) or size < 6:
+            self._damaged(f"directory {d['ino']}: shortform size {size} does not fit its fork")
+            return []
+        count, i8 = fork[0], fork[1]
+        isz = 8 if i8 else 4
+        parent = int.from_bytes(fork[2:2 + isz], "big") & XFS_MAXINUMBER
+        wide = int(parent > 0xFFFFFFFF)                 # XFS_DIR2_MAX_SHORT_INUM
+        pos = 2 + isz
+        out = []
+        for _ in range(count):
+            if pos + 3 > size:
+                break
+            nl = fork[pos]
+            name = bytes(fork[pos + 3:pos + 3 + nl])
+            q = pos + 3 + nl
+            ft = None
+            if self.ftype:
+                ft = fork[q] if q < size else None
+                q += 1
+            if q + isz > size or not nl:
+                break
+            child = int.from_bytes(fork[q:q + isz], "big") & XFS_MAXINUMBER
+            wide += child > 0xFFFFFFFF
+            out.append((name, child, ft))
+            pos = q + isz
+        # xfs_dir2_sf_verify (xfs_dir2_sf.c:698): the header's count of 8-byte
+        # numbers must be the count of numbers that need 8 bytes, and the
+        # entries must end exactly at the directory's size
+        if wide != i8:
+            self._damaged(f"directory {d['ino']}: its shortform header counts {i8} 8-byte inode "
+                          f"numbers where {wide} need 8 bytes")
+            return []
+        if len(out) != count or pos != size:
+            self._damaged(f"directory {d['ino']}: {len(out)} of {count} shortform entries read, "
+                          f"ending at byte {pos} of {size}")
+        return out
+
+    def _data_block_entries(self, ino, db, daddr, buf):
+        """The entries of one directory data block (single-block or multi-block
+        form), walking entries and free regions the way __xfs_dir3_data_check
+        does (xfs_dir2_data.c:96): a free region starts with tag 0xffff and its
+        length; an entry is the inode number, name length, name, file type
+        (ftype only) and a tag that must equal the entry's own offset, rounded
+        up to 8 bytes (xfs_dir2_data_entsize, xfs_dir2_priv.h:200)."""
+        kind = XFS_DIR_DATA_MAGICS.get(bytes(buf[:4]))
+        if kind is None or (self.v5 != (buf[3:4] == b"3")):
+            self._damaged(f"directory {ino}: block {db} is not a directory data block")
+            return []
+        if self.v5 and not self._v3_header_ok(ino, db, daddr, buf, 4, 8, 24, 40, "block"):
+            return []
+        end = len(buf)
+        if kind == "block":                             # xfs_dir3_data_end_offset
+            count, = struct.unpack_from(">I", buf, end - 8)
+            end = end - 8 - count * 8
+            if end < self.data_entry_offset:
+                self._damaged(f"directory {ino}: block {db} counts {count} leaf entries")
+                return []
+        out, pos = [], self.data_entry_offset
+        while pos + 8 <= end:
+            if struct.unpack_from(">H", buf, pos)[0] == XFS_DIR2_DATA_FREE_TAG:
+                length, = struct.unpack_from(">H", buf, pos + 2)
+                if length < 8 or length % 8 or pos + length > end:
+                    self._damaged(f"directory {ino}: block {db} has a bad free region at {pos}")
+                    break
+                pos += length
+                continue
+            child, = struct.unpack_from(">Q", buf, pos)
+            nl = buf[pos + 8]
+            size = (8 + 1 + nl + (1 if self.ftype else 0) + 2 + 7) & ~7
+            if not nl or pos + size > end:
+                self._damaged(f"directory {ino}: block {db} has a bad entry at {pos}")
+                break
+            if struct.unpack_from(">H", buf, pos + size - 2)[0] != pos:
+                self._damaged(f"directory {ino}: block {db}: the entry at {pos} has a tag "
+                              "that is not its own offset")
+                break
+            name = bytes(buf[pos + 9:pos + 9 + nl])
+            ft = buf[pos + 9 + nl] if self.ftype else None
+            if name not in (b".", b".."):
+                out.append((name, child & XFS_MAXINUMBER, ft))
+            pos += size
+        return out
+
+    def listdir(self, ino):
+        ents = self._dir_entries(ino) or []
+        return sorted((n.decode("utf-8", "surrogateescape"), c) for n, c, _ft in ents)
+
+    def dir_report(self, ino):
+        """How a directory is stored, for a check: its format named the way
+        xfs_dir2_format decides it (xfs_dir2.c:264), its data fork format, the
+        entries listed, and the live entries its own hash index counts ("." and
+        ".." included), from the block tail or the leaf blocks; None for a
+        shortform directory, which has no index. Leaf and node blocks are held
+        to the same v5 header checks as data blocks."""
+        d = self.inode(ino)
+        if d is None or d["mode"] & S_IFMT != S_IFDIR:
+            return None
+        ents = self._dir_entries(ino) or []
+        rep = dict(fork=XFS_FMT_NAMES.get(d["format"]), entries=len(ents), indexed=None)
+        if d["format"] == XFS_FMT_LOCAL:
+            rep["format"] = "shortform"
+            return rep
+        runs = self._extents(d) or []
+        eof = max((lb + n for lb, _pb, n, _u in runs), default=0)
+        rep["format"] = ("block" if eof == self.dir_fsbcount else
+                         "leaf" if eof == self.leafblk + self.dir_fsbcount else "node")
+        if rep["format"] == "block":
+            blocks = self._dir_blocks(d, 0, self.dir_fsbcount)
+            if blocks:
+                count, stale = struct.unpack_from(">II", blocks[0][2], self.dir_blksize - 8)
+                rep["indexed"] = count - stale
+            return rep
+        total = 0
+        for db, daddr, buf in self._dir_blocks(d, self.leafblk, self.freeblk):
+            magic, = struct.unpack_from(">H", buf, 8)
+            if magic not in XFS_DIR_LEAF_MAGICS and magic not in XFS_DA_NODE_MAGICS:
+                self._damaged(f"directory {ino}: block {db} is not a leaf or node block")
+                return rep
+            if self.v5 and not self._v3_header_ok(ino, db, daddr, buf, 12, 16, 32, 48,
+                                                  "leaf or node block"):
+                return rep
+            if magic in XFS_DA_NODE_MAGICS:
+                continue                                # a da node block: no entries
+            at = 56 if self.v5 else 12                 # struct xfs_dir3_leaf_hdr / xfs_dir2_leaf_hdr
+            count, stale = struct.unpack_from(">HH", buf, at)
+            total += count - stale
+        rep["indexed"] = total
+        return rep
+
+    # -- free space ----------------------------------------------------------
+    def _bnobt_runs(self, agno, agbase, length, root, levels):
+        """[(start block in the group, blocks)] from one group's bnobt, raising
+        XfsUnreadable at the first block that fails its checks."""
+        bs = self.bs
+        hdr = 56 if self.v5 else 16                     # XFS_BTREE_SBLOCK_CRC_LEN / _LEN
+        magic = XFS_ABTB_CRC_MAGIC if self.v5 else XFS_ABTB_MAGIC
+        runs, seen = [], set()
+        todo = [(root, levels - 1)]
+        while todo:
+            agbno, want = todo.pop()
+            if agbno in seen or agbno >= length or len(seen) > 1 << 20:
+                raise XfsUnreadable(f"AG {agno}: bnobt block {agbno} repeats or is out of range")
+            seen.add(agbno)
+            blk = read_at(self.fh, agbase + agbno * bs, bs)
+            if len(blk) < bs or blk[:4] != magic:
+                raise XfsUnreadable(f"AG {agno}: bnobt block {agbno} is not one")
+            lvl, n = struct.unpack_from(">HH", blk, 4)
+            if lvl != want:
+                raise XfsUnreadable(f"AG {agno}: bnobt block {agbno} is at the wrong level")
+            if self.v5:
+                blkno, = struct.unpack_from(">Q", blk, 16)
+                owner, = struct.unpack_from(">I", blk, 48)
+                if not xfs_cksum_ok(blk, 52) or owner != agno or blk[32:48] != self.meta_uuid \
+                        or blkno != (agbase + agbno * bs - self.base) // 512:
+                    raise XfsUnreadable(f"AG {agno}: bnobt block {agbno} fails its checks")
+            if lvl == 0:
+                for i in range(min(n, (bs - hdr) // 8)):
+                    runs.append(struct.unpack_from(">II", blk, hdr + i * 8))
+                continue
+            mx = (bs - hdr) // 12                       # xfs_allocbt_maxrecs, xfs_alloc_btree.c:563
+            for i in range(min(n, mx)):
+                todo.append((struct.unpack_from(">I", blk, hdr + mx * 8 + i * 4)[0], lvl - 1))
+        return runs
+
+    def free_extents(self, min_bytes=0):
+        """[(byte offset, length)] for the runs of space the volume says are free.
+
+        Each allocation group's AGF (one sector after its superblock,
+        XFS_AGF_DADDR, xfs_format.h:610) roots a B+tree of free extents by block
+        number (the bnobt), whose leaf records are a start block in the group and
+        a length (struct xfs_alloc_rec, xfs_format.h:1543) under a short btree
+        header (xfs_format.h:1928). The blocks held on the AGFL for the btrees'
+        own growth are not in it, and are not reported.
+
+        Nothing is reported unless every group's AGF and every bnobt block passes
+        its checks (magic, level, and on v5 the CRC, block number, owner and
+        uuid) and the free blocks the tree records add up to the AGF's own
+        agf_freeblks, the same comparison xfs_repair makes (repair/scan.c:3173).
+
+        Offsets are into the image rather than the volume, so a caller reading
+        the whole disk can use them directly. ``min_bytes`` drops runs too short
+        to hold anything worth recovering.
+        """
+        bs, out = self.bs, []
+        for agno in range(self.agcount):
+            agbase = self.base + agno * self.agblocks * bs
+            agf = read_at(self.fh, agbase + self.sectsize, self.sectsize)
+            if len(agf) < self.sectsize or agf[:4] != XFS_AGF_MAGIC:
+                return []
+            version, seqno, length, root = struct.unpack_from(">IIII", agf, 4)
+            level, = struct.unpack_from(">I", agf, 28)
+            freeblks, = struct.unpack_from(">I", agf, 52)
+            if version != 1 or seqno != agno or (self.v5 and not xfs_cksum_ok(agf, 216)):
+                return []
+            try:
+                runs = self._bnobt_runs(agno, agbase, length, root, level)
+            except XfsUnreadable:
+                return []
+            if sum(n for _s, n in runs) != freeblks:
+                return []
+            out.extend((agbase + s * bs, n * bs) for s, n in sorted(runs) if n * bs >= min_bytes)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Btrfs
+#
+# Btrfs is read here directly, no mounting, from its on-disk format as
+# btrfs-progs defines it at v6.17.1 (commit
+# 06981428c08f78f019a2f4956407fd84b495e21e, https://github.com/kdave/btrfs-progs),
+# with the kernel's own fs/btrfs at v7.0 (commit
+# 028ef9c96e96197026887c0f092424679298aae8) where only the kernel settles a
+# rule. Line numbers below are at those commits. No code was copied; qnxprobe
+# is MIT and both are GPL.
+#
+#   superblock at 64 KiB, 4 KiB long          kernel-shared/ctree.h:72-73
+#   mirrors at 16 KiB << (12 * n), n = 1, 2   kernel-shared/disk-io.h:35-36,148-156
+#   struct btrfs_super_block, BTRFS_MAGIC     kernel-shared/uapi/btrfs_tree.h:668-726, 14
+#   checksum types and sizes                  btrfs_tree.h:381-384, kernel-shared/ctree.c:49-55
+#   crc32c stored as ~crc, little endian;     crypto/hash.c:32-40, 42-50
+#     xxhash64 with seed 0, little endian
+#   sha256; blake2b with a 32-byte digest     crypto/hash.c:64-81, crypto/hash.h:23
+#   a block's checksum covers its bytes from  kernel-shared/disk-io.c:186-216, 1785
+#     32 to the end; the superblock's 32..4096
+#   struct btrfs_header, item, key_ptr        btrfs_tree.h:482-497, 549-580
+#   a leaf's item offsets count from the end  btrfs_tree.h:549-567
+#     of the header
+#   a child's generation must equal the one   kernel-shared/disk-io.c:275 (verify_parent_transid)
+#     its parent's pointer records
+#   sys_chunk_array: key then chunk, repeated kernel-shared/volumes.c:2577-2666
+#   struct btrfs_chunk, btrfs_stripe          btrfs_tree.h:629-663
+#   logical to physical, every profile        kernel-shared/volumes.c:2093-2313
+#   block group profile bits                  btrfs_tree.h:1154-1185
+#   object ids and item types                 btrfs_tree.h:38-132, 141-282
+#   struct btrfs_root_item, root_ref          btrfs_tree.h:921-982
+#   struct btrfs_inode_item, timespec         btrfs_tree.h:867-899
+#   struct btrfs_inode_ref, inode_extref      btrfs_tree.h:853-865
+#   struct btrfs_dir_item (several share an   btrfs_tree.h:905-911, kernel-shared/ctree.h:901
+#     item when their crc32c name hashes collide)
+#   file extent types and item; inline data   btrfs_tree.h:1063-1119
+#     starts at disk_bytenr
+#   compression types                         kernel-shared/compression.h:108-111
+#   incompat and compat_ro feature bits       kernel-shared/uapi/btrfs.h:322-362
+#   reading a file's extents                  cmds/restore.c:292-471, 617-760
+#   LZO framing: total length, then segments  linux fs/btrfs/lzo.c:24-59, 429-546
+#     of one sector, none crossing a sector
+#   zlib: a stream with or without header     linux fs/btrfs/zlib.c:351-384
+#   a subvolume is entered only through a     linux fs/btrfs/inode.c:5811-5875, 6096-6102
+#     matching ROOT_REF; otherwise an empty
+#     directory stands in its place
+#   readdir walks DIR_INDEX items             linux fs/btrfs/inode.c:6304-6349
+#
+# What is read: one device's superblock (the primary when it holds, as a
+# normal open reads only the primary; otherwise the copy SBREAD_RECOVER would
+# take, disk-io.c:1933-2017: see _btrfs_pick_super), the chunk tree, the root
+# tree, and every file tree reachable from the top-level subvolume (id 5):
+# subvolumes and snapshots are directories in it, as the kernel and "btrfs
+# restore -s" present them. Inline, regular and preallocated extents, holes
+# both explicit and implied (NO_HOLES), and zlib, LZO and zstd extents are
+# read; zstd needs Python 3.14 (compression.zstd). Every tree block's
+# checksum, address, filesystem id and structure are checked, and on every
+# read the level, generation and first key its parent records; a DUP copy is
+# tried when the first fails. Items are held to the kernel's tree checker
+# (linux fs/btrfs/tree-checker.c) where a wrong one would misread a file.
+#
+# What is refused, each by name: RAID0, RAID10, RAID5 and RAID6 chunks (their
+# data is striped across devices, so one image does not hold it); a chunk with
+# no copy on this device; an extent whose encryption or other_encoding field is
+# set (btrfs_tree.h:1084-1088: a reader that does not understand them treats
+# them as incompatible); extent tree v2. A log tree is not replayed: the volume
+# is read as of its last committed transaction, and the note says a log tree
+# is present.
+# ---------------------------------------------------------------------------
+BTRFS_SUPER_OFF = 0x10000
+BTRFS_SUPER_SIZE = 4096
+BTRFS_SUPER_MIRRORS = (0x10000, 0x4000 << 12, 0x4000 << 24)
+BTRFS_MAGIC = b"_BHRfS_M"
+BTRFS_CSUM_NAMES = {0: "crc32c", 1: "xxhash64", 2: "sha256", 3: "blake2b"}
+BTRFS_CSUM_SIZES = {0: 4, 1: 8, 2: 32, 3: 32}
+BTRFS_HEADER_SIZE = 101                 # struct btrfs_header, packed
+BTRFS_ITEM_SIZE = 25                    # btrfs_disk_key (17) + offset + size
+BTRFS_KEY_PTR_SIZE = 33                 # btrfs_disk_key + blockptr + generation
+BTRFS_MAX_LEVEL = 8                     # kernel-shared/ctree.h BTRFS_MAX_LEVEL
+BTRFS_RESERVED_1M = 1 << 20             # kernel-shared/ctree.h:200
+BTRFS_STRIPE_LEN = 64 << 10             # kernel-shared/volumes.h BTRFS_STRIPE_LEN
+# object ids
+BTRFS_ROOT_TREE_OBJECTID, BTRFS_EXTENT_TREE_OBJECTID = 1, 2
+BTRFS_CHUNK_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID = 3, 4
+BTRFS_FS_TREE_OBJECTID, BTRFS_ROOT_TREE_DIR_OBJECTID = 5, 6
+BTRFS_FREE_SPACE_TREE_OBJECTID, BTRFS_BLOCK_GROUP_TREE_OBJECTID = 10, 11
+BTRFS_FIRST_FREE_OBJECTID = 256
+BTRFS_LAST_FREE_OBJECTID = (1 << 64) - 256
+BTRFS_FIRST_CHUNK_TREE_OBJECTID = 256
+BTRFS_EMPTY_SUBVOL_DIR_OBJECTID = 2
+# item types
+BTRFS_INODE_ITEM_KEY, BTRFS_INODE_REF_KEY, BTRFS_INODE_EXTREF_KEY = 1, 12, 13
+BTRFS_XATTR_ITEM_KEY, BTRFS_ORPHAN_ITEM_KEY = 24, 48
+BTRFS_DIR_ITEM_KEY, BTRFS_DIR_INDEX_KEY, BTRFS_EXTENT_DATA_KEY = 84, 96, 108
+BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_BACKREF_KEY, BTRFS_ROOT_REF_KEY = 132, 144, 156
+BTRFS_EXTENT_ITEM_KEY, BTRFS_METADATA_ITEM_KEY = 168, 169
+BTRFS_BLOCK_GROUP_ITEM_KEY = 192
+BTRFS_FREE_SPACE_INFO_KEY, BTRFS_FREE_SPACE_EXTENT_KEY = 198, 199
+BTRFS_FREE_SPACE_BITMAP_KEY = 200
+BTRFS_DEV_EXTENT_KEY, BTRFS_DEV_ITEM_KEY, BTRFS_CHUNK_ITEM_KEY = 204, 216, 228
+# block group (chunk) type and profile bits
+BTRFS_BG_DATA, BTRFS_BG_SYSTEM, BTRFS_BG_METADATA = 1 << 0, 1 << 1, 1 << 2
+BTRFS_BG_PROFILES = ((1 << 3, "RAID0"), (1 << 4, "RAID1"), (1 << 5, "DUP"),
+                     (1 << 6, "RAID10"), (1 << 7, "RAID5"), (1 << 8, "RAID6"),
+                     (1 << 9, "RAID1C3"), (1 << 10, "RAID1C4"))
+BTRFS_BG_MIRRORED = (1 << 4) | (1 << 5) | (1 << 9) | (1 << 10)    # RAID1, DUP, RAID1C3/4
+BTRFS_BG_STRIPED = (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8)      # RAID0, RAID10, RAID5/6
+# feature bits (kernel-shared/uapi/btrfs.h)
+BTRFS_INCOMPAT_NAMES = ((0, "mixed_backref"), (1, "default_subvol"), (2, "mixed_groups"),
+                        (3, "compress_lzo"), (4, "compress_zstd"), (5, "big_metadata"),
+                        (6, "extended_iref"), (7, "raid56"), (8, "skinny_metadata"),
+                        (9, "no_holes"), (10, "metadata_uuid"), (11, "raid1c34"),
+                        (12, "zoned"), (13, "extent_tree_v2"), (14, "raid_stripe_tree"),
+                        (16, "simple_quota"))
+BTRFS_INCOMPAT_METADATA_UUID = 1 << 10
+BTRFS_INCOMPAT_EXTENT_TREE_V2 = 1 << 13
+BTRFS_INCOMPAT_RAID_STRIPE_TREE = 1 << 14
+BTRFS_INCOMPAT_COMPRESS_ZSTD = 1 << 4
+BTRFS_COMPAT_RO_BLOCK_GROUP_TREE = 1 << 3
+# file extents
+BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_REG, BTRFS_FILE_EXTENT_PREALLOC = 0, 1, 2
+BTRFS_FILE_EXTENT_INLINE_DATA_START = 21    # offsetof(btrfs_file_extent_item, disk_bytenr)
+BTRFS_COMPRESS = {0: "none", 1: "zlib", 2: "lzo", 3: "zstd"}
+BTRFS_ROOT_SUBVOL_RDONLY = 1 << 0
+_BTRFS_KEY_MAX = ((1 << 64) - 1, 255, (1 << 64) - 1)
+# linux fs/btrfs/compression.h:34-40
+BTRFS_MAX_COMPRESSED = BTRFS_MAX_UNCOMPRESSED = 128 << 10
+# the largest i_size: sb->s_maxbytes = MAX_LFS_FILESIZE (linux fs/btrfs/super.c:963),
+# LLONG_MAX on a 64-bit kernel
+BTRFS_MAX_FILE_SIZE = (1 << 63) - 1
+# item sizes the kernel's tree checker requires (linux fs/btrfs/tree-checker.c)
+BTRFS_INODE_ITEM_SIZE = 160                 # check_inode_item, 1141-1145
+BTRFS_FILE_EXTENT_ITEM_SIZE = 53            # check_extent_data_item, 296-302
+BTRFS_DEV_EXTENT_SIZE = 48                  # struct btrfs_dev_extent, btrfs_tree.h:845-851
+BTRFS_ROOT_ITEM_LEGACY_SIZE = 239           # btrfs_legacy_root_item_size, btrfs_tree.h:970-973
+# directory entry types to file type bits, btrfs_tree.h:395-402
+BTRFS_FT_MODE = {1: 0o100000, 2: 0o040000, 3: 0o020000, 4: 0o060000, 5: 0o010000,
+                 6: 0o140000, 7: 0o120000}
+
+_BTRFS_CRC32C_TABLE = None
+
+
+def btrfs_crc32c(data, crc=0xFFFFFFFF):
+    """The CRC-32C (Castagnoli, reflected polynomial 0x82F63B78) register after
+    ``data``, starting from ``crc``, with no final inversion: crypto/crc32c.c
+    (the polynomial at line 34, the table walk at line 204). btrfs stores the
+    inverted value (crypto/hash.c:32-40) and hashes names from a seed of ~1
+    (kernel-shared/ctree.h:901-903)."""
+    global _BTRFS_CRC32C_TABLE                            # pylint: disable=global-statement
+    if _BTRFS_CRC32C_TABLE is None:
+        table = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+            table.append(c)
+        _BTRFS_CRC32C_TABLE = table
+    t = _BTRFS_CRC32C_TABLE
+    for b in data:
+        crc = t[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+_XXH_P1, _XXH_P2 = 0x9E3779B185EBCA87, 0xC2B2AE3D27D4EB4F
+_XXH_P3, _XXH_P4, _XXH_P5 = 0x165667B19E3779F9, 0x85EBCA77C2B2AE63, 0x27D4EB2F165667C5
+_M64 = (1 << 64) - 1
+
+
+def _xxh_rotl(x, r):
+    return ((x << r) | (x >> (64 - r))) & _M64
+
+
+def _xxh_round(acc, lane):
+    acc = (acc + lane * _XXH_P2) & _M64
+    return (_xxh_rotl(acc, 31) * _XXH_P1) & _M64
+
+
+def btrfs_xxh64(data, seed=0):
+    """XXH64 of ``data``, as crypto/xxhash.h defines it: the primes at lines
+    1238-1242, XXH64_round and XXH64_mergeRound at 1252-1266, the avalanche at
+    1268-1276, the tail at 1296-1338 and the four-lane body at 1340-1373."""
+    data = bytes(data)
+    n, i = len(data), 0
+    if n >= 32:
+        v1 = (seed + _XXH_P1 + _XXH_P2) & _M64
+        v2 = (seed + _XXH_P2) & _M64
+        v3 = seed & _M64
+        v4 = (seed - _XXH_P1) & _M64
+        lanes = struct.unpack_from(f"<{(n // 32) * 4}Q", data)
+        for j in range(0, len(lanes), 4):
+            v1 = _xxh_round(v1, lanes[j])
+            v2 = _xxh_round(v2, lanes[j + 1])
+            v3 = _xxh_round(v3, lanes[j + 2])
+            v4 = _xxh_round(v4, lanes[j + 3])
+        i = (n // 32) * 32
+        h = (_xxh_rotl(v1, 1) + _xxh_rotl(v2, 7) + _xxh_rotl(v3, 12) + _xxh_rotl(v4, 18)) & _M64
+        for v in (v1, v2, v3, v4):
+            h ^= _xxh_round(0, v)
+            h = (h * _XXH_P1 + _XXH_P4) & _M64
+    else:
+        h = (seed + _XXH_P5) & _M64
+    h = (h + n) & _M64
+    while i + 8 <= n:
+        h ^= _xxh_round(0, struct.unpack_from("<Q", data, i)[0])
+        h = (_xxh_rotl(h, 27) * _XXH_P1 + _XXH_P4) & _M64
+        i += 8
+    if i + 4 <= n:
+        h ^= (struct.unpack_from("<I", data, i)[0] * _XXH_P1) & _M64
+        h = (_xxh_rotl(h, 23) * _XXH_P2 + _XXH_P3) & _M64
+        i += 4
+    while i < n:
+        h ^= (data[i] * _XXH_P5) & _M64
+        h = (_xxh_rotl(h, 11) * _XXH_P1) & _M64
+        i += 1
+    h ^= h >> 33
+    h = (h * _XXH_P2) & _M64
+    h ^= h >> 29
+    h = (h * _XXH_P3) & _M64
+    h ^= h >> 32
+    return h
+
+
+def btrfs_csum(csum_type, data):
+    """The checksum btrfs stores for ``data``, as many bytes as the type keeps
+    (btrfs_csum_data, kernel-shared/disk-io.c:165-184), or None for a type this
+    does not know."""
+    if csum_type == 0:
+        return struct.pack("<I", btrfs_crc32c(data) ^ 0xFFFFFFFF)
+    if csum_type == 1:
+        return struct.pack("<Q", btrfs_xxh64(data))
+    if csum_type == 2:
+        import hashlib                              # pylint: disable=import-outside-toplevel
+        return hashlib.sha256(data).digest()
+    if csum_type == 3:
+        import hashlib                              # pylint: disable=import-outside-toplevel
+        return hashlib.blake2b(data, digest_size=32).digest()
+    return None
+
+
+def _btrfs_uuid(b):
+    h = bytes(b).hex()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def _btrfs_super(buf, at):
+    """The fields of a superblock read at byte ``at`` of its device, with
+    ``csum_ok`` saying whether its checksum holds, or None when the magic is not
+    there. Offsets are those of struct btrfs_super_block (btrfs_tree.h:668-726)."""
+    if len(buf) < BTRFS_SUPER_SIZE or buf[64:72] != BTRFS_MAGIC:
+        return None
+    (bytenr, flags, _magic, generation, root, chunk_root, log_root, _unused, total_bytes,
+     bytes_used, root_dir, num_devices, sectorsize, nodesize, _leafsize, stripesize,
+     sys_size, chunk_gen, compat, compat_ro, incompat, csum_type, root_level,
+     chunk_level, log_level) = struct.unpack_from("<QQ8sQQQQQQQQQIIIIIQQQQHBBB", buf, 48)
+    devid, dev_total, dev_used = struct.unpack_from("<QQQ", buf, 201)
+    label = buf[299:299 + 256].split(b"\x00")[0].decode("utf-8", "replace")
+    csum = btrfs_csum(csum_type, buf[32:BTRFS_SUPER_SIZE])
+    size = BTRFS_CSUM_SIZES.get(csum_type, 0)
+    return dict(
+        at=at, bytenr=bytenr, flags=flags, generation=generation, root=root,
+        chunk_root=chunk_root, log_root=log_root, total_bytes=total_bytes,
+        bytes_used=bytes_used, root_dir=root_dir, num_devices=num_devices,
+        sectorsize=sectorsize, nodesize=nodesize, stripesize=stripesize,
+        sys_array=bytes(buf[811:811 + min(sys_size, 2048)]), sys_size=sys_size,
+        chunk_generation=chunk_gen, compat=compat, compat_ro=compat_ro, incompat=incompat,
+        csum_type=csum_type, root_level=root_level, chunk_level=chunk_level,
+        log_level=log_level, devid=devid, dev_total=dev_total, dev_used=dev_used,
+        dev_uuid=bytes(buf[267:283]), fsid=bytes(buf[32:48]),
+        metadata_uuid=bytes(buf[571:587]), label=label,
+        csum_ok=csum is not None and csum == bytes(buf[:size]))
+
+
+def _btrfs_super_sane(sb):
+    """Why a superblock whose checksum holds still cannot be used, or None. The
+    limits are the ones btrfs_check_super applies (kernel-shared/disk-io.c)."""
+    def pow2(v):
+        return v > 0 and v & (v - 1) == 0
+    if sb["csum_type"] not in BTRFS_CSUM_NAMES:
+        return f"checksum type {sb['csum_type']} is not one btrfs defines"
+    if not (pow2(sb["sectorsize"]) and 4096 <= sb["sectorsize"] <= 65536):
+        return f"sector size {sb['sectorsize']} is out of range"
+    if not (pow2(sb["nodesize"]) and sb["sectorsize"] <= sb["nodesize"] <= 65536):
+        return f"node size {sb['nodesize']} is out of range"
+    if sb["sys_size"] > 2048:
+        return f"sys_chunk_array_size {sb['sys_size']} is over 2048"
+    if sb["bytenr"] != sb["at"]:
+        return f"it records its own place as {sb['bytenr']:#x}, not {sb['at']:#x}"
+    return None
+
+
+def _btrfs_pick_super(fh, base):
+    """(superblock, [(byte offset, generation, csum_ok)], why) for a device at
+    ``base``; the superblock is None when no copy can be used, and ``why``
+    says so.
+
+    The primary copy at 64 KiB must carry the magic: "btrfs only recognizes
+    disks with a valid 0x1 0000 superblock" (Documentation/dev/
+    On-disk-format.rst:78-79), so a device without it is not Btrfs and its
+    mirrors are not looked at. A primary whose checksum holds and which passes
+    the sanity checks is used, as a normal open reads only the primary
+    (disk-io.c:1942, max_super is 1 without SBREAD_RECOVER). Otherwise every
+    copy is tried as SBREAD_RECOVER does (disk-io.c:1974-2014): a copy is
+    skipped when its checksum or its checks fail, the first good copy sets the
+    fsid every later one must carry, and the good copy with the highest
+    generation is taken."""
+    found = []
+    primary = _btrfs_super(read_at(fh, base + BTRFS_SUPER_OFF, BTRFS_SUPER_SIZE),
+                           BTRFS_SUPER_OFF)
+    if primary is None:
+        return None, found, "no Btrfs magic in the superblock at 64 KiB"
+    found.append((BTRFS_SUPER_OFF, primary["generation"], primary["csum_ok"]))
+    if primary["csum_ok"] and not _btrfs_super_sane(primary):
+        return primary, found, None
+    best, fsid = None, None
+    for at in BTRFS_SUPER_MIRRORS:
+        sb = primary if at == BTRFS_SUPER_OFF else \
+            _btrfs_super(read_at(fh, base + at, BTRFS_SUPER_SIZE), at)
+        if sb is None:
+            continue
+        if at != BTRFS_SUPER_OFF:
+            found.append((at, sb["generation"], sb["csum_ok"]))
+        if not sb["csum_ok"] or _btrfs_super_sane(sb):
+            continue
+        if fsid is None:
+            fsid = sb["fsid"]
+        elif sb["fsid"] != fsid:
+            continue
+        if best is None or sb["generation"] > best["generation"]:   # pylint: disable=unsubscriptable-object
+            best = sb
+    if best is None:
+        why = ("its superblock checksum does not hold" if not primary["csum_ok"]
+               else _btrfs_super_sane(primary))
+        return None, found, f"{why}, and no mirror copy holds either"
+    return best, found, None
+
+
+class BtrfsUnreadable(Exception):
+    """A Btrfs structure or file this reader cannot hand back whole; the message says why."""
+
+
+def _btrfs_check_block(buf, nodesize, sectorsize):
+    """Why a tree block's own structure is wrong, or None: the checks the
+    kernel's tree checker makes before any item is used (linux
+    fs/btrfs/tree-checker.c, __btrfs_check_leaf 2018-2166 and
+    __btrfs_check_node 2179-2234). A leaf's keys rise strictly, its items'
+    data is packed from the end of the block with no gap or overlap, and no
+    item's data overlaps the item headers; a node holds 1 to the most
+    pointers that fit, its keys rise strictly, and no pointer is 0 or off a
+    sector boundary."""
+    nritems = struct.unpack_from("<I", buf, 96)[0]
+    level = buf[100]
+    if level >= BTRFS_MAX_LEVEL:
+        return f"level {level} is not below {BTRFS_MAX_LEVEL}"
+    if level == 0:
+        if BTRFS_HEADER_SIZE + nritems * BTRFS_ITEM_SIZE > nodesize:
+            return f"a leaf claims {nritems:,} items, more than fit"
+        data_size = nodesize - BTRFS_HEADER_SIZE
+        prev, expect_end = (0, 0, 0), data_size
+        for i in range(nritems):
+            o = BTRFS_HEADER_SIZE + i * BTRFS_ITEM_SIZE
+            key = _btrfs_key(buf, o)
+            if key <= prev:
+                return f"item {i} key {key} does not follow {prev}"
+            ioff, isz = struct.unpack_from("<II", buf, o + 17)
+            if ioff + isz != expect_end or ioff + isz > data_size:
+                return f"item {i} ends at {ioff + isz}, not {expect_end}"
+            if BTRFS_HEADER_SIZE + ioff < o + BTRFS_ITEM_SIZE:
+                return f"item {i} data overlaps the item headers"
+            prev, expect_end = key, ioff
+        return None
+    most = (nodesize - BTRFS_HEADER_SIZE) // BTRFS_KEY_PTR_SIZE
+    if not 1 <= nritems <= most:
+        return f"a node claims {nritems:,} pointers, not 1 to {most}"
+    prev = None
+    for i in range(nritems):
+        o = BTRFS_HEADER_SIZE + i * BTRFS_KEY_PTR_SIZE
+        key = _btrfs_key(buf, o)
+        ptr = struct.unpack_from("<Q", buf, o + 17)[0]
+        if prev is not None and key <= prev:
+            return f"pointer {i} key {key} does not follow {prev}"
+        if not ptr or ptr % sectorsize:
+            return f"pointer {i} is {ptr:#x}, 0 or off a sector boundary"
+        prev = key
+    return None
+
+
+def _btrfs_key(buf, off):
+    return struct.unpack_from("<QBQ", buf, off)
+
+
+def _btrfs_profile(chunk_type):
+    names = [n for bit, n in BTRFS_BG_PROFILES if chunk_type & bit]
+    return "/".join(names) if names else "single"
+
+
+def _btrfs_decompress(comp, data, ram_bytes, sectorsize):
+    """The bytes a compressed extent (or compressed inline data) holds.
+
+    zlib: a zlib stream, or, when its first two bytes are a zlib header, the
+    raw deflate after them, its adler32 not checked: fs/btrfs/zlib.c:351-384.
+    LZO: a le32 total length, then segments of a le32 length and an LZO1X
+    stream of at most one sector, a segment header never crossing a sector
+    boundary (up to 3 padding bytes skipped): fs/btrfs/lzo.c:24-59, 429-546.
+    zstd: one zstd frame; anything past it (the rest of the last sector) is not
+    read: fs/btrfs/zstd.c.
+
+    The kernel never makes a compressed extent that holds more than 128 KiB,
+    stored or decompressed (BTRFS_MAX_COMPRESSED and BTRFS_MAX_UNCOMPRESSED,
+    linux fs/btrfs/compression.h:34-40; inode.c:9934-9935 refuses an encoded
+    write past them), so a ``ram_bytes`` or a stored length outside 1 byte to
+    128 KiB is refused before anything is decompressed. That also bounds what
+    a damaged stream can make this decompress."""
+    if not 0 < ram_bytes <= BTRFS_MAX_UNCOMPRESSED:
+        raise DecompressError(f"ram_bytes {ram_bytes:,} is outside the 1 to "
+                              f"{BTRFS_MAX_UNCOMPRESSED:,} a compressed extent holds")
+    if not 0 < len(data) <= BTRFS_MAX_COMPRESSED:
+        raise DecompressError(f"{len(data):,} stored bytes is outside the 1 to "
+                              f"{BTRFS_MAX_COMPRESSED:,} a compressed extent holds")
+    if comp == 1:
+        import zlib                                 # pylint: disable=import-outside-toplevel
+        d = data
+        if (len(d) > 2 and not d[1] & 0x20 and (d[0] & 0x0F) == 8
+                and ((d[0] << 8) + d[1]) % 31 == 0):
+            z = zlib.decompressobj(-((d[0] >> 4) + 8))
+            d = d[2:]
+        else:
+            z = zlib.decompressobj()
+        try:
+            out = z.decompress(d, ram_bytes)
+        except zlib.error as exc:
+            raise DecompressError(f"zlib: {exc}") from None
+        return out
+    if comp == 2:
+        if len(data) < 4:
+            raise DecompressError("LZO extent shorter than its header")
+        total = struct.unpack_from("<I", data, 0)[0]
+        if total > len(data) or total < 4:
+            raise DecompressError(f"LZO header records {total:,} bytes, the extent holds "
+                                  f"{len(data):,}")
+        out, pos = bytearray(), 4
+        while pos < total and len(out) < ram_bytes:
+            if pos + 4 > total:
+                raise DecompressError("LZO segment header past the recorded length")
+            seg = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            if seg == 0 or pos + seg > total:
+                raise DecompressError(f"LZO segment of {seg:,} bytes does not fit the extent")
+            out += lzo1x_decompress(data[pos:pos + seg], limit=sectorsize)
+            pos += seg
+            left = sectorsize - pos % sectorsize
+            if left < 4:
+                pos += left
+        return bytes(out)
+    if comp == 3:
+        z = _zstd_module()
+        if z is None:
+            raise DecompressError("zstd needs Python 3.14 or later (compression.zstd); "
+                                  "this Python does not carry it")
+        try:
+            dec = z.ZstdDecompressor()
+            return dec.decompress(bytes(data), ram_bytes)
+        except Exception as exc:                    # ZstdError, not a stable name
+            raise DecompressError(f"zstd: {exc}") from None
+    raise DecompressError(f"compression type {comp} is not one btrfs defines")
+
+
+def btrfs_extent_bytes(extents, isize, read_logical, sectorsize, cap=None):
+    """Yield a file's bytes from its parsed extent items, ``isize`` of them at
+    most (``cap`` lowers that), zeros wherever no extent covers a range.
+
+    ``extents`` is [(file offset, extent dict)] in key order, each dict as
+    BtrfsWalker._extent() parses an EXTENT_DATA item. A range no item covers is
+    a hole (NO_HOLES drops hole items, btrfs.h:356); so is a REG extent with
+    disk_bytenr 0 (restore.c:376-378). A PREALLOC extent reads as zeros, as
+    restore.c:721 skips it. An uncompressed extent's bytes start ``offset``
+    into the disk extent; a compressed one is decompressed whole and then
+    ``offset`` into the result (restore.c:350-471). Inline data starts the file
+    and is ram_bytes long (restore.c:292-348).
+
+    ``read_logical(addr, n)`` returns n bytes at a logical address. Kept apart
+    from the walker so the self-test can drive it with extents no fixture
+    writes."""
+    limit = isize if cap is None else min(isize, cap)
+    pos = 0
+
+    def zeros(n):
+        while n > 0:
+            piece = min(n, 1 << 20)
+            yield bytes(piece)
+            n -= piece
+
+    for off, ext in extents:
+        if pos >= limit:
+            return
+        if off > pos:                                   # a hole up to this extent
+            for z in zeros(min(off, limit) - pos):
+                yield z
+            pos = min(off, limit)
+            if pos >= limit:
+                return
+        if ext["encryption"] or ext["other_encoding"]:
+            raise BtrfsUnreadable(f"extent at file offset {off:,} is encrypted or encoded "
+                                  f"(encryption {ext['encryption']}, other_encoding "
+                                  f"{ext['other_encoding']}), which this does not read")
+        if ext["type"] == BTRFS_FILE_EXTENT_INLINE:
+            data = ext["inline"]
+            if ext["compression"]:
+                try:
+                    data = _btrfs_decompress(ext["compression"], data, ext["ram_bytes"],
+                                             sectorsize)
+                except DecompressError as exc:
+                    raise BtrfsUnreadable(f"inline extent: {exc}") from None
+            data = data[:ext["ram_bytes"]]
+            length = len(data)
+        elif ext["type"] in (BTRFS_FILE_EXTENT_REG, BTRFS_FILE_EXTENT_PREALLOC):
+            length = ext["num_bytes"]
+            data = None
+        else:
+            raise BtrfsUnreadable(f"extent at file offset {off:,} has type {ext['type']}, "
+                                  "which btrfs does not define")
+        end = off + length
+        if end <= pos:                                  # wholly behind what was given
+            continue
+        skip = pos - off                                # an overlap, never expected
+        want = min(end, limit) - pos
+        if data is not None:
+            yield data[skip:skip + want]
+        elif ext["type"] == BTRFS_FILE_EXTENT_PREALLOC or ext["disk_bytenr"] == 0:
+            for z in zeros(want):
+                yield z
+        elif ext["compression"] == 0:
+            at = ext["disk_bytenr"] + ext["offset"] + skip
+            left = want
+            while left > 0:
+                n = min(left, 1 << 20)
+                chunk = read_logical(at, n)
+                if len(chunk) < n:
+                    raise BtrfsUnreadable(f"extent at logical {at:#x} reads {len(chunk):,} "
+                                          f"of {n:,} bytes")
+                yield chunk
+                at += n
+                left -= n
+        else:
+            if not 0 < ext["disk_num_bytes"] <= BTRFS_MAX_COMPRESSED:
+                raise BtrfsUnreadable(
+                    f"compressed extent at logical {ext['disk_bytenr']:#x} records "
+                    f"{ext['disk_num_bytes']:,} stored bytes, outside the 1 to "
+                    f"{BTRFS_MAX_COMPRESSED:,} a compressed extent holds")
+            raw = read_logical(ext["disk_bytenr"], ext["disk_num_bytes"])
+            try:
+                full = _btrfs_decompress(ext["compression"], raw, ext["ram_bytes"],
+                                         sectorsize)
+            except DecompressError as exc:
+                raise BtrfsUnreadable(f"extent at logical {ext['disk_bytenr']:#x}: "
+                                      f"{exc}") from None
+            piece = full[ext["offset"] + skip:ext["offset"] + skip + want]
+            if len(piece) < want:
+                raise BtrfsUnreadable(
+                    f"compressed extent at logical {ext['disk_bytenr']:#x} gives "
+                    f"{len(full):,} bytes, short of the {ext['offset'] + skip + want:,} "
+                    "its file needs")
+            yield piece
+        pos += want
+    if pos < limit:                                     # a hole to the end of the file
+        for z in zeros(limit - pos):
+            yield z
+
+
+class BtrfsWalker:
+    """List and read a Btrfs volume from one device.
+
+    A node is an int: the file tree's id shifted left 64, plus the inode
+    number in it. A hard link is one node reached by two names; a subvolume or
+    snapshot is a directory whose node is in its own tree. ``damage`` collects
+    what could not be read, each as text, as the walk finds it."""
+
+    def __init__(self, fh, base):
+        self.fh, self.base = fh, base
+        self.damage = []
+        self._seen_damage = set()
+        self._cache = collections.OrderedDict()
+        self._named = {}                            # node -> (dir entry type, name)
+        best, self.superblocks, why = _btrfs_pick_super(fh, base)
+        if best is None:
+            raise BtrfsUnreadable(why)
+        self.sb = sb = best
+        self.nodesize, self.sectorsize = sb["nodesize"], sb["sectorsize"]
+        self.csum_type = sb["csum_type"]
+        self.csum_size = BTRFS_CSUM_SIZES[self.csum_type]
+        self.fsid = (sb["metadata_uuid"] if sb["incompat"] & BTRFS_INCOMPAT_METADATA_UUID
+                     else sb["fsid"])
+        self.devid = sb["devid"]
+        if sb["incompat"] & BTRFS_INCOMPAT_EXTENT_TREE_V2:
+            raise BtrfsUnreadable("extent tree v2 (an experimental format) is not read")
+        # chunk map: logical start -> (length, type, [(devid, physical)], num_stripes)
+        self.chunks = {}
+        self._chunk_starts = []
+        self._bootstrap_chunks(sb["sys_array"])
+        for (_obj, typ, logical), data in self._items(sb["chunk_root"], sb["chunk_level"],
+                                                      (BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                                                       BTRFS_CHUNK_ITEM_KEY, 0),
+                                                      (BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                                                       BTRFS_CHUNK_ITEM_KEY, _BTRFS_KEY_MAX[2]),
+                                                      sb["chunk_generation"]):
+            if typ == BTRFS_CHUNK_ITEM_KEY:
+                try:
+                    self._add_chunk(logical, data, 0, len(data))
+                except BtrfsUnreadable as exc:
+                    self._hurt(f"chunk tree: {exc}")
+        self._roots = {}
+        fs = self.root_item(BTRFS_FS_TREE_OBJECTID)
+        if fs is None:
+            raise BtrfsUnreadable("the root tree has no item for the top-level file tree (5)")
+        self.root = (BTRFS_FS_TREE_OBJECTID << 64) | fs["root_dirid"]
+
+    def _hurt(self, msg):
+        """Record damage once, however often the walk meets it."""
+        if msg not in self._seen_damage:
+            self._seen_damage.add(msg)
+            self.damage.append(msg)
+
+    # -- address translation ------------------------------------------------
+    def _add_chunk(self, logical, buf, off, room):
+        """Add the chunk item at ``off`` in ``buf``, which has ``room`` bytes
+        from ``off`` for it; returns its size."""
+        if room < 80:
+            raise BtrfsUnreadable(f"chunk item at logical {logical:#x} is {room} bytes")
+        length, _owner, stripe_len, ctype = struct.unpack_from("<QQQQ", buf, off)
+        num_stripes, sub_stripes = struct.unpack_from("<HH", buf, off + 44)
+        if not num_stripes or 48 + 32 * num_stripes > room or not length:
+            raise BtrfsUnreadable(f"chunk at logical {logical:#x} has {num_stripes} stripes "
+                                  f"and length {length:,} in {room} bytes")
+        stripes = [struct.unpack_from("<QQ", buf, off + 48 + 32 * i)
+                   for i in range(num_stripes)]
+        if logical not in self.chunks:
+            bisect.insort(self._chunk_starts, logical)
+        self.chunks[logical] = dict(length=length, type=ctype, stripes=stripes,
+                                    stripe_len=stripe_len, sub_stripes=sub_stripes)
+        return 48 + 32 * num_stripes
+
+    def _bootstrap_chunks(self, arr):
+        """The SYSTEM chunks the superblock carries, enough to read the chunk
+        tree: a disk key then a chunk item, repeated (volumes.c:2577-2666)."""
+        pos = 0
+        while pos + 17 <= len(arr):
+            _obj, typ, logical = _btrfs_key(arr, pos)
+            pos += 17
+            if typ != BTRFS_CHUNK_ITEM_KEY:
+                raise BtrfsUnreadable(f"sys_chunk_array holds item type {typ}, not a chunk")
+            if pos + 80 > len(arr):
+                raise BtrfsUnreadable("sys_chunk_array is cut inside a chunk")
+            n = struct.unpack_from("<H", arr, pos + 44)[0]
+            if not n or pos + 48 + 32 * n > len(arr):
+                raise BtrfsUnreadable("sys_chunk_array is cut inside a chunk's stripes")
+            pos += self._add_chunk(logical, arr, pos, len(arr) - pos)
+        if not self.chunks:
+            raise BtrfsUnreadable("sys_chunk_array holds no chunk")
+
+    def _chunk(self, logical):
+        i = bisect.bisect_right(self._chunk_starts, logical) - 1
+        if i < 0:
+            return None, None
+        start = self._chunk_starts[i]
+        ch = self.chunks[start]
+        if logical >= start + ch["length"]:
+            return None, None
+        return start, ch
+
+    def copies(self, logical):
+        """[(image byte offset, bytes to the end of this stripe)] for each copy
+        of ``logical`` that lies on this device, first copy first.
+
+        A SINGLE chunk has one stripe, a DUP chunk two on the same device, a
+        RAID1, RAID1C3 or RAID1C4 chunk one per device; each stripe holds the
+        chunk whole, at stripe offset + (logical - chunk start)
+        (volumes.c:2168-2290, the num_stripes = 1, DUP and RAID1 cases). A
+        striped profile (RAID0, RAID10, RAID5, RAID6) is refused by name."""
+        start, ch = self._chunk(logical)
+        if ch is None:
+            raise BtrfsUnreadable(f"logical address {logical:#x} lies in no chunk")
+        if ch["type"] & BTRFS_BG_STRIPED:
+            raise BtrfsUnreadable(f"logical address {logical:#x} is in a "
+                                  f"{_btrfs_profile(ch['type'])} chunk, striped across devices, "
+                                  "which one image does not hold")
+        if len(ch["stripes"]) > 1 and not ch["type"] & BTRFS_BG_MIRRORED:
+            raise BtrfsUnreadable(f"chunk at {start:#x} has {len(ch['stripes'])} stripes "
+                                  "and no mirrored profile")
+        off = logical - start
+        out = [(self.base + phys + off, ch["length"] - off)
+               for devid, phys in ch["stripes"] if devid == self.devid]
+        if not out:
+            raise BtrfsUnreadable(f"logical address {logical:#x} has no copy on this device "
+                                  f"(devid {self.devid})")
+        return out
+
+    def read_logical(self, logical, n):
+        """n bytes at a logical address, from the first copy on this device,
+        across chunk boundaries."""
+        out = bytearray()
+        while len(out) < n:
+            phys, room = self.copies(logical + len(out))[0]
+            take = min(n - len(out), room)
+            if take <= 0:                           # a stripe that holds nothing past here
+                raise BtrfsUnreadable(f"logical address {logical + len(out):#x} is past the "
+                                      "end of its chunk's stripe")
+            got = read_at(self.fh, phys, take)
+            out += got
+            if len(got) < take:
+                break
+        return bytes(out)
+
+    # -- tree blocks ----------------------------------------------------------
+    def _copy(self, logical, phys):
+        """The block at one copy with its own checks done (checksum, the
+        address it records, filesystem id, structure), cached by copy; or the
+        reason it fails, as a str."""
+        key = (logical, phys)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return hit
+        buf = read_at(self.fh, phys, self.nodesize)
+        if len(buf) < self.nodesize:
+            return f"copy at {phys:#x} lies past the end of the image"
+        if btrfs_csum(self.csum_type, buf[32:]) != buf[:self.csum_size]:
+            return f"copy at {phys:#x}: checksum does not hold"
+        hbytenr = struct.unpack_from("<Q", buf, 48)[0]
+        if hbytenr != logical:
+            return f"copy at {phys:#x} records address {hbytenr:#x}"
+        if buf[32:48] != self.fsid:
+            return f"copy at {phys:#x} belongs to another filesystem"
+        bad = _btrfs_check_block(buf, self.nodesize, self.sectorsize)
+        if bad:
+            return f"copy at {phys:#x}: {bad}"
+        self._cache[key] = buf
+        while len(self._cache) > 4096:
+            self._cache.popitem(last=False)
+        return buf
+
+    def _block(self, logical, level=None, generation=None, first_key=None):
+        """The tree block at ``logical`` from the first copy that passes every
+        check: its own (``_copy``), and, on every read whether cached or not,
+        the level, generation and first key its parent records for it
+        (verify_parent_transid, disk-io.c:275; btrfs_verify_level_key, linux
+        fs/btrfs/tree-checker.c:2302-2355, which compares the first key only
+        for a block no newer than the last committed transaction). A copy that
+        fails is recorded as damage when another copy is read instead."""
+        why = []
+        for phys, _room in self.copies(logical):
+            buf = self._copy(logical, phys)
+            if isinstance(buf, str):
+                why.append(buf)
+                continue
+            hgen = struct.unpack_from("<Q", buf, 80)[0]
+            nritems, hlevel = struct.unpack_from("<IB", buf, 96)
+            if level is not None and hlevel != level:
+                why.append(f"copy at {phys:#x} is level {hlevel}, its parent says {level}")
+                continue
+            if generation is not None and hgen != generation:
+                why.append(f"copy at {phys:#x} is generation {hgen}, its parent says "
+                           f"{generation}")
+                continue
+            if first_key is not None and hgen <= self.sb["generation"]:
+                if not nritems:
+                    why.append(f"copy at {phys:#x} holds nothing, its parent names a first key")
+                    continue
+                got = _btrfs_key(buf, BTRFS_HEADER_SIZE)
+                if got != first_key:
+                    why.append(f"copy at {phys:#x} starts at key {got}, its parent says "
+                               f"{first_key}")
+                    continue
+            if why:
+                self._hurt(f"tree block at logical {logical:#x}: " + "; ".join(why)
+                           + f"; read from the copy at {phys:#x}")
+            return buf
+        raise BtrfsUnreadable(f"tree block at logical {logical:#x}: " + "; ".join(why))
+
+    def _items(self, bytenr, level, lo, hi, generation=None, first_key=None):
+        """Yield (key, item bytes) for every item whose key is in [lo, hi], in
+        key order, from the tree whose root block is at ``bytenr``. A child
+        block that cannot be read is recorded as damage and passed over, so
+        what the rest of the tree holds is still returned; the root block not
+        being readable raises."""
+        buf = self._block(bytenr, level, generation, first_key)
+        nritems = struct.unpack_from("<I", buf, 96)[0]
+        if level == 0:
+            for i in range(nritems):
+                o = BTRFS_HEADER_SIZE + i * BTRFS_ITEM_SIZE
+                key = _btrfs_key(buf, o)
+                if key < lo:
+                    continue
+                if key > hi:
+                    return
+                ioff, isz = struct.unpack_from("<II", buf, o + 17)
+                start = BTRFS_HEADER_SIZE + ioff
+                yield key, buf[start:start + isz]
+            return
+        ptrs = []
+        for i in range(nritems):
+            o = BTRFS_HEADER_SIZE + i * BTRFS_KEY_PTR_SIZE
+            ptrs.append((_btrfs_key(buf, o),) + struct.unpack_from("<QQ", buf, o + 17))
+        for i, (key, child, gen) in enumerate(ptrs):
+            nxt = ptrs[i + 1][0] if i + 1 < len(ptrs) else None
+            if nxt is not None and nxt <= lo:
+                continue                            # everything below is before lo
+            if key > hi:
+                return
+            try:
+                for item in self._items(child, level - 1, lo, hi, gen, key):
+                    yield item
+            except BtrfsUnreadable as exc:
+                self._hurt(f"under node {bytenr:#x}: {exc}")
+
+    def _tree_items(self, tree, lo, hi):
+        if tree == BTRFS_ROOT_TREE_OBJECTID:
+            return self._items(self.sb["root"], self.sb["root_level"], lo, hi,
+                               self.sb["generation"])
+        r = self.root_item(tree)
+        if r is None:
+            raise BtrfsUnreadable(f"the root tree has no item for tree {tree}")
+        # a tree's root block carries the generation its ROOT_ITEM records
+        # (btrfs_root_generation, as read_tree_root_path reads it)
+        return self._items(r["bytenr"], r["level"], lo, hi, r["generation"])
+
+    def _root_items(self, lo, hi):
+        return self._tree_items(BTRFS_ROOT_TREE_OBJECTID, lo, hi)
+
+    def root_item(self, tree):
+        """The newest ROOT_ITEM for ``tree`` (largest key offset, as
+        btrfs_find_last_root takes it), parsed, or None."""
+        if tree in self._roots:
+            return self._roots[tree]
+        found = None
+        for key, data in self._root_items((tree, BTRFS_ROOT_ITEM_KEY, 0),
+                                          (tree, BTRFS_ROOT_ITEM_KEY, _BTRFS_KEY_MAX[2])):
+            if len(data) >= BTRFS_ROOT_ITEM_LEGACY_SIZE:
+                found = (key, data)
+            else:
+                self._hurt(f"ROOT_ITEM of tree {tree} is {len(data)} bytes, under "
+                           f"{BTRFS_ROOT_ITEM_LEGACY_SIZE}")
+        r = None
+        if found is not None:
+            key, data = found
+            mtime = struct.unpack_from("<Q", data, 136)[0]
+            r = dict(generation=struct.unpack_from("<Q", data, 160)[0],
+                     root_dirid=struct.unpack_from("<Q", data, 168)[0],
+                     bytenr=struct.unpack_from("<Q", data, 176)[0],
+                     flags=struct.unpack_from("<Q", data, 208)[0],
+                     refs=struct.unpack_from("<I", data, 216)[0],
+                     level=data[238], offset=key[2], mtime=mtime)
+        self._roots[tree] = r
+        return r
+
+    # -- inodes and directories ----------------------------------------------
+    @staticmethod
+    def _split(node):
+        return node >> 64, node & _M64
+
+    def inode(self, node):
+        """The INODE_ITEM of a node, parsed (btrfs_tree.h:872-899), or None
+        when there is none. An item that is not 160 bytes, a mode with bits
+        outside the type, set-id, sticky and permission bits (both as
+        check_inode_item refuses, linux fs/btrfs/tree-checker.c:1141-1174),
+        or a size past the largest file the kernel allows (super.c:963)
+        raises BtrfsUnreadable."""
+        tree, ino = self._split(node)
+        for _key, d in self._tree_items(tree, (ino, BTRFS_INODE_ITEM_KEY, 0),
+                                        (ino, BTRFS_INODE_ITEM_KEY, 0)):
+            if len(d) != BTRFS_INODE_ITEM_SIZE:
+                raise BtrfsUnreadable(f"inode {ino} of tree {tree} is {len(d)} bytes, "
+                                      f"not {BTRFS_INODE_ITEM_SIZE}")
+            size, nbytes = struct.unpack_from("<QQ", d, 16)
+            nlink, uid, gid, mode = struct.unpack_from("<IIII", d, 40)
+            rdev, flags = struct.unpack_from("<QQ", d, 56)
+            if mode & ~(S_IFMT | 0o7777):
+                raise BtrfsUnreadable(f"inode {ino} of tree {tree} has mode {mode:#o}, with "
+                                      "bits no mode has")
+            if size > BTRFS_MAX_FILE_SIZE:
+                raise BtrfsUnreadable(f"inode {ino} of tree {tree} records size {size:,}, past "
+                                      f"the largest file btrfs allows ({BTRFS_MAX_FILE_SIZE:,})")
+            t = {name: struct.unpack_from("<QI", d, at)
+                 for name, at in (("atime", 112), ("ctime", 124), ("mtime", 136),
+                                  ("otime", 148))}
+            return dict(size=size, nbytes=nbytes, nlink=nlink, uid=uid, gid=gid, mode=mode,
+                        rdev=rdev, flags=flags, **t)
+        return None
+
+    def entry(self, node):
+        """(mode, size, mtime) of a node. A directory entry whose inode item is
+        missing or unreadable is still an entry: readdir lists a name from its
+        DIR_INDEX item alone (linux fs/btrfs/inode.c btrfs_real_readdir,
+        6304-6425, reads no inode item), so it is returned with the file
+        type its directory entry records, no permission bits, size 0 and time
+        0, and the damage is recorded. Reading it then fails, by name."""
+        tree, ino = self._split(node)
+        if ino == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID:
+            # A subvolume link with no matching ROOT_REF: the kernel shows an
+            # empty directory, mode S_IFDIR | 0755, with no time on the disk
+            # (inode.c new_simple_dir, 6008-6040), so its time here is 0.
+            return S_IFDIR | 0o755, 0, 0
+        why = None
+        try:
+            ino_item = self.inode(node)
+        except BtrfsUnreadable as exc:
+            ino_item, why = None, str(exc)
+        if ino_item is not None:
+            return ino_item["mode"], ino_item["size"], ino_item["mtime"][0]
+        named = self._named.get(node)
+        if named is None:
+            if why:
+                self._hurt(f"inode {ino} of tree {tree}: {why}")
+            return None
+        ftype, name = named
+        self._hurt(f"inode {ino} of tree {tree}, named {name!r} by its directory: "
+                   + (why or "no INODE_ITEM") + "; listed with the type its directory "
+                   "entry records")
+        return BTRFS_FT_MODE.get(ftype, 0), 0, 0
+
+    def times(self, node):
+        """{"modified", "accessed", "changed", "created"} as (seconds,
+        nanoseconds) from the inode item, or None."""
+        try:
+            i = self.inode(node)
+        except BtrfsUnreadable:
+            return None
+        if i is None:
+            return None
+        return {"modified": i["mtime"], "accessed": i["atime"], "changed": i["ctime"],
+                "created": i["otime"]}
+
+    def _dir_entries(self, data, where=""):
+        """(location key, type, name) for each btrfs_dir_item packed in one
+        item; a DIR_ITEM holds more than one when names share a hash. An entry
+        whose name or data runs past the item is recorded as damage and ends
+        the item."""
+        out, at = [], 0
+        while at < len(data):
+            if at + 30 > len(data):
+                self._hurt(f"directory item {where}: {len(data) - at} bytes left, short of "
+                           "an entry")
+                break
+            loc = _btrfs_key(data, at)
+            data_len, name_len, ftype = struct.unpack_from("<HHB", data, at + 25)
+            if at + 30 + name_len + data_len > len(data) or not name_len:
+                self._hurt(f"directory item {where}: an entry of name {name_len} and data "
+                           f"{data_len} bytes does not fit its {len(data)} bytes")
+                break
+            name = bytes(data[at + 30:at + 30 + name_len])
+            out.append((loc, ftype, name))
+            at += 30 + name_len + data_len
+        return out
+
+    def _subvol_ref(self, parent_tree, child, dirid, name):
+        """True when the root tree links subvolume ``child`` into directory
+        ``dirid`` of ``parent_tree`` under ``name`` (fixup_tree_root_location,
+        inode.c:5836-5857). A ROOT_REF too short for what it holds is damage,
+        and links nothing."""
+        for _key, d in self._root_items((parent_tree, BTRFS_ROOT_REF_KEY, child),
+                                        (parent_tree, BTRFS_ROOT_REF_KEY, child)):
+            if len(d) < 18 or 18 + struct.unpack_from("<H", d, 16)[0] > len(d):
+                self._hurt(f"ROOT_REF of tree {parent_tree} to {child} is {len(d)} bytes, "
+                           "short of what it records")
+                return False
+            ref_dir, _seq, nlen = struct.unpack_from("<QQH", d, 0)
+            return ref_dir == dirid and bytes(d[18:18 + nlen]) == name
+        return False
+
+    def listdir(self, node):
+        """[(name, node)] for a directory, sorted by name, from its DIR_INDEX
+        items, as readdir reads them. A subvolume or snapshot entry leads into
+        its own tree. If a directory has no DIR_INDEX items its DIR_ITEMs are
+        read instead."""
+        tree, ino = self._split(node)
+        if ino == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID:
+            return []
+        out = []
+        try:
+            for kind in (BTRFS_DIR_INDEX_KEY, BTRFS_DIR_ITEM_KEY):
+                for key, d in self._tree_items(tree, (ino, kind, 0),
+                                               (ino, kind, _BTRFS_KEY_MAX[2])):
+                    for loc, ftype, name in self._dir_entries(d, f"{key} of tree {tree}"):
+                        out.append((name, loc, ftype))
+                if out:
+                    break
+        except BtrfsUnreadable as exc:
+            self._hurt(f"directory {ino} of tree {tree}: {exc}")
+        result, seen = [], set()
+        for name, loc, ftype in out:
+            if name in seen:
+                continue
+            seen.add(name)
+            text = name.decode("utf-8", "surrogateescape")
+            if loc[1] == BTRFS_ROOT_ITEM_KEY:
+                child = loc[0]
+                if child == tree:
+                    continue                        # a snapshot's entry for itself
+                try:
+                    linked = self._subvol_ref(tree, child, ino, name)
+                    r = self.root_item(child) if linked else None
+                except BtrfsUnreadable as exc:
+                    self._hurt(f"subvolume {child}: {exc}")
+                    r = None
+                if r is None:
+                    result.append((text, (child << 64) | BTRFS_EMPTY_SUBVOL_DIR_OBJECTID))
+                else:
+                    result.append((text, (child << 64) | r["root_dirid"]))
+            else:
+                child = (tree << 64) | loc[0]
+                self._named.setdefault(child, (ftype, text))
+                result.append((text, child))
+        return sorted(result)
+
+    def links(self, node):
+        """[(parent directory inode, name)] for every name the inode records for
+        itself: its INODE_REF items, keyed by parent, each holding one or more
+        (index, name) pairs, and its INODE_EXTREF items, each holding (parent,
+        index, name) entries (btrfs_tree.h:853-865). A file with many names in
+        one directory keeps the overflow as extended refs."""
+        tree, ino = self._split(node)
+        out = []
+        for (_o, typ, off), d in self._tree_items(tree, (ino, BTRFS_INODE_REF_KEY, 0),
+                                                  (ino, BTRFS_INODE_EXTREF_KEY,
+                                                   _BTRFS_KEY_MAX[2])):
+            at = 0
+            if typ == BTRFS_INODE_REF_KEY:
+                while at + 10 <= len(d):
+                    _index, nlen = struct.unpack_from("<QH", d, at)
+                    if at + 10 + nlen > len(d):
+                        self._hurt(f"INODE_REF of inode {ino} in tree {tree}: a name runs "
+                                   "past the item")
+                        break
+                    out.append((off, bytes(d[at + 10:at + 10 + nlen])))
+                    at += 10 + nlen
+            elif typ == BTRFS_INODE_EXTREF_KEY:
+                while at + 18 <= len(d):
+                    parent, _index, nlen = struct.unpack_from("<QQH", d, at)
+                    if at + 18 + nlen > len(d):
+                        self._hurt(f"INODE_EXTREF of inode {ino} in tree {tree}: a name runs "
+                                   "past the item")
+                        break
+                    out.append((parent, bytes(d[at + 18:at + 18 + nlen])))
+                    at += 18 + nlen
+        return out
+
+    # -- file content ---------------------------------------------------------
+    @staticmethod
+    def _extent(d, file_off=0, sectorsize=4096):
+        """An EXTENT_DATA item, parsed (btrfs_tree.h:1069-1119), refused with
+        BtrfsUnreadable where the kernel's check_extent_data_item refuses it
+        (linux fs/btrfs/tree-checker.c:207-321): a file offset off a sector
+        boundary, an item shorter than the inline header, a type or
+        compression btrfs does not define, an inline extent anywhere but file
+        offset 0, an uncompressed inline extent whose ram_bytes is not the
+        bytes it holds, a regular or preallocated item that is not 53 bytes or
+        whose sizes and offsets are off a sector boundary, and an end past
+        2^64. Also refused, as btrfs restore refuses it (cmds/restore.c:381-
+        388): an offset past the extent it reads from."""
+        if file_off % sectorsize:
+            raise BtrfsUnreadable(f"file extent at {file_off:,} is off a sector boundary")
+        if len(d) < BTRFS_FILE_EXTENT_INLINE_DATA_START:
+            raise BtrfsUnreadable(f"file extent item of {len(d)} bytes, under the "
+                                  f"{BTRFS_FILE_EXTENT_INLINE_DATA_START} of its header")
+        gen, ram, comp, enc, other, typ = struct.unpack_from("<QQBBHB", d, 0)
+        if typ > BTRFS_FILE_EXTENT_PREALLOC or comp not in BTRFS_COMPRESS:
+            raise BtrfsUnreadable(f"file extent at {file_off:,} has type {typ} and "
+                                  f"compression {comp}, which btrfs does not define")
+        ext = dict(generation=gen, ram_bytes=ram, compression=comp, encryption=enc,
+                   other_encoding=other, type=typ)
+        if typ == BTRFS_FILE_EXTENT_INLINE:
+            if file_off:
+                raise BtrfsUnreadable(f"inline extent at file offset {file_off:,}; an inline "
+                                      "extent is only ever at offset 0")
+            ext["inline"] = bytes(d[BTRFS_FILE_EXTENT_INLINE_DATA_START:])
+            if not comp and len(ext["inline"]) != ram:
+                raise BtrfsUnreadable(f"inline extent holds {len(ext['inline']):,} bytes "
+                                      f"but records ram_bytes {ram:,}")
+        else:
+            if len(d) != BTRFS_FILE_EXTENT_ITEM_SIZE:
+                raise BtrfsUnreadable(f"file extent item of {len(d)} bytes, not "
+                                      f"{BTRFS_FILE_EXTENT_ITEM_SIZE}")
+            (ext["disk_bytenr"], ext["disk_num_bytes"], ext["offset"],
+             ext["num_bytes"]) = struct.unpack_from("<QQQQ", d, 21)
+            for name in ("ram_bytes", "disk_bytenr", "disk_num_bytes", "offset", "num_bytes"):
+                if ext[name] % sectorsize:
+                    raise BtrfsUnreadable(f"file extent at {file_off:,}: {name} "
+                                          f"{ext[name]:,} is off a sector boundary")
+            if file_off + ext["num_bytes"] > _M64:
+                raise BtrfsUnreadable(f"file extent at {file_off:,} ends past 2^64")
+            if ext["disk_bytenr"] and typ == BTRFS_FILE_EXTENT_REG and (
+                    (not comp and ext["offset"] >= ext["disk_num_bytes"])
+                    or ext["offset"] > ram):
+                raise BtrfsUnreadable(f"file extent at {file_off:,} starts {ext['offset']:,} "
+                                      "into an extent that does not reach that far")
+        return ext
+
+    def extents(self, node):
+        """[(file offset, extent dict)] for a file, in offset order. An item
+        the kernel would refuse makes the file unreadable, and is recorded."""
+        tree, ino = self._split(node)
+        out, prev_end = [], 0
+        for key, d in self._tree_items(tree, (ino, BTRFS_EXTENT_DATA_KEY, 0),
+                                       (ino, BTRFS_EXTENT_DATA_KEY, _BTRFS_KEY_MAX[2])):
+            try:
+                ext = self._extent(d, key[2], self.sectorsize)
+                # consecutive extents do not overlap (tree-checker.c:323-341;
+                # an inline extent ends at ram_bytes rounded up to a sector,
+                # file_extent_end)
+                if key[2] < prev_end:
+                    raise BtrfsUnreadable(f"file extent at {key[2]:,} starts before the one "
+                                          f"before it ends ({prev_end:,})")
+                if ext["type"] == BTRFS_FILE_EXTENT_INLINE:
+                    prev_end = -(-ext["ram_bytes"] // self.sectorsize) * self.sectorsize
+                else:
+                    prev_end = key[2] + ext["num_bytes"]
+                out.append((key[2], ext))
+            except BtrfsUnreadable as exc:
+                self._hurt(f"inode {ino} of tree {tree}: {exc}")
+                raise
+        return out
+
+    def read_file(self, node, size):
+        """Yield the file's bytes, the inode's size of them (at most ``size``),
+        holes and preallocated ranges as zeros."""
+        tree, ino = self._split(node)
+        try:
+            ino_item = self.inode(node)
+            if ino_item is None:
+                raise BtrfsUnreadable("no inode item")
+            for chunk in btrfs_extent_bytes(self.extents(node), ino_item["size"],
+                                            self.read_logical, self.sectorsize, cap=size):
+                yield chunk
+        except BtrfsUnreadable as exc:
+            # A zstd extent on a Python without zstd is not damage: the note
+            # says so once for the volume.
+            if not ("zstd needs Python" in str(exc) and _zstd_module() is None):
+                self._hurt(f"inode {ino} of tree {tree} not read: {exc}")
+            raise
+
+    def readlink(self, node):
+        ino_item = self.inode(node)
+        if ino_item is None:
+            return ""
+        # mkfs.btrfs --rootdir stores the target with a trailing NUL
+        # (mkfs/rootdir.c:368-370), the kernel without; the inode's size is
+        # the target's length either way.
+        data = b"".join(btrfs_extent_bytes(self.extents(node), ino_item["size"],
+                                           self.read_logical, self.sectorsize))
+        return data.decode("utf-8", "surrogateescape")
+
+    # -- the volume -------------------------------------------------------------
+    def default_subvolume(self):
+        """The subvolume id the root tree's "default" entry names, or None
+        (Documentation/dev/On-disk-format.rst, BTRFS_ROOT_TREE_DIR_OBJECTID)."""
+        h = btrfs_crc32c(b"default", 0xFFFFFFFE)
+        for _key, d in self._root_items((BTRFS_ROOT_TREE_DIR_OBJECTID, BTRFS_DIR_ITEM_KEY, h),
+                                        (BTRFS_ROOT_TREE_DIR_OBJECTID, BTRFS_DIR_ITEM_KEY, h)):
+            for loc, _t, name in self._dir_entries(d, "default"):
+                if name == b"default":
+                    return loc[0]
+        return None
+
+    def subvolumes(self):
+        """[(id, read-only, snapshot)] for every file tree the root tree holds
+        other than the top level. A snapshot's ROOT_ITEM key carries the
+        transaction it was taken in, a subvolume's carries 0 (restore.c:1058-1061)."""
+        out = []
+        for (obj, _t, off), d in self._root_items(
+                (BTRFS_FIRST_FREE_OBJECTID, BTRFS_ROOT_ITEM_KEY, 0),
+                (BTRFS_LAST_FREE_OBJECTID, BTRFS_ROOT_ITEM_KEY, _BTRFS_KEY_MAX[2])):
+            if _t != BTRFS_ROOT_ITEM_KEY or len(d) < BTRFS_ROOT_ITEM_LEGACY_SIZE:
+                continue
+            flags = struct.unpack_from("<Q", d, 208)[0]
+            out.append((obj, bool(flags & BTRFS_ROOT_SUBVOL_RDONLY), off != 0))
+        return out
+
+    def profiles(self):
+        """{"data"/"metadata"/"system": set of profile names} over the chunks."""
+        out = collections.defaultdict(set)
+        for ch in self.chunks.values():
+            for bit, name in ((BTRFS_BG_DATA, "data"), (BTRFS_BG_METADATA, "metadata"),
+                              (BTRFS_BG_SYSTEM, "system")):
+                if ch["type"] & bit:
+                    out[name].add(_btrfs_profile(ch["type"]))
+        return dict(out)
+
+    @property
+    def note(self):
+        """What a reader of this volume needs to know before trusting a listing,
+        or None."""
+        parts = []
+        sb = self.sb
+        if sb["at"] != BTRFS_SUPER_OFF:
+            parts.append(f"the primary superblock does not hold, so the mirror at "
+                         f"{sb['at']:#x} (generation {sb['generation']:,}) was read")
+        if sb["log_root"]:
+            parts.append("a log tree is present (changes fsync'd after the last commit); "
+                         "it is not replayed, so the volume reads as of its last commit")
+        if sb["num_devices"] != 1:
+            parts.append(f"one device (devid {self.devid}) of {sb['num_devices']}; only data "
+                         "with a copy on this device is read")
+        striped = sorted({_btrfs_profile(c["type"]) for c in self.chunks.values()
+                          if c["type"] & BTRFS_BG_STRIPED})
+        if striped:
+            parts.append(f"{', '.join(striped)} chunks are not read")
+        if sb["incompat"] & BTRFS_INCOMPAT_COMPRESS_ZSTD and _zstd_module() is None:
+            parts.append("zstd compressed; this Python has no zstd (3.14 adds it), so a "
+                         "zstd-compressed file cannot be read")
+        try:
+            default = self.default_subvolume()
+        except BtrfsUnreadable:
+            default = None
+        if default not in (None, BTRFS_FS_TREE_OBJECTID):
+            parts.append(f"the default subvolume is id {default}; it is listed where the "
+                         "top-level tree (id 5) links it")
+        return "; ".join(parts) or None
+
+    def unallocated(self):
+        """[(device offset, length)] of this device that no chunk is allocated
+        on: from 1 MiB, below which btrfs allocates nothing (ctree.h:200), to
+        the device's size, less the DEV_EXTENT items of the device tree
+        (btrfs_tree.h:845-851) and the superblock copies."""
+        dev_total = self.sb["dev_total"]
+        used = []
+        for (_d, _t, phys), d in self._tree_items(BTRFS_DEV_TREE_OBJECTID,
+                                                  (self.devid, BTRFS_DEV_EXTENT_KEY, 0),
+                                                  (self.devid, BTRFS_DEV_EXTENT_KEY,
+                                                   _BTRFS_KEY_MAX[2])):
+            if len(d) != BTRFS_DEV_EXTENT_SIZE:
+                # Its length is not known, so the space it would cover is not
+                # called free: the run up to the next one is left out.
+                self._hurt(f"DEV_EXTENT at {phys:#x} is {len(d)} bytes, not "
+                           f"{BTRFS_DEV_EXTENT_SIZE}; the space after it is not reported free")
+                used.append((phys, _BTRFS_KEY_MAX[0]))
+                continue
+            used.append((phys, phys + struct.unpack_from("<Q", d, 24)[0]))
+        for m in BTRFS_SUPER_MIRRORS:
+            used.append((m, m + BTRFS_SUPER_SIZE))
+        used.sort()
+        out, pos = [], BTRFS_RESERVED_1M
+        for s, e in used:
+            if pos >= dev_total:
+                break
+            if s > pos:
+                out.append((pos, min(s, dev_total) - pos))
+            pos = max(pos, e)
+        if pos < dev_total:
+            out.append((pos, dev_total - pos))
+        return [(s, n) for s, n in out if n > 0]
+
+    def free_logical(self):
+        """[(logical start, length)] inside the block groups that no
+        EXTENT_ITEM or METADATA_ITEM of the extent tree covers. A superblock
+        copy inside a chunk is not taken out here (free_extents() takes it out
+        at its place on the device), so this is the same account the free
+        space tree keeps, which the self-test checks. A block group is a
+        BLOCK_GROUP_ITEM keyed (start, 192, length), in the extent tree or, with
+        the block-group-tree feature, in tree 11 (btrfs_tree.h:257, 1217-1221;
+        btrfs.h:339). A METADATA_ITEM (skinny metadata) covers one node."""
+        bg_tree = (BTRFS_BLOCK_GROUP_TREE_OBJECTID
+                   if self.sb["compat_ro"] & BTRFS_COMPAT_RO_BLOCK_GROUP_TREE
+                   else BTRFS_EXTENT_TREE_OBJECTID)
+        groups = [(k[0], k[2]) for k, _d in self._tree_items(
+            bg_tree, (0, BTRFS_BLOCK_GROUP_ITEM_KEY, 0), _BTRFS_KEY_MAX)
+            if k[1] == BTRFS_BLOCK_GROUP_ITEM_KEY]
+        taken = []
+        for (obj, typ, off), _d in self._tree_items(BTRFS_EXTENT_TREE_OBJECTID,
+                                                    (0, 0, 0), _BTRFS_KEY_MAX):
+            if typ == BTRFS_EXTENT_ITEM_KEY:
+                taken.append((obj, obj + off))
+            elif typ == BTRFS_METADATA_ITEM_KEY:
+                taken.append((obj, obj + self.nodesize))
+        taken.sort()
+        out = []
+        for gstart, glen in groups:
+            gend, pos = gstart + glen, gstart
+            i = bisect.bisect_left(taken, (gstart, 0))
+            if i > 0 and taken[i - 1][1] > gstart:
+                i -= 1
+            while i < len(taken) and taken[i][0] < gend:
+                s, e = taken[i]
+                if s > pos:
+                    if out and out[-1][0] + out[-1][1] == pos:
+                        out[-1] = (out[-1][0], out[-1][1] + s - pos)
+                    else:
+                        out.append((pos, s - pos))
+                pos = max(pos, e)
+                i += 1
+            if pos < gend:
+                if out and out[-1][0] + out[-1][1] == pos:
+                    out[-1] = (out[-1][0], out[-1][1] + gend - pos)
+                else:
+                    out.append((pos, gend - pos))
+        return out
+
+    def free_space_tree(self):
+        """[(logical start, length)] the free space tree records as free, or
+        None when the volume has none: FREE_SPACE_EXTENT items keyed (start,
+        199, length), and FREE_SPACE_BITMAP items keyed (start, 200, length)
+        whose bit n, least significant first, marks sector n free
+        (btrfs_tree.h:264-278; free-space-tree.c:100-118, extent_io.c:664-668).
+        A second account of the same space, kept by the filesystem; the
+        self-test holds free_logical() against it."""
+        if self.root_item(BTRFS_FREE_SPACE_TREE_OBJECTID) is None:
+            return None
+        out = []
+        for (obj, typ, off), d in self._tree_items(BTRFS_FREE_SPACE_TREE_OBJECTID,
+                                                   (0, 0, 0), _BTRFS_KEY_MAX):
+            if typ == BTRFS_FREE_SPACE_EXTENT_KEY:
+                out.append((obj, off))
+            elif typ == BTRFS_FREE_SPACE_BITMAP_KEY:
+                if len(d) * 8 < off // self.sectorsize:
+                    self._hurt(f"free space bitmap at {obj:#x} is {len(d)} bytes, short of "
+                               f"{off // self.sectorsize} bits")
+                    continue
+                run = None
+                for n in range(off // self.sectorsize):
+                    if d[n >> 3] >> (n & 7) & 1:
+                        if run is None:
+                            run = obj + n * self.sectorsize
+                    elif run is not None:
+                        out.append((run, obj + n * self.sectorsize - run))
+                        run = None
+                if run is not None:
+                    out.append((run, obj + off - run))
+        merged = []
+        for s, n in sorted(out):
+            if merged and merged[-1][0] + merged[-1][1] == s:
+                merged[-1] = (merged[-1][0], merged[-1][1] + n)
+            else:
+                merged.append((s, n))
+        return merged
+
+    def free_extents(self, min_bytes=0):
+        """[(byte offset, length)] of this device's space the volume says is
+        free, offsets into the image: what unallocated() gives, and each range
+        free_logical() gives at every copy of its chunk on this device (both
+        copies of a DUP chunk), less the 4 KiB of each superblock copy. Ranges
+        in striped chunks are not mapped and so not reported. ``min_bytes``
+        drops runs shorter than that."""
+        try:
+            runs = list(self.unallocated())
+        except BtrfsUnreadable as exc:
+            self._hurt(f"device tree: {exc}; unallocated space not reported")
+            runs = []
+        try:
+            inside = self.free_logical()
+        except BtrfsUnreadable as exc:
+            self._hurt(f"extent tree: {exc}; free space inside block groups not reported")
+            inside = []
+        for s, n in inside:
+            try:
+                cps = self.copies(s)
+            except BtrfsUnreadable:
+                continue
+            for phys, _room in cps:
+                runs.append((phys - self.base, n))
+        runs.sort()
+        out = []
+        for s, n in runs:
+            pieces = [(s, s + n)]
+            for m in BTRFS_SUPER_MIRRORS:
+                cut = []
+                for a, b in pieces:
+                    if a < m + BTRFS_SUPER_SIZE and m < b:
+                        cut += [(a, m), (m + BTRFS_SUPER_SIZE, b)]
+                    else:
+                        cut.append((a, b))
+                pieces = [(a, b) for a, b in cut if b > a]
+            out += [(self.base + a, b - a) for a, b in pieces]
+        return [(s, n) for s, n in out if n >= max(min_bytes, 1)]
+
+
+def _btrfs_chunk_root_present(fh, base, sb):
+    """True when the chunk tree root block ``sb`` names, mapped through the
+    superblock's own SYSTEM chunks, has a checksum that holds and records its
+    own address and the superblock's filesystem id, at any of its copies; or
+    when every copy lies past the end of the image, so an image cut short is
+    still named for what it holds. False when a copy is there and is not that
+    block."""
+    try:
+        w = BtrfsWalker.__new__(BtrfsWalker)
+        w.fh, w.base, w.devid = fh, base, sb["devid"]
+        w.chunks, w._chunk_starts = {}, []                      # pylint: disable=protected-access
+        w._bootstrap_chunks(sb["sys_array"])                    # pylint: disable=protected-access
+        w.nodesize, w.sectorsize = sb["nodesize"], sb["sectorsize"]
+        w.csum_type, w.csum_size = sb["csum_type"], BTRFS_CSUM_SIZES[sb["csum_type"]]
+        w.fsid = (sb["metadata_uuid"] if sb["incompat"] & BTRFS_INCOMPAT_METADATA_UUID
+                  else sb["fsid"])
+        w._cache = collections.OrderedDict()                    # pylint: disable=protected-access
+        got = [w._copy(sb["chunk_root"], phys)                  # pylint: disable=protected-access
+               for phys, _r in w.copies(sb["chunk_root"])]
+        return any(not isinstance(g, str) for g in got) or all(
+            g.endswith("lies past the end of the image") for g in got)
+    except (BtrfsUnreadable, struct.error, ValueError, KeyError):
+        return False
+
+
+def identify_btrfs(fh, base, size=None):
+    """Return ("btrfs", lines) for a Btrfs volume at base, else None.
+
+    Claimed only when the magic is at 64 KiB + 64, a superblock copy can be
+    used (_btrfs_pick_super: the primary's checksum holds, or a mirror's does
+    and agrees with the others on the fsid), and the chunk tree's root block
+    that superblock names is there: a tree block whose checksum holds and
+    which records its own address and this filesystem's id (without it
+    nothing on the volume can be found, and btrfs-progs' open_ctree fails
+    too). Eight magic bytes alone are not enough, and neither is a whole
+    superblock copied or left behind where its filesystem is not, so such a
+    volume falls through to the identifiers after this one."""
+    sb, _found, _why = _btrfs_pick_super(fh, base)
+    if sb is None:
+        return None
+    try:
+        w = BtrfsWalker(fh, base)
+    except (BtrfsUnreadable, struct.error, ValueError) as exc:
+        if not _btrfs_chunk_root_present(fh, base, sb):
+            return None                     # the superblock's filesystem is not here
+        return "btrfs", [f"uuid         {_btrfs_uuid(sb['fsid'])}",
+                         f"walk         not possible: {exc}"]
+    sb = w.sb
+    feats = [n for bit, n in BTRFS_INCOMPAT_NAMES if sb["incompat"] >> bit & 1]
+    prof = w.profiles()
+    lines = [
+        f"label        {sb['label'] or '(none)'}",
+        f"uuid         {_btrfs_uuid(sb['fsid'])}",
+        f"generation   {sb['generation']:,}   checksum {BTRFS_CSUM_NAMES[sb['csum_type']]}",
+        f"used         {human(sb['bytes_used'])} of {human(sb['total_bytes'])}",
+        f"devices      {sb['num_devices']}   this one devid {sb['devid']}, "
+        f"{human(sb['dev_total'])}",
+        f"blocks       node {sb['nodesize']:,}, sector {sb['sectorsize']:,} bytes",
+        "profiles     " + ", ".join(f"{k} {'/'.join(sorted(v))}" for k, v in sorted(prof.items())),
+        "features     " + (", ".join(feats) or "(none)"),
+    ]
+    try:
+        subs = w.subvolumes()
+        if subs:
+            snaps = sum(1 for _i, _ro, snap in subs if snap)
+            lines.append(f"subvolumes   {len(subs) - snaps} and {snaps} snapshots, besides the "
+                         "top level")
+    except BtrfsUnreadable as exc:
+        lines.append(f"subvolumes   not read: {exc}")
+    if size is not None and sb["dev_total"] > size:
+        lines.append(f"note         the device records {human(sb['dev_total'])} but the region "
+                     f"holds {human(size)}, so its end is missing")
+    note = w.note
+    if note:
+        lines.append(f"note         {note}")
+    return "btrfs", lines
+
+
+# ---------------------------------------------------------------------------
+# ReFS, Microsoft's Resilient File System, format 3.x. Read only.
+#
+# Microsoft publishes no specification of ReFS. The structures below follow
+# two public descriptions, and every field this reads was checked against
+# volumes Windows 11 (build 26200, ReFS 3.14) wrote, listed and hashed on the
+# mounted volume (tools/make_refs_fixtures.ps1), and against forefst's own
+# inventory of its four sample volumes (_refs_forefst_checks):
+#
+#   [forefst]   xbqt/forefst, commit d4d5fd28942eb14ebe11d90f4eb9342f5e3d7b92,
+#               docs/structures/{vbr,supb,chkp,page_header,page_references,
+#               btree_node,object_table,container_table,directory_entries,
+#               extent_descriptors,volume_info,mlog,system_oids}.md,
+#               docs/attributes/{NAMED_DATA,STANDARD_INFORMATION}.md and
+#               docs/concepts/{checksum_architecture,virtual_addressing,
+#               hard_links,snapshots_versioning}.md.
+#               GPL-3.0; the documentation is read, no code is taken from it.
+#   [libfsrefs] libyal/libfsrefs, commit 77e1b7ba68cf225ec888a61e9784fb9a93a0156f,
+#               "documentation/Resilient File System (ReFS).asciidoc" (GFDL 1.3):
+#               the volume header, the metadata block reference, the ministore
+#               node header and node record, and the version list.
+#   [MS-FSCC]   Microsoft's File System Control Codes, 2.1.2.4 and 2.1.2.5, for
+#               the symbolic link and mount point reparse buffers, which ReFS
+#               stores as NTFS does.
+#
+# The chain from the boot sector to a file:
+#   boot sector (sector 0)   "ReFS" at 3, "FSRS" at 0x10, sector size 0x20,
+#                            sectors per cluster 0x24, version 0x28/0x29
+#   superblock (cluster 30)  the two checkpoint locations; carries its own
+#                            checksum over one cluster with its descriptor zeroed
+#   checkpoint               the newer of two by the clock at 0x60, each with the
+#                            same kind of self checksum; holds 13 root references
+#   container table (root 7) maps the virtual cluster numbers everything else
+#                            uses to the clusters they occupy
+#   object table (root 0)    directory and system object id -> its table
+#   directory table          name rows (0x30), split-out file records (0x40)
+#                            and the directory's own record (0x10)
+#   file record              a table of its own inside the name row: $DATA
+#                            inline or as extents, named streams, reparse data
+# Every metadata page is checked against the checksum its parent's reference
+# records for it (CRC-64/NVME on these volumes; CRC32-C and SHA-256 are the
+# other kinds [forefst page_references.md]). A page that fails is reported, and
+# the rows under it are left out rather than read from bytes that do not match.
+#
+# What is not done: the metadata log is not replayed. ReFS commits changes to
+# the log first and folds them into a checkpoint later, and a volume detached
+# before that keeps its newest files only in the log (the first Windows fixture,
+# detached seconds after its files were written, is one). The reader shows the
+# volume as of its newest checkpoint and says how many log records follow it.
+# Deleted files are not recovered. ReFS 1.x and 2.x use other structures
+# [libfsrefs "format version 1"] and are identified and refused.
+# ---------------------------------------------------------------------------
+REFS_FS_NAME = b"ReFS\x00\x00\x00\x00"           # boot sector +3 [libfsrefs, forefst vbr.md]
+REFS_FSRS = b"FSRS"                              # boot sector +0x10
+REFS_SUPERBLOCK_LCN = 30                         # [forefst supb.md]
+REFS_PAGE_BYTES = 0x4000                         # a metadata page: 4 clusters of 4 KiB, or one 64 KiB cluster
+REFS_ROOT_OBJECTS, REFS_ROOT_OBJECTS_COPY = 0, 5      # checkpoint roots [forefst chkp.md]
+REFS_ROOT_CONTAINERS, REFS_ROOT_CONTAINERS_COPY = 7, 8
+REFS_ROOT_DIR = 0x600                            # the root directory's object id
+REFS_VOLUME_INFO = 0x500                         # its row 0x510 holds the label [forefst volume_info.md]
+REFS_LIVE_STREAM = 0x1000                        # sub-stream id of a file's current $DATA [forefst extent_descriptors.md]
+REFS_ATTR_DIRECTORY = 0x10000000                 # set on a directory's name row [forefst directory_entries.md]
+REFS_ATTR_REPARSE = 0x400                        # FILE_ATTRIBUTE_REPARSE_POINT
+REFS_TAG_SYMLINK, REFS_TAG_MOUNT_POINT = 0xA000000C, 0xA0000003
+REFS_LOGFILE_INFO = 0x9                          # the logfile information table [forefst system_oids.md]
+REFS_LOG_CONTROL_LCNS = (0x30, 0x31)             # where the control pages were on four of six volumes
+REFS_CRC64_SENTINEL = (0xABBAFFFFABBAFFFE, 0xABBAFFFFABBAFFFF)   # [forefst checksum_architecture.md]
+REFS_NEWEST_MINOR = 14                           # 3.14, the newest version forefst documents and Windows wrote here
+REFS_DAMAGE_CAP = 1000                           # damage lines kept; damage_count counts them all
+REFS_MAX_FILE_BYTES = 35 << 50                   # 35 PB, Microsoft's ReFS maximum file size, taken as PiB
+REFS_CONTAINER_COMPRESSED = 0x800                # [forefst concepts/compression.md], see _clusters
+REFS_ATTR_SPARSE, REFS_ATTR_ENCRYPTED = 0x200, 0x4000   # FILE_ATTRIBUTE_* [MS-FSCC] 2.6
+# The checksum kind a page reference must carry, by the boot sector's selector
+# (0x2A) and, for a volume upgraded with the selector left at 0, by the
+# checkpoint's page reference size (0x5C) [forefst vbr.md, page_references.md].
+REFS_KIND_BY_SELECTOR = {2: 2, 4: 4}
+REFS_KIND_BY_REFSIZE = {0x30: 2, 0x48: 4, 0x68: 2}
+
+_REFS_CRC_TABLES = {}
+
+
+def _refs_crc(data, poly, width):
+    """A reflected CRC with all-ones initial value and final xor, which is the
+    shape of both CRC32-C (poly 0x82F63B78) and CRC-64/NVME (0x9A6C9329AC4BC9B5),
+    the two ReFS uses [forefst checksum_architecture.md]."""
+    table = _REFS_CRC_TABLES.get(poly)
+    if table is None:
+        table = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ poly if c & 1 else c >> 1
+            table.append(c)
+        _REFS_CRC_TABLES[poly] = table
+    mask = (1 << width) - 1
+    c = mask
+    for b in data:
+        c = table[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c ^ mask
+
+
+def refs_crc32c(data):
+    return _refs_crc(data, 0x82F63B78, 32)
+
+
+def refs_crc64(data):
+    return _refs_crc(data, 0x9A6C9329AC4BC9B5, 64)
+
+
+def _refs_digest_matches(kind, digest, data):
+    """True or False for a checksum kind this computes, None for one it does not.
+    Kind 0 records no checksum and also answers None."""
+    if kind == 1 and len(digest) == 4:
+        return struct.unpack("<I", digest)[0] == refs_crc32c(data)
+    if kind == 2 and len(digest) == 8:
+        got = refs_crc64(data)
+        if got == REFS_CRC64_SENTINEL[0]:
+            got = REFS_CRC64_SENTINEL[1]
+        return struct.unpack("<Q", digest)[0] == got
+    if kind == 4 and len(digest) == 32:
+        import hashlib
+        return hashlib.sha256(data).digest() == digest
+    return None
+
+
+def _refs_reference(buf, off):
+    """(four cluster numbers, checksum kind, digest) of the page reference at
+    off: four u64 slots, then flags, kind at +0x22, the digest's offset from
+    +0x20 at +0x23, its length at +0x24 [forefst page_references.md, libfsrefs
+    "metadata block reference - format version 3"]."""
+    if off < 0 or off + 0x28 > len(buf):
+        raise RefsDamage(f"a page reference at {off:#x} runs past its page")
+    slots = struct.unpack_from("<4Q", buf, off)
+    kind, doff = buf[off + 0x22], buf[off + 0x23]
+    dlen = struct.unpack_from("<H", buf, off + 0x24)[0]
+    digest = bytes(buf[off + 0x20 + doff:off + 0x20 + doff + dlen])
+    if len(digest) != dlen:
+        raise RefsDamage(f"a page reference at {off:#x} has a digest past its page")
+    return slots, kind, digest
+
+
+def _refs_self_checksum(page, cluster, desc_off, desc_len):
+    """Whether a superblock's or checkpoint's own checksum holds: computed over
+    its first cluster with the descriptor that holds it zeroed [forefst supb.md,
+    checksum_architecture.md]. None when it records a kind this does not compute,
+    which the callers treat as not holding."""
+    if desc_off + desc_len > len(page) or desc_off + 0x28 > len(page):
+        return False
+    _slots, kind, digest = _refs_reference(page, desc_off)
+    body = bytearray(page[:cluster])
+    body[desc_off:desc_off + desc_len] = bytes(desc_len)
+    return _refs_digest_matches(kind, digest, bytes(body))
+
+
+def _refs_node(buf, hoff, where="a node"):
+    """(level, flags, [(key, value, row flags)]) of the B+ tree node whose
+    header is at hoff in buf.
+
+    The header [libfsrefs "node header", forefst btree_node.md]: level at +0x0C
+    (0 is a leaf), flags at +0x0D, the key index from +0x10 to +0x20 and its
+    count at +0x14. The index holds a u32 per row whose low 16 bits are the
+    row's offset from the header. A row: its size, then the key's offset and
+    length, row flags, the value's offset and length, all from the row's start.
+    The index is the authority; bytes it does not name are not rows. An end
+    of 0 means not set (libfsrefs); every node on the six volumes measured
+    here sets it, as forefst measured on 118,351 pages.
+    """
+    if hoff < 0 or hoff + 0x24 > len(buf):
+        raise RefsDamage(f"{where}: its node header lies outside it")
+    level, flags = buf[hoff + 0x0C], buf[hoff + 0x0D]
+    start, count = struct.unpack_from("<II", buf, hoff + 0x10)
+    end = struct.unpack_from("<I", buf, hoff + 0x20)[0]
+    if end == 0:            # "or 0 if not set" [libfsrefs "node header"]
+        end = start + 4 * count
+    if end < start or (end - start) // 4 != count or hoff + end > len(buf):
+        raise RefsDamage(f"{where}: its key index ({start:#x} to {end:#x}) does not "
+                         f"hold the {count} rows its header counts")
+    rows = []
+    for i in range(count):
+        pos = hoff + (struct.unpack_from("<I", buf, hoff + start + 4 * i)[0] & 0xFFFF)
+        if pos + 16 > len(buf):
+            raise RefsDamage(f"{where}: row {i} lies outside it")
+        size, koff, klen, rflags, voff, vlen = struct.unpack_from("<IHHHHH", buf, pos)
+        if (size < 16 or pos + size > len(buf) or koff + klen > size
+                or voff + vlen > size):
+            raise RefsDamage(f"{where}: row {i} runs past its own size")
+        rows.append((bytes(buf[pos + koff:pos + koff + klen]),
+                     bytes(buf[pos + voff:pos + voff + vlen]), rflags))
+    return level, flags, rows
+
+
+class RefsDamage(ValueError):
+    """A ReFS structure that does not check out: a checksum that does not hold,
+    or a field that points outside what holds it."""
+
+
+class RefsEntry(collections.namedtuple("RefsEntry", "dir key")):
+    """A file, link or reparse directory: the directory that names it and its
+    name as stored (UTF-16LE). Directories are their object id, an int."""
+
+    __slots__ = ()
+
+
+class RefsStreamRef(collections.namedtuple("RefsStreamRef", "file name")):
+    """An alternate data stream: its file's node and the stream's name. A type
+    of its own, as NtfsStreamRef is, so a caller can keep streams apart."""
+
+    __slots__ = ()
+
+
+class _RefsDir:
+    """One directory table, read whole: its name rows in key order, its
+    split-out file records by (file id, home directory), and its own record."""
+
+    __slots__ = ("names", "records", "own")
+
+    def __init__(self):
+        self.names, self.records, self.own = collections.OrderedDict(), {}, None
+
+
+class RefsWalker:
+    """List and read files from a ReFS 3.x volume, same interface as the other
+    walkers: root, listdir, entry, read_file, stamps, readlink, named_streams,
+    allocation.
+
+    A directory's node is its object id. A file's is a RefsEntry, the directory
+    that names it and the name. A file is stored one of two ways
+    [forefst directory_entries.md]: its whole record inside its name row (the
+    row's key flag is 1), or, once it has been moved or given a second name, a
+    short name row (flag 2) that points at its record, kept in the directory it
+    was created in under its id there. Windows reports that pair, the id and the
+    directory's object id, as the file's 128-bit file id, and file_id() gives
+    the same two numbers.
+
+    Read: $DATA held inline in the record, $DATA in extents (sparse runs read as
+    zeros), named streams inline and in extents, symbolic links and junctions
+    (mode S_IFLNK, target from readlink()), hard links (each name lists the one
+    record). Not read, and refused with a reason rather than guessed: a stream
+    record laid out other than as ReFS 3.14 writes it. ``note`` says when the metadata log
+    holds changes newer than the checkpoint, which are not applied.
+    """
+
+    root = REFS_ROOT_DIR
+
+    def __init__(self, fh, base):
+        self.fh, self.base = fh, base
+        boot = read_at(fh, base, 512)
+        if len(boot) < 512 or boot[3:11] != REFS_FS_NAME or boot[0x10:0x14] != REFS_FSRS:
+            raise ValueError("not a ReFS boot sector")
+        self.total_sectors, self.bps, self.spc = struct.unpack_from("<QII", boot, 0x18)
+        self.version = (boot[0x28], boot[0x29])
+        self.serial = struct.unpack_from("<Q", boot, 0x38)[0]
+        self.cluster = self.bps * self.spc
+        why_not = _refs_version_refusal(*self.version)
+        if why_not:
+            raise ValueError(why_not)
+        self.checksum_selector = struct.unpack_from("<H", boot, 0x2A)[0]
+        if self.cluster < 512 or self.cluster & (self.cluster - 1):
+            raise ValueError(f"a cluster of {self.cluster} bytes is not a power of two")
+        self.boot_checksum_ok = struct.unpack_from("<H", boot, 0x16)[0] == _refs_boot_checksum(boot)
+        self.total_clusters = self.total_sectors * self.bps // self.cluster
+        self.page_clusters = max(1, REFS_PAGE_BYTES // self.cluster)
+        self.damage, self.damage_count, self._where = [], 0, ""
+        self._pages = collections.OrderedDict()
+        self._dirs = collections.OrderedDict()
+        self._index_rows = {}                   # directory object id -> its name row in its parent
+        self._dir_parent = {REFS_ROOT_DIR: None}  # directory object id -> the directory naming it
+        self.pages_checked = collections.Counter()   # checksum kind -> pages that matched it
+        self.superblock_lcn, sb = self._superblock()
+        self.volume_guid = sb[0x50:0x60]
+        ref_off, ref_count = struct.unpack_from("<II", sb, 0x70)
+        if ref_count < 1 or ref_off + 8 * ref_count > self.cluster:
+            raise RefsDamage("the superblock's checkpoint list lies outside it")
+        self.checkpoint_lcns = struct.unpack_from(f"<{ref_count}Q", sb, ref_off)
+        self.checkpoint_lcn, cp, self.checkpoint_tie = self._checkpoint()
+        self.checkpoint_version = struct.unpack_from("<HH", cp, 0x54)
+        refsize = struct.unpack_from("<I", cp, 0x5C)[0]
+        self.page_kind = (REFS_KIND_BY_SELECTOR.get(self.checksum_selector)
+                          if self.checksum_selector else REFS_KIND_BY_REFSIZE.get(refsize))
+        if self.page_kind is None:
+            raise RefsDamage(f"a checksum selector {self.checksum_selector} with page "
+                             f"references of {refsize} bytes, which no source describes")
+        self.clock, _allocator, self.checkpoint_lsn = struct.unpack_from("<QQQ", cp, 0x60)
+        self.checkpoint_flags = struct.unpack_from("<I", cp, 0x78)[0]
+        nroots = struct.unpack_from("<I", cp, 0x90)[0]
+        if self.checkpoint_flags & 0x200:        # the root list is reached through an offset
+            at = struct.unpack_from("<I", cp, 0x94)[0]
+        else:
+            at = 0x94
+        if nroots < 13 or at + 4 * nroots > len(cp):
+            raise RefsDamage("the checkpoint's root list lies outside it")
+        self.root_offsets = struct.unpack_from(f"<{nroots}I", cp, at)
+        self._cp = cp
+        self.containers = {}
+        self.containers = self._containers()
+        self.bad_containers = self._check_containers()
+        self.compression_format = self._compression_format()
+        self.objects = self._objects()
+        self.logged = self._logged_after_checkpoint()
+        notes = []
+        if self.logged:
+            notes.append(
+                f"{self.logged:,} metadata log "
+                f"{'records follow' if self.logged != 1 else 'record follows'} "
+                "the newest checkpoint. Windows applies them when it mounts the volume; "
+                "this reader does not, so it shows the volume as of that checkpoint, and "
+                "what changed after it is missing or older here")
+        self.note = "; ".join(notes) or None
+
+    def _hurt(self, what):
+        """Record one thing that did not check out. The first REFS_DAMAGE_CAP
+        are kept in ``damage``; ``damage_count`` counts every one."""
+        self.damage_count += 1
+        if len(self.damage) < REFS_DAMAGE_CAP:
+            self.damage.append(self._where + what)
+
+    # -- the bootstrap ------------------------------------------------------
+
+    def _superblock(self):
+        """Of the three superblock copies, at cluster 30 and two and three
+        clusters from the end, the one with the highest clock (+0x68) among
+        those whose own checksum holds, the first in that order on a tie
+        [forefst supb.md: CmsVolume::ChooseSuperBlock]."""
+        best_clock, best_lcn, best_sb = -1, None, None
+        for lcn in (REFS_SUPERBLOCK_LCN, self.total_clusters - 2, self.total_clusters - 3):
+            sb = read_at(self.fh, self.base + lcn * self.cluster, self.cluster)
+            if len(sb) < 0x100 or sb[:4] != b"SUPB":
+                continue
+            doff, dlen = struct.unpack_from("<II", sb, 0x78)
+            if _refs_self_checksum(sb, self.cluster, doff, dlen) is not True:
+                self._hurt(f"the superblock at cluster {lcn:,} fails its own checksum")
+                continue
+            clock = struct.unpack_from("<Q", sb, 0x68)[0]
+            if clock > best_clock:
+                best_clock, best_lcn, best_sb = clock, lcn, sb
+        if best_sb is None:
+            raise RefsDamage("no superblock with a checksum that holds (cluster 30 and the "
+                             "two backups at the end of the volume)")
+        return best_lcn, best_sb
+
+    def _checkpoint(self):
+        """(cluster, page, tied clock or None) of the checkpoint with the higher
+        clock (+0x60) of those whose own checksum holds [forefst chkp.md]. On
+        an equal clock the driver signals a tie rather than choosing; this reads
+        the first and reports the tie."""
+        best_clock, best_lcn, best_cp, tie = -1, None, None, None
+        size = max(self.cluster, REFS_PAGE_BYTES)
+        for lcn in self.checkpoint_lcns:
+            cp = read_at(self.fh, self.base + lcn * self.cluster, size)
+            if len(cp) < 0x100 or cp[:4] != b"CHKP":
+                self._hurt(f"no checkpoint at cluster {lcn:,}")
+                continue
+            doff, dlen = struct.unpack_from("<II", cp, 0x58)
+            if _refs_self_checksum(cp, self.cluster, doff, dlen) is not True:
+                self._hurt(f"the checkpoint at cluster {lcn:,} fails its own checksum")
+                continue
+            clock = struct.unpack_from("<Q", cp, 0x60)[0]
+            if clock == best_clock:
+                tie = clock
+            elif clock > best_clock:
+                best_clock, best_lcn, best_cp, tie = clock, lcn, cp, None
+        if best_cp is None:
+            raise RefsDamage("neither checkpoint has a checksum that holds")
+        return best_lcn, best_cp, tie
+
+    def _root(self, index):
+        return self._cp, self.root_offsets[index]
+
+    def _containers(self):
+        """{container id: (first cluster, clusters in it, flags)} from the container
+        table, which is addressed by real cluster numbers where the other roots
+        this reads are virtual [forefst chkp.md]. The first
+        cluster is the u64 16 bytes before the value's end, the count at +0x18
+        [forefst container_table.md], the flags at +0x14. Its copy (root 8) is
+        read if it fails."""
+        out = {}
+        for index in (REFS_ROOT_CONTAINERS, REFS_ROOT_CONTAINERS_COPY):
+            before = self.damage_count
+            try:
+                for key, value, _f in self._table(*self._root(index), virtual=False):
+                    if len(key) >= 8 and len(value) >= 0x20:
+                        out[struct.unpack_from("<Q", key, 0)[0]] = (
+                            struct.unpack_from("<Q", value, len(value) - 16)[0],
+                            struct.unpack_from("<I", value, 0x18)[0],
+                            struct.unpack_from("<I", value, 0x14)[0])
+            except RefsDamage as exc:
+                self._hurt(f"container table (root {index}): {exc}")
+            if out and self.damage_count == before:
+                return out
+            out = {}
+        raise RefsDamage("neither copy of the container table reads whole")
+
+    def _objects(self):
+        """{object id: its object table value}, from root 0 or its copy, root 5.
+        A key is 16 bytes, the id in its second half [forefst object_table.md]."""
+        for index in (REFS_ROOT_OBJECTS, REFS_ROOT_OBJECTS_COPY):
+            before = self.damage_count
+            out = {}
+            try:
+                for key, value, _f in self._table(*self._root(index), virtual=True):
+                    if len(key) == 16 and len(value) >= 0x50:
+                        out[struct.unpack_from("<Q", key, 8)[0]] = value
+            except RefsDamage as exc:
+                self._hurt(f"object table (root {index}): {exc}")
+            if out and self.damage_count == before:
+                return out
+        raise RefsDamage("neither copy of the object table reads whole")
+
+    def _check_containers(self):
+        """{container id: why} for containers whose clusters cannot be where
+        the table says: a first cluster not a multiple of the container size,
+        a range past the end of the volume, or one overlapping another. None of
+        the 34,000 containers on the six volumes measured is any of these, so
+        each is reported and reading from it refused rather than trusted."""
+        bad = {}
+        spans = sorted((first, first + count, cid) for cid, (first, count, _f) in
+                       self.containers.items())
+        for i, (first, end, cid) in enumerate(spans):
+            count = end - first
+            if i + 1 < len(spans) and spans[i + 1][0] < end:
+                bad[cid] = f"overlaps container {spans[i + 1][2]}"
+                bad[spans[i + 1][2]] = f"overlaps container {cid}"
+            if not count or first % count:
+                bad[cid] = f"starts at cluster {first:,}, not a multiple of its {count:,} clusters"
+            elif end > self.total_clusters:
+                bad[cid] = f"reaches cluster {end:,}, past the volume's {self.total_clusters:,}"
+        for cid, why in sorted(bad.items()):
+            self._hurt(f"container {cid} {why}")
+        return bad
+
+    def _compression_format(self):
+        """The volume's compression policy, the u16 at 0xA4 of the container
+        table's root page (0 none, 1 LZ4, 2 ZSTD, 3 LZ4QAT) [forefst
+        concepts/compression.md, container_table.md]. 0 on every volume measured."""
+        try:
+            page = self._page(*_refs_reference(*self._root(REFS_ROOT_CONTAINERS)), virtual=False)
+        except RefsDamage:
+            return None
+        return struct.unpack_from("<H", page, 0xA4)[0]
+
+    def translate(self, vlcn):
+        """The cluster a virtual cluster number stands for: the container is
+        the number shifted right by the bit length of the clusters in one
+        container, the cluster within it the low bits [forefst
+        virtual_addressing.md]."""
+        if not self.containers:
+            return vlcn
+        cpc = next(iter(self.containers.values()))[1]
+        if not cpc or cpc & (cpc - 1):
+            raise RefsDamage(f"the container table gives {cpc} clusters a container")
+        got = self.containers.get(vlcn >> cpc.bit_length())
+        if got is None:
+            raise RefsDamage(f"virtual cluster {vlcn:#x} is in no container the table maps")
+        why = getattr(self, "bad_containers", {}).get(vlcn >> cpc.bit_length())
+        if why:
+            raise RefsDamage(f"virtual cluster {vlcn:#x} is in container "
+                             f"{vlcn >> cpc.bit_length()}, which {why}")
+        return got[0] + (vlcn & (got[1] - 1))
+
+    def _page(self, slots, kind, digest, virtual):
+        """One metadata page, its clusters read in slot order and checked
+        against the digest its parent recorded, which must be of the kind the
+        volume uses. Pages are cached under the digest they were checked
+        against, so a reference carrying another digest is checked afresh."""
+        if kind != self.page_kind:
+            raise RefsDamage(f"a page reference records checksum kind {kind} where this volume "
+                             f"uses kind {self.page_kind}, so the page cannot be checked")
+        key = (slots[0], virtual, digest)
+        hit = self._pages.get(key)
+        if hit is not None:
+            self._pages.move_to_end(key)
+            return hit
+        lcns = [self.translate(s) if virtual else s for s in slots[:self.page_clusters]]
+        page = b"".join(read_at(self.fh, self.base + lcn * self.cluster, self.cluster)
+                        for lcn in lcns)
+        where = f"the page at cluster {lcns[0]:,}"
+        if len(page) != self.page_clusters * self.cluster:
+            raise RefsDamage(f"{where} lies past the end of the image")
+        if _refs_digest_matches(kind, digest, page) is not True:
+            raise RefsDamage(f"{where} does not match the checksum its parent records")
+        self.pages_checked[kind] += 1
+        if page[:4] != b"MSB+":
+            raise RefsDamage(f"{where} is not a B+ tree page")
+        self._pages[key] = page
+        if len(self._pages) > 512:
+            self._pages.popitem(last=False)
+        return page
+
+    def _table(self, buf, ref_off, virtual, depth=0, seen=None):
+        """Every leaf row of the tree whose root page the reference at ref_off
+        in buf names. An index row's value is the reference of a child page. A
+        child page that does not check out is recorded in ``damage`` and its rows
+        are left out; the rest of the table is still read. A page is read at
+        most once in one walk, so no arrangement of references can loop, and a
+        walk reads at most as many pages as the volume holds."""
+        if seen is None:
+            seen = set()
+        slots, kind, digest = _refs_reference(buf, ref_off)
+        if (slots[0], virtual) in seen:
+            raise RefsDamage(f"a table names its page at cluster {slots[0]:,} twice")
+        if len(seen) > self.total_clusters // self.page_clusters:
+            raise RefsDamage("a table names more pages than the volume holds")
+        seen.add((slots[0], virtual))
+        page = self._page(slots, kind, digest, virtual=virtual)
+        hoff = 0x50 + struct.unpack_from("<I", page, 0x50)[0]
+        yield from self._node_rows(page, hoff, virtual, depth, "a table page", seen)
+
+    def _node_rows(self, buf, hoff, virtual, depth, where, seen=None):
+        if depth > 16:
+            raise RefsDamage("a table nests deeper than any volume measured")
+        if seen is None:
+            seen = set()
+        level, _flags, rows = _refs_node(buf, hoff, where)
+        if not level:
+            yield from rows
+            return
+        for _key, value, _f in rows:
+            try:
+                yield from self._table(value, 0, virtual, depth + 1, seen)
+            except (RefsDamage, struct.error) as exc:
+                self._hurt(str(exc))
+
+    def _embedded(self, value, where="a record"):
+        """The rows of the table held inside a row's value: its node header is
+        at the u32 the value begins with, as a page's is at 0x50 [forefst
+        directory_entries.md]. A node of a higher level points at child pages."""
+        if len(value) < 4:
+            raise RefsDamage(f"{where} is too short to hold a table")
+        return list(self._node_rows(value, struct.unpack_from("<I", value, 0)[0],
+                                    True, 0, where))
+
+    # -- directories --------------------------------------------------------
+
+    def _dir(self, oid):
+        hit = self._dirs.get(oid)
+        if hit is not None:
+            self._dirs.move_to_end(oid)
+            return hit
+        value = self.objects.get(oid)
+        if value is None:
+            raise RefsDamage(f"directory {oid:#x} has no row in the object table")
+        d = _RefsDir()
+        outer, self._where = self._where, f"directory {oid:#x}: "
+        try:
+            rows = list(self._table(value, 0x20, virtual=True))
+        finally:
+            self._where = outer
+        for key, val, _f in rows:
+            if len(key) < 2:
+                continue
+            rtype = struct.unpack_from("<H", key, 0)[0]
+            if rtype == 0x30 and len(key) >= 4:
+                d.names[key[4:]] = (struct.unpack_from("<H", key, 2)[0], val)
+            elif rtype == 0x40 and len(key) >= 24:
+                d.records[struct.unpack_from("<QQ", key, 8)] = val
+            elif rtype == 0x10:
+                d.own = val
+        self._dirs[oid] = d
+        if len(self._dirs) > 32:
+            self._dirs.popitem(last=False)
+        return d
+
+    def _row(self, node):
+        d = self._dir(node.dir)
+        got = d.names.get(node.key)
+        if got is None:
+            raise RefsDamage(f"no name row for {node.key.decode('utf-16-le', 'replace')!r} "
+                             f"in directory {node.dir:#x}")
+        return got
+
+    def _record(self, node):
+        """(record value, ordinal, home directory) for a file: the name row's own
+        value when the record is in it (flag 1), else the record its directory
+        of creation keeps under (ordinal, home) (flag 2)."""
+        kf, val = self._row(node)
+        if kf == 1:
+            if len(val) < 0x88:
+                raise RefsDamage("a file record shorter than its fixed fields")
+            return val, struct.unpack_from("<Q", val, 0x80)[0], node.dir
+        if kf == 2 and len(val) >= 0x48:
+            ordinal, home = struct.unpack_from("<QQ", val, 0)
+            rec = self._dir(home).records.get((ordinal, home))
+            if rec is None:
+                raise RefsDamage(f"file id {ordinal:#x} has no record in directory {home:#x}")
+            return rec, ordinal, home
+        raise RefsDamage(f"a name row with key flag {kf}, which this reader does not read")
+
+    @staticmethod
+    def _is_dir_row(kf, val):
+        return (kf == 2 and len(val) >= 0x44
+                and struct.unpack_from("<I", val, 0x40)[0] & REFS_ATTR_DIRECTORY)
+
+    def _dir_reparse(self, oid):
+        """(tag, data) of the reparse point a directory's own record holds, or None."""
+        own = self._dir(oid).own
+        return None if own is None else self._reparse_of(own)
+
+    def listdir(self, node):
+        oid = node if isinstance(node, int) else self._link_dir(node)
+        out = []
+        for key, (kf, val) in self._dir(oid).names.items():
+            name = key.decode("utf-16-le", "replace")
+            if self._is_dir_row(kf, val):
+                child = struct.unpack_from("<Q", val, 8)[0]
+                # A directory has one name: a row naming the root, the
+                # directory itself, or a directory another one already names
+                # is a tree that does not hold together. Each such row is
+                # reported and left out, so no loop forms and nothing is
+                # silently skipped by a walk that has seen the directory.
+                had = self._dir_parent.get(child, oid) if child != REFS_ROOT_DIR else -1
+                if child == oid or had != oid:
+                    self._hurt(f"directory {oid:#x} names {name!r} as directory {child:#x}, "
+                               + ("the root" if child == REFS_ROOT_DIR else
+                                  "itself" if child == oid else
+                                  f"which directory {had:#x} already names"))
+                    continue
+                self._dir_parent[child] = oid
+                self._index_rows[child] = val
+                if struct.unpack_from("<I", val, 0x40)[0] & REFS_ATTR_REPARSE:
+                    got = self._dir_reparse(child)
+                    if got is not None and got[0] in (REFS_TAG_SYMLINK, REFS_TAG_MOUNT_POINT):
+                        out.append((name, RefsEntry(oid, key)))
+                        continue
+                out.append((name, child))
+            elif kf in (1, 2):
+                out.append((name, RefsEntry(oid, key)))
+        return out
+
+    def _link_dir(self, node):
+        kf, val = self._row(node)
+        if not self._is_dir_row(kf, val):
+            raise RefsDamage("not a directory")
+        return struct.unpack_from("<Q", val, 8)[0]
+
+    # -- one file -----------------------------------------------------------
+
+    def _attributes_of(self, record):
+        """The rows of a file record's own table, as (marker, type, key, value).
+        A key begins with a u64 this does not use, then the marker
+        (0x80000001 or 0x80000002) and the attribute type [forefst
+        directory_entries.md, NAMED_DATA.md]; other keys read as marker 0."""
+        out = []
+        for key, value, _f in self._embedded(record):
+            if len(key) >= 16:
+                marker, atype = struct.unpack_from("<IH", key, 8)
+                if marker not in (0x80000001, 0x80000002):
+                    marker, atype = 0, None
+            else:
+                marker, atype = 0, None
+            out.append((marker, atype, key, value))
+        return out
+
+    @staticmethod
+    def _inline(value):
+        """(size, bytes) of an attribute held in its row: size at +0x20, the
+        content at +8's offset plus +0x0C's summary size [forefst
+        NAMED_DATA.md, which the $DATA row shares]."""
+        if len(value) < 0x28:
+            raise RefsDamage("an inline stream row shorter than its header")
+        size = struct.unpack_from("<Q", value, 0x20)[0]
+        start = sum(struct.unpack_from("<II", value, 8))
+        if size > REFS_MAX_FILE_BYTES:
+            raise RefsDamage(f"a stream of {size:,} bytes, more than ReFS allows a file")
+        data = value[start:start + size]
+        if len(data) != size:
+            raise RefsDamage("an inline stream runs past its row")
+        return size, data
+
+    def _extent_stream(self, value):
+        """(size, valid length, value) of a stream held in extents. The value
+        is a table: a header with the sizes (total allocation +0x30, size +0x38,
+        valid length +0x40 [forefst extent_descriptors.md, ReFS 3.7+ layout])
+        and a node of extent records, which _extents() reads. The sizes are
+        read here and the map only when it is needed, so a file whose map does
+        not check out is still listed with its size."""
+        if len(value) < 0x58:
+            raise RefsDamage("a stream record shorter than its header")
+        if struct.unpack_from("<I", value, 0x0C)[0] != 0x200:
+            raise RefsDamage("a stream record laid out other than as ReFS 3.14 writes it "
+                             f"(summary size {struct.unpack_from('<I', value, 0x0C)[0]:#x})")
+        size, valid = struct.unpack_from("<QQ", value, 0x38)
+        if size > REFS_MAX_FILE_BYTES or valid > REFS_MAX_FILE_BYTES:
+            raise RefsDamage(f"a stream of {max(size, valid):,} bytes, more than ReFS allows a "
+                             "file (35 PB, Microsoft's ReFS overview)")
+        return size, valid, value, ()
+
+    def _extents(self, value, older=()):
+        """The sorted (file cluster, run length, virtual cluster, flags) of a
+        stream record's map, with the clusters it does not hold itself taken
+        from the snapshot records in ``older``, newest first (see
+        _main_stream). A record of a level-0 node of 24-byte extent
+        records: the virtual cluster, flags, record size, the file's cluster
+        and the run length. Once the map outgrows the record its node is of a
+        higher level, each row's value the reference of a child page that holds
+        the same kind of node [forefst extent_descriptors.md]."""
+        out = []
+        self._extent_node(value, struct.unpack_from("<I", value, 0)[0], out, 0, set())
+        out.sort()
+        _refs_no_overlap(out)
+        for snap in older:
+            held = [(vcn, vcn + run) for vcn, run, _v, f in out if not f & 0x20]
+            theirs = []
+            self._extent_node(snap, struct.unpack_from("<I", snap, 0)[0], theirs, 0, set())
+            theirs.sort()
+            _refs_no_overlap(theirs)
+            for vcn, run, vlcn, eflags in theirs:
+                if eflags & 0x20:
+                    continue
+                for a, b in _refs_uncovered(vcn, vcn + run, held):
+                    out.append((a, b - a, vlcn + (a - vcn), eflags))
+            out.sort()
+        if older:                               # a hole is now a gap no version fills
+            out = [e for e in out if not e[3] & 0x20]
+        return out
+
+    def _extent_node(self, buf, hoff, out, depth, seen):
+        if hoff + 0x24 > len(buf):
+            raise RefsDamage("a stream's extent node lies outside what holds it")
+        level, flags = buf[hoff + 0x0C], buf[hoff + 0x0D]
+        if level:
+            if depth > 8:
+                raise RefsDamage("an extent map nests deeper than any volume measured")
+            for _key, val, _f in _refs_node(buf, hoff, "an extent map")[2]:
+                slots, kind, digest = _refs_reference(val, 0)
+                if slots[0] in seen:
+                    raise RefsDamage(f"an extent map names its page at cluster {slots[0]:,} twice")
+                seen.add(slots[0])
+                page = self._page(slots, kind, digest, virtual=True)
+                self._extent_node(page, 0x50 + struct.unpack_from("<I", page, 0x50)[0],
+                                  out, depth + 1, seen)
+            return
+        if not flags & 0x04:
+            raise RefsDamage("a stream's extent node is not marked as one")
+        start, count = struct.unpack_from("<II", buf, hoff + 0x10)
+        end = struct.unpack_from("<I", buf, hoff + 0x20)[0]
+        if end == 0:
+            end = start + 4 * count
+        if end < start or (end - start) // 4 != count or hoff + end > len(buf):
+            raise RefsDamage("a stream's extent index does not hold the rows it counts")
+        for i in range(count):
+            pos = hoff + (struct.unpack_from("<I", buf, hoff + start + 4 * i)[0] & 0xFFFF)
+            if pos + 24 > len(buf):
+                raise RefsDamage("an extent record runs past what holds it")
+            vlcn, eflags, _rsize, vcn, _pad, run = struct.unpack_from("<QHHIII", buf, pos)
+            out.append((vcn, run, vlcn, eflags))
+
+    def _main_stream(self, record):
+        """("inline", size, bytes), ("extents", size, valid, record) or
+        ("empty", 0) for the unnamed $DATA: an inline row (marker 0x80000001,
+        type 0x80) or the row of sub-stream 0x1000 (marker 0x80000002), the
+        live one beside any snapshots [forefst extent_descriptors.md]."""
+        attrs = self._attributes_of(record)
+        for marker, atype, key, value in attrs:
+            if atype == 0x80 and marker == 0x80000001:
+                return ("inline",) + self._inline(value)
+        live, snaps = None, []
+        for marker, atype, key, value in attrs:
+            if atype == 0x80 and marker == 0x80000002 and len(key) >= 0x18:
+                sub = struct.unpack_from("<Q", key, 0x10)[0]
+                if sub == REFS_LIVE_STREAM:
+                    live = value
+                elif sub > REFS_LIVE_STREAM:
+                    snaps.append((sub, value))
+        if live is not None:
+            # A snapshotted file's live stream holds only the clusters written
+            # since the last snapshot; for the rest the driver reads the most
+            # recent snapshot that holds them, and the snapshots' sub-stream ids
+            # rise with age, 0x1001 the oldest [forefst concepts/
+            # snapshots_versioning.md, structures/extent_descriptors.md].
+            size, valid, value, _none = self._extent_stream(live)
+            older = []
+            for sub, v in sorted(snaps, reverse=True):
+                if len(v) < 0x58 or struct.unpack_from("<I", v, 0x0C)[0] != 0x200:
+                    raise RefsDamage(f"the record of snapshot stream {sub:#x} is not one this "
+                                     "reader can read, so the file's live content cannot be "
+                                     "put together")
+                older.append(v)
+            older = tuple(older)
+            return ("extents", size, valid, value, older)
+        size = struct.unpack_from("<Q", record, 0x58)[0] if len(record) >= 0x60 else 0
+        if size:
+            raise RefsDamage(f"a record of {size:,} bytes with no $DATA this reader finds")
+        return ("empty", 0)
+
+    def _named(self, record):
+        """{name: (row value, attrs)} of the alternate data streams: type 0xB0
+        rows whose stream summary flags (+0x10) are 0, not 2, which marks a
+        snapshot [forefst NAMED_DATA.md]."""
+        attrs = self._attributes_of(record)
+        out = collections.OrderedDict()
+        for marker, atype, key, value in attrs:
+            if atype == 0xB0 and marker == 0x80000002 and len(value) >= 0x28:
+                if struct.unpack_from("<H", value, 0x10)[0] == 0:
+                    out[key[0x10:].decode("utf-16-le", "replace")] = value
+        return out, attrs
+
+    def _stream_owner(self, ref):
+        """The record that holds a stream: its file's, or a directory's own."""
+        if isinstance(ref.file, int):
+            own = self._dir(ref.file).own
+            if own is None:
+                raise RefsDamage(f"directory {ref.file:#x} has no record of its own")
+            return own
+        return self._record(ref.file)[0]
+
+    def _named_stream(self, record, name):
+        named, attrs = self._named(record)
+        value = named.get(name)
+        if value is None:
+            raise RefsDamage(f"no stream named {name!r}")
+        if not struct.unpack_from("<H", value, 2)[0] & 0x1000:
+            return ("inline",) + self._inline(value)
+        # Held in extents: the extents are in a row of their own that names no
+        # stream. forefst (NAMED_DATA.md) ties the two by the stream's size; the
+        # allocation is required to agree as well, and a tie is refused.
+        size, alloc = struct.unpack_from("<Q", value, 0x20)[0], struct.unpack_from("<Q", value, 0x18)[0]
+        found = []
+        for marker, _atype, _key, val in attrs:
+            if marker == 0 and len(val) >= 0x58 and struct.unpack_from("<I", val, 0x0C)[0] == 0x200:
+                if struct.unpack_from("<QQ", val, 0x30) == (alloc, size):
+                    found.append(val)
+        if len(found) != 1:
+            raise RefsDamage(f"the stream {name!r} is held in extents and "
+                             f"{len(found)} extent records match its size, so which one "
+                             "holds it cannot be told")
+        return ("extents",) + self._extent_stream(found[0])
+
+    def _read_stream(self, stream, want, sparse=True, name=""):
+        if stream[0] == "empty":
+            return
+        if stream[0] == "inline":
+            if want:
+                yield stream[2][:want]
+            return
+        size, valid, extents = stream[1], stream[2], self._extents(stream[3], stream[4])
+        want = min(want, size)
+        reach = max((vcn + run for vcn, run, _l, _f in extents), default=0) * self.cluster
+        if reach > struct.unpack_from("<Q", stream[3], 0x30)[0]:
+            # On every stream of the six volumes measured the map ends within
+            # the stream's total allocation (+0x30).
+            self._hurt(f"{name}: its extents reach {reach:,} bytes, past the "
+                       f"{struct.unpack_from('<Q', stream[3], 0x30)[0]:,} its record allocates")
+        if not sparse:
+            # A file that is not sparse has an extent, written or not, for
+            # every cluster of its size; a range none covers is a map that
+            # does not hold together [forefst extent_descriptors.md, "A sparse
+            # file's entries tile only its allocated clusters"]. It still reads
+            # as zeros, and is reported.
+            covered = [(vcn, vcn + run) for vcn, run, _l, _f in extents]
+            need = -(-size // self.cluster)
+            for a, b in _refs_uncovered(0, need, covered):
+                self._hurt(f"{name}: no extent covers clusters {a:,} to {b - 1:,} of a file not "
+                           "marked sparse; they read as zeros")
+                break
+        for piece, at in self._stream_pieces(extents, want):
+            if at + len(piece) > valid:                   # past the valid length reads as zeros
+                keep = max(0, valid - at)
+                piece = piece[:keep] + bytes(len(piece) - keep)
+            yield piece
+
+    def _stream_pieces(self, extents, want):
+        """(bytes, offset) over the first want bytes of a stream in extents,
+        in file order. A range no extent covers is a hole and reads as zeros."""
+        cl = self.cluster
+        pos = 0
+        for vcn, run, vlcn, eflags in extents:
+            if pos >= want:
+                break
+            at, end = vcn * cl, min((vcn + run) * cl, want)
+            if at > pos:                                  # a hole before this run
+                for z in _refs_zeros(min(at, want) - pos):
+                    yield z, pos
+                    pos += len(z)
+            if end <= pos:
+                continue
+            # bit 0x20 is a sparse hole; a known flags word without bit 0x10 is a
+            # run allocated but not yet written, which reads as zeros [forefst
+            # extent_descriptors.md]. Both occur on forefst's sample volumes, where
+            # 32 unwritten runs lie over clusters holding bytes that are not the
+            # file's (a script's file header mid-file, a B+ tree page).
+            if eflags & 0x20 or (eflags and not eflags & 0x10):
+                for z in _refs_zeros(end - pos):
+                    yield z, pos
+                    pos += len(z)
+                continue
+            if not vlcn:
+                raise RefsDamage("an extent at virtual cluster 0 that is not marked a hole")
+            first, skip = divmod(pos - at, cl)
+            for chunk in self._clusters(vlcn + first, (end - pos + skip + cl - 1) // cl):
+                piece = chunk[skip:skip + end - pos]
+                skip = 0
+                yield piece, pos
+                pos += len(piece)
+                if pos >= end:
+                    break
+        for z in _refs_zeros(want - pos):
+            yield z, pos
+            pos += len(z)
+
+    def _container_flags(self, vlcn):
+        """The container table's flags (+0x14) for the container holding vlcn.
+        forefst (concepts/compression.md) says a container holding compressed
+        data is marked by bit 0x800 of the in-memory flags word loaded from the
+        container table row; that the bit is this field's is inferred, and no
+        container on the six volumes measured carries it."""
+        if not self.containers:
+            return 0
+        cpc = next(iter(self.containers.values()))[1]
+        got = self.containers.get(vlcn >> cpc.bit_length())
+        return got[2] if got is not None and len(got) > 2 else 0
+
+    def _clusters(self, vlcn, n):
+        """Bytes of n clusters from virtual cluster vlcn, at most 1 MiB a read.
+        A run must end within its container: the virtual number of the
+        cluster after a container's last is not a cluster of the next one,
+        since translation shifts by one bit more than the in-container offset
+        holds [forefst virtual_addressing.md, IsValidContainerLcn]. No run on
+        the six volumes measured crosses, so one that does is refused."""
+        step = max(1, (1 << 20) // self.cluster)
+        if self.containers:
+            cpc = next(iter(self.containers.values()))[1]
+            if (vlcn & (cpc - 1)) + n > cpc:
+                raise RefsDamage(f"a run of {n:,} clusters from virtual cluster {vlcn:#x} "
+                                 "crosses the end of its container")
+        while n > 0:
+            take = min(n, step)
+            lcn = self.translate(vlcn)
+            if self._container_flags(vlcn) & REFS_CONTAINER_COMPRESSED:
+                raise RefsDamage(f"virtual cluster {vlcn:#x} lies in a container marked compressed, "
+                                 "whose clusters this reader does not decompress")
+            data = read_at(self.fh, self.base + lcn * self.cluster, take * self.cluster)
+            if len(data) < take * self.cluster:
+                data += bytes(take * self.cluster - len(data))
+            yield data
+            vlcn += take
+            n -= take
+
+    def _reparse_of(self, record):
+        """(tag, data) of a record's reparse row (type 0xC0): the reparse buffer
+        at the row's content offset, tag then data length then data, as NTFS
+        keeps it [MS-FSCC 2.1.2]."""
+        for marker, atype, _key, value in self._attributes_of(record):
+            if atype == 0xC0 and marker == 0x80000001 and len(value) >= 0x10:
+                at = struct.unpack_from("<I", value, 8)[0]
+                if at + 8 <= len(value):
+                    tag, length = struct.unpack_from("<IH", value, at)
+                    return tag, value[at + 8:at + 8 + length]
+        return None
+
+    @staticmethod
+    def _link_target(tag, data):
+        """The target a symbolic link or mount point names: its print name, or
+        the substitute name when that is empty [MS-FSCC 2.1.2.4, 2.1.2.5]."""
+        if len(data) < 8:
+            return ""
+        so, sl, po, pl = struct.unpack_from("<4H", data, 0)
+        path = data[12:] if tag == REFS_TAG_SYMLINK else data[8:]
+        name = path[po:po + pl] or path[so:so + sl]
+        return name.decode("utf-16-le", "replace")
+
+    def _kind(self, node):
+        """("link", target) or ("file", record, ordinal, home) for a RefsEntry."""
+        kf, val = self._row(node)
+        if self._is_dir_row(kf, val):
+            got = self._dir_reparse(struct.unpack_from("<Q", val, 8)[0])
+            return ("link", self._link_target(*got) if got else "")
+        rec, ordinal, home = self._record(node)
+        got = self._reparse_of(rec)
+        if got is not None and got[0] in (REFS_TAG_SYMLINK, REFS_TAG_MOUNT_POINT):
+            return ("link", self._link_target(*got))
+        return ("file", rec, ordinal, home)
+
+    def _times_of(self, value):
+        if len(value) < 0x48:
+            return (0, 0, 0, 0)
+        return struct.unpack_from("<4Q", value, 0x28)
+
+    def filetimes(self, node):
+        """The four FILETIMEs as stored, (created, modified, changed, accessed).
+
+        A file's are the four at +0x28 to +0x40 of its record, which ReFS
+        updates at once; a name row of a moved or linked file keeps a copy that
+        is refreshed only when that name is opened, so it can be older
+        [forefst concepts/hard_links.md, directory_entries.md]. A directory's are
+        those of its own record, except the change time: Windows reports the
+        copy in the directory's name row in its parent (+0x20), which forefst
+        measured against PowerShell (attributes/STANDARD_INFORMATION.md, 0x10);
+        on the fixture Windows wrote here the two copies never differ. The
+        root has no name row. A stream has its file's times."""
+        if isinstance(node, RefsStreamRef):
+            node = node.file
+        if isinstance(node, int):
+            return self._dir_times(node, self._index_rows.get(node))
+        kf, val = self._row(node)
+        if self._is_dir_row(kf, val):
+            return self._dir_times(struct.unpack_from("<Q", val, 8)[0], val)
+        return self._times_of(self._record(node)[0])
+
+    def _dir_times(self, oid, row):
+        own = self._dir(oid).own
+        times = list(self._times_of(own)) if own is not None else [0, 0, 0, 0]
+        if row is not None and len(row) >= 0x28:
+            times[2] = struct.unpack_from("<Q", row, 0x20)[0]
+        return tuple(times)
+
+    def stamps(self, node):
+        """(created, modified, accessed) in Unix seconds, 0 where unset, as
+        NtfsWalker.stamps gives them."""
+        c, m, _ch, a = self.filetimes(node)
+        return ntfs_time(c), ntfs_time(m), ntfs_time(a)
+
+    def inode(self, node):
+        return node
+
+    def entry(self, node):
+        """(mode, size, mtime). When a file's record does not check out, what is
+        wrong is added to ``damage`` and the file is still listed, with the size
+        and modified time its name row holds, so a listing shows it and reading
+        it fails with the reason; None only when not even that row is there."""
+        try:
+            return self._entry(node)
+        except (RefsDamage, struct.error, IndexError) as exc:
+            self._hurt(f"{self._name_of(node)}: {exc}")
+        if isinstance(node, RefsEntry):
+            try:
+                kf, val = self._row(node)
+            except (RefsDamage, struct.error, IndexError):
+                return None
+            if kf == 2 and len(val) >= 0x40:            # an index entry: size +0x38, times +0x10
+                return (0o100644, struct.unpack_from("<Q", val, 0x38)[0],
+                        ntfs_time(struct.unpack_from("<Q", val, 0x18)[0]))
+            if kf == 1 and len(val) >= 0x60:            # its own record: size +0x58, times +0x28
+                return (0o100644, struct.unpack_from("<Q", val, 0x58)[0],
+                        ntfs_time(self._times_of(val)[1]))
+        return None
+
+    @staticmethod
+    def _name_of(node):
+        if isinstance(node, RefsStreamRef):
+            return f"{RefsWalker._name_of(node.file)}:{node.name}"
+        if isinstance(node, RefsEntry):
+            return f"{node.key.decode('utf-16-le', 'replace')!r} in directory {node.dir:#x}"
+        return f"directory {node:#x}"
+
+    def _entry(self, node):
+        if isinstance(node, int):
+            if node not in self.objects:
+                raise RefsDamage("no row in the object table")
+            return (S_IFDIR | 0o755, 0, ntfs_time(self.filetimes(node)[1]))
+        if isinstance(node, RefsStreamRef):
+            rec = self._stream_owner(node)
+            stream = self._named_stream(rec, node.name)
+            return (0o100644, stream[1], ntfs_time(self._times_of(rec)[1]))
+        got = self._kind(node)
+        mtime = ntfs_time(self.filetimes(node)[1])
+        if got[0] == "link":
+            return (S_IFLNK | 0o777, len(got[1].encode("utf-8")), mtime)
+        return (0o100644, self._main_stream(got[1])[1], mtime)
+
+    def data_form(self, node):
+        """How a file's unnamed $DATA is held: "inline" in its record, in
+        "extents", or "empty"; None for a directory or a link."""
+        if not isinstance(node, RefsEntry):
+            return None
+        got = self._kind(node)
+        return self._main_stream(got[1])[0] if got[0] == "file" else None
+
+    def readlink(self, node):
+        got = self._kind(node) if isinstance(node, RefsEntry) else ("file",)
+        return got[1] if got[0] == "link" else ""
+
+    def read_file(self, node, size):
+        """The content, refused with a reason (RefsDamage) when the records do
+        not check out, the file is encrypted (FILE_ATTRIBUTE_ENCRYPTED: what is
+        on disk is ciphertext), or the data lies in a compressed container."""
+        try:
+            if isinstance(node, RefsStreamRef):
+                rec = self._stream_owner(node)
+                stream = self._named_stream(rec, node.name)
+            else:
+                got = self._kind(node)
+                if got[0] != "file":
+                    return
+                rec = got[1]
+                stream = self._main_stream(rec)
+            attrs = self._refuse_unreadable(rec)
+            yield from self._read_stream(stream, size, bool(attrs & REFS_ATTR_SPARSE),
+                                         self._name_of(node))
+        except (struct.error, IndexError) as exc:
+            raise RefsDamage(f"{self._name_of(node)}: a record field lies outside its row "
+                             f"({exc})") from exc
+
+    @staticmethod
+    def _refuse_unreadable(record):
+        """The record's attributes, after refusing a file whose content is
+        ciphertext: FILE_ATTRIBUTE_ENCRYPTED [MS-FSCC] 2.6, which ReFS sets for
+        EFS on Windows Server 2025 (Microsoft's ReFS overview)."""
+        attrs = struct.unpack_from("<I", record, 0x48)[0]
+        if attrs & REFS_ATTR_ENCRYPTED:
+            raise RefsDamage("the file is encrypted (EFS), so what is on disk is ciphertext "
+                             "and is not read")
+        return attrs
+
+    def named_streams(self, node):
+        """[(name, size)] of a file's alternate data streams, or of a directory's.
+        A record that does not check out is added to ``damage`` and gives []."""
+        try:
+            return self._named_streams(node)
+        except (RefsDamage, struct.error, IndexError) as exc:
+            self._hurt(f"{self._name_of(node)}: {exc}")
+            return []
+
+    def _named_streams(self, node):
+        if isinstance(node, int):
+            own = self._dir(node).own
+            if own is None:
+                return []
+            rec = own
+        elif isinstance(node, RefsEntry):
+            got = self._kind(node)
+            if got[0] != "file":
+                return []
+            rec = got[1]
+        else:
+            return []
+        out = []
+        for name, value in self._named(rec)[0].items():
+            out.append((name, struct.unpack_from("<Q", value, 0x20)[0]))
+        return out
+
+    def stream_ref(self, node, name):
+        """The node of one alternate data stream, for entry() and read_file()."""
+        return RefsStreamRef(node, name)
+
+    def attributes(self, node):
+        """The file attribute bits a record stores (+0x48), as stored. A
+        directory's name row sets 0x10000000 where Windows reports 0x10."""
+        if isinstance(node, RefsStreamRef):
+            node = node.file
+        if isinstance(node, int):
+            own = self._dir(node).own
+            return struct.unpack_from("<I", own, 0x48)[0] if own is not None else 0
+        kf, val = self._row(node)
+        if self._is_dir_row(kf, val):
+            return struct.unpack_from("<I", val, 0x40)[0]
+        return struct.unpack_from("<I", self._record(node)[0], 0x48)[0]
+
+    def file_id(self, node):
+        """(id, directory object id), the two halves of the 128-bit file id
+        Windows reports: 0 and its own object id for a directory, the file's id
+        in its directory of creation and that directory's for a file."""
+        if isinstance(node, int):
+            return (0, node)
+        kf, val = self._row(node)
+        if self._is_dir_row(kf, val):
+            return (0, struct.unpack_from("<Q", val, 8)[0])
+        _rec, ordinal, home = self._record(node)
+        return (ordinal, home)
+
+    def link_count(self, node):
+        """How many names a file's record lists (type 0x39 rows, each a parent
+        and a name), or 1 for a record that lists none, which is how a file
+        never moved or linked is kept. Measured, not documented: it matches the
+        link count Windows reports for every file of the fixture."""
+        if isinstance(node, int):
+            return 1
+        got = self._kind(node)
+        if got[0] != "file":
+            return 1
+        n = sum(1 for _m, atype, _k, _v in self._attributes_of(got[1]) if atype == 0x39)
+        return n or 1
+
+    def allocation(self, node):
+        """What the volume stores for a file beside the size it records, with
+        the keys NtfsWalker.allocation uses. ``stored`` is the stream's own
+        allocation as its record holds it, which counts reserved runs that
+        read as zeros, plus any clusters a snapshotted file reads from its
+        snapshots; or the bytes of an inline stream. It equals the allocation
+        Windows reported for every file in extents on the fixture, and
+        forefst's allocated size on its four sample volumes. ``sparse`` is the
+        file's sparse attribute."""
+        if isinstance(node, RefsStreamRef):
+            rec = self._stream_owner(node)
+            stream = self._named_stream(rec, node.name)
+        else:
+            got = self._kind(node)
+            if got[0] != "file":
+                return None
+            rec = got[1]
+            stream = self._main_stream(rec)
+        attrs = struct.unpack_from("<I", rec, 0x48)[0]
+        reparse = self._reparse_of(rec)
+        stored = 0
+        if stream[0] == "inline":
+            stored = len(stream[2])
+        elif stream[0] == "extents":
+            # The stream's own allocation (+0x48 of its record [forefst
+            # extent_descriptors.md]) counts runs reserved as well as written;
+            # a snapshotted file adds the clusters it reads from its snapshots,
+            # which the record counts as the snapshots' [forefst
+            # concepts/snapshots_versioning.md].
+            own = sum(run for _v, run, _l, f in self._extents(stream[3]) if not f & 0x20)
+            merged = sum(run for _v, run, _l, f in self._extents(stream[3], stream[4])
+                         if not f & 0x20)
+            stored = struct.unpack_from("<Q", stream[3], 0x48)[0] + (merged - own) * self.cluster
+        return {"size": stream[1], "stored": stored,
+                "sparse": bool(attrs & 0x200), "compression": "",
+                "reparse_tag": reparse[0] if reparse else None,
+                "attributes": attrs, "placeholder": False}
+
+    def volume_label(self):
+        """The label from the volume information table (object 0x500, row
+        0x510), or None when it cannot be read [forefst volume_info.md]."""
+        value = self.objects.get(REFS_VOLUME_INFO)
+        if value is None:
+            return None
+        try:
+            for key, val, _f in self._table(value, 0x20, virtual=True):
+                if key[:2] == b"\x10\x05":
+                    return val.decode("utf-16-le", "replace").split("\x00")[0]
+        except RefsDamage:
+            return None
+        return ""
+
+    # -- the metadata log ---------------------------------------------------
+
+    def _log_control_lcns(self):
+        """Where the log's two control pages are: the fourth and fifth u64 of
+        row 1 of the logfile information table (object 0x9), which forefst
+        (mlog.md) says holds the log's areas. That those two are the control
+        pages is measured, not documented: they name the pages forefst's mlog
+        report shows on two of its sample volumes, and 0x30 and 0x31 on the
+        other two and on both Windows 11 fixtures here. When the row cannot be
+        read, 0x30 and 0x31 are tried."""
+        value = self.objects.get(REFS_LOGFILE_INFO)
+        try:
+            for key, val, _f in (self._table(value, 0x20, virtual=True) if value else ()):
+                if key[:4] == b"\x01\x00\x00\x00" and len(val) >= 0x28:
+                    return struct.unpack_from("<QQ", val, 0x18)
+        except RefsDamage as exc:
+            self._hurt(f"logfile information table: {exc}")
+        return REFS_LOG_CONTROL_LCNS
+
+    def _logged_after_checkpoint(self):
+        """How many log records follow the checkpoint's log position (+0x70),
+        each found where that position puts it, carrying that position, the one
+        before it as its predecessor, and a check value that holds; or None when
+        the log's control page is not found.
+
+        The control page (signature "MLog", type 1) gives the data area's first
+        cluster at +8 of its payload; a record is at that cluster plus the low
+        32 bits of its position in 4 KiB log blocks, and its length in blocks is
+        at +0x38 [forefst mlog.md]. A volume Windows detached cleanly has no
+        record there; refs-test.vhdx, detached seconds after its files were
+        written, has 16. This counts what is present; it decodes none of it.
+        """
+        ctl_seq, area, block = -1, None, 0x1000
+        for lcn in self._log_control_lcns():
+            page = read_at(self.fh, self.base + lcn * self.cluster, 0x1000)
+            if len(page) < 0x1000 or page[:4] != b"MLog" or not _refs_log_check(page):
+                continue
+            eh = struct.unpack_from("<I", page, 0x54)[0]
+            if eh + 0x38 > len(page) or struct.unpack_from("<I", page, eh + 0x30)[0] != 1:
+                continue
+            pay = eh + struct.unpack_from("<I", page, eh + 0x28)[0]
+            if pay + 0x18 > len(page):
+                continue
+            seq = struct.unpack_from("<Q", page, 0x20)[0]
+            if seq > ctl_seq:
+                ctl_seq, area = seq, struct.unpack_from("<QQ", page, pay + 8)
+                block = struct.unpack_from("<I", page, 0x0C)[0] or 0x1000
+        if area is None:
+            return None
+        start, end = area
+        lsn, prev, count = self.checkpoint_lsn, None, 0
+        while count < 1 << 20:
+            off = start * self.cluster + (lsn & 0xFFFFFFFF) * block
+            if off >= end * self.cluster:
+                break
+            rec = read_at(self.fh, self.base + off, block)
+            if len(rec) < block or rec[:4] != b"MLog" or not _refs_log_check(rec):
+                break
+            got, before, length = struct.unpack_from("<QQI", rec, 0x28)
+            if got != lsn or (prev is not None and before != prev) or not length:
+                break
+            count += 1
+            prev, lsn = lsn, lsn + length
+        return count
+
+
+def _refs_version_refusal(major, minor):
+    """Why a volume of this version is not read, or None. Format 1 and 2 keep
+    their metadata in another layout [libfsrefs]; past 3.14 nothing describes
+    the format, and the boot sector's version is critical to a mount [forefst
+    vbr.md], so a newer one is refused by name rather than read as 3.14."""
+    if major < 3:
+        return (f"ReFS {major}.{minor}: volumes before format 3 keep their metadata in "
+                "another layout (libfsrefs documents it as format version 1), which this "
+                "reader does not read")
+    if major > 3 or minor > REFS_NEWEST_MINOR:
+        return (f"ReFS {major}.{minor}: newer than ReFS 3.{REFS_NEWEST_MINOR}, the newest "
+                "version any source describes or any volume this was checked against carries")
+    return None
+
+
+def _refs_no_overlap(extents):
+    """Refuse a sorted map in which two extents cover one file cluster, or a
+    run that reaches past the largest file ReFS allows."""
+    end = 0
+    for vcn, run, _vlcn, _flags in extents:
+        if vcn < end:
+            raise RefsDamage(f"two extents of the map cover file cluster {vcn:,}, so which "
+                             "holds its bytes cannot be told")
+        end = vcn + run
+    if end and end > REFS_MAX_FILE_BYTES // 512:
+        raise RefsDamage("an extent reaches past the largest file ReFS allows")
+
+
+def _refs_uncovered(lo, hi, held):
+    """The parts of [lo, hi) that no (start, end) in held covers."""
+    out, pos = [], lo
+    for a, b in sorted(held):
+        if b <= pos or a >= hi:
+            continue
+        if a > pos:
+            out.append((pos, a))
+        pos = max(pos, b)
+        if pos >= hi:
+            break
+    if pos < hi:
+        out.append((pos, hi))
+    return out
+
+
+def _refs_zeros(n):
+    while n > 0:
+        take = min(n, 1 << 20)
+        yield bytes(take)
+        n -= take
+
+
+def _refs_boot_checksum(boot):
+    """The boot sector's own 16-bit check: rotate right one bit, then add each
+    byte from 3 to 511 except the field at 0x16 [forefst vbr.md]."""
+    c = 0
+    for i in range(3, 512):
+        if i in (0x16, 0x17):
+            continue
+        c = (((c >> 1) | (c << 15)) + boot[i]) & 0xFFFF
+    return c
+
+
+def _refs_log_check(page):
+    """Whether a log block's check value (+8 of the entry header named at 0x54)
+    holds: the block's u64 words folded by xor into four lanes, the lanes
+    xored together and the halves folded [forefst mlog.md, "Verifying a record"].
+    A record is one log block, so the chained seed is always 0 here."""
+    eh = struct.unpack_from("<I", page, 0x54)[0]
+    if eh + 0x10 > len(page) or len(page) % 32:
+        return False
+    body = bytearray(page)
+    want = struct.unpack_from("<Q", body, eh + 8)[0]
+    body[eh + 8:eh + 16] = bytes(8)
+    lanes = [0, 0, 0, 0]
+    for i, word in enumerate(struct.unpack(f"<{len(body) // 8}Q", body)):
+        lanes[i & 3] ^= word
+    v = lanes[0] ^ lanes[1] ^ lanes[2] ^ lanes[3]
+    return want == (v >> 32) ^ (v & 0xFFFFFFFF)
+
+
+class _RefsSparseImage:
+    """The committed ReFS fixtures: a partition of which only the bytes the
+    reader reads are kept, each at its own offset (tools/make_refs_fixture.py).
+    A gzip of b"QNXPROBE-SPARSE 1\\n", a line of JSON with the partition size
+    and the [offset, length] runs, then the runs' bytes. Every other byte reads
+    as zero. Read only, like every image this tool opens."""
+
+    def __init__(self, raw):
+        magic, rest = raw.split(b"\n", 1)
+        if magic != b"QNXPROBE-SPARSE 1":
+            raise ValueError("not a qnxprobe sparse fixture")
+        head, self.data = rest.split(b"\n", 1)
+        self.head = json.loads(head)
+        self.size, self.pos = self.head["size"], 0
+        self.starts, self.runs, at = [], [], 0
+        for off, n in self.head["runs"]:
+            self.starts.append(off)
+            self.runs.append((off, n, at))
+            at += n
+        if at != len(self.data):
+            raise ValueError("the fixture's runs do not add up to its bytes")
+
+    def patched(self, off, data):
+        """A copy with data written at off, for the checks that break the
+        fixture on purpose: within one run, or wholly outside every run, where
+        it becomes a run of its own."""
+        copy = object.__new__(_RefsSparseImage)
+        copy.__dict__.update(self.__dict__)
+        i = bisect.bisect_right(self.starts, off) - 1
+        if i >= 0 and off + len(data) <= self.runs[i][0] + self.runs[i][1]:
+            start, _n, at = self.runs[i]
+            body = bytearray(self.data)
+            body[at + off - start:at + off - start + len(data)] = data
+            copy.data, copy.pos = bytes(body), 0
+            return copy
+        if (i >= 0 and off < self.runs[i][0] + self.runs[i][1]) or (
+                i + 1 < len(self.runs) and off + len(data) > self.runs[i + 1][0]):
+            raise ValueError("a patch that straddles the fixture's runs")
+        runs = sorted([(o, n) for o, n, _a in self.runs] + [(off, len(data))])
+        pieces, copy.starts, copy.runs, at = [], [], [], 0
+        for o, n in runs:
+            pieces.append(data if o == off else self._run_bytes(o, n))
+            copy.starts.append(o)
+            copy.runs.append((o, n, at))
+            at += n
+        copy.data, copy.pos = b"".join(pieces), 0
+        return copy
+
+    def _run_bytes(self, off, n):
+        for start, length, at in self.runs:
+            if start == off and length == n:
+                return self.data[at:at + n]
+        raise ValueError("no such run")
+
+    def seek(self, off, whence=0):
+        self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        end = self.size if n is None or n < 0 else min(self.size, self.pos + n)
+        out = bytearray(max(0, end - self.pos))
+        i = max(0, bisect.bisect_right(self.starts, self.pos) - 1)
+        while i < len(self.runs) and self.runs[i][0] < end:
+            start, length, at = self.runs[i]
+            lo, hi = max(start, self.pos), min(start + length, end)
+            if lo < hi:
+                out[lo - self.pos:hi - self.pos] = self.data[at + lo - start:at + hi - start]
+            i += 1
+        self.pos = end
+        return bytes(out)
+
+
+def identify_refs(fh, base, size=None):
+    """("refs", lines) for a ReFS volume at base, else None.
+
+    ReFS names itself at byte 3 of its boot sector and carries "FSRS" at 0x10;
+    both are required. A format 1.x or 2.x volume is named and refused.
+    """
+    del size
+    b = read_at(fh, base, 512)
+    if len(b) < 512 or b[3:11] != REFS_FS_NAME or b[0x10:0x14] != REFS_FSRS:
+        return None
+    sectors, bps, spc = struct.unpack_from("<QII", b, 0x18)
+    major, minor = b[0x28], b[0x29]
+    lines = [f"version      ReFS {major}.{minor} (boot sector)",
+             f"bytes/sector {bps}   sectors/cluster {spc}   cluster {bps * spc:,} bytes",
+             f"volume       {human(sectors * bps)} ({sectors:,} sectors)",
+             f"serial       {struct.unpack_from('<Q', b, 0x38)[0]:016x}"]
+    if struct.unpack_from("<H", b, 0x16)[0] != _refs_boot_checksum(b):
+        lines.append("boot sector  its checksum does not hold")
+    why_not = _refs_version_refusal(major, minor)
+    if why_not:
+        lines.append(f"contents     not read: {why_not}")
+        return "refs", lines
+    try:
+        w = RefsWalker(fh, base)
+    except (ValueError, OSError, struct.error) as exc:
+        lines.append(f"walk         not possible: {exc}")
+        return "refs", lines
+    label = w.volume_label()
+    if label is not None:
+        lines.append(f"label        {label or '(none)'}")
+    lines.append(f"checkpoint   clock {w.clock:,} at cluster {w.checkpoint_lcn:,}, "
+                 f"written as ReFS {w.checkpoint_version[0]}.{w.checkpoint_version[1]}")
+    if w.checkpoint_tie is not None:
+        lines.append(f"checkpoint   both checkpoints carry clock {w.checkpoint_tie:,}; the driver "
+                     "reports such a tie rather than choosing, and the first listed was read")
+    if w.compression_format:
+        lines.append(f"compression  the volume's policy names format {w.compression_format}; "
+                     "data in a container marked compressed is not read")
+    if w.logged is None:
+        lines.append("log          its control page was not found, so whether changes "
+                     "follow the checkpoint is not known")
+    elif w.logged:
+        lines.append(f"log          {w.note}")
+    else:
+        lines.append("log          no record follows the checkpoint")
+    for d in w.damage[:3]:
+        lines.append(f"damage       {d}")
+    if w.damage_count > 3:
+        lines.append(f"damage       {w.damage_count - 3:,} more")
+    return "refs", lines
+
+
 def walker_for(kind, fh, base, size=None):
     """The walker class for a filesystem kind, or None if it has no walker.
 
@@ -11774,6 +15927,8 @@ def walker_for(kind, fh, base, size=None):
         return ExfatWalker(fh, base)
     if kind == "ntfs":
         return NtfsWalker(fh, base)
+    if kind == "refs":
+        return RefsWalker(fh, base)
     if kind == "f2fs":
         return F2fsWalker(fh, base)
     if kind in ("hfs+", "hfsx"):
@@ -11791,6 +15946,10 @@ def walker_for(kind, fh, base, size=None):
         return IfsWalker(fh, base)
     if kind == "squashfs":
         return SquashfsWalker(fh, base)
+    if kind == "xfs":
+        return XfsWalker(fh, base, size)
+    if kind == "btrfs":
+        return BtrfsWalker(fh, base)
     if kind == "ubifs":
         return _cached_walker(fh, base, size, kind, lambda: UbifsWalker(fh, base))
     if kind == "ubi":
@@ -14897,6 +19056,614 @@ def _lvm_hostile_checks(disk, whole, regions, want, paths, parts, m_off, r_off):
     return out
 
 
+class _XfsPatchedImage:
+    """A read-only view of an image held in memory with some byte ranges
+    replaced, so a self-check can damage a structure without copying the image."""
+
+    def __init__(self, data, patches=()):
+        self.data, self.patches, self.pos = data, list(patches), 0
+
+    def seek(self, off, whence=0):
+        self.pos = off if whence == 0 else self.pos + off if whence == 1 else len(self.data) + off
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        end = len(self.data) if n is None or n < 0 else min(len(self.data), self.pos + n)
+        buf = bytearray(self.data[self.pos:end])
+        for at, rep in self.patches:
+            lo, hi = max(at, self.pos), min(at + len(rep), end)
+            if lo < hi:
+                buf[lo - self.pos:hi - self.pos] = rep[lo - at:hi - at]
+        self.pos = end
+        return bytes(buf)
+
+
+def _xfs_self_checks():
+    """[(label, passed or None for a skip)] for the XFS reader, from the images
+    mkfs.xfs wrote (tools/make_xfs_fixtures.sh) and what was recorded beside
+    each: a listing and sha256 of every file from the source tree, and xfs_db's
+    and xfs_logprint's own view of the image."""
+    import gzip
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    names = ("xfs-v5", "xfs-v4", "xfs-v5-4kn")
+    need = [f"{n}{ext}" for n in names for ext in (".img.gz", ".known.json.gz")]
+    absent = [n for n in need if not os.path.isfile(os.path.join(here, n))]
+    if absent:
+        return [(f"the XFS fixtures are not beside this script ({', '.join(absent)}), so the "
+                 "XFS reader was not checked against them", None)]
+    # Fixtures the root-only builder makes (tools/make_xfs_root_fixtures.sh) are
+    # checked the same way when they are present.
+    extra = [n for n in ("xfs-mounted", "xfs-dirty")
+             if os.path.isfile(os.path.join(here, f"{n}.img.gz"))
+             and os.path.isfile(os.path.join(here, f"{n}.known.json.gz"))]
+    out = []
+    # The CRC32C check value from the CRC RevEng catalogue, written out so that a
+    # wrong table cannot pass every checksum it is also used to make.
+    out.append(("XFS checksums are CRC32C (check value 0xE3069283)",
+                ~xfs_crc32c(b"123456789") & 0xFFFFFFFF == 0xE3069283))
+    images = {}
+    for n in tuple(extra) + names:
+        with gzip.open(os.path.join(here, f"{n}.img.gz"), "rb") as gz:
+            images[n] = gz.read()
+        with gzip.open(os.path.join(here, f"{n}.known.json.gz"), "rt", encoding="utf-8") as kf:
+            known = json.load(kf)
+        out.extend(_xfs_fixture_checks(n, images[n], known))
+        if n not in names:
+            images.pop(n)                       # keep only the three the damage checks patch
+    out.extend(_xfs_damage_checks(images["xfs-v5-4kn"]))
+    out.extend(_xfs_structure_checks(images["xfs-v5"], images["xfs-v4"]))
+    return out
+
+
+def _xfs_fixture_checks(name, data, known):
+    """The checks of one fixture against what was recorded when it was made."""
+    import hashlib
+    out = []
+    fh = _XfsPatchedImage(data)
+    kind = identify_fs(fh, 0, len(data))[0]
+    try:
+        w = walker_for(kind, fh, 0, len(data)) if kind else None
+        why = ""
+    except XfsUnreadable as exc:
+        w, why = None, f", refused: {exc}"
+    out.append((f"{name} is identified as xfs and walked ({kind}{why})",
+                kind == "xfs" and w is not None))
+    if w is None:
+        return out
+    got = {p: (node, mode, size) for p, node, mode, size, _mt, _r in walk_all(w)}
+    ents = known["entries"]
+    good, first = 0, []
+    files = sum(1 for e in ents if e["type"] == "file")
+    hashed = 0
+    for e in ents:
+        g = got.pop(e["path"], None)
+        why = None
+        if g is None:
+            why = "missing"
+        else:
+            info = w.inode_info(g[0])
+            if g[1] != e["mode"]:
+                why = f"mode {g[1]:o}, not {e['mode']:o}"
+            elif e["type"] != "dir" and g[2] != e["size"]:
+                why = f"size {g[2]}, not {e['size']}"
+            elif info["mtime"] != e["mtime_ns"]:
+                why = f"mtime {info['mtime']}, not {e['mtime_ns']}"
+            elif e["type"] == "symlink" and w.readlink(g[0]) != e["target"]:
+                why = "symlink target"
+            elif e["type"] == "file":
+                h, n = hashlib.sha256(), 0
+                try:
+                    for chunk in w.read_file(g[0], g[2]):
+                        h.update(chunk)
+                        n += len(chunk)
+                except XfsUnreadable as exc:
+                    why = f"read refused: {exc}"
+                if why is None and (n != e["size"] or h.hexdigest() != e["sha256"]):
+                    why = f"content ({n} bytes read)"
+                elif why is None:
+                    hashed += 1
+        if why:
+            if len(first) < 3:
+                first.append(f"{e['path'][:60]}: {why}")
+        else:
+            good += 1
+    extras = sorted(got) if not known.get("allow_extra") else []
+    out.append((f"{name}: every entry matches the source tree in path, type and mode, size, "
+                f"mtime to the nanosecond and symlink target, and every regular file its sha256 "
+                f"({good} of {len(ents)} entries, {hashed} of {files} files"
+                + (f"; first: {'; '.join(first)}" if first else "")
+                + (f"; {len(extras)} extra, first {extras[0]!r}" if extras else "") + ")",
+                good == len(ents) and hashed == files and not extras))
+    links = known.get("hard_links", [])
+    nodes = {}
+    for path, node, _m, _s, _mt, _r in walk_all(w):
+        nodes[path] = node
+    same = sum(1 for grp in links if len({nodes.get(q) for q in grp}) == 1 and nodes.get(grp[0]))
+    if links:
+        out.append((f"{name}: names the source tree gave one inode share one inode here "
+                    f"({same} of {len(links)} groups)", same == len(links)))
+    # Directory and file formats against xfs_db's own reading of the image.
+    db = known.get("xfs_db", {})
+    shown, wrong, counted = [], [], 0
+    for path, rec in db.items():
+        node = w.root if path == "/" else nodes.get(path)
+        info = w.inode_info(node) if node is not None else None
+        if info is None:
+            wrong.append(f"{path}: not found")
+            continue
+        if info["format"] != rec["fork"]:
+            wrong.append(f"{path}: fork {info['format']}, xfs_db {rec['fork']}")
+        if "dir_format" in rec:
+            rep = w.dir_report(node)
+            if rep["format"] != rec["dir_format"]:
+                wrong.append(f"{path}: {rep['format']}, xfs_db {rec['dir_format']}")
+            elif rep["indexed"] is not None and rep["indexed"] != rep["entries"] + 2:
+                wrong.append(f"{path}: {rep['entries']} entries, its index counts {rep['indexed']}")
+            shown.append(f"{path} {rep['format']}" + (" (B+tree map)" if rec["fork"] == "btree" else ""))
+        runs = w._extents(w.inode(node)) or []          # pylint: disable=protected-access
+        if len(runs) != rec["extents"] or info["nextents"] != rec["extents"]:
+            wrong.append(f"{path}: {len(runs)} extents mapped and {info['nextents']} counted, "
+                         f"xfs_db {rec['extents']}")
+        counted += len(runs)
+    out.append((f"{name}: directory and fork formats, and every extent map ({counted} extents), "
+                f"agree with xfs_db ({'; '.join(shown)})"
+                + (f"; {'; '.join(wrong[:3])}" if wrong else ""), not wrong and bool(shown)))
+    # A v5 inode's creation time is written once, when it is made; its change
+    # time only moves on from there (xfs_format.h:969-971). Read from the wrong
+    # place, the two would not sit within a day of each other on every inode.
+    if w.v5:
+        gaps = [w.inode_info(n)["ctime"] - w.inode_info(n)["crtime"] for n in nodes.values()]
+        out.append((f"{name}: every inode's creation time is at or before its change time, within "
+                    f"a day ({len(gaps)} inodes)", bool(gaps) and all(0 <= g < 86400 * 10**9 for g in gaps)))
+    # Free space against xfs_db's freesp, which also lists the AGFL blocks.
+    if "freesp" in known:
+        ag_bytes = w.agblocks * w.bs
+        mine = sorted(((off // ag_bytes), (off % ag_bytes) // w.bs, n // w.bs) for off, n in w.free_extents())
+        theirs = sorted(tuple(r) for r in known["freesp"])
+        left = list(theirs)
+        unmatched = 0
+        for r in mine:
+            if r in left:
+                left.remove(r)
+            else:
+                unmatched += 1
+        agfl = sum(known.get("flcount", []))
+        ok = bool(mine) and not unmatched and all(r[2] == 1 for r in left) and len(left) == agfl
+        out.append((f"{name}: the free extents are xfs_db's, less the {agfl} free-list blocks it "
+                    f"also lists ({len(mine)} runs, {sum(r[2] for r in mine):,} blocks)", ok))
+    if "log" in known:
+        st, _detail, head, tail = w.log_state
+        lg = known["log"]
+        out.append((f"{name}: the log is {st}, head {head}, tail {tail}, as xfs_logprint finds it "
+                    f"({lg['state'].lower()}, head {lg['head']}, tail {lg['tail']})",
+                    (st, head, tail) == (lg["state"].lower(), lg["head"], lg["tail"])))
+    out.append((f"{name}: no structure failed its check ({len(w.damage)} did)", not w.damage))
+    return out
+
+
+def _xfs_damage_checks(data):
+    """What the reader does when a structure is damaged or a feature refused,
+    each made by patching the xfs-v5-4kn fixture in memory."""
+    out = []
+    base = XfsWalker(_XfsPatchedImage(data), 0)
+    sb = base.sb
+    nodes = {p: node for p, node, _m, _s, _mt, _r in walk_all(base)}
+    hello, large, sparse = nodes["hello.txt"], nodes["data/large.bin"], nodes["data/sparse.bin"]
+    want_large = b"".join(base.read_file(large, base.entry(large)[1]))
+    want_sparse = b"".join(base.read_file(sparse, base.entry(sparse)[1]))
+
+    def inode_patch(ino, edit):
+        """The inode's bytes after edit(bytearray), with its CRC made to hold again."""
+        at = base.inode_offset(ino)
+        raw = bytearray(data[at:at + base.isz])
+        edit(raw)
+        raw[100:104] = b"\0\0\0\0"
+        raw[100:104] = struct.pack("<I", ~xfs_crc32c(bytes(raw)) & 0xFFFFFFFF)
+        return at, bytes(raw)
+
+    def sb_patch(edit):
+        raw = bytearray(data[:sb["sectsize"]])
+        edit(raw)
+        raw[224:228] = b"\0\0\0\0"
+        raw[224:228] = struct.pack("<I", ~xfs_crc32c(bytes(raw)) & 0xFFFFFFFF)
+        return 0, bytes(raw)
+
+    # An extent marked unwritten reads as zeros, at full length.
+    def unwritten(raw):
+        raw[base.core] |= 0x80                       # bit 63 of the first extent's l0
+    w = XfsWalker(_XfsPatchedImage(data, [inode_patch(sparse, unwritten)]), 0)
+    got = b"".join(w.read_file(sparse, len(want_sparse)))
+    runs = w._extents(w.inode(sparse))               # pylint: disable=protected-access
+    lo, hi = runs[0][0] * w.bs, (runs[0][0] + runs[0][2]) * w.bs
+    out.append(("an XFS extent flagged unwritten reads as zeros at its full length and the rest "
+                f"of the file is unchanged ({len(runs)} extents, the first {hi - lo:,} bytes)",
+                len(runs) >= 2 and runs[0][3] and not runs[1][3] and len(got) == len(want_sparse)
+                and want_sparse[lo:hi] != bytes(hi - lo) and got[lo:hi] == bytes(hi - lo)
+                and got[:lo] == want_sparse[:lo] and got[hi:] == want_sparse[hi:]
+                and got[hi:] != bytes(len(got) - hi)))
+    # An inode whose CRC fails is left out, counted, and the rest still lists.
+    at = base.inode_offset(hello)
+    w = XfsWalker(_XfsPatchedImage(data, [(at + 60, bytes([data[at + 60] ^ 0x01]))]), 0)
+    listed = {p for p, *_r in walk_all(w)}
+    out.append(("an XFS inode that fails its CRC is left out and counted as damage, and the "
+                "rest of the volume still lists",
+                "hello.txt" not in listed and len(listed) == len(nodes) - 1
+                and any("fails its CRC" in x for x in w.damage) and "damaged" in (w.note or "")))
+    # A realtime file is listed but not read.
+    def realtime(raw):
+        raw[91] |= XFS_DIFLAG_REALTIME
+    w = XfsWalker(_XfsPatchedImage(data, [inode_patch(large, realtime)]), 0)
+    try:
+        list(w.read_file(large, 4096))
+        why = ""
+    except XfsUnreadable as exc:
+        why = str(exc)
+    out.append(("an XFS realtime file is listed but its read is refused, saying why",
+                w.entry(large) is not None and "realtime" in why))
+    # A log whose last record is not an unmount record is dirty, and is said so.
+    lstart = base._fsb_off(sb["logstart"])            # pylint: disable=protected-access
+    head = base.log_state[2]
+    rec = next(i for i in range(head - 1, -1, -1)
+               if data[lstart + i * 512:lstart + i * 512 + 4] == b"\xfe\xed\xba\xbe")
+    op = lstart + (rec + 1) * 512 + 9
+    fh = _XfsPatchedImage(data, [(op, bytes([data[op] & ~XLOG_UNMOUNT_TRANS & 0xFF]))])
+    kind, lines = identify_fs(fh, 0, len(data))
+    w = XfsWalker(fh, 0)
+    tail_lsn = struct.unpack_from(">Q", data, lstart + rec * 512 + 24)[0] & 0xFFFFFFFF
+    out.append(("an XFS log whose last record is not an unmount record is reported dirty and "
+                "not replayed, in the volume's lines and its note",
+                w.log_state[0] == "dirty" and w.log_state[3] == tail_lsn and kind == "xfs"
+                and any(ln.startswith("log          dirty") for ln in lines)
+                and "not replayed" in (w.note or "")))
+    # Incompatible features outside the list read are refused by name.
+    def zoned(raw):
+        struct.pack_into(">I", raw, 216, struct.unpack_from(">I", raw, 216)[0] | 0x200 | 0x8000)
+    fh = _XfsPatchedImage(data, [sb_patch(zoned)])
+    kind, lines = identify_fs(fh, 0, len(data))
+    try:
+        XfsWalker(fh, 0)
+        why = ""
+    except XfsUnreadable as exc:
+        why = str(exc)
+    out.append(("an XFS volume with an incompatible feature not read here is named xfs and "
+                "refused, by name or by bit",
+                kind == "xfs" and "zoned realtime" in why and "unknown bit 0x8000" in why
+                and any(ln.startswith("walk         not possible") for ln in lines)))
+    # A v5 superblock whose CRC fails is not walked, as the kernel will not mount it.
+    fh = _XfsPatchedImage(data, [(108, b"X")])     # the label, CRC left as it was
+    try:
+        XfsWalker(fh, 0)
+        why = ""
+    except XfsUnreadable as exc:
+        why = str(exc)
+    out.append(("an XFS v5 superblock whose CRC fails is not walked", "CRC" in why))
+    # The control: one byte of file data changed is a file that no longer matches.
+    runs = base._extents(base.inode(large))           # pylint: disable=protected-access
+    off = base._fsb_off(runs[0][1]) + 100              # pylint: disable=protected-access
+    w = XfsWalker(_XfsPatchedImage(data, [(off, bytes([data[off] ^ 0xFF]))]), 0)
+    out.append(("the XFS content check can fail: one byte changed in a file's block changes "
+                "what is read", b"".join(w.read_file(large, len(want_large))) != want_large))
+    return out
+
+
+
+def _xfs_fix_crc(buf, off):
+    """buf with the XFS CRC at ``off`` made to hold again, for a self-check that
+    damages a structure on purpose and wants only its other checks to see it."""
+    buf = bytearray(buf)
+    buf[off:off + 4] = b"\0\0\0\0"
+    buf[off:off + 4] = struct.pack("<I", ~xfs_crc32c(bytes(buf)) & 0xFFFFFFFF)
+    return bytes(buf)
+
+
+def _xfs_structure_checks(v5, v4):
+    """The kernel's checks of each structure, each shown to catch what it is for
+    on a patched in-memory copy of the xfs-v5 fixture (v4 for the checks only a
+    v4 volume needs), and each with whatever else would let the damage through
+    left intact: a CRC made to hold again, say, so that only the check under
+    test can see the change."""
+    # pylint: disable=protected-access
+    out = []
+    base = XfsWalker(_XfsPatchedImage(v5), 0)
+    nodes = {p: n for p, n, *_r in walk_all(base)}
+    eo = base.data_entry_offset
+
+    def walker(patches, data=v5, size=None):
+        return XfsWalker(_XfsPatchedImage(data, patches), 0, size)
+
+    def ipatch(w0, data, ino, edit):
+        at = w0.inode_offset(ino)
+        raw = bytearray(data[at:at + w0.isz])
+        edit(raw)
+        return at, (_xfs_fix_crc(raw, 100) if w0.v5 else bytes(raw))
+
+    def refusal(fn):
+        try:
+            fn()
+        except XfsUnreadable as exc:
+            return str(exc)
+        return ""
+
+    def first_block(path):
+        runs = base._extents(base.inode(nodes[path]))
+        return base._fsb_off(runs[0][1])
+
+    def entries_at(buf, n):
+        """The offsets and sizes of the first n entries of a directory data block."""
+        pos, found = eo, []
+        while len(found) < n:
+            nl = buf[pos + 8]
+            size = (8 + 1 + nl + (1 if base.ftype else 0) + 2 + 7) & ~7
+            found.append((pos, size))
+            pos += size
+        return found
+
+    # Shortform directories with 8-byte inode numbers: the entries parse at that
+    # width, and a header whose count of them is wrong is damage.
+    sf = nodes["dirs/sf"]
+    ents = base._sf_entries(base.inode(sf))
+    wide = (1 << 40) | ents[0][1]
+    parent = base.inode(sf)["fork"][2:6]
+
+    def to_i8(i8):
+        def edit(raw):
+            body = bytearray([len(ents), i8]) + bytes(4) + parent
+            at = 0x60
+            for k, (nm, child, ft) in enumerate(ents):
+                body += (bytes([len(nm)]) + struct.pack(">H", at) + nm
+                         + (bytes([ft]) if base.ftype else b"")
+                         + (wide if k == 0 else child).to_bytes(8, "big"))
+                at += 16
+            raw[base.core:base.core + len(body)] = body
+            struct.pack_into(">Q", raw, 56, len(body))
+        return edit
+    w = walker([ipatch(base, v5, sf, to_i8(1))])
+    got = w._sf_entries(w.inode(sf))
+    w2 = walker([ipatch(base, v5, sf, to_i8(2))])
+    bad = w2._sf_entries(w2.inode(sf))
+    out.append(("an XFS shortform directory with 8-byte inode numbers parses at that width, and "
+                "one whose header miscounts them is damage",
+                got == [(nm, wide if k == 0 else c, ft) for k, (nm, c, ft) in enumerate(ents)]
+                and bad == [] and any("8-byte inode numbers" in x for x in w2.damage)))
+
+    # Directory data blocks: the CRC, and on a block whose CRC holds, its own
+    # disk address, its owner and the volume's uuid; and each entry's tag.
+    blk_off = first_block("dirs/block")
+    blk = v5[blk_off:blk_off + base.dir_blksize]
+    found = entries_at(blk, 3)
+    p1, (p3, s3) = found[0][0], found[2]
+    w = walker([(blk_off + p3 + 9, bytes([blk[p3 + 9] ^ 0x01]))])
+    out.append(("an XFS directory block that fails its CRC is skipped and counted as damage",
+                w.listdir(nodes["dirs/block"]) == []
+                and any("block 0 fails its CRC" in x for x in w.damage)))
+
+    def header(edit):
+        b = bytearray(blk)
+        edit(b)
+        return [(blk_off, _xfs_fix_crc(b, 4))]
+    owner = walker(header(lambda b: struct.pack_into(">Q", b, 40, nodes["hello.txt"])))
+    uuid_ = walker(header(lambda b: b.__setitem__(24, b[24] ^ 0x01)))
+    node = nodes["dirs/node"]
+    blocks = base._dir_blocks(base.inode(node), 0, base.leafblk)
+    nruns = base._extents(base.inode(node))
+
+    def db_off(db):
+        for lb, pb, c, _u in nruns:
+            if lb <= db < lb + c:
+                return base._fsb_off(pb + db - lb)
+        return None
+    a, b = blocks[0][0], blocks[1][0]
+    moved = walker([(db_off(b), v5[db_off(a):db_off(a) + base.bs])])
+    names = [n for n, _c in moved.listdir(node)]
+    out.append(("an XFS directory block whose CRC holds but that names another owner, another "
+                "volume or another disk address is skipped and counted as damage",
+                owner.listdir(nodes["dirs/block"]) == [] and uuid_.listdir(nodes["dirs/block"]) == []
+                and any("of inode" in x for x in owner.damage)
+                and any("on this volume" in x for x in uuid_.damage)
+                and len(names) == len(set(names)) < len(base.listdir(node))
+                and any(f"not block {blocks[1][1]}" in x for x in moved.damage)))
+    tagged = walker(header(lambda b: struct.pack_into(">H", b, p3 + s3 - 2, p1)))
+    listed = tagged.listdir(nodes["dirs/block"])
+    out.append(("an XFS directory entry whose tag is not its own offset stops the block there, "
+                "counted as damage",
+                len(listed) < len(base.listdir(nodes["dirs/block"]))
+                and any("has a tag" in x for x in tagged.damage)))
+
+    # Extent B+tree blocks: the CRC, and a height past what the volume allows.
+    mext = nodes["data/manyext.bin"]
+    md = base.inode(mext)
+    maxrecs = (len(md["fork"]) - 4) // 16
+    leaf = base._fsb_off(struct.unpack_from(">Q", md["fork"], 4 + maxrecs * 8)[0])
+    w = walker([(leaf + base.bmbt_hdr + 3, bytes([v5[leaf + base.bmbt_hdr + 3] ^ 0x01]))])
+    why = refusal(lambda: b"".join(w.read_file(mext, md["size"])))
+    w2 = walker([ipatch(base, v5, mext, lambda r: struct.pack_into(">H", r, base.core, 1200))])
+    why2 = refusal(lambda: b"".join(w2.read_file(mext, md["size"])))
+    out.append(("an XFS extent B+tree block that fails its CRC refuses the file, and a root taller "
+                f"than the volume allows ({base.bm_maxlevels} levels) is refused without recursing",
+                "fails its CRC" in why and "levels" in why2
+                and any("fails its CRC" in x for x in w.damage)))
+
+    # Extents: one crossing the end of its AG, one on an AG's headers; an AG
+    # shorter than agblocks when it is the last; more extents than the fork holds.
+    large = nodes["data/large.bin"]
+
+    def move_first(start):
+        def edit(raw):
+            l0, l1 = struct.unpack_from(">QQ", raw, base.core)
+            l0 = (l0 & ~0x1FF) | (start >> 43)
+            l1 = ((start & ((1 << 43) - 1)) << 21) | (l1 & 0x1FFFFF)
+            struct.pack_into(">QQ", raw, base.core, l0, l1)
+        return edit
+    crossing = walker([ipatch(base, v5, large, move_first(base.agblocks - 1))])
+    on_hdr = walker([ipatch(base, v5, large, move_first(0))])
+    size = base.entry(large)[1]
+    why = refusal(lambda: b"".join(crossing.read_file(large, size)))
+    why2 = refusal(lambda: b"".join(on_hdr.read_file(large, size)))
+
+    def short_last(raw):
+        struct.pack_into(">Q", raw, 8, (base.agcount - 1) * base.agblocks + 10)
+    shrunk = walker([(0, _xfs_fix_crc(_xfs_edit(v5[:base.sectsize], short_last), 224))])
+    shrunk_list = [p for p, *_r in walk_all(shrunk)]
+    in_last = sum(1 for n in nodes.values() if n >> base.agino_log == base.agcount - 1)
+    many = walker([ipatch(base, v5, large, lambda r: struct.pack_into(">Q", r, 24, 1 << 40))])
+    out.append(("an XFS extent that crosses its AG's end or lies on an AG's headers refuses the "
+                "file; the last AG ends where the volume does; a fork counting more extents than "
+                "it holds is damage",
+                "outside its AG" in why and "outside its AG" in why2 and in_last > 0
+                and len(shrunk_list) < len(nodes) and any("outside the volume" in x for x in shrunk.damage)
+                and many.entry(large) is None and any("extents in a fork" in x for x in many.damage)))
+
+    # Inode magic: the kernel's first check, and the inode is counted, not lost silently.
+    one = nodes["data/one_block.bin"]
+    at = base.inode_offset(one)
+    w = walker([(at, b"XX")])
+    listed = {p for p, *_r in walk_all(w)}
+    out.append(("an XFS inode without its magic is left out and counted as damage",
+                "data/one_block.bin" not in listed and len(listed) == len(nodes) - 1
+                and any("no inode magic" in x for x in w.damage)))
+
+    # Remote symlinks: the v5 header's offset, length, owner and disk address,
+    # each with the CRC made to hold; and only the blocks the target needs are read.
+    lnk = nodes["links/long"]
+    target = base.readlink(lnk)
+    loff = first_block("links/long")
+    sblk = v5[loff:loff + base.bs]
+    bad = []
+    for at, val in ((4, struct.pack(">I", 1)), (8, struct.pack(">I", 1)),
+                    (32, struct.pack(">Q", nodes["hello.txt"])), (40, struct.pack(">Q", 1))):
+        b = bytearray(sblk)
+        b[at:at + len(val)] = val
+        w = walker([(loff, _xfs_fix_crc(b, 12))])
+        bad.append(bool(refusal(lambda w=w: w.readlink(lnk))))
+
+    class _Counting(_XfsPatchedImage):
+        largest = 0
+
+        def read(self, n=-1):
+            _Counting.largest = max(_Counting.largest, n)
+            return super().read(n)
+
+    def big_count(raw):
+        l0, l1 = struct.unpack_from(">QQ", raw, base.core)
+        struct.pack_into(">QQ", raw, base.core, l0, (l1 & ~0x1FFFFF) | 2000)
+    w = XfsWalker(_Counting(v5, [ipatch(base, v5, lnk, big_count)]), 0)
+    _Counting.largest = 0
+    same = w.readlink(lnk) == target
+    out.append(("an XFS remote symlink whose header names another offset, length, owner or block "
+                "is refused, and one mapped to 2,000 blocks reads only the block its target needs",
+                all(bad) and len(bad) == 4 and same and _Counting.largest <= base.bs))
+
+    # A volume larger than its region: said in the note and the lines, and what
+    # lies past the end is counted rather than lost silently.
+    cut = v4[:len(v4) // 2]
+    w = XfsWalker(_XfsPatchedImage(cut), 0, len(cut))
+    listed = [p for p, *_r in walk_all(w)]
+    lines = identify_xfs(_XfsPatchedImage(cut), 0, len(cut))[1]
+    full = sum(1 for _ in walk_all(XfsWalker(_XfsPatchedImage(v4), 0)))
+    # The same volume in a region half its size inside a longer image (a
+    # partition followed by another): nothing past the region is read as its own.
+    full4 = XfsWalker(_XfsPatchedImage(v4), 0)
+    n4 = {p: node for p, node, *_r in walk_all(full4)}
+    big4 = n4["data/large.bin"]
+    last = full4._extents(full4.inode(big4))[-1]
+    region = full4._fsb_off(last[1]) + full4.bs     # the region ends one block into its last extent
+    part = XfsWalker(_XfsPatchedImage(v4), 0, region)
+    plisted = [p for p, *_r in walk_all(part)]
+    before = EOF_SHORTFALL["bytes"]
+    got = b"".join(part.read_file(big4, full4.entry(big4)[1]))
+    short = EOF_SHORTFALL["bytes"] - before
+    want = b"".join(full4.read_file(big4, full4.entry(big4)[1]))
+    past = (last[2] - 1) * full4.bs
+    out.append(("an XFS volume cut to half its size says its end is missing, and each structure "
+                "past the cut is counted as damage; in a region shorter than the image, what lies "
+                "past the region is not read as the volume's",
+                "its end is missing" in (w.note or "") and bool(w.damage) and len(listed) < full
+                and any(ln.startswith("INCOMPLETE") for ln in lines)
+                and bool(part.damage) and len(plisted) < full and len(got) == len(want)
+                and short >= past > 0 and got[:len(want) - past] == want[:len(want) - past]))
+
+    # Identification: claimed only once verified.
+    zeros = bytes(4 << 20)
+    bad_crc = _XfsPatchedImage(v5, [(108, b"X")])
+    graft = _XfsPatchedImage(zeros, [(0, v4[:512])])
+    out.append(("an XFS superblock is claimed only once verified: a v5 one whose CRC fails and a "
+                "v4 one whose root inode does not read as a directory are not; the v4 fixture is",
+                identify_xfs(bad_crc, 0, len(v5)) is None and identify_xfs(graft, 0, len(zeros)) is None
+                and (identify_xfs(_XfsPatchedImage(v4), 0, len(v4)) or [None])[0] == "xfs"))
+    return out
+
+
+def _xfs_edit(buf, edit):
+    """A bytearray copy of buf after edit(copy)."""
+    b = bytearray(buf)
+    edit(b)
+    return b
+
+
+def _shared_extract_checks():
+    """[(label, passed)] for what every walker's extraction shares: hostile stored
+    names cannot reach a zip member as a path, and a walker's damage is counted."""
+    import io
+    import shutil
+    import tempfile
+    out = []
+    cases = {"a/b.txt": "vol/a/b.txt", "sp ace/%pct": "vol/sp ace/%pct",
+             "../../x": "vol/%2E%2E/%2E%2E/x", "dir/./f": "vol/dir/%2E/f",
+             "/abs": "vol/%2F/abs", "c:d": "vol/c%3Ad", "x\x00y": "vol/x%00y",
+             "..\\..\\a.txt": "vol/..%5C..%5Ca.txt"}
+    got = {k: zip_member_name("vol", k) for k in cases}
+    out.append(("a stored name that climbs out ('..'), starts at a root, or carries a backslash, "
+                "colon or control character becomes a safe zip member name; ordinary names are "
+                "kept as stored", got == cases))
+
+    class _Hostile:
+        """A walker whose names are what a damaged or hostile volume can store."""
+        root = 0
+        damage = ["structure one failed its check", "structure two failed its check"]
+        names = {1: "../escaped.txt", 2: "ok.txt", 3: "..\\win.txt", 4: "nul\x00cut.txt"}
+
+        def listdir(self, node):
+            return [(n, i) for i, n in self.names.items()] if node == 0 else []
+
+        def entry(self, node):
+            return (0o040755, 0, 0) if node == 0 else (0o100644, 3, 0)
+
+        def read_file(self, _node, _size):
+            yield b"abc"
+
+    w = _Hostile()
+    buf, log = io.BytesIO(), []
+    with zipfile.ZipFile(buf, "w") as out_zip:
+        tally = extract_to_zip(out_zip, w, "vol", collect(w, w.root), log)
+    names = zipfile.ZipFile(buf).namelist()
+    # A folder of its own inside the temporary one: the CI build replaces mkdtemp
+    # with one that always returns its fixtures folder, so count only what this
+    # extraction wrote.
+    dest = os.path.join(tempfile.mkdtemp(prefix="qnxprobe-zip-"), "hostile-names")
+    os.makedirs(dest, exist_ok=True)
+    try:
+        zipfile.ZipFile(buf).extractall(dest)
+        inside = all(os.path.realpath(os.path.join(root, f)).startswith(os.path.realpath(dest) + os.sep)
+                     for root, _d, fs in os.walk(dest) for f in fs)
+        written = sum(len(fs) for _r, _d, fs in os.walk(dest))
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
+    renamed = [line for line in log if "RENAMED" in line]
+    out.append((f"an extraction of four hostile names writes four members, all inside the folder "
+                f"they are extracted into, and logs the three renamed ({tally[0]} written, "
+                f"{len(renamed)} renamed, {written} on disk)",
+                tally[0] == 4 and len(names) == 4 and written == 4 and inside and len(renamed) == 3
+                and not any(n.startswith("/") or "/../" in "/" + n for n in names)))
+    out.append(("a walker's recorded damage is counted and shown",
+                damage_lines(w) == (2, ["structure one failed its check",
+                                        "structure two failed its check"])
+                and damage_lines(object()) == (0, [])))
+    return out
+
+
 def _lvm_self_checks():
     """[(label, passed)] for the LVM2 reader, from the fixtures lvm2 wrote. A
     absent fixture is one failed check that names it, not a silent skip."""
@@ -15220,6 +19987,1387 @@ def _lvm_self_checks():
     return out + _lvm_hostile_checks(disk, whole, regions, want, paths, parts, m_off, r_off)
 
 
+def _btrfs_find_item(w, tree, key):
+    """(leaf logical address, item header offset, data offset, data size) of
+    the item with exactly ``key`` in ``tree``, found by descending from the
+    tree's root; for the self-test, which edits items in place."""
+    if tree == BTRFS_ROOT_TREE_OBJECTID:
+        bytenr, level = w.sb["root"], w.sb["root_level"]
+    else:
+        r = w.root_item(tree)
+        bytenr, level = r["bytenr"], r["level"]
+    while True:
+        buf = w._block(bytenr)                                  # pylint: disable=protected-access
+        n = struct.unpack_from("<I", buf, 96)[0]
+        if level == 0:
+            for i in range(n):
+                o = BTRFS_HEADER_SIZE + i * BTRFS_ITEM_SIZE
+                if _btrfs_key(buf, o) == key:
+                    ioff, isz = struct.unpack_from("<II", buf, o + 17)
+                    return bytenr, o, BTRFS_HEADER_SIZE + ioff, isz
+            raise KeyError(key)
+        child = None
+        for i in range(n):
+            o = BTRFS_HEADER_SIZE + i * BTRFS_KEY_PTR_SIZE
+            if _btrfs_key(buf, o) <= key:
+                child = struct.unpack_from("<Q", buf, o + 17)[0]
+        if child is None:
+            raise KeyError(key)
+        bytenr, level = child, level - 1
+
+
+def _btrfs_edit_block(raw, w, logical, fn):
+    """Apply ``fn`` to every copy of the tree block at ``logical`` in the
+    bytearray ``raw`` and write a checksum that holds over the result, so the
+    edit reaches the reader's later checks rather than stopping at the first."""
+    for phys, _room in w.copies(logical):
+        blk = bytearray(raw[phys:phys + w.nodesize])
+        fn(blk)
+        cs = btrfs_csum(w.csum_type, bytes(blk[32:]))
+        blk[:len(cs)] = cs
+        raw[phys:phys + w.nodesize] = blk
+
+
+def _btrfs_self_checks():
+    """[(label, passed or None for a skip)] for the Btrfs reader, from the
+    images mkfs.btrfs, btrfs-convert and the kernel wrote
+    (tools/make_btrfs_fixtures.sh, tools/make_btrfs_root_fixtures.sh),
+    sha256sum and lstat() over the source trees, the hash of the ext4 image
+    before it was converted, the volume's own free space tree, and copies of
+    those images changed in memory to break one rule each. Each group of
+    checks runs on its own, so one that raises is one FAIL that names the
+    exception and the rest still run."""
+    import gzip
+    import hashlib
+    import io
+    import zlib                                                 # pylint: disable=import-outside-toplevel
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    variants = ("none", "zlib", "zstd", "lzo", "xxhash", "sha256", "blake2")
+    need = ([f"btrfs-{v}.img.gz" for v in variants]
+            + ["btrfs-convert.img.gz", "btrfs-convert.sha256", "btrfs-raid1-dev2.img.gz",
+               "btrfs.src.sha256", "btrfs.src.json"])
+    absent = [n for n in need if not os.path.isfile(os.path.join(here, n))]
+    if absent:
+        return [(f"the Btrfs fixtures are not beside this script ({', '.join(absent)}), so the "
+                 "Btrfs reader was not checked against them", None)]
+    out = []
+    zstd_ok = _zstd_module() is not None
+
+    def sums(name):
+        got = {}
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    h, rel = line.rstrip("\n").split("  ", 1)
+                    got[rel] = h
+        return got
+
+    def load(name):
+        with gzip.open(os.path.join(here, name), "rb") as gz:
+            return gz.read()
+
+    def walk(raw):
+        w = BtrfsWalker(io.BytesIO(bytes(raw)), 0)
+        return w, {p: (node, mode, sz, mt) for p, node, mode, sz, mt, _r in walk_all(w)}
+
+    def section(name, fn):
+        try:
+            fn()
+        except Exception as exc:                                # pylint: disable=broad-except
+            out.append((f"the Btrfs checks of {name} ran ({type(exc).__name__}: {exc})", False))
+
+    want = sums("btrfs.src.sha256")
+    with open(os.path.join(here, "btrfs.src.json"), encoding="utf-8") as fh:
+        listing = json.load(fh)
+    none_raw = load("btrfs-none.img.gz")
+
+    # Known values for the two checksums carried as pure Python: the CRC-32C
+    # check value of "123456789" from the CRC catalogue (0xE3069283), and
+    # XXH64 of nothing with seed 0 from xxHash's own sanity table.
+    out.append(("crc32c and xxhash64 give their published check values",
+                btrfs_crc32c(b"123456789") ^ 0xFFFFFFFF == 0xE3069283
+                and btrfs_xxh64(b"") == 0xEF46DB3751D8E999))
+
+    def variant(v):
+        raw = load(f"btrfs-{v}.img.gz")
+        img = io.BytesIO(raw)
+        kind = (identify_fs(img, 0, len(raw)) or (None,))[0]
+        w = walker_for(kind, img, 0, len(raw)) if kind == "btrfs" else None
+        if w is None:
+            out.append((f"btrfs-{v}: identified as btrfs (got {kind})", False))
+            return
+        got = {p: (node, mode, sz, mt) for p, node, mode, sz, mt, _r in walk_all(w)}
+        bad = []
+        for e in listing:
+            g = got.get(e["path"])
+            why = None
+            if g is None:
+                why = "missing"
+            elif g[1] != e["mode"]:
+                why = f"mode {g[1]:o}, not {e['mode']:o}"
+            elif e["type"] == "file" and g[2] != e["size"]:
+                why = f"size {g[2]}, not {e['size']}"
+            elif g[3] != e["mtime"]:
+                why = f"mtime {g[3]}, not {e['mtime']}"
+            elif e["type"] == "symlink" and w.readlink(g[0]) != e["target"]:
+                why = "symlink target"
+            if why:
+                bad.append(f"{e['path'][:40]}: {why}")
+        extra = sorted(set(got) - {e["path"] for e in listing})
+        out.append((f"btrfs-{v}: all {len(listing)} entries listed with the type, permission "
+                    "bits, size, mtime and symlink target lstat() recorded at the source, and "
+                    "nothing else" + (f" ({len(bad)} differ, e.g. {bad[:2]}; extra {extra[:2]})"
+                                      if bad or extra else ""), not bad and not extra))
+        if v == "zstd" and not zstd_ok:
+            out.append(("btrfs-zstd: files read back (this Python has no zstd; 3.14 adds "
+                        "compression.zstd)", None))
+            out.append(("btrfs-zstd: the note says zstd cannot be read on this Python",
+                        "zstd" in (w.note or "")))
+        else:
+            match = 0
+            for rel, digest in want.items():
+                g = got.get(rel)
+                if g is None:
+                    continue
+                try:
+                    data = b"".join(w.read_file(g[0], g[2]))
+                except (BtrfsUnreadable, DecompressError):
+                    continue
+                if len(data) == g[2] and hashlib.sha256(data).hexdigest() == digest:
+                    match += 1
+            out.append((f"btrfs-{v}: every regular file reads back with the sha256 sha256sum "
+                        f"recorded over the source ({match} of {len(want)})", match == len(want)))
+        out.append((f"btrfs-{v}: no tree block failed its checks", not w.damage))
+        fst = w.free_space_tree()
+        out.append((f"btrfs-{v}: the space free_logical() finds free from the extent tree is "
+                    "the space the volume's own free space tree records",
+                    fst is not None and w.free_logical() == fst))
+
+    for v in variants:
+        section(f"btrfs-{v}", lambda v=v: variant(v))
+
+    def lzo_paths():
+        w = BtrfsWalker(io.BytesIO(load("btrfs-lzo.img.gz")), 0)
+        items = list(w._tree_items(BTRFS_FS_TREE_OBJECTID, (0, 0, 0), _BTRFS_KEY_MAX))  # pylint: disable=protected-access
+        exts = [w._extent(d, k[2]) for k, d in items if k[1] == BTRFS_EXTENT_DATA_KEY]  # pylint: disable=protected-access
+        out.append(("btrfs-lzo holds LZO-compressed regular and inline extents, uncompressed "
+                    "ones, and INODE_EXTREF items, so each of those paths was read",
+                    any(e["compression"] == 2 and e["type"] == 1 for e in exts)
+                    and any(e["compression"] == 2 and e["type"] == 0 for e in exts)
+                    and any(e["compression"] == 0 and e["type"] == 1 for e in exts)
+                    and any(k[1] == BTRFS_INODE_EXTREF_KEY for k, _d in items)))
+    section("btrfs-lzo extent kinds", lzo_paths)
+
+    def links_and_space():
+        w = BtrfsWalker(io.BytesIO(none_raw), 0)
+        got = {p: node for p, node, *_r in walk_all(w)}
+        # Hard links: every name of one source inode is one node, and the
+        # inode's own refs (INODE_REF and INODE_EXTREF) name exactly those paths.
+        groups = collections.defaultdict(list)
+        for e in listing:
+            if e["type"] == "file" and e["nlink"] > 1:
+                groups[e["ino"]].append(e["path"])
+        dirs = {"": w.root}
+        dirs.update({p: n for p, n in got.items() if p in {e["path"] for e in listing
+                                                           if e["type"] == "dir"}})
+        by_ino = {n & _M64: p for p, n in dirs.items() if n >> 64 == BTRFS_FS_TREE_OBJECTID}
+        hl_ok = bool(groups)
+        for paths in groups.values():
+            nodes = {got.get(p) for p in paths}
+            if len(nodes) != 1 or None in nodes:
+                hl_ok = False
+                continue
+            named = sorted(((by_ino.get(parent, "?") + "/" if by_ino.get(parent, "?") else "")
+                            + name.decode("utf-8", "surrogateescape"))
+                           for parent, name in w.links(nodes.pop()))
+            hl_ok = hl_ok and named == sorted(paths)
+        out.append((f"btrfs-none: each of the {len(groups)} hard-linked inodes is one node under "
+                    "all its names, and its INODE_REF and INODE_EXTREF items name exactly those "
+                    "paths", hl_ok))
+        # times(): mkfs.btrfs --rootdir stores seconds only, and no creation
+        # time (mkfs/rootdir.c:288-295); btrfs-live, which the kernel wrote,
+        # checks the nanoseconds.
+        ns = [e for e in listing if e["mtime_ns"]]
+        ns_ok = bool(ns) and all(w.times(got[e["path"]]) is not None
+                                 and w.times(got[e["path"]])["modified"] == (e["mtime"], 0)
+                                 and w.times(got[e["path"]])["created"] == (0, 0) for e in ns)
+        out.append((f"btrfs-none: times() gives the modification second lstat() recorded, with "
+                    f"the 0 nanoseconds and 0 creation time mkfs.btrfs --rootdir writes ({len(ns)} "
+                    "entry set to the nanosecond at the source)", ns_ok))
+        # Free space: nothing reported free overlaps a byte a file's extent
+        # occupies; the unallocated total is what the superblock's device item
+        # leaves.
+        fe = w.free_extents()
+        used = []
+        for rel, node in got.items():
+            for _off, fx_ext in (w.extents(node) if rel in want else []):
+                if fx_ext["type"] != BTRFS_FILE_EXTENT_INLINE and fx_ext["disk_bytenr"]:
+                    for phys, _room in w.copies(fx_ext["disk_bytenr"]):
+                        used.append((phys, phys + fx_ext["disk_num_bytes"]))
+        starts = [s for s, _n in fe]
+        clash = 0
+        for a, b in used:
+            i = bisect.bisect_right(starts, a) - 1
+            for s, n in fe[max(i, 0):max(i, 0) + 2]:
+                if s < b and a < s + n:
+                    clash += 1
+        un = sum(n for _s, n in w.unallocated())
+        expect = w.sb["dev_total"] - w.sb["dev_used"] - BTRFS_RESERVED_1M - sum(
+            BTRFS_SUPER_SIZE for m in BTRFS_SUPER_MIRRORS[1:] if m < w.sb["dev_total"]
+            and not any(phys <= m < phys + ch["length"] for ch in w.chunks.values()
+                        for _d, phys in ch["stripes"]))
+        out.append((f"btrfs-none: no free run overlaps any of the {len(used)} data extents, and "
+                    "the unallocated space is the device size less what its device item records "
+                    "used", bool(used) and clash == 0 and un == expect))
+    section("btrfs-none hard links, times and free space", links_and_space)
+
+    def superblocks():
+        w = BtrfsWalker(io.BytesIO(none_raw), 0)
+        # A broken first copy of a DUP tree block is read from the second and
+        # recorded; both copies broken leaves an empty listing, not a crash.
+        fs = w.root_item(BTRFS_FS_TREE_OBJECTID)
+        c1, c2 = [p for p, _r in w.copies(fs["bytenr"])]
+        bad1 = bytearray(none_raw)
+        bad1[c1 + 200] ^= 0xFF
+        w1, l1 = walk(bad1)
+        bad1[c2 + 200] ^= 0xFF
+        w2, l2 = walk(bad1)
+        out.append(("btrfs-none: a tree block whose first copy fails its checksum is read from "
+                    "its DUP copy and the repair recorded; with both copies broken the walk "
+                    "lists nothing and records why",
+                    len(l1) == len(listing) and any("read from the copy" in d for d in w1.damage)
+                    and not l2 and any("checksum does not hold" in d for d in w2.damage)))
+
+        def resum(buf, at):
+            cs = btrfs_csum(w.csum_type, bytes(buf[at + 32:at + BTRFS_SUPER_SIZE]))
+            buf[at:at + len(cs)] = cs
+        mirror = BTRFS_SUPER_MIRRORS[1]
+        # The primary's checksum fails: the mirror at 64 MiB is read, and said.
+        bad_sb = bytearray(none_raw)
+        bad_sb[BTRFS_SUPER_OFF + 300] ^= 0x01
+        k_sb, lines_sb = identify_fs(io.BytesIO(bytes(bad_sb)), 0, len(bad_sb))
+        out.append(("btrfs-none: a primary superblock whose checksum fails is passed over for the "
+                    "mirror at 64 MiB, and the report says so",
+                    k_sb == "btrfs" and any("mirror at 0x4000000" in ln for ln in lines_sb)))
+        # A good primary is used even when a mirror records a later generation.
+        newer = bytearray(none_raw)
+        struct.pack_into("<Q", newer, mirror + 72, w.sb["generation"] + 5)
+        resum(newer, mirror)
+        pick, _f, _why = _btrfs_pick_super(io.BytesIO(bytes(newer)), 0)
+        # ...and among mirrors, when the primary fails, the newer one is taken.
+        newer[BTRFS_SUPER_OFF + 300] ^= 0x01
+        pick2, _f2, _why2 = _btrfs_pick_super(io.BytesIO(bytes(newer)), 0)
+        out.append(("btrfs-none: a primary superblock that holds is used though a mirror "
+                    "records a later generation; with the primary broken, the mirror is used",
+                    pick is not None and pick["at"] == BTRFS_SUPER_OFF
+                    and pick2 is not None and pick2["at"] == mirror))
+
+        # All three copies, on a sparse stand-in for a device of more than
+        # 256 GiB: with the primary broken the good copy of the highest
+        # generation is taken, and a copy with another fsid is not, however
+        # new it is (disk-io.c:1974-2014).
+        class Sparse:
+            def __init__(self, parts):
+                self.parts, self.pos = parts, 0
+
+            def seek(self, pos, _whence=0):
+                self.pos = pos
+
+            def read(self, n):
+                for at, blob in self.parts.items():
+                    if at <= self.pos < at + len(blob):
+                        return blob[self.pos - at:self.pos - at + n]
+                return bytes(n)
+        sbs = {}
+        for at, gen in ((BTRFS_SUPER_OFF, w.sb["generation"]),
+                        (mirror, w.sb["generation"] + 1),
+                        (BTRFS_SUPER_MIRRORS[2], w.sb["generation"] + 2)):
+            blob = bytearray(none_raw[BTRFS_SUPER_OFF:BTRFS_SUPER_OFF + BTRFS_SUPER_SIZE])
+            struct.pack_into("<QQ", blob, 48, at, struct.unpack_from("<Q", blob, 56)[0])
+            struct.pack_into("<Q", blob, 72, gen)
+            resum(blob, 0)
+            sbs[at] = blob
+        sbs[BTRFS_SUPER_OFF][300] ^= 0x01                       # the primary fails
+        three, _f3, _w3 = _btrfs_pick_super(Sparse({k: bytes(v) for k, v in sbs.items()}), 0)
+        other = bytearray(sbs[BTRFS_SUPER_MIRRORS[2]])
+        other[32] ^= 0x01                                       # another fsid
+        resum(other, 0)
+        sbs[BTRFS_SUPER_MIRRORS[2]] = other
+        fsid_pick, _f4, _w4 = _btrfs_pick_super(Sparse({k: bytes(v) for k, v in sbs.items()}), 0)
+        out.append(("with the primary superblock broken, the mirror of the highest generation "
+                    "is taken, and not one carrying another fsid",
+                    three is not None and three["at"] == BTRFS_SUPER_MIRRORS[2]
+                    and fsid_pick is not None and fsid_pick["at"] == mirror))
+        # The magic alone does not make a volume Btrfs: a broken primary with
+        # no mirror that holds is not claimed, and neither is a device whose
+        # primary has no magic though a mirror holds.
+        both = bytearray(none_raw)
+        both[BTRFS_SUPER_OFF + 300] ^= 0x01
+        both[mirror + 300] ^= 0x01
+        nomagic = bytearray(none_raw)
+        nomagic[BTRFS_SUPER_OFF + 64:BTRFS_SUPER_OFF + 72] = bytes(8)
+        bare = bytearray(1 << 20)
+        bare[BTRFS_SUPER_OFF + 64:BTRFS_SUPER_OFF + 72] = BTRFS_MAGIC
+        out.append(("Btrfs is claimed only with a superblock whose checksum holds: not on the "
+                    "magic alone, not on a broken primary with no good mirror, not on mirrors "
+                    "behind a primary with no magic",
+                    identify_btrfs(io.BytesIO(bytes(both)), 0) is None
+                    and identify_btrfs(io.BytesIO(bytes(nomagic)), 0) is None
+                    and identify_btrfs(io.BytesIO(bytes(bare)), 0) is None))
+        # A whole superblock whose checksum holds, where its filesystem is
+        # not (copied into an image of something else), is not claimed; an
+        # image cut short of the chunk tree is still named.
+        graft = bytearray(len(none_raw) // 2)          # holds where the chunk tree was
+        graft[BTRFS_SUPER_OFF:BTRFS_SUPER_OFF + BTRFS_SUPER_SIZE] = \
+            none_raw[BTRFS_SUPER_OFF:BTRFS_SUPER_OFF + BTRFS_SUPER_SIZE]
+        cut = identify_btrfs(io.BytesIO(none_raw[:2 << 20]), 0)
+        out.append(("a Btrfs superblock copied where its filesystem is not is not claimed; an "
+                    "image cut short of the chunk tree is",
+                    identify_btrfs(io.BytesIO(bytes(graft)), 0) is None
+                    and cut is not None and any("not possible" in ln for ln in cut[1])))
+    section("superblocks and DUP copies", superblocks)
+
+    def tree_checks():
+        # Each of these breaks one rule in a tree block, with the checksum
+        # rewritten so the block passes that check and reaches the one under
+        # test. Each must be recorded as damage, and none may stop the walk.
+        w0 = BtrfsWalker(io.BytesIO(none_raw), 0)
+        fs = w0.root_item(BTRFS_FS_TREE_OBJECTID)
+        root = w0._block(fs["bytenr"])                          # pylint: disable=protected-access
+        c0, g0 = struct.unpack_from("<QQ", root, BTRFS_HEADER_SIZE + 17)
+        ptr1 = BTRFS_HEADER_SIZE + BTRFS_KEY_PTR_SIZE
+        cases = {
+            # child 1 points at the node itself: one level too high
+            "level": (fs["bytenr"], lambda b: struct.pack_into(
+                "<QQ", b, ptr1 + 17, fs["bytenr"], struct.unpack_from("<Q", b, 80)[0])),
+            # child 0's generation in its parent is one off
+            "generation": (fs["bytenr"], lambda b: struct.pack_into(
+                "<Q", b, BTRFS_HEADER_SIZE + 25, g0 + 1)),
+            # child 1 points at child 0, whose first key is not the one named
+            "starts at key": (fs["bytenr"], lambda b: struct.pack_into(
+                "<QQ", b, ptr1 + 17, c0, g0)),
+            # a leaf of this volume that names another filesystem
+            "another filesystem": (c0, lambda b: b.__setitem__(slice(32, 48), bytes(16))),
+            # a leaf that claims more items than fit
+            "more than fit": (c0, lambda b: struct.pack_into("<I", b, 96, 0xFFFFFFFF)),
+        }
+        for want_text, (target, fn) in cases.items():
+            raw = bytearray(none_raw)
+            _btrfs_edit_block(raw, w0, target, fn)
+            w, got = walk(raw)
+            hit = any(want_text in d for d in w.damage)
+            out.append((f"btrfs-none: a tree block that breaks one rule ({want_text}) is "
+                        f"recorded as damage and the walk goes on ({len(got)} of "
+                        f"{len(listing)} entries)", hit))
+        # The cache does not excuse a block from its parent's checks: a block
+        # read once as level 1 is refused when asked for as a leaf.
+        w = BtrfsWalker(io.BytesIO(none_raw), 0)
+        w._block(fs["bytenr"], fs["level"])                     # pylint: disable=protected-access
+        try:
+            w._block(fs["bytenr"], 0)                           # pylint: disable=protected-access
+            cached_ok = False
+        except BtrfsUnreadable:
+            cached_ok = True
+        out.append(("a cached tree block is still held to the level its parent records",
+                    cached_ok))
+    section("tree block checks", tree_checks)
+
+    def item_checks():
+        w0, l0 = walk(none_raw)
+        node = l0["a_fifo"][0]
+        ino = node & _M64
+        key = None
+        for k, d in w0._tree_items(BTRFS_FS_TREE_OBJECTID,          # pylint: disable=protected-access
+                                   (256, BTRFS_DIR_INDEX_KEY, 0), (256, BTRFS_DIR_INDEX_KEY, _M64)):
+            if _btrfs_key(d, 0)[0] == ino:
+                key = k
+        # A DIR_INDEX that names an inode with no INODE_ITEM is still listed,
+        # with its directory entry's type, and recorded.
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID, key)
+        _btrfs_edit_block(raw, w0, leaf, lambda b: struct.pack_into("<Q", b, do, 99999))
+        w, got = walk(raw)
+        out.append(("a directory entry whose inode is missing is listed with the type its entry "
+                    "records, and recorded as damage",
+                    got.get("a_fifo", (0, 0))[1] == BTRFS_FT_MODE[5]
+                    and any("99999" in d and "a_fifo" in d for d in w.damage)
+                    and len(got) == len(l0)))
+        # DIR_INDEX is what is read, not DIR_ITEM: a DIR_ITEM whose name is
+        # changed changes nothing listed.
+        h = btrfs_crc32c(b"tiny.txt", 0xFFFFFFFE)
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID,
+                                              (256, BTRFS_DIR_ITEM_KEY, h))
+        _btrfs_edit_block(raw, w0, leaf, lambda b: b.__setitem__(do + 30, ord("X")))
+        w, got = walk(raw)
+        out.append(("names are read from DIR_INDEX, not DIR_ITEM (a changed DIR_ITEM name "
+                    "changes nothing listed)", "tiny.txt" in got and "Xiny.txt" not in got))
+        # A subvolume's entry for itself (a snapshot taken into itself) is not
+        # followed (restore.c:1034-1043).
+        sub = w0.root_item(256)
+        skey = None
+        for k, d in w0._tree_items(256, (sub["root_dirid"], BTRFS_DIR_INDEX_KEY, 0),  # pylint: disable=protected-access
+                                   (sub["root_dirid"], BTRFS_DIR_INDEX_KEY, _M64)):
+            if bytes(d[30:30 + struct.unpack_from("<H", d, 27)[0]]) == b"in_subvol.txt":
+                skey = k
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, 256, skey)
+        _btrfs_edit_block(raw, w0, leaf, lambda b: struct.pack_into(
+            "<QBQ", b, do, 256, BTRFS_ROOT_ITEM_KEY, _M64))
+        w, got = walk(raw)
+        out.append(("a subvolume's directory entry for itself is not listed",
+                    "subvol/in_subvol.txt" not in got and "subvol/inner" in got))
+        # A ROOT_REF whose name runs past its item links nothing: the
+        # subvolume shows as the empty directory the kernel shows, with no
+        # exception, and is recorded.
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_ROOT_TREE_OBJECTID,
+                                              (5, BTRFS_ROOT_REF_KEY, 256))
+        _btrfs_edit_block(raw, w0, leaf, lambda b: struct.pack_into("<H", b, do + 16, 4000))
+        w, got = walk(raw)
+        out.append(("a ROOT_REF too short for its name is recorded, and its subvolume is the "
+                    "empty directory an unlinked one is",
+                    "subvol" in got and "subvol/inner" not in got
+                    and any("ROOT_REF" in d for d in w.damage)))
+        # An uncompressed inline extent whose ram_bytes is not what it holds is
+        # refused, as is an inline extent past offset 0, and a regular one off
+        # a sector boundary.
+        tiny = l0["tiny.txt"]
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID,
+                                              (tiny[0] & _M64, BTRFS_EXTENT_DATA_KEY, 0))
+        _btrfs_edit_block(raw, w0, leaf, lambda b: struct.pack_into("<Q", b, do + 8, 3))
+        w, got = walk(raw)
+        try:
+            b"".join(w.read_file(got["tiny.txt"][0], 7))
+            ram_refused = False
+        except BtrfsUnreadable:
+            ram_refused = any("ram_bytes" in d for d in w.damage)
+        inline = struct.pack("<QQBBHB", 1, 4, 0, 0, 0, 0) + b"abcd"
+        reg = struct.pack("<QQBBHBQQQQ", 1, 4096, 0, 0, 0, 1, 0x100000, 4096, 100, 4096)
+        item_refused = []
+        for d, off in ((inline, 4096), (reg, 0), (inline[:10], 0)):
+            try:
+                BtrfsWalker._extent(d, off, 4096)               # pylint: disable=protected-access
+                item_refused.append(False)
+            except BtrfsUnreadable:
+                item_refused.append(True)
+        out.append(("inline extents with a wrong ram_bytes or off offset 0, a regular extent off "
+                    "a sector boundary and a short extent item are refused",
+                    ram_refused and all(item_refused)
+                    and BtrfsWalker._extent(inline, 0, 4096)["inline"] == b"abcd"))  # pylint: disable=protected-access
+        # An inode size past the largest file btrfs allows is damage.
+        raw = bytearray(none_raw)
+        leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID,
+                                              (tiny[0] & _M64, BTRFS_INODE_ITEM_KEY, 0))
+        _btrfs_edit_block(raw, w0, leaf, lambda b: struct.pack_into("<Q", b, do + 16, 1 << 63))
+        w, got = walk(raw)
+        out.append(("an inode size past the largest file btrfs allows is recorded, and the name "
+                    "still listed", got.get("tiny.txt", (0, 0, -1))[2] == 0
+                    and any("largest file" in d for d in w.damage)))
+    section("item checks", item_checks)
+
+    def mapping():
+        # Address mapping, on a walker with chunks set by hand over a small
+        # image: the copies of a DUP chunk in stripe order, a read that crosses
+        # from one chunk to the next, a RAID1 chunk read from this device's
+        # copy, and a RAID0 chunk refused by name.
+        disk = bytearray(1 << 20)
+        for i in range(len(disk) // 4096):
+            disk[i * 4096:(i + 1) * 4096] = bytes([i]) * 4096
+        w = BtrfsWalker.__new__(BtrfsWalker)
+        w.fh, w.base, w.devid = io.BytesIO(bytes(disk)), 0, 2
+        w.chunks, w._chunk_starts = {}, []                      # pylint: disable=protected-access
+
+        def chunk(logical, length, ctype, stripes):
+            w.chunks[logical] = dict(length=length, type=ctype, stripes=stripes,
+                                     stripe_len=BTRFS_STRIPE_LEN, sub_stripes=1)
+            bisect.insort(w._chunk_starts, logical)             # pylint: disable=protected-access
+        chunk(0x100000, 0x8000, BTRFS_BG_DATA | (1 << 5), [(2, 0x10000), (2, 0x40000)])  # DUP
+        chunk(0x200000, 0x2000, BTRFS_BG_DATA, [(2, 0x80000)])                         # SINGLE
+        chunk(0x202000, 0x2000, BTRFS_BG_DATA, [(2, 0x20000)])                         # SINGLE
+        chunk(0x300000, 0x4000, BTRFS_BG_DATA | (1 << 4), [(1, 0x90000), (2, 0xA0000)])  # RAID1
+        chunk(0x400000, 0x4000, BTRFS_BG_DATA | (1 << 3), [(1, 0), (2, 0)])            # RAID0
+        dup = [p for p, _r in w.copies(0x101000)]
+        cross = w.read_logical(0x201000, 0x2000)
+        raid1 = w.read_logical(0x301000, 0x1000)
+        try:
+            w.copies(0x400000)
+            striped = False
+        except BtrfsUnreadable as exc:
+            striped = "RAID0" in str(exc)
+        out.append(("chunk mapping: DUP copies in stripe order, a read across two chunks, a "
+                    "RAID1 chunk read from this device's copy, a RAID0 chunk refused by name",
+                    dup == [0x11000, 0x41000]
+                    and cross == bytes([0x81]) * 4096 + bytes([0x20]) * 4096
+                    and raid1 == bytes([0xA1]) * 4096 and striped))
+    section("chunk mapping", mapping)
+
+    def extent_shapes():
+        # Extent shapes driven through the function read_file() uses: a hole no
+        # item covers (NO_HOLES), a hole item (disk_bytenr 0), a preallocated
+        # extent, a regular extent read from an offset into its disk extent, a
+        # zlib extent read from an offset into what it decompresses to, an
+        # extent that runs past the file's size, and an encrypted extent, which
+        # is refused.
+        disk = bytes(range(256)) * 64                           # logical 0x10000.., 16 KiB
+        plain = b"".join(b"%06d" % i for i in range(3000))      # 18,000 bytes
+        comp = zlib.compress(plain)
+        space = {0x10000: disk, 0x40000: comp}
+
+        def rd(addr, n):
+            for base_, buf in space.items():
+                if base_ <= addr < base_ + len(buf):
+                    return buf[addr - base_:addr - base_ + n]
+            return b""
+
+        def ext(typ, **kw):
+            d = dict(type=typ, compression=0, encryption=0, other_encoding=0, ram_bytes=0,
+                     disk_bytenr=0, disk_num_bytes=0, offset=0, num_bytes=0)
+            d.update(kw)
+            return d
+        shapes = [
+            (0, ext(1, disk_bytenr=0x10000, disk_num_bytes=16384, offset=100, num_bytes=4096,
+                    ram_bytes=16384)),
+            (8192, ext(1, disk_bytenr=0, num_bytes=4096)),                   # hole item
+            (12288, ext(2, disk_bytenr=0x10000, disk_num_bytes=16384, num_bytes=4096)),
+            (16384, ext(1, compression=1, disk_bytenr=0x40000, disk_num_bytes=len(comp),
+                        ram_bytes=len(plain), offset=600, num_bytes=12000)),
+            (28384, ext(1, disk_bytenr=0x10000, disk_num_bytes=16384, num_bytes=16384,
+                        ram_bytes=16384)),
+        ]
+        isize = 28384 + 1000
+        expect = (disk[100:4196] + bytes(4096) + bytes(4096) + bytes(4096)
+                  + plain[600:12600] + disk[:1000])
+        got_b = b"".join(btrfs_extent_bytes(shapes, isize, rd, 4096))
+        try:
+            b"".join(btrfs_extent_bytes([(0, ext(1, encryption=1, disk_bytenr=0x10000,
+                                                 disk_num_bytes=4096, num_bytes=4096))],
+                                        4096, rd, 4096))
+            enc = False
+        except BtrfsUnreadable:
+            enc = True
+        tail = b"".join(btrfs_extent_bytes(shapes[:1], 9000, rd, 4096))
+        out.append(("extents mkfs.btrfs --rootdir does not write (holes with and without an "
+                    "item, preallocated, offsets into plain and zlib extents, past the size, a "
+                    "trailing hole) read as the format says, and an encrypted extent is refused",
+                    got_b == expect and enc and tail == disk[100:4196] + bytes(9000 - 4096)))
+        # zlib: with a zlib header the adler32 is not checked, as the kernel
+        # reads it (zlib.c:374-382); a stream whose adler32 is wrong still reads.
+        bad_adler = bytearray(zlib.compress(plain))
+        bad_adler[-1] ^= 0xFF
+        zl = _btrfs_decompress(1, bytes(bad_adler), len(plain), 4096) == plain
+        # A compressed extent past the kernel's 128 KiB, either way, is refused
+        # before it is decompressed, so a small stream cannot ask for a large
+        # output.
+        bomb = zlib.compress(bytes(4 << 20))
+        bounds = []
+        for ram, data in ((0, bomb), (1 << 63, bomb), (4 << 20, bomb),
+                          (4096, bytes(BTRFS_MAX_COMPRESSED + 1))):
+            try:
+                _btrfs_decompress(1, data, ram, 4096)
+                bounds.append(False)
+            except DecompressError:
+                bounds.append(True)
+        capped = len(_btrfs_decompress(1, bomb, BTRFS_MAX_UNCOMPRESSED, 4096))
+        out.append(("zlib extents read without their adler32 check, and compressed extents "
+                    "outside 1 to 128 KiB are refused before decompressing",
+                    zl and all(bounds) and capped == BTRFS_MAX_UNCOMPRESSED))
+        # LZO framing: a segment header never crosses a sector, so 1 to 3
+        # bytes left in a sector are padding and 4 are not (lzo.c:533-542).
+        # Segments made of literal-only LZO1X (lzo.rst: a first byte over 17
+        # is a run of that many less 17 literals; 17 0 0 ends the stream).
+        sector, payload, plan = 512, bytearray(4), []
+        data_out = bytearray()
+        pads_seen = set()
+        seed = 0
+        while len(payload) < 6 * sector:
+            room = sector - len(payload) % sector
+            # pick a segment length that leaves 1, 2, 3 or 4 bytes in turn
+            leave = (seed % 4) + 1
+            seed += 1
+            total = room - leave                            # header + stream bytes
+            lit = total - 4 - 4                             # minus seg header, op, end
+            if lit < 1 or lit > 238:
+                lit = 40
+            stream = bytes([17 + lit]) + bytes((seed * 7 + i) & 0xFF for i in range(lit)) \
+                + b"\x11\x00\x00"
+            payload += struct.pack("<I", len(stream)) + stream
+            data_out += stream[1:1 + lit]
+            left = sector - len(payload) % sector
+            if left < 4:
+                pads_seen.add(left)
+                payload += bytes(left)
+            plan.append(lit)
+        struct.pack_into("<I", payload, 0, len(payload))
+        lzo_got = _btrfs_decompress(2, bytes(payload), len(data_out), sector)
+        out.append((f"LZO segments are read across sector padding of {sorted(pads_seen)} bytes "
+                    "and none", lzo_got == bytes(data_out) and pads_seen == {1, 2, 3}))
+        # Compressed inline data that decompresses to more than ram_bytes is
+        # cut to ram_bytes, the length the inline extent records.
+        seg = bytes([17 + 40]) + bytes(range(40)) + b"\x11\x00\x00"
+        lzo_inline = struct.pack("<II", 8 + len(seg), len(seg)) + seg
+        inl = dict(type=0, compression=2, encryption=0, other_encoding=0, ram_bytes=10,
+                   inline=lzo_inline)
+        cut = b"".join(btrfs_extent_bytes([(0, inl)], 40, rd, 4096))
+        out.append(("compressed inline data is cut to the ram_bytes it records, the rest of the "
+                    "file read as a hole", cut == bytes(range(10)) + bytes(30)))
+    section("extent shapes and decompression", extent_shapes)
+
+    def convert_and_raid():
+        raw = load("btrfs-convert.img.gz")
+        img = io.BytesIO(raw)
+        kind = (identify_fs(img, 0, len(raw)) or (None,))[0]
+        cs = sums("btrfs-convert.sha256")
+        match = 0
+        if kind == "btrfs":
+            w = walker_for(kind, img, 0, len(raw))
+            got = {p: (node, sz) for p, node, _m, sz, _t, _r in walk_all(w)}
+            for rel, digest in cs.items():
+                if rel in got:
+                    h = hashlib.sha256()
+                    try:
+                        for chunk in w.read_file(*got[rel]):
+                            h.update(chunk)
+                    except (BtrfsUnreadable, DecompressError):
+                        continue
+                    match += h.hexdigest() == digest
+        out.append((f"btrfs-convert: an ext4 volume btrfs-convert converted is identified as "
+                    f"btrfs, and its files and the saved ext4 image (holes included) read back "
+                    f"with the sha256 they had before conversion ({match} of {len(cs)})",
+                    kind == "btrfs" and match == len(cs)))
+        raw = load("btrfs-raid1-dev2.img.gz")
+        img = io.BytesIO(raw)
+        kind = (identify_fs(img, 0, len(raw)) or (None,))[0]
+        ok = False
+        if kind == "btrfs":
+            w = walker_for(kind, img, 0, len(raw))
+            stripe_two = all(ch["stripes"][0][0] != 2 for ch in w.chunks.values())
+            ok = (w.devid == 2 and w.entry(w.root) is not None and list(walk_all(w)) == []
+                  and not w.damage and "of 2" in (w.note or "") and stripe_two)
+        out.append(("btrfs-raid1-dev2: device 2 of a RAID1 pair, whose copy is never a chunk's "
+                    "first stripe, reads its trees from its own copies", ok))
+    section("btrfs-convert and btrfs-raid1-dev2", convert_and_raid)
+
+    # The fixtures only root can make (tools/make_btrfs_root_fixtures.sh): a
+    # volume the kernel wrote, with holes, preallocated and punched extents,
+    # reflinks, partly overwritten compressed extents, snapshots and deleted
+    # files, and a volume copied with a log tree not yet committed. Checked
+    # when they are present, skipped when not.
+    def live():
+        raw = load("btrfs-live.img.gz")
+        img = io.BytesIO(raw)
+        w = walker_for("btrfs", img, 0, len(raw))
+        got = {p: (node, mode, sz, mt) for p, node, mode, sz, mt, _r in walk_all(w)}
+        lwant = sums("btrfs-live.src.sha256")
+        with open(os.path.join(here, "btrfs-live.src.json"), encoding="utf-8") as fh:
+            llist = json.load(fh)
+        match = no_zstd = 0
+        for rel, digest in lwant.items():
+            g = got.get(rel)
+            if g is not None:
+                try:
+                    data = b"".join(w.read_file(g[0], g[2]))
+                except (BtrfsUnreadable, DecompressError) as exc:
+                    no_zstd += _zstd_module() is None and "zstd" in str(exc)
+                    continue
+                match += hashlib.sha256(data).hexdigest() == digest
+        out.append((f"btrfs-live: every file the kernel wrote reads back with the sha256 taken "
+                    f"through the mount ({match} of {len(lwant)}"
+                    + (f"; {no_zstd} zstd file(s) not read: this Python has no zstd"
+                       if no_zstd else "") + ")", match + no_zstd == len(lwant)))
+        bad = []
+        for e in llist:
+            g = got.get(e["path"])
+            # A snapshot's link to a subvolume it does not hold is an empty
+            # directory the kernel makes up on lookup (inode 2) with the time
+            # of that lookup, which no disk records; its time is not compared.
+            loose = e["type"] == "dir" and e["ino"] == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID
+            if g is None or g[1] != e["mode"] or (e["type"] == "file" and g[2] != e["size"]) \
+                    or (not loose and g[3] != e["mtime"]):
+                bad.append(e["path"])
+            elif not loose and (w.times(g[0]) or {}).get("modified") != (e["mtime"],
+                                                                         e["mtime_ns"]):
+                bad.append(e["path"] + " (nanoseconds)")
+        extra = sorted(set(got) - {e["path"] for e in llist})
+        stale = sum(1 for e in llist if e["type"] == "dir"
+                    and e["ino"] == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID)
+        out.append((f"btrfs-live: all {len(llist)} entries, snapshots and subvolumes included "
+                    f"({stale} stale subvolume link(s)), listed as lstat() saw them through the "
+                    "mount, to the nanosecond, and nothing else"
+                    + (f" (differ: {bad[:3]}; extra {extra[:3]})" if bad or extra else ""),
+                    not bad and not extra and stale > 0))
+        # deleted files: each 64 KiB block of them is found, at a sector
+        # boundary, inside the space free_extents() reports
+        wanted = set(sums("btrfs-live.deleted.sha256").values())
+        hits = set()
+        for s0, n in w.free_extents(min_bytes=65536):
+            run = read_at(img, s0, n)
+            for at in range(0, n - 65536 + 1, 4096):
+                h = hashlib.sha256(run[at:at + 65536]).hexdigest()
+                if h in wanted:
+                    hits.add(h)
+        out.append((f"btrfs-live: every 64 KiB block of the deleted files is in the space "
+                    f"free_extents() reports ({len(hits)} of {len(wanted)})",
+                    bool(wanted) and hits == wanted))
+
+    names = ["btrfs-live.img.gz", "btrfs-live.src.sha256", "btrfs-live.src.json",
+             "btrfs-live.deleted.sha256"]
+    if not all(os.path.isfile(os.path.join(here, n)) for n in names):
+        out.append(("btrfs-live (holes, preallocated and punched extents, reflinks, overwritten "
+                    "compressed extents, snapshots, deleted files) not checked: its fixtures "
+                    "are made by tools/make_btrfs_root_fixtures.sh, which needs root", None))
+    else:
+        section("btrfs-live", live)
+
+    def logtree():
+        raw = load("btrfs-logtree.img.gz")
+        img = io.BytesIO(raw)
+        kind, _lines = identify_fs(img, 0, len(raw))
+        w = walker_for(kind, img, 0, len(raw)) if kind == "btrfs" else None
+        got = {p for p, *_r in walk_all(w)} if w else set()
+        out.append(("btrfs-logtree: the note says a log tree is present and not replayed, the "
+                    "file committed before it is listed, and the file only the log holds is not",
+                    w is not None and "log tree is present" in (w.note or "")
+                    and "committed.txt" in got and "fsynced.txt" not in got))
+    if not os.path.isfile(os.path.join(here, "btrfs-logtree.img.gz")):
+        out.append(("btrfs-logtree (a log tree not yet replayed) not checked: its fixture is "
+                    "made by tools/make_btrfs_root_fixtures.sh, which needs root", None))
+    else:
+        section("btrfs-logtree", logtree)
+    return out
+
+
+def _refs_test_node(rows, flags=0, level=0, bare=False):
+    """A B+ tree node as the reader expects one (header, rows, key index),
+    built for the self-test's synthetic records. rows are (key, value) pairs,
+    or for a stream node (bare) the 24-byte extent records themselves."""
+    body = bytearray(0x28)
+    offsets = []
+    for row in rows:
+        offsets.append(len(body))
+        if bare:
+            body += row
+        else:
+            key, value = row
+            body += struct.pack("<IHHHHHH", 16 + len(key) + len(value), 16, len(key), 0,
+                                16 + len(key), len(value), 0) + key + value
+        while len(body) % 8:
+            body += b"\x00"
+    start = len(body)
+    for o in offsets:
+        body += struct.pack("<I", o | 0xFFFF0000)
+    body[0x0C], body[0x0D] = level, flags
+    struct.pack_into("<II", body, 0x10, start, len(rows))
+    struct.pack_into("<I", body, 0x20, len(body))
+    return bytes(body)
+
+
+def _refs_test_record(rows, attrs=0x20):
+    """A file record: fixed fields (attributes at +0x48), then its table at 0xA8."""
+    head = bytearray(0xA8)
+    struct.pack_into("<I", head, 0, 0xA8)
+    struct.pack_into("<I", head, 0x48, attrs)
+    return bytes(head) + _refs_test_node(rows)
+
+
+def _refs_test_stream(extents, size, valid=None, alloc=None):
+    """A stream record in extents: sizes at +0x30..+0x40, summary size 0x200
+    at +0x0C, its extent node at 0x88; extents are (vcn, run, vlcn, flags)."""
+    head = bytearray(0x88)
+    struct.pack_into("<I", head, 0, 0x88)
+    struct.pack_into("<I", head, 0x0C, 0x200)
+    struct.pack_into("<QQQ", head, 0x30, size if alloc is None else alloc, size,
+                     size if valid is None else valid)
+    recs = [struct.pack("<QHHIII", vlcn, flags, 24, vcn, 0, run) for vcn, run, vlcn, flags in extents]
+    return bytes(head) + _refs_test_node(recs, flags=0x04, bare=True)
+
+
+def _refs_attr_key(marker, atype, sub, tail=b""):
+    return struct.pack("<QIHH", 0, marker, atype, sub) + tail
+
+
+def _refs_unit_checks(img, w, got, known):
+    """Checks of single rules, on the fixture and on records built here, so
+    that a change to any of them fails without forefst's volumes mounted.
+    Each label names the rule."""
+    import io
+    out = []
+    times = {k["path"]: k for k in known}
+    fixed = times["times/fixed.txt"]
+    node = got["times/fixed.txt"][1]
+    unix = tuple((int(fixed[k]) - NTFS_EPOCH_DELTA * 10_000_000) / 10_000_000
+                 for k in ("created", "modified", "accessed"))
+    out.append(("stamps() gives created, modified and accessed in Unix seconds, as Windows "
+                "reported them for times/fixed.txt",
+                all(abs(a - b) < 1e-6 for a, b in zip(w.stamps(node), unix))))
+
+    # Unwritten runs, valid data length, and the read of a real run.
+    big = got["sizes/size_65537.bin"][1]
+    stream = w._main_stream(w._record(big)[0])  # pylint: disable=protected-access
+    first = w._extents(stream[3])[0]  # pylint: disable=protected-access
+    real = b"".join(p for p, _a in w._stream_pieces([(0, 1, first[2], 0x50)], w.cluster))  # pylint: disable=protected-access
+    unwritten = b"".join(p for p, _a in w._stream_pieces([(0, 1, first[2], 0x40)], w.cluster))  # pylint: disable=protected-access
+    whole = b"".join(w._read_stream(stream, stream[1]))  # pylint: disable=protected-access
+    short = b"".join(w._read_stream((stream[0], stream[1], 1000) + stream[3:], stream[1]))  # pylint: disable=protected-access
+    out.append(("a run marked allocated but not written (flags 0x40) reads as zeros though its "
+                "cluster holds bytes, and bytes past the valid data length read as zeros",
+                real.strip(b"\x00") != b"" and unwritten == bytes(w.cluster)
+                and short[:1000] == whole[:1000] and short[1000:] == bytes(len(whole) - 1000)))
+
+    # Container arithmetic on a made-up volume: 512-byte clusters, 4 a container.
+    t = RefsWalker.__new__(RefsWalker)
+    disk = b"".join(bytes([i]) * 512 for i in range(64))
+    t.fh, t.base, t.cluster, t.bad_containers = io.BytesIO(disk), 0, 512, {}
+    t.damage, t.damage_count, t._where, t.total_clusters = [], 0, "", 64  # pylint: disable=protected-access
+    t.containers = {2: (9, 4, 0), 3: (24, 4, 0), 4: (24, 8, 0), 5: (64, 8, 0)}
+    odd = t._check_containers()  # pylint: disable=protected-access
+    t.containers = {2: (8, 4, 0), 3: (32, 4, REFS_CONTAINER_COMPRESSED)}
+    inside = b"".join(t._clusters((2 << 3) | 1, 3))  # pylint: disable=protected-access
+    turned = []
+    for vlcn, n in (((2 << 3) | 2, 3), ((3 << 3) | 0, 1)):
+        try:
+            b"".join(t._clusters(vlcn, n))  # pylint: disable=protected-access
+            turned.append(False)
+        except RefsDamage:
+            turned.append(True)
+    out.append(("virtual cluster translation: container = number >> bit length of its size, the "
+                "rest the offset; a run past its container's end and a container marked "
+                "compressed are refused; a container not aligned to its size, overlapping "
+                "another or reaching past the volume is reported",
+                inside == bytes([9]) * 512 + bytes([10]) * 512 + bytes([11]) * 512
+                and turned == [True, True] and sorted(odd) == [2, 3, 4, 5]
+                and "multiple" in odd[2] and "overlaps" in odd[3] and "past" in odd[5]))
+
+    # A directory's change time comes from its name row in its parent.
+    sizes = got["sizes"][1]
+    row = w._index_rows[sizes]  # pylint: disable=protected-access
+    own = w._times_of(w._dir(sizes).own)  # pylint: disable=protected-access
+    w._index_rows[sizes] = row[:0x20] + struct.pack("<Q", 123456789) + row[0x28:]  # pylint: disable=protected-access
+    moved = w.filetimes(sizes)
+    w._index_rows[sizes] = row  # pylint: disable=protected-access
+    out.append(("a directory's change time is the copy in its name row, its other times its "
+                "own record's",
+                moved == (own[0], own[1], 123456789, own[3])))
+
+    # Streams and snapshots, on records built here.
+    ads = struct.pack("<IIII", 0, 0x30 + 2, 0x0C, 0x30) + bytes(0x08) + struct.pack("<QQQQ", 2, 2, 2, 2) + bytes(4) + b"hi"
+    snap = bytearray(ads)
+    struct.pack_into("<H", snap, 0x10, 2)
+    rec = _refs_test_record([(_refs_attr_key(0x80000002, 0xB0, 5, "one".encode("utf-16-le")), ads),
+                             (_refs_attr_key(0x80000002, 0xB0, 5, "two".encode("utf-16-le")), bytes(snap))])
+    named = list(w._named(rec)[0])  # pylint: disable=protected-access
+    data = lambda sub, base: _refs_attr_key(0x80000002, 0x80, 0x0E, struct.pack("<QQ", sub, base))
+    live = _refs_test_record([
+        (data(0x1000, 0x1002), _refs_test_stream([], w.cluster)),
+        (data(0x1001, 0x0008), _refs_test_stream([(0, 1, 0x1111, 0x50)], w.cluster)),
+        (data(0x1002, 0x1001), _refs_test_stream([(0, 1, 0x2222, 0x50)], w.cluster))])
+    merged = w._main_stream(live)  # pylint: disable=protected-access
+    out.append(("a stream whose summary flags say snapshot (2) is not listed as an alternate "
+                "stream, and a live stream with no clusters of its own reads from its newest "
+                "snapshot (sub-stream 0x1002 before 0x1001)",
+                named == ["one"]
+                and [e[2] for e in w._extents(merged[3], merged[4])] == [0x2222]))  # pylint: disable=protected-access
+
+    # Damaged and hostile records.
+    broken = []
+    shorted = _refs_test_record([(data(0x1000, 0x1001), _refs_test_stream([], 10)),
+                                 (data(0x2000, 0x0008), b"\x00" * 8)])
+    for build in (lambda: w._main_stream(shorted),  # pylint: disable=protected-access
+                  lambda: w._extents(_refs_test_stream([(0, 2, first[2], 0x50), (1, 1, first[2], 0x50)], 3 * w.cluster)),  # pylint: disable=protected-access
+                  lambda: w._extent_stream(_refs_test_stream([], 1 << 60))):  # pylint: disable=protected-access
+        try:
+            build()
+            broken.append(False)
+        except RefsDamage:
+            broken.append(True)
+        except Exception:                            # pylint: disable=broad-except
+            broken.append(None)                      # raised, but not as damage
+    before = w.damage_count
+    gap = _refs_test_stream([(0, 1, first[2], 0x50), (2, 1, first[2] + 2, 0x50)], 3 * w.cluster)
+    gapped = b"".join(w._read_stream(("extents", 3 * w.cluster, 3 * w.cluster, gap, ()),  # pylint: disable=protected-access
+                                     3 * w.cluster, False, "made up"))
+    gap_hurt = w.damage_count - before
+    over = _refs_test_stream([(0, 3, first[2], 0x50)], 3 * w.cluster, alloc=w.cluster)
+    b"".join(w._read_stream(("extents", 3 * w.cluster, 3 * w.cluster, over, ()),  # pylint: disable=protected-access
+                            3 * w.cluster, True, "made up"))
+    over_hurt = w.damage_count - before - gap_hurt
+    encrypted = []
+    for attrs in (0x20, 0x20 | REFS_ATTR_ENCRYPTED):
+        try:
+            w._refuse_unreadable(_refs_test_record([], attrs))  # pylint: disable=protected-access
+            encrypted.append(False)
+        except RefsDamage:
+            encrypted.append(True)
+    out.append(("a snapshot row too short for a stream, two extents over one cluster, a size "
+                "past ReFS's 35 PB and an encrypted file's content are refused; a gap in a file "
+                "not marked sparse, and extents past the stream's allocation, are reported, "
+                "the gap reading as zeros",
+                broken == [True, True, True] and gap_hurt == 1 and over_hurt == 1
+                and encrypted == [False, True]
+                and gapped[w.cluster:2 * w.cluster] == bytes(w.cluster)))
+
+    fresh = RefsWalker(img, 0)
+    many = got["many"][1]
+    slots, kind, digest = _refs_reference(fresh.objects[many], 0x20)
+    root = bytearray(fresh._page(slots, kind, digest, virtual=True))  # pylint: disable=protected-access
+    hoff = 0x50 + struct.unpack_from("<I", root, 0x50)[0]
+    start = struct.unpack_from("<I", root, hoff + 0x10)[0]
+    places = []
+    for i in range(struct.unpack_from("<I", root, hoff + 0x14)[0]):
+        pos = hoff + (struct.unpack_from("<I", root, hoff + start + 4 * i)[0] & 0xFFFF)
+        places.append(pos + struct.unpack_from("<H", root, pos + 0x0A)[0])
+    root[places[1]:places[1] + 0x30] = root[places[0]:places[0] + 0x30]
+    twice = list(fresh._node_rows(bytes(root), hoff, True, 0, "a made-up page"))  # pylint: disable=protected-access
+    wrong = []
+    page = fresh._page(slots, kind, digest, virtual=True)  # pylint: disable=protected-access
+    for bad_kind, bad_digest in ((kind, bytes(len(digest))), (0, b""),
+                                 (1, struct.pack("<I", refs_crc32c(page)))):
+        try:
+            fresh._page(slots, bad_kind, bad_digest, virtual=True)  # pylint: disable=protected-access
+            wrong.append(False)
+        except RefsDamage:
+            wrong.append(True)
+    capped = RefsWalker(img, 0)
+    for _i in range(REFS_DAMAGE_CAP + 500):
+        capped._hurt("made up")  # pylint: disable=protected-access
+    out.append(("a table naming one child page twice reads it once and reports it; a cached page "
+                "asked for under another digest, under checksum kind 0, or under a CRC32-C that "
+                "matches it on a CRC-64 volume, is refused; damage "
+                f"keeps {REFS_DAMAGE_CAP} lines and counts the rest",
+                any("twice" in d for d in fresh.damage) and len(twice) > 0
+                and wrong == [True, True, True] and len(capped.damage) == REFS_DAMAGE_CAP
+                and capped.damage_count == REFS_DAMAGE_CAP + 500))
+
+    loop = RefsWalker(img, 0)
+    sizes_row = w._index_rows[sizes]  # pylint: disable=protected-access
+    attrs = got["attrs"][1]
+    loop._dir(attrs).names["loop".encode("utf-16-le")] = (2, sizes_row[:8] + struct.pack("<Q", REFS_ROOT_DIR) + sizes_row[16:])  # pylint: disable=protected-access
+    loop._dir(attrs).names["twin".encode("utf-16-le")] = (2, sizes_row)  # pylint: disable=protected-access
+    loop.listdir(loop.root)
+    names = [n for n, _x in loop.listdir(attrs)]
+    out.append(("a directory row naming the root, or a directory another one names, is "
+                "reported and left out",
+                "loop" not in names and "twin" not in names
+                and sum(1 for d in loop.damage if "names" in d) == 2))
+
+    # The boot sector's version, the superblock's clock, a checkpoint tie.
+    def boot_with(major, minor):
+        img.seek(0)
+        b = bytearray(img.read(512))
+        b[0x28], b[0x29] = major, minor
+        struct.pack_into("<H", b, 0x16, _refs_boot_checksum(bytes(b)))
+        return img.patched(0, bytes(b))
+    newer = []
+    for major, minor in ((3, 15), (9, 99)):
+        kind_n, lines_n = identify_refs(boot_with(major, minor), 0)
+        try:
+            RefsWalker(boot_with(major, minor), 0)
+            newer.append(False)
+        except ValueError:
+            newer.append(kind_n == "refs" and any("newer than ReFS 3.14" in x for x in lines_n))
+    sb_at = (w.total_clusters - 2) * w.cluster
+    img.seek(REFS_SUPERBLOCK_LCN * w.cluster)
+    sb = bytearray(img.read(w.cluster))
+    struct.pack_into("<Q", sb, 0x68, struct.unpack_from("<Q", sb, 0x68)[0] + 1)
+    doff, dlen = struct.unpack_from("<II", sb, 0x78)
+    body = bytearray(sb)
+    body[doff:doff + dlen] = bytes(dlen)
+    struct.pack_into("<I", sb, doff + 0x20 + sb[doff + 0x23], refs_crc32c(bytes(body)))
+    later = RefsWalker(img.patched(sb_at, bytes(sb)), 0)
+    # Both checkpoint slots holding the same checkpoint: equal clocks.
+    other = [lcn for lcn in w.checkpoint_lcns if lcn != w.checkpoint_lcn][0]
+    img.seek(w.checkpoint_lcn * w.cluster)
+    tied = img.patched(other * w.cluster, img.read(max(w.cluster, REFS_PAGE_BYTES)))
+    _k, tie_lines = identify_refs(tied, 0)
+    out.append(("ReFS 3.15 and 9.99 are refused by name; of the superblock copies the one with "
+                "the higher clock (+0x68) is read; a checkpoint clock tie is reported",
+                newer == [True, True] and later.superblock_lcn == w.total_clusters - 2
+                and RefsWalker(tied, 0).checkpoint_tie == w.clock
+                and any("both checkpoints carry clock" in x for x in tie_lines)))
+    return out
+
+
+def _refs_fixture_checks():
+    """[(label, passed or None for a skip)] for the ReFS reader, from the volumes
+    Windows 11 wrote (tools/make_refs_fixtures.ps1, make-refs.ps1), shipped as the
+    bytes the reader reads (tools/make_refs_fixture.py), against what Windows
+    reported about each file while the volume was mounted."""
+    import gzip
+    import hashlib
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    need = ("refs-fixture.bin.gz", "refs-fixture.known.tsv.gz", "refs-dirty.bin.gz")
+    absent = [n for n in need if not os.path.isfile(os.path.join(here, n))]
+    if absent:
+        return [(f"the ReFS fixtures are not beside this script ({', '.join(absent)}), so the "
+                 "ReFS reader was not checked against them", None)]
+    with gzip.open(os.path.join(here, "refs-fixture.bin.gz"), "rb") as gz:
+        img = _RefsSparseImage(gz.read())
+    with gzip.open(os.path.join(here, "refs-dirty.bin.gz"), "rb") as gz:
+        dirty = _RefsSparseImage(gz.read())
+    with gzip.open(os.path.join(here, "refs-fixture.known.tsv.gz"), "rt", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    head = lines[0].split("\t")
+    known = [dict(zip(head, line.split("\t"))) for line in lines[1:]]
+    entries = [k for k in known if k["kind"] not in ("stream", "deleted")]
+    unshipped = set(img.head.get("not_shipped", []))
+    out = []
+
+    kind, ident = identify_refs(img, 0)
+    out.append(("the Windows 11 ReFS fixture is identified as refs, version 3.14, from its "
+                "boot sector, with no log record after its checkpoint",
+                kind == "refs" and ident[0].endswith("ReFS 3.14 (boot sector)")
+                and "log          no record follows the checkpoint" in ident))
+    w = RefsWalker(img, 0)
+    got = {item[0]: item for item in walk_all(w)}
+    kinds = {"file": S_IFREG, "dir": S_IFDIR, "filelink": S_IFLNK, "dirlink": S_IFLNK}
+    wrong = collections.defaultdict(list)
+    hashed = 0
+    for k in entries:
+        item = got.get(k["path"])
+        if item is None:
+            wrong["missing"].append(k["path"])
+            continue
+        node, mode, size = item[1], item[2], item[3]
+        if mode & S_IFMT != kinds[k["kind"]]:
+            wrong["type"].append(k["path"])
+        if w.filetimes(node) != tuple(int(k[t]) for t in ("created", "modified", "changed", "accessed")):
+            wrong["times"].append(k["path"])
+        ordinal, oid = w.file_id(node)
+        if struct.pack("<QQ", ordinal, oid).hex() != k["file_id"]:
+            wrong["file id"].append(k["path"])
+        if k["kind"] in ("filelink", "dirlink") and w.readlink(node) != k["target"]:
+            wrong["link target"].append(k["path"])
+        if k["kind"] != "file":
+            continue
+        if size != int(k["size"]):
+            wrong["size"].append(k["path"])
+        if w.link_count(node) != int(k["links"]):
+            wrong["links"].append(k["path"])
+        if w.attributes(node) & 0xFFFF != int(k["attributes"], 16):
+            wrong["attributes"].append(k["path"])
+        alloc = w.allocation(node)
+        if w.data_form(node) == "extents" and alloc["stored"] != int(k["allocated"]):
+            wrong["stored"].append(k["path"])
+        if k["path"] in unshipped:
+            continue
+        digest = hashlib.sha256()
+        for chunk in w.read_file(node, size):
+            digest.update(chunk)
+        hashed += 1
+        if digest.hexdigest() != k["sha256"]:
+            wrong["content"].append(k["path"])
+    listed = {k["path"] for k in entries}
+    extra = [p for p in got if p not in listed and not p.startswith("System Volume Information")]
+    files = sum(1 for k in entries if k["kind"] == "file")
+    out.append((f"every one of the {len(entries):,} entries Windows listed is walked with its "
+                "type, size, four FILETIMEs to the 100 ns, 128-bit file id, link count, "
+                "attributes and link target as Windows reported them, and nothing else is "
+                "listed" + "".join(f"; {n} {what} wrong (first {v[0]!r})"
+                                   for what, v in wrong.items() if what != "content"
+                                   for n in [len(v)])
+                + (f"; {len(extra)} not in Windows's listing (first {extra[0]!r})" if extra else ""),
+                not [v for what, v in wrong.items() if what != "content"] and not extra))
+    out.append((f"{hashed:,} of the {files:,} files read back with the SHA-256 Windows recorded "
+                f"(the {len(unshipped)} whose random content is not shipped are left out by name: "
+                f"{', '.join(sorted(unshipped))})"
+                + (f"; {len(wrong['content'])} do not (first {wrong['content'][0]!r})"
+                   if wrong["content"] else ""),
+                hashed == files - len(unshipped) and not wrong["content"]))
+    streams = [k for k in known if k["kind"] == "stream"]
+    sgood = 0
+    for k in streams:
+        path, name = k["path"].rsplit(":", 1)
+        node = got[path][1] if path in got else None
+        if node is None or dict(w.named_streams(node)).get(name) != int(k["size"]):
+            continue
+        data = b"".join(w.read_file(w.stream_ref(node, name), int(k["size"])))
+        sgood += hashlib.sha256(data).hexdigest() == k["sha256"]
+    dnode = got.get("ads/dir_with_stream", (None, None))[1]
+    on_dir = (dnode is not None and w.named_streams(dnode) == [("onadir", 25)]
+              and b"".join(w.read_file(w.stream_ref(dnode, "onadir"), 25))
+              == b"a stream on a directory\r\n")
+    out.append((f"the {len(streams)} alternate data streams Windows listed (two inline, one in "
+                f"extents) read back with the SHA-256 it recorded ({sgood} of {len(streams)}), and "
+                "the stream the script wrote on a directory reads as written",
+                sgood == len(streams) and on_dir))
+    gone = [k["path"] for k in known if k["kind"] == "deleted" and k["path"] in got]
+    out.append(("none of the 17 files and folders created and then deleted is listed"
+                + (f" ({len(gone)} are: {gone[0]!r})" if gone else ""),
+                not gone and sum(1 for k in known if k["kind"] == "deleted") == 17))
+    out.append(("no page of the fixture fails its checksum", not w.damage))
+
+    # The first fixture: detached seconds after its files were written, so they
+    # are only in the log, after the checkpoint the reader reads.
+    kind, ident = identify_refs(dirty, 0)
+    wd = RefsWalker(dirty, 0)
+    out.append(("a volume whose newest checkpoint predates its files says that 16 log records "
+                "follow it and that they are not applied, and lists the checkpoint's empty root",
+                kind == "refs" and wd.logged == 16 and wd.note is not None
+                and any(line.startswith("log          16 metadata log records") for line in ident)
+                and wd.listdir(wd.root) == []))
+
+    # Broken on purpose: each must be reported, not read past.
+    # One letter of one name in a leaf page of the 2,500-entry directory: the
+    # page's structure still holds, so only its checksum can catch it.
+    many = dict(w.listdir(w.root))["many"]
+    ref = (w.objects[many], 0x20)
+    while True:
+        slots, ckind, digest = _refs_reference(*ref)
+        page = w._page(slots, ckind, digest, virtual=True)  # pylint: disable=protected-access
+        hoff = 0x50 + struct.unpack_from("<I", page, 0x50)[0]
+        level, _f, rows = _refs_node(page, hoff)
+        if not level:
+            break
+        ref = (rows[-1][1], 0)                          # name rows sort last
+    index = hoff + struct.unpack_from("<I", page, hoff + 0x10)[0]
+    i = next(n for n, row in enumerate(rows) if row[0][:2] == b"\x30\x00")
+    key = rows[i][0]
+    row = hoff + (struct.unpack_from("<I", page, index + 4 * i)[0] & 0xFFFF)
+    in_page = row + struct.unpack_from("<H", page, row + 4)[0] + 0x10   # a letter of the name
+    at = w.translate(slots[in_page // w.cluster]) * w.cluster + in_page % w.cluster
+    name = key[4:].decode("utf-16-le")
+    hurt = img.patched(at, bytes([page[in_page] ^ 0x01]))
+    wb = RefsWalker(hurt, 0)
+    seen = [n for n, _x in wb.listdir(many)]
+    whole = [n for n, _x in w.listdir(many)]
+    out.append((f"one letter of {name!r} changed in a leaf page of a 2,500-entry directory: the "
+                "page fails its checksum and is reported, its rows are left out rather than "
+                f"read with the wrong name, and the rest of the directory is still listed "
+                f"({len(seen):,} of {len(whole):,} entries)",
+                any(f"{many:#x}" in d and "checksum" in d for d in wb.damage)
+                and name not in seen and set(seen) < set(whole) and len(seen) > 0))
+    two = img.patched(0x28, b"\x02")
+    kind2, lines2 = identify_refs(two, 0)
+    try:
+        RefsWalker(two, 0)
+        turned_away = False
+    except ValueError as exc:
+        turned_away = "before format 3" in str(exc)
+    out.append(("a boot sector that says ReFS 2.x is identified and refused by version",
+                kind2 == "refs" and turned_away and any("not read: ReFS 2." in x for x in lines2)))
+    first = wd.checkpoint_lsn
+    rec_at = None
+    for off, n, _a in dirty.runs:
+        dirty.seek(off)
+        blob = dirty.read(n)
+        for b in range(0, n, 0x1000):
+            if blob[b:b + 4] == b"MLog" and struct.unpack_from("<Q", blob, b + 0x28)[0] == first + 5:
+                rec_at = off + b
+    cut = dirty.patched(rec_at + 0x200, b"\xff") if rec_at is not None else dirty
+    out.append(("a byte changed in the sixth log record after the checkpoint stops the count "
+                "at five, the records whose check values hold",
+                rec_at is not None and RefsWalker(cut, 0).logged == 5))
+    out.extend(_refs_unit_checks(img, w, got, known))
+    return out
+
+
+REFS_FOREFST_SAMPLES = os.path.join("/Volumes", "Corpus", "Data for DLEAPP", "Public_Test_Images",
+                                    "forefst-ReFS")
+# name: (corpus key, cluster bytes, the checksum kind its metadata pages carry)
+REFS_FOREFST_IMAGES = {
+    "wininsiderrefs8gtest2": ("forefst_refs314_64k_sha256", 0x10000, 4),
+    "win11refs2tspecials": ("forefst_refs314_specials", 0x1000, 2),
+    "win11refs2tsnapshots": ("forefst_refs314_snapshots", 0x1000, 2),
+    "win11refstestmftecmd": ("forefst_refs314_usn", 0x1000, 2),
+}
+
+
+def _refs_self_checks():
+    """The ReFS checks: the committed fixtures, then forefst's sample volumes
+    where they are mounted."""
+    return _refs_fixture_checks() + _refs_forefst_checks()
+
+
+def _refs_filetime_text(v):
+    """A FILETIME as forefst prints one: UTC, to the 100 ns."""
+    if not v:
+        return None
+    when = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=v // 10)
+    return when.strftime("%Y-%m-%d %H:%M:%S") + ".%07d" % (v % 10_000_000)
+
+
+def _refs_forefst_checks():
+    """[(label, passed or None for a skip)] against xbqt/forefst's four sample
+    volumes (GPL-3.0 data, never copied into this repository), read where the
+    corpus keeps them, or under QNXPROBE_REFS_SAMPLES. Each is checked entry
+    by entry against forefst's own inventory (forefst/files.jsonl beside it),
+    an independent reader rather than Windows. Where forefst prints a file's
+    times from a name row (a moved or linked file) the record's own differ
+    from it, and the check requires the name row to hold exactly forefst's
+    values, so each such difference is explained by the bytes rather than
+    waved through."""
+    root = os.environ.get("QNXPROBE_REFS_SAMPLES") or REFS_FOREFST_SAMPLES
+    out = []
+    for name, (key, cluster, ckind) in REFS_FOREFST_IMAGES.items():
+        image = os.path.join(root, name, f"{name}.raw")
+        listing = os.path.join(root, name, "forefst", "files.jsonl")
+        if not (os.path.isfile(image) and os.path.isfile(listing)):
+            out.append((f"forefst's sample volume {name} (corpus key {key}) is not at {root}, "
+                        "so the ReFS reader was not checked against it", None))
+            continue
+        out.extend(_refs_forefst_check(name, key, cluster, ckind, image, listing))
+    return out
+
+
+def _refs_forefst_check(name, key, cluster, ckind, image, listing):
+    with open(listing, encoding="utf-8") as fh:
+        theirs = {r["full_path"]: r for r in (json.loads(line) for line in fh if line.strip())}
+    img = open_image_trying(image)
+    try:
+        w = RefsWalker(img, 32768 * SECTOR)
+        mine = {item[0]: item for item in walk_all(w)}
+        wrong = collections.defaultdict(list)
+        stale = 0
+        for path, r in theirs.items():
+            if path not in mine:
+                wrong["missing"].append(path)
+                continue
+            node, mode = mine[path][1], mine[path][2]
+            fmt = mode & S_IFMT
+            # forefst marks directories (directory links among them) and gives
+            # a reparse target for links; anything else is a file
+            want_fmt = (S_IFLNK if r["reparse_target"] else
+                        S_IFDIR if r["is_directory"] else S_IFREG)
+            if fmt != want_fmt:
+                wrong["type"].append(path)
+            times = w.filetimes(node)
+            text = [_refs_filetime_text(t) for t in times]
+            want = [r[k] for k in ("created", "modified", "changed", "accessed")]
+            if text != want:
+                row = w._row(node) if isinstance(node, RefsEntry) else (0, b"")  # pylint: disable=protected-access
+                copy = ([_refs_filetime_text(t) for t in struct.unpack_from("<4Q", row[1], 0x10)]
+                        if row[0] == 2 and len(row[1]) >= 0x30 else None)
+                if copy == want and not r["is_directory"]:
+                    stale += 1
+                else:
+                    wrong["times"].append(path)
+            ordinal, oid = w.file_id(node)
+            if r["is_directory"] and fmt == S_IFDIR and int(r["oid"], 16) != oid:
+                wrong["object id"].append(path)
+            if fmt == S_IFREG:
+                if mine[path][3] != r["file_size"]:
+                    wrong["size"].append(path)
+                if r["file_id"] and int(r["file_id"], 16) != ordinal:
+                    wrong["file id"].append(path)
+                if r["creation_dir_oid"] and int(r["creation_dir_oid"], 16) != oid:
+                    wrong["home directory"].append(path)
+                if r["hard_link_count"] is not None and w.link_count(node) != r["hard_link_count"]:
+                    wrong["link count"].append(path)
+                if (r["allocated_size"] is not None and w.data_form(node) == "extents"
+                        and w.allocation(node)["stored"] != r["allocated_size"]):
+                    wrong["allocation"].append(path)
+            if fmt == S_IFLNK and w.readlink(node) != r["reparse_target"]:
+                wrong["link target"].append(path)
+            if sorted(n for n, _s in w.named_streams(node)) != sorted(
+                    (r["ads_names"] or "").split(";") if r["ads_names"] else []):
+                wrong["streams"].append(path)
+        extra = [p for p in mine if p not in theirs]
+        label = (f"{name} ({key}): all {len(theirs):,} entries forefst lists are walked, "
+                 "none more, each with forefst's type, size, file id, directory, link count, "
+                 "allocation, link target, stream names and four times"
+                 + (f", except {stale} moved or linked files whose times forefst prints "
+                    "from a name row, which holds exactly those values while the file's own "
+                    "record holds others" if stale else "")
+                 + "".join(f"; {len(v)} {what} wrong (first {v[0]!r})" for what, v in wrong.items())
+                 + (f"; {len(extra)} not in forefst's list (first {extra[0]!r})" if extra else ""))
+        out = [(label, not wrong and not extra)]
+        checked = w.pages_checked.get(ckind, 0)
+        out.append((f"{name}: {w.cluster:,}-byte clusters, every metadata page read checked "
+                    f"against its {('CRC-64' if ckind == 2 else 'SHA-256')} ({checked:,} pages), "
+                    "none failing, no damage, and no log record after the checkpoint",
+                    w.cluster == cluster and checked > 0 and not w.damage and w.logged == 0
+                    and set(w.pages_checked) == {ckind}))
+        if name == "win11refstestmftecmd":
+            out.append(_refs_integrity_check(w, mine))
+        if name == "win11refs2tsnapshots":
+            out.append(_refs_snapshot_check(w, mine))
+    finally:
+        getattr(img, "close", lambda: None)()
+    return out
+
+
+def _refs_integrity_check(w, mine, budget=3000):
+    """Files written with integrity streams keep a CRC32-C of each cluster
+    after its extent record [forefst extent_descriptors.md]. What read_file()
+    returns for those clusters is checked against them, up to ``budget``
+    clusters, among them the file whose extent map spans child pages."""
+    paths = sorted(p for p, it in mine.items() if it[2] & S_IFMT == S_IFREG)
+    paths = [p for p in paths if p.endswith("dotnet-sdk-9.0.314-win-x64.exe")] + paths
+    good = bad = spanned = 0
+    for path in paths:
+        if good + bad >= budget:
+            break
+        node, size = mine[path][1], mine[path][3]
+        if w.data_form(node) != "extents":
+            continue
+        value = w._main_stream(w._record(node)[0])[3]  # pylint: disable=protected-access
+        sums = []
+        _refs_checksummed_runs(w, value, struct.unpack_from("<I", value, 0)[0], sums)
+        if not sums:
+            continue
+        spanned += bool(value[struct.unpack_from("<I", value, 0)[0] + 0x0C])
+        reader = w.read_file(node, size)
+        pending, at = b"", 0
+        for vcn, crcs in sorted(sums):
+            for k, crc in enumerate(crcs):
+                if good + bad >= budget:
+                    break
+                want = (vcn + k) * w.cluster
+                while at + len(pending) < want + w.cluster:
+                    chunk = next(reader, None)
+                    if chunk is None:
+                        break
+                    pending += chunk
+                piece = pending[want - at:want - at + w.cluster]
+                piece += bytes(w.cluster - len(piece))
+                if refs_crc32c(piece) == crc:
+                    good += 1
+                else:
+                    bad += 1
+                drop = max(0, want + w.cluster - at)
+                pending, at = pending[drop:], at + drop
+    return (f"win11refstestmftecmd: {good:,} clusters of files with integrity streams read back "
+            f"matching the CRC32-C ReFS stored for each" + (f", {bad} not" if bad else "")
+            + (", the 226 MB file whose extent map spans child pages among them" if spanned else ""),
+            good > 0 and not bad and spanned > 0)
+
+
+def _refs_checksummed_runs(w, buf, hoff, out):
+    """(file cluster, [CRC32-C per cluster]) of each extent record that carries
+    them (flag 0x80): 24 bytes, then one u32 per cluster of its run."""
+    if buf[hoff + 0x0C]:
+        for _k, val, _f in _refs_node(buf, hoff)[2]:
+            page = w._page(*_refs_reference(val, 0), virtual=True)  # pylint: disable=protected-access
+            _refs_checksummed_runs(w, page, 0x50 + struct.unpack_from("<I", page, 0x50)[0], out)
+        return
+    start, count = struct.unpack_from("<II", buf, hoff + 0x10)
+    for i in range(count):
+        pos = hoff + (struct.unpack_from("<I", buf, hoff + start + 4 * i)[0] & 0xFFFF)
+        _v, flags, size, vcn, _p, run = struct.unpack_from("<QHHIII", buf, pos)
+        if flags & 0x80 and size >= 24 + 4 * run:
+            out.append((vcn, list(struct.unpack_from(f"<{run}I", buf, pos + 24))))
+
+
+def _refs_snapshot_check(w, mine):
+    """A snapshotted file's live stream holds only what changed since its last
+    snapshot. forefst's snapshots_versioning.md works this volume's test.txt
+    through: four versions, the live one "abc\\r\\n", with no cluster of its own.
+    arg.txt's two .bak copies,
+    whole files of their own, hold what arg.txt held when they were made."""
+    def read(path):
+        node, size = mine[path][1], mine[path][3]
+        return b"".join(w.read_file(node, size))
+    test = read("testsnapshots/test.txt")
+    arg = read("testsnapshots/arg.txt")
+    baks = [read(p) for p in mine if p.startswith("testsnapshots/arg.txt.bak.")]
+    return ("win11refs2tsnapshots: a snapshotted file's live stream is read through its "
+            f"snapshots: test.txt, whose live stream holds no cluster of its own, reads {test!r} "
+            f"as forefst documents, and arg.txt the same {len(arg)} bytes as its {len(baks)} "
+            "backup copies",
+            test == b"abc\r\n" and len(baks) == 2 and all(b == arg for b in baks) and arg != bytes(len(arg)))
+
+
 def identify_fs(fh, base, size=None):
     """Return (name, [detail lines]) for whatever sits at this partition.
 
@@ -15280,6 +21428,20 @@ def identify_fs(fh, base, size=None):
         if found:
             return found
 
+    # XFS before ext: it is accepted on its superblock's geometry, where ext's
+    # 2-byte magic at 1080 falls inside XFS's own AG headers.
+    xfs = identify_xfs(fh, base, size)
+    if xfs:
+        return xfs
+
+    # Btrfs before ext, the more specific test first: an 8-byte magic and a
+    # checksum over the superblock, against ext's 2-byte magic. mkfs.btrfs
+    # 6.17.1 and mke2fs 1.47.2 each clear the other's signature (measured), so
+    # the order decides something only on an image older tools wrote.
+    found = identify_btrfs(fh, base, size)
+    if found:
+        return found
+
     sb = read_at(fh, base + EXT_SB_OFF, 1024)
     if len(sb) == 1024 and _e(sb, "magic", 2) == EXT_MAGIC:
         bs = 1024 << _e(sb, "log_block_size")
@@ -15326,6 +21488,10 @@ def identify_fs(fh, base, size=None):
     hfs = identify_hfsplus(fh, base)
     if hfs:
         return hfs
+
+    refs = identify_refs(fh, base, size)
+    if refs:
+        return refs
 
     ntfs = identify_ntfs(fh, base)
     if ntfs:
@@ -16779,14 +22945,20 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     except Exception as exc:
                         print(f"        could not extract: {exc}")
 
-                if kind in ("fat32", "fat16", "fat12", "exfat", "ntfs", "f2fs", "hfs+", "hfsx", "apfs",
+                if kind in ("fat32", "fat16", "fat12", "exfat", "ntfs", "refs", "f2fs", "hfs+", "hfsx", "apfs",
                             "etfs", "efs", "qnx4", "squashfs", "jffs2", "ubi",
-                            "ubifs", "yaffs1", "yaffs2") + CFG_KINDS and wanted:
+                            "ubifs", "yaffs1", "yaffs2", "xfs", "btrfs") + CFG_KINDS and wanted:
                     if do_list:
                         print(f"        CONTENTS  (depth {list_depth})")
                         try:
                             w = walker_for(kind, fh, b, sz)
                             print_tree(w, w.root, 1, list_depth, [list_max], pad=8)
+                            n_dmg, dmg = damage_lines(w)
+                            if n_dmg:
+                                print(f"        DAMAGE  {n_dmg:,} item(s) recorded while listing"
+                                      + (", first:" if dmg else ""))
+                                for line in dmg:
+                                    print(f"          {line}")
                         except Exception as exc:
                             print(f"        could not walk this filesystem: {exc}")
                     if zf is not None:
@@ -16808,13 +22980,20 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                     "symlinks_or_special_skipped": sk,
                                     "failed": fa, "short": sh, "excluded": dropped,
                                 })
+                            n_dmg, dmg = damage_lines(w, 50)
+                            if n_dmg and manifest is not None:
+                                manifest[-1]["damage_recorded"] = n_dmg
+                                manifest[-1]["damage_first"] = dmg
                             print(f"            {f_:,} files, {human(wr)}"
                                   + (f", {sk:,} symlinks or special files skipped" if sk else "")
                                   + (f", {fa:,} FAILED" if fa else "")
                                   + (f", {sh:,} SHORT" if sh else "")
-                                  + (f", {dropped:,} excluded" if dropped else ""))
+                                  + (f", {dropped:,} excluded" if dropped else "")
+                                  + (f", {n_dmg:,} DAMAGED structure(s) recorded" if n_dmg else ""))
                             for line in log[:5]:
                                 print(line)
+                            for line in dmg[:5]:
+                                print(f"            DAMAGE {line}")
                             if miss:
                                 print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
                                 if manifest is not None:
@@ -21676,6 +27855,17 @@ def self_test():
         # pvs, saved beside them as lvm-fixture.lvs.json) is the layout they are
         # checked against; the file hashes come from sha256sum over the source
         # trees (tools/make_lvm_fixtures.sh).
+        # What every walker's extraction shares: safe zip member names, and
+        # damage a walker recorded counted where a listing or extraction shows it.
+        try:
+            shared_checks = _shared_extract_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            shared_checks = [(f"the shared extraction checks ran ({type(exc).__name__}: {exc})", False)]
+        for label, cond in shared_checks:
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
         try:
             lvm_checks = _lvm_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
@@ -21684,6 +27874,21 @@ def self_test():
             lvm_checks += _luks_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the LUKS checks ran ({type(exc).__name__}: {exc})", False)]
+        # XFS: mkfs.xfs wrote the fixtures from a source tree whose listing and
+        # hashes were recorded beside them, with xfs_db's and xfs_logprint's own
+        # reading of each image (tools/make_xfs_fixtures.sh).
+        try:
+            lvm_checks += _xfs_self_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the XFS checks ran ({type(exc).__name__}: {exc})", False)]
+        try:
+            lvm_checks += _btrfs_self_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the Btrfs checks ran ({type(exc).__name__}: {exc})", False)]
+        try:
+            lvm_checks += _refs_self_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
             if cond is None:
                 print(f"  [SKIP] {label}")
@@ -24366,8 +30571,8 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(
         prog="qnxprobe.py",
-        description="Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+ and "
-                    "APFS filesystems, the Linux flash filesystems SquashFS, JFFS2, "
+        description="Read QNX6, QNX4, ETFS, EFS, ext2/3/4, Btrfs, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, "
+                    "APFS and XFS filesystems, the Linux flash filesystems SquashFS, JFFS2, "
                     "UBI/UBIFS and YAFFS1/YAFFS2, QNX IFS boot images, and the U-Boot "
                     "environment and Belkin libnvram stores a flash chip carries, out of "
                     "raw disk images and flash dumps, the linear and striped logical "
@@ -24388,7 +30593,7 @@ if __name__ == "__main__":
                          "the detector reports both ways, then delete them")
     ap.add_argument("--list", action="store_true",
                     help="walk each filesystem found and list its contents "
-                         "(qnx6, qnx4, ext2/3/4, FAT32, FAT16, FAT12, exFAT, NTFS, HFS+, APFS, ETFS and EFS)")
+                         "(qnx6, qnx4, ext2/3/4, Btrfs, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, APFS, XFS, ETFS and EFS)")
     ap.add_argument("--depth", type=int, default=2, metavar="N",
                     help="how deep to walk with --list (default: 2)")
     ap.add_argument("--list-max", type=int, default=400, metavar="N",
