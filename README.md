@@ -2,10 +2,11 @@
 
 Read QNX6, QNX4, ETFS, EFS, ext2/3/4, Btrfs, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, APFS and XFS filesystems,
 the Linux flash filesystems SquashFS, JFFS2, UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot
-images, out of raw disk images and flash dumps, including the linear and striped logical
-volumes of an LVM2 physical volume: identify each by its own on-disk structure
-rather than trusting a partition type byte, list, and extract to a zip with a
-provenance manifest. No mounting, no admin rights, standard library only.
+images, out of raw disk images and flash dumps, including the logical volumes of an
+LVM2 physical volume (linear, striped, RAID1 and RAID4/5/6/10) and Linux md RAID
+arrays assembled from their member images (see "RAID" below): identify each by its own
+on-disk structure rather than trusting a partition type byte, list, and extract to a
+zip with a provenance manifest. No mounting, no admin rights, standard library only.
 
 QNX is what a lot of vehicle infotainment runs on, and it is the reason this tool
 exists and keeps its name. When a head unit image lands on your desk, the first
@@ -2295,15 +2296,21 @@ read as lvm2 writes it; single-quoted strings, floating-point, hexadecimal and o
 Since 1.67, a RAID1 volume, and an old-style mirror, is read from the first of its copies
 whose extents are all in the image: lvm2 lists a raid1 segment's copies under `raids`
 (raid.c) and a mirror's under `mirrors` (mirrored.c), each a hidden logical volume
-holding the volume's data from its start. Which copies are in sync is kept in the RAID
-metadata, which is not read, so a copy that fell out of sync is read as it is; a
+holding the volume's data from its start. Since this release a raid1 copy lvm2 marks
+REBUILD, one on a physical volume marked MISSING, and one the dm-raid superblock lists as
+failed, still recovering or behind is passed over for the next (see "RAID" below); a
+mirror's copies, and a raid1 copy out of sync in some other way, are read as they are; a
 segment with a `data_offset`, which lvm2 writes while a reshape moves the data, is not
 read. On the fixture the two copies hold the same bytes, the files read from the first
 match their source, and with the first copy's physical volume missing the second is read.
 The old-style mirror is read by the same code but no fixture holds one.
 
+A RAID4, RAID5, RAID6 or RAID10 volume is read too, from its image volumes in the image,
+with one missing read from the other copy or rebuilt from parity (see "RAID" below); a volume group whose physical volumes are spread over
+several images is read when all of them are given on the command line.
+
 Not read, and named in the physical volume's report with the reason (since 1.65 also in its
-`note` in `volumes()`, which a LEAPP run log prints): a RAID volume other than RAID1, one
+`note` in `volumes()`, which a LEAPP run log prints): a RAID0 volume, one
 with a run on a physical volume that is not in the image, and one on extents of something
 that is not a physical volume of the group (a move in progress). Thin, cache, VDO and
 snapshot volumes are refused by
@@ -2333,6 +2340,274 @@ the public image of The Open University's "Defaced web server (Ubuntu 22.04)"
 simulation (https://doi.org/10.21954/ou.rd.26038669.v1), whose root filesystem is in a
 logical volume, 1.63 reported that partition only as not recognised; 1.64 reads the
 logical volume as ext4 and walks its 93,747 entries.
+
+## RAID
+
+A RAID set arrives as several images, one per disk. Give them all on the command line
+and qnxprobe reads each image as before, then assembles the arrays their members belong
+to and reads each array as an image of its own:
+
+```
+qnxprobe.py --extract out.zip disk0.img disk1.img disk2.img disk3.img
+```
+
+Each member image is opened as qnxprobe opens any image, so it can be raw, split, E01,
+VHDX or any other format it reads (the fixtures are raw), and a member can be the whole
+disk or a partition. An image that holds no member
+of anything is read exactly as before. Hardware RAID imaged as one logical disk needs
+none of this: it is already one image.
+
+What is read:
+
+- **Linux md (mdadm) arrays**, metadata 0.90, 1.0, 1.1 and 1.2: linear, RAID0 (with the
+  original and the alternate layout over members of different sizes), RAID1, RAID4,
+  RAID5 in its six layouts, RAID6 in its fourteen, and RAID10 near, far and offset.
+- **LVM RAID4, RAID5, RAID6 and RAID10 volumes** (dm-raid), inside one image or across
+  several. An image volume lvm2 marks REBUILD, one on a physical volume lvm2 marks MISSING
+  or that is not among the images given, and one the dm-raid superblock in its metadata
+  volume lists as failed, is treated as missing: a RAID10 volume is read from the other
+  copy, and a RAID4/5/6 volume rebuilt from parity when the dm-raid superblock says the
+  array is in sync and lvm2 does not mark the volume NOTSYNCED; otherwise it is refused.
+- **A RAID4 or RAID5 array missing one member, and a RAID6 array missing one or two**:
+  the missing member's chunks are rebuilt from parity (XOR, and for RAID6 the Q
+  syndrome), but only when the array was stopped clean. A RAID1 or RAID10 array missing
+  members is read from the copies that are there.
+
+The report gets a RAID section after the images: each member found, then each array with
+its level, layout, chunk, metadata version, uuid and event count, which image holds each
+role, which roles are missing, which members were left out and why, and what was refused.
+Each array that is read then gets a report of its own, named `md_<name>_<first eight hex
+digits of its uuid>` (or `lvm_<group>_<volume>` for a volume group spread over images),
+and its volumes are extracted under that name followed by the volume's own
+(`md_qp_qp46_5e57911c_lba0_...`). In `volumes.json` such a volume's `image` is that name,
+and a `raid` record gives the array's members, roles, missing roles and notes.
+
+The exit status is 1 only when an array has every member it needs among the images given
+and is still not read. One rule serves md arrays and LVM volumes: what was given decides
+it, not why it was refused. A member or leg given but unusable (stale, faulty, cut short,
+marked REBUILD, a failed device) counts as given, and the members or legs not given at
+all must be no more than the level can lose (RAID4/5 one, RAID6 two, RAID10 its copies
+less one, RAID1 all but one, linear and RAID0 none). So four RAID5 members of which two
+are stale exit 1, and so does an LVM raid5 volume with one leg's image not given and
+another leg marked REBUILD. Part of an array
+(one member given alone, or beside images that belong to nothing, or LVM images holding
+too few of a volume's legs) is reported as members, with a line naming the roles
+or physical volumes not given, and leaves the exit status as v1.68 had it. When the members are partitions of
+the one image given, that line instead says how many of them can be used, and the members
+left out above say why the others cannot. Members of metadata this only names (DDF
+and the others below) do not change the exit status. A RAID1 array whose data starts at
+the first byte of the member it is read from (metadata 0.90 or 1.0) is not read a second
+time: that member's own listing above shows the same bytes, and the RAID section says so.
+
+A member is assembled the way the kernel assembles it (drivers/md/md.c): its superblock
+must pass its checksum at the place its metadata version puts it, and members are grouped
+by array uuid. A member more than one event behind the freshest superblock is left out as
+stale (its disk failed or was removed, and writes after that never reached it); one event
+behind takes its role from the freshest superblock, for metadata 1.x from its role table
+(md.c 2111-2133) and for 0.90 from the freshest `disks[]` entry of its device number, and
+is left out when that entry no longer has it in sync. The same holds for a write journal
+device, and a journal device whose own superblock has no journal feature is left out
+(md.c 2146-2150). A spare, a member marked faulty, one still being rebuilt, one whose superblock
+gives the array a different level or layout, one whose image is shorter than the array
+needs, a 1.1 or 1.2 superblock whose data offset falls inside the superblock (md.c
+1877-1882), a member one event behind whose device number is past the freshest role table
+(md.c 2125-2130), and a second copy of a member already used are all left out and named. When a 0.90 or 1.0
+superblock is found both from the whole disk and from a partition that ends where the disk
+does, the member is the partition. A physical volume given twice (the same image, or two
+copies of one disk) is read once and the second named. A RAID1 member whose superblock is at its end
+(metadata 0.90 or 1.0) starts with the filesystem itself, so read alone it is listed as
+that filesystem, as before; every other member read alone is listed as `linux md member`.
+
+Not read, each named with why:
+
+- a reshape in progress (part of the array is in the old layout and part in the new);
+- more members missing than the level can lose, or every copy of some RAID10 chunks;
+- a degraded RAID4, RAID5 or RAID6 array not stopped clean, whose parity may not match
+  its data;
+- a RAID5 or RAID6 array with a write journal whose device is not given, or whose journal
+  holds data for a stripe with no parity after it (a write held only in the journal). The
+  journal is walked as the kernel replays it at start (raid5-cache.c). A stripe whose data
+  and parity are both logged is one the kernel rewrites from the log; on an array stopped
+  clean the array is read from its members as they are (the fixture's journal holds one
+  such stripe, and its array reads to the bytes the kernel presented), and on one not
+  stopped clean it is refused;
+- a RAID0 array of members of different sizes that records no layout (made before Linux
+  5.4), a RAID10 layout with far sets, a clustered array, and a 0.90 superblock written
+  by a big-endian host;
+- what the kernel itself would not run: a RAID4/5/6 chunk that is not a power of two of
+  at least 4 KiB (raid5.c 7492-7497), a RAID10 layout of fewer than two copies (raid10.c
+  3848), and a superblock recording more members than its role table holds (more than 27
+  for 0.90), which is refused before anything is sized by it;
+- a member's bad block log on a linear or RAID0 array, which keeps no other copy, or on a
+  RAID4/5/6 array not stopped clean, and a bad block range nothing can supply (above);
+- an LVM raid segment whose image volumes nest more than four deep or name the volume
+  itself (the group's other volumes are still read);
+- metadata this does not read: DDF and Intel IMSM (RST) members by their anchors at the
+  end of the disk, and GPT partitions of Windows LDM, Windows Storage Spaces and Apple RAID
+  by their type.
+
+A write-intent bitmap and a partial parity log (PPL) are noted and not used: the bitmap
+marks regions to resync when a stale member is added back, and no stale member is read; a
+PPL is for an array stopped unclean, and a degraded one of those is refused above. The
+fixtures with each, stopped clean, read to the bytes the kernel presented.
+
+A 1.x member's bad block log is read as the kernel reads it (md.c 1890-1920): the ranges
+it lists on that member are never read from it, but from the other copy (RAID1, RAID10)
+or rebuilt from parity (RAID4/5/6, on an array stopped clean), and the report names the
+member and the ranges. Before the array is read, every array chunk such a range touches
+is read once: if neither another copy nor parity can supply one (both RAID1 or RAID10
+copies listed bad, two RAID5 members bad at the same place, a bad range on a degraded
+array), the array is refused, naming each member and range. A member whose bad block log
+runs past the end of its image is left out, as md would not load it. A member whose read
+fails (a damaged chunk of its container, for one) is tried once more, then read around as
+md reads around a failed read: from the other copy (RAID1, RAID10), or rebuilt from parity
+(RAID4/5/6) on an array stopped clean. On a RAID4/5/6 array not stopped clean its parity
+may be out of step, so such a read is not rebuilt: it ends short there. On a mirror not
+stopped clean md reads the first readable copy and moves to the next when that read fails
+(raid1-10.c 278-289, raid1.c 589-612), and so does this, so the bytes may be the other
+copy's version of a region being resynced; the array's notes say it was not stopped clean.
+And
+should a RAID read fail all the same, with nothing to read around it, it ends short, so the file it belongs to is extracted as
+`.SHORT-<got>-of-<size>-bytes` and counted short in `volumes.json`, never filled with
+zeros. An LVM RAID volume's metadata volumes are read for the dm-raid superblock
+(dm-raid.c 1954-1975): its in-sync offset, its failed-device list, each device's own
+recovery offset (a device still being recovered, dm-raid.c 2499-2508, is treated as
+missing), whether it holds a dm-raid superblock at all (one without, when another image
+volume's superblock exists, is a device dm-raid would take as new and rebuild, super_load
+2207-2222, and is treated as missing) and its event count (a device whose superblock is more than one event behind the
+freshest is treated as missing too; dm-raid takes the array's state from the freshest
+superblock alone, and leaving out one that fell behind is md's own rule, md.c 2087,
+applied here as the stricter reading). An LVM raid1 volume uses the same tests to pass
+over a copy for the next good one, and is refused when no copy is good; NOTSYNCED does
+not stop a raid1 volume, which needs no parity. An old-style mirror's copies are read as
+they are. `--unallocated` on an LVM RAID volume with an image volume missing says how
+many bytes of its free space lie in chunks rebuilt from parity, which are on no disk, and
+leaves them out (`rebuilt_bytes_not_written` in `unallocated.json`).
+
+A 1.1 or 1.2 superblock's role table is rounded up to the device's logical block size
+before its data offset is checked against it (md.c 1872-1882). An image says its logical
+block size only through a GPT header found at 4096 bytes; for any other image 512 bytes
+is assumed.
+
+From Python, `raid_open(paths)` opens the images and assembles them, and
+`raid_assemble([(label, image), ...])` does the same for images already open; each of
+the result's `arrays` has `lines()`, `describe()`, `refused` (None, or why it was not read)
+and `image`, which `volumes()`, `main()` and the walkers read like any image:
+
+```python
+import qnxprobe as q
+
+with q.raid_open(["disk0.img", "disk1.img", "disk2.img"]) as rs:
+    for arr in rs.arrays:
+        print("\n".join(arr.lines()))
+        if arr.image is not None:
+            for vol in q.volumes(arr.image):
+                print(vol["kind"], vol["label"])
+```
+
+The layouts follow the kernel's own code (Linux v7.0) and mdadm's (4.5), each structure
+and rule cited where it is used in `qnxprobe.py` and listed under "Where the constants
+come from" below. The fixtures were written by `tools/make_raid_fixtures.sh`, and
+`raid-fixtures.json` records the machine it ran on: Linux 7.0.0-38-generic on aarch64
+(little-endian), mdadm 4.5 (package 4.5-5ubuntu1.1), lvm2 2.03.31 and mke2fs 1.47.2. Every
+lvm2 key and flag this relies on was checked in lvm2 2.03.31 (commit
+`3a6e221c569eb253fa38a772b15e53b5de65b5d1`) as well as in the pinned 2.03.43. They are small
+member images of 49 md arrays that are read (linear 1, RAID0 4, RAID1 5, RAID4 1, RAID5
+12, RAID6 18, RAID10 8, across all four metadata versions), among them RAID5 on GPT
+partitions, RAID1 with members of different sizes, RAID0 over members of three sizes in
+both layouts, a bitmap, PPL and a write journal, three built degraded (a RAID5 and two
+RAID6 created with members missing) and three whose members failed and were removed before
+more was written (a RAID5 with one stale member, a RAID6 with two, a RAID1 with one); one
+more stopped during a reshape, and a DDF set; and LVM RAID volumes, ten inside one image
+(raid4, raid5 in its five layouts, raid6 in three, and raid10) and three across five
+images (raid5, raid6, raid10). While each array ran, the script recorded the sha256 and size of
+the device the kernel presented, the kernel's own parity check, `mdadm --examine` and
+`--detail`, and `lvs`; the files came from a generated tree whose sha256 and listing it
+recorded.
+
+`--self-test` checks that every one of those 49 md arrays and 13 LVM volumes reads back to
+the sha256 and size of the device the kernel presented, every file (199 in the md
+arrays) to its source's sha256 and every listing to its source's; that each member holds
+the role `mdadm --examine` gives it; that with each member of every full RAID1, RAID4,
+RAID5 and RAID10 array left out in turn, and each one or two of every RAID6 array, the
+array still reads to the kernel's bytes (299 member sets); that the same comparison
+fails when one RAID5 layout is read as another (the control); that the md signature is
+where each metadata version puts it on every md member image (194), as `mdadm --examine`
+places it (the positive control for a search of other images); and that the reshape and the DDF
+set are refused by name. It also checks inputs changed after mdadm wrote them: a failed
+checksum, a member one and two events behind, a member image cut short, the same member
+given twice, a member of another level, an array not stopped clean with and without a
+member missing, too many members missing, a missing journal device, a journal holding
+data with no parity, a big-endian 0.90 superblock, a RAID10 layout with far sets, a RAID0
+with no layout recorded, a clustered array, and (constructed, no fixture holds them) an
+IMSM anchor and GPT partitions of Windows LDM, Storage Spaces and Apple RAID. It writes no
+disk image to disk.
+
+It also checks the cases an independent review raised, each built from a fixture and each
+shown to fail without its fix: a bad block log over spoiled bytes on a RAID1 and a RAID5
+member (read to the kernel's bytes) and on a linear array (refused); a 0.90 member one
+event behind that the freshest superblocks mark faulty, with a chunk written after it
+failed (left out, the chunk read as written); 0.90 RAID1 and RAID5 members on MBR
+partitions that end where their disks end (read from the partitions to the kernel's
+bytes); 4,000,000,000 members recorded (refused at once); a 1,900-member RAID10 near=2
+with every other member given (read, its copies checked by looking at each chunk pattern
+once, counted rather than timed); a journal meta block whose payloads run past it, given
+beside an unrelated array (that array refused by name, the other read); a stale journal
+device and a journal device for an array with no journal; a RAID5 chunk that is not a
+power of two, a one-copy RAID10, a data offset inside the superblock and a device number
+past the freshest role table; the device uuid against `mdadm --examine`; a degraded RAID1
+not stopped clean; one member given alone, and a lone RAID1 member; IMSM and DDF anchors on
+a 4096-byte-sector disk; an LVM image volume marked REBUILD, one dm-raid lists as failed,
+and a physical volume marked MISSING, each with its bytes spoiled (read to the kernel's
+bytes from parity or the other copy); a volume marked NOTSYNCED with an image volume to
+rebuild (refused); a raid segment naming its own volume (refused, the others read); each
+of the five images of the volume group across images left out in turn (all 15 volume
+reads to the kernel's bytes); and one of those images given twice (read once).
+
+And the cases a second review raised, each also shown to fail without its fix: bad block
+ranges on eight arrangements another copy or parity can supply (read to the kernel's
+bytes) and five nothing can (RAID5 two overlapping, RAID5 with a member missing, RAID6
+two with a member missing, RAID10 and RAID1 both copies: refused, naming member and
+range); a RAID1 read whose copies are both bad, built past that refusal (extracted as
+`.SHORT` and counted short) and an LVM RAID read with two image volumes gone (short); an
+LVM image volume whose dm-raid superblock says it is still recovering, and one two events
+behind (rebuilt from parity to the kernel's bytes, their bytes spoiled); an LVM raid1 copy
+marked REBUILD (the other read) and both copies marked (refused); one member beside an
+unrelated image and a lone member whose superblock is refused (exit status untouched),
+and a complete set refused (counted); members on one image's partitions (no request for
+other images); a 1.2 data offset one sector past the superblock (accepted with 512-byte
+logical blocks, refused with 4096); a bad block log cut off by the end of the image
+(member left out); and free space in rebuilt chunks (said and left out). That free-space
+check writes one file, in a folder of its own inside the self-test's temporary folder.
+
+And a third review's: the command line's RAID step, report included (`raid_run`, the code
+`qnxprobe.py` runs after the images), over every non-empty subset of the member images of
+a RAID1, RAID5, RAID6, RAID10 and 0.90 RAID5 set and of the five images of the volume group
+across images (110 subsets): nothing escapes, exactly the arrays and volumes the subset
+can hold (worked out from the level and from where `lvs` put each image volume, not from
+the reader) are read, each to the kernel's bytes, and none counts against the exit status;
+four RAID5 members two of them stale, and an LVM volume refused for its own REBUILD marks
+with every image given (both count), against the same volume with images missing (does
+not); a metadata volume with no dm-raid superblock (rebuilt from parity); and members
+whose reads fail over a range (read around from the other copy or parity; with both RAID1
+copies failing, the read ends short and gives no digest). A fault in one array's report or
+read is said and never stops the others being reported or read.
+
+And a fourth review's: a RAID5 not stopped clean whose data member fails to read where its
+parity is out of step (the read ends short, it is not rebuilt), with an unclean RAID1 copy
+failing (read from the next copy, as md does); the LVM exit rule by legs (one leg's image
+not given and another marked REBUILD: counts); the layout control now requires a full read
+before comparing digests; and a member read that fails once and serves when tried again
+(read in full, in one read, on RAID0).
+
+What no fixture exercises as mdadm or lvm2 wrote it (the cases above are changed copies of
+fixtures): a big-endian 0.90 array (refused), a bad block log written by the kernel, a
+dm-raid superblock listing a failed device, LVM's raid6 layouts with a
+dedicated Q (raid6_ls_6 and the rest; md's own versions of those layouts are in the
+fixtures and read through the same code), an array
+whose members are partitions of one image, an LVM volume group on an md array, and free
+space read from an array (the fixtures hold ext4, whose free space is not reported). IMSM
+and DDF are named only; their arrays are not read.
 
 ## XFS
 
@@ -2714,6 +2989,7 @@ reported as not recognised, with its first bytes shown.
 | `--private-key FILE` | For an AFF, an Apple disk image or an AD-encrypted set sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
+| several images | Each image is read, then each Linux md array and each LVM volume group spread over several of them is assembled from its members and read as an image of its own (see [RAID](#raid)) |
 | `--version` | Print the version |
 
 ## The self-test, and why it is not decoration
@@ -3087,8 +3363,52 @@ record's id within its directory at 0x80 (it equals the low half of the file id 
 reports, for every file), a directory's other three times in its own record, and the link
 count as the number of names a record lists.
 
-`--help` prints this same sourcing, so it travels with the tool. (The ReFS lines above are
-in this README only for now.)
+Linux md RAID and LVM RAID, from the Linux kernel at v7.0 (commit
+`028ef9c96e96197026887c0f092424679298aae8`), mdadm at mdadm-4.5 (commit
+`8f0c7692d48414ff7b3fe927ce75799c65ef24b1`) and lvm2 at v2_03_43 (commit
+`7b0bce6909611966bdc1e17c2408e1ec3b0f8c17`):
+
+```
+MD_SB_MAGIC 0xa92b4efc, roles, feature bits     include/uapi/linux/raid/md_p.h 95-109, 306-343
+0.90 superblock, host byte order, last 64 KiB   md_p.h 44-47, 131-209; md.c 1054-1058
+0.90 checksum, folded                           md.c 1249-1281
+1.x superblock, little-endian                   md_p.h 225-304
+1.0 at the end, 1.1 at 0, 1.2 at 4 KiB          md.c 1814-1826 (super_1_load)
+1.x checksum                                    md.c 1774-1794
+events: one behind is used, more is refused     md.c 1550-1554, 2087, 2111-2133
+RAID0 without the layout bit has no layout      md.c 1519-1520, 2060-2061
+linear                                          md-linear.c 113-150
+RAID0 zones, original and alternate layouts     raid0.c 65-298, 304-352, 560-590
+RAID10 near/far/offset                          raid10.c 581-642, 3712-3815
+RAID4/5/6 parity and data placement             raid5.c 2946-3149
+RAID6 Q slot order                              raid5.c 124-161, 1603-1640
+array sizes                                     raid5.c 7309-7321, raid10.c 3712-3730,
+                                                md-linear.c, raid0.c 357-370
+write journal walk and checksum                 raid5-cache.c 1722-1752, 1800-1846,
+                                                2061-2246, 2941-3000, 3079
+GF(2^8) over 0x11d, exp/inv/exi tables          lib/raid6/mktables.c 21-34, 108-171
+two data, or data and P, from P and Q           lib/raid6/recov.c 19-89
+several superblocks: the newest ctime           mdadm util.c 1259-1300
+DDF anchor 0xDE11DE11 in the last sector        mdadm super-ddf.c 145, 977-1000
+IMSM "Intel Raid ISM Cfg Sig. " 2 sectors back  mdadm super-intel.c 38, 4594 (512 and
+                                                4096-byte sectors)
+lvm2 RAID segment keys, raids list              lvm2 lib/raid/raid.c 45-190, 202-224
+                                                (2.03.31: 45-185, 197-229)
+"raid5" is raid5_ls, "raid6" is raid6_zr        lvm2 libdm/libdm-deptree.c 92-109
+                                                (2.03.31: 86-103)
+MISSING, NOTSYNCED, REBUILD                     lvm2 lib/format_text/flags.c 50-51, 65-66
+                                                (the same lines in 2.03.31)
+dm-raid superblock: failed devices, in sync     dm-raid.c 1953-1975
+bad block log                                   md.c 1890-1920, 1180-1181; md.h 300-312
+dm-raid types to md level and layout            dm-raid.c 294-313
+LDM, Storage Spaces, Apple RAID GPT types       util-linux v2.41.6 (commit
+                                                02822c9374fc72d38baf8a1f859eb0813970bf3f)
+                                                include/pt-gpt-partnames.h 37-41, 193-194;
+                                                Microsoft PARTITION_INFORMATION_GPT
+```
+
+`--help` prints this same sourcing, so it travels with the tool. (The ReFS and RAID lines
+above are in this README only for now.)
 
 ## What it does not do
 
@@ -3126,10 +3446,14 @@ in this README only for now.)
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
-- **LVM2: linear, striped, RAID1 and mirror logical volumes are read.** A RAID volume of
-  another level, a thin, cache, VDO or snapshot volume, or one with a run on a physical
-  volume missing from the image, is named in the report with why and not read (see
+- **LVM2: linear, striped, RAID1, mirror and RAID4/5/6/10 logical volumes are read.** A
+  RAID0 volume, a thin, cache, VDO or snapshot volume, or one with a run on a physical
+  volume missing from the images given, is named in the report with why and not read (see
   "LVM2" above).
+- **RAID: Linux md and LVM RAID only.** Arrays are assembled from the member images given
+  together; a degraded parity array is rebuilt only when it was stopped clean, and an
+  array mid-reshape is refused. DDF, Intel IMSM (RST), Windows LDM and Storage Spaces, and
+  Apple RAID members are named and not read (see "RAID" above).
 - **LUKS: AES only, and only what a passphrase opens.** A LUKS container with another
   cipher, with dm-integrity, with a keyslot that is not of the luks2 type, or being
   re-encrypted is named and not read (see "LUKS" above). A detached LUKS2 header is not
