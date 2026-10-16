@@ -2505,6 +2505,194 @@ with q.raid_open(["disk0.img", "disk1.img", "disk2.img"]) as rs:
                 print(vol["kind"], vol["label"])
 ```
 
+### Finding the other members from one of them
+
+Since 1.70, `--find-members` takes one member image and finds the others beside it:
+
+```
+qnxprobe.py --find-members --extract out.zip disk0.img
+```
+
+For each image given that holds a Linux md member or an LVM2 physical volume, qnxprobe
+looks in that image's folder for the other members. It goes by what each file records
+about itself, never by its name:
+
+- an md member is added when its superblock passes its checksum at a place the kernel
+  looks for it, read with the same code the assembly uses, and carries an array uuid
+  that the image given holds;
+- an LVM2 physical volume is added when its label is one lvm2 accepts, its own id is
+  listed under `physical_volumes` in the newest copy (highest seqno) of the metadata of
+  a volume group the image given holds, and its own metadata, when it has any, names
+  that group's id.
+
+Before anything is read, the report names the folder, the arrays and volume groups looked
+for, any `WARNING` (below), every other entry of the folder with what became of it and
+why, and the md roles or physical volumes that no file holds. A file added that also
+holds a member of some other array or volume group (on another partition, say) is read
+with it all the same, and the report names that identity as not one of the image given's,
+so not searched for. Each file added is then read exactly as if it had been typed on the
+command line, so the RAID section and the exit status are what they would be for the full
+list. Without `--find-members` nothing changes: `--list` prints the same bytes and exits
+with the same status as 1.69 on each of the 83 other fixture images and the 203 RAID
+member images given alone (the one-image LVM RAID fixture among them), and on each of the
+51 md fixture sets (the DDF set and the set stopped during a reshape among them) and the
+five-image LVM RAID set given in full.
+
+What the search looks at:
+
+- **The image's own folder only.** A subfolder is named and skipped, as are symbolic
+  links and anything that is not a regular file (a device, a pipe, a socket). One exception:
+  a differencing VHD in the folder makes the vendored reader open its parent disk where the
+  VHD's parent locator points, which can be an absolute path outside the folder (the reader
+  opens only a regular file there). Each file
+  that is opened is opened without blocking and without following a link (on systems that have
+  those open flags; Windows has neither), and checked through
+  the open descriptor to be the regular file it was when listed, before a byte is read,
+  so a file swapped for a pipe in between is refused rather than waited on. A raw file
+  and the segments of a split raw set are read only through descriptors checked that
+  way. An acquisition container (E01, VHD and the rest) is read by the vendored reader,
+  which opens its files by name: just before that, the file is checked again and every
+  entry of the folder whose name starts with its stem must be a regular file or a
+  folder; the moment between that check and the reader's own open is not closed.
+- **One file per member.** A member is named by its md array uuid and device uuid (0.90
+  records no device uuid, so its device number is used), or by its physical volume id.
+  A file with the same device and inode as one given is not opened; one with the same
+  device and inode as a file already looked at (a hard link) has only its first and last
+  512 bytes read, to tell what kind of file it is, and is then named as the same file. A
+  member the image given holds is always read from the
+  image given, never from another file. When another file holds a newer copy of it (md
+  events, lvm2 metadata seqno), or one as new with different bytes, the report gives a
+  `WARNING`, ahead of the list of files, naming that file and saying the copy given is stale or differs. Of
+  other files holding one member, the newest is used, as mdadm keeps the newer of two
+  members claiming one role (`Assemble.c` 841-843, mdadm-4.5). When the newest copies
+  are as new as each other, they are compared byte for byte over the whole partition or
+  image the member is on. If they are the same, the first looked at is used and the others
+  are named as its copies. If not, none is used: each is rejected as `ambiguous-member`,
+  and the member is reported missing, so the array is rebuilt without it where its level
+  allows and refused where it does not. mdadm itself refuses to assemble two 0.90
+  members with one role and the same event count (`Assemble.c` 820-838); this applies
+  that to 1.x members and to physical volumes as well. How lvm2 itself chooses between
+  duplicate physical volumes was not checked.
+- **Every place a member can begin.** Each file is opened as qnxprobe opens any image
+  (raw, a split raw set, E01 and the other containers the vendored ewfprobe reads), and
+  the whole image and each partition its MBR, EBR chain or GPT gives are read at the
+  places the assembly reads, so a member can be a partition. Acquisition containers are
+  opened first, then the first segment of each split raw set, then the rest, each in name
+  order; a file that one of them is read from (`disk1.E02`, `disk2.002`) is named as part
+  of it. An image given as its second segment is read as its whole set.
+- **Bounded reads.** At most 256 files are opened per search (`max_candidates`), the
+  first 256 by name; the rest are named as not opened. At most 64 MiB is read from any
+  one of them through qnxprobe's own reads (`read_budget`), besides the first and last
+  512 bytes of each file read to tell what kind of file it is, and a file that asks for
+  more, as a metadata area claiming to be larger would, is named as over the limit. A
+  file smaller than 2,048 bytes, the four sectors an LVM2 label can sit in, is named and
+  not opened. The reads an acquisition reader makes to open its container (an EWF set's
+  section tables, for one) are its own and not counted. The image given is read as it
+  needs, and so are two copies of one member compared byte for byte: the comparison stops
+  at the first difference, so copies that are the same are read in full.
+- **Files that do not open** (a split set with a hole, a damaged container, an encrypted
+  one without its password) are named with why and never stop the search. An encrypted
+  container is tried with the passwords and keys given with `--password-file`,
+  `--password-env` and `--private-key`.
+
+Not supported: folders read as images (an AFD folder, a sparse bundle) are skipped as
+folders; the search does not follow identities it finds in the files it adds (it looks
+for what the image given holds, one step); a volume group whose physical volumes are md
+arrays is found only through those arrays' members; DDF and Intel IMSM members are named,
+not searched for; and the window (`qnxprobe_gui.py`) does not offer the search yet. A
+0.90 member is told from another by its device number, and mdadm can give a disk added
+to an array a number a removed disk had (`Manage.c` 959-971, mdadm-4.5), so two different
+disks of one 0.90 array, the removed one and its replacement, can count as one member
+here: the one given is used if either is, otherwise the newer, or neither when they are
+as new as each other and differ.
+
+E01 is not among the committed fixtures, so the self-test covers containers with a fixed
+VHD and a split raw set. A manual test on 2026-10-16, not repeated by the self-test: a
+five-segment E01 of an md RAID5 member, written by `ewfacquire` 20140816 and read through
+the vendored ewfprobe 0.12.0, was found as a member (its other four segments named as
+part of it) and searched from as the image given, and the array read with it hashed to
+the bytes the kernel presented.
+
+From Python, `raid_siblings(path)` returns what the search found, and its `paths()` are
+what `raid_open()` takes:
+
+```python
+import qnxprobe as q
+
+found = q.raid_siblings("disk0.img")
+print("\n".join(found.lines()))
+for rec in found.added:
+    print(rec["path"], rec["files"], rec["identities"])
+for rec in found.rejected:
+    print(rec["path"], rec["code"], rec["why"])
+with q.raid_open(found.paths()) as rs:
+    for arr in rs.arrays:
+        print("\n".join(arr.lines()))
+```
+
+`raid_siblings(path, passwords=(), private_keys=(), also_given=(), max_candidates=256,
+min_bytes=2048, read_budget=64 MiB)` never raises for a file it cannot read; when the
+image given itself does not open, `error` says why. The result has `start`, `folder`,
+`given` (the files the image given is read from), `identities` (each md array and volume
+group looked for), `checked` (one record per other entry of the folder, in the order looked
+at, each with `path`, `status`, `code` and `why`), `added`, `rejected` (rejected and
+skipped), `missing` (md roles, or physical volumes by name and id, that no file given or
+found holds; a member whose copies were ambiguous is among them, and says so), `warnings`,
+`ambiguous` (each member whose newest copies differ: `files`, `identity`), `notes`,
+`lines()` and `describe()` (all of it as a dict for JSON). An added record also has
+`files`, every file its image is read from, `not_searched` when it also holds members of
+other arrays or volume groups, and `identities`, each member it holds that matched: for md the array uuid, name, metadata version, role, events and
+device uuid (0.90: device number); for LVM the physical volume's name and id, and the
+volume group's name, id and seqno. `also_given` takes images the caller already has: they
+are never added, and their members count as present.
+
+The statuses and codes: `added` (`md-array-uuid`, `lvm-vg-pv`); `part-of` (`segment`);
+`rejected`, opened and not used (`different-array`, `different-vg`, `pv-not-listed`,
+`duplicate-member`, `ambiguous-member`, `bad-metadata` for an md superblock magic or an
+LVM2 label that does not check out, `foreign-metadata` for DDF or IMSM metadata,
+`no-raid-metadata`, `unreadable`, `not-regular` or `changed` for a file that was not, when
+opened, the regular file it was when listed, `over-budget`); and `skipped`, not opened
+(`symlink`, `directory`, `not-regular`, `changed`, `same-file`, `too-small`, `over-limit`,
+and `unreadable` for an entry that could not even be looked at or opened).
+
+`--self-test` puts the member images of each of the 50 md sets that are not DDF in a
+folder of their own, with decoys beside them: a member of another array (of the same level
+for 48 of the 50 sets; the linear and RAID4 sets have no other set of their level), a copy
+of a member with one superblock byte changed so its checksum fails, a FAT12 image, a small
+text file, a symbolic link to a member, a subfolder holding a copy of a member, a hard link
+to a member, a byte copy of a member, and a split set with a hole. From each of the 194
+members it checks that exactly the other members are added and each decoy gets the status
+and code it is there for, that every member added carries the array uuid `mdadm --examine`
+gives the start, and that the roles reported missing are those no member file holds by
+`mdadm --examine`. Each of the 49 md arrays that are read is read from the members found to
+the sha256 and size of the device the kernel presented. The same is done for the five LVM
+RAID images with a physical volume of another volume group, a label whose checksum fails
+and a physical volume id the group does not list as decoys, and each of the three volumes
+read from the images found hashes to the kernel's bytes from each of the five starts.
+Members in a fixed VHD and in a split raw set are found and read to the kernel's bytes.
+Each rule is shown to matter by turning it off and seeing the comparison fail: the array
+uuid, the volume group id, the physical volume listing, symbolic links, subfolders, the
+same file, a second copy of a member, the size floor, and the superblock and label
+checksums (given its checksum again, the changed copy is no longer rejected for it). A linear or
+RAID0 member given alone does not read as its array. A search limited to two files names
+the rest as not opened and reports the members among them as missing, and with a 4,096-byte
+read limit every file that opens is rejected as over the limit and none is added.
+
+It also checks the cases an independent review raised, each shown to fail with its fix
+taken out: two files swapped for pipes just after they are listed are refused and the
+search returns (it runs in a thread with a 60-second limit; skipped where there are no
+pipes); two copies of a 0.90 RAID5 member as new as each other with 4 KiB different are
+both rejected as ambiguous, the role is reported missing and the array is rebuilt without
+it to the kernel's bytes; given one of those copies, it is used and the other raised as a
+warning; for metadata 1.2, three such copies with one different are all ambiguous, while
+two byte-for-byte copies give one member and the array reads to the kernel's bytes; two
+copies of an LVM2 physical volume with the same seqno and different bytes are ambiguous
+and the physical volume is reported missing; given an older copy of a member while the
+newer one is beside it, the copy given is used and the newer one named in a warning; an
+added physical volume that also holds an md superblock of another array names that array
+as not searched for; and the sibling checks and the free-space check leave no temporary
+folder behind.
+
 The layouts follow the kernel's own code (Linux v7.0) and mdadm's (4.5), each structure
 and rule cited where it is used in `qnxprobe.py` and listed under "Where the constants
 come from" below. The fixtures were written by `tools/make_raid_fixtures.sh`, and
