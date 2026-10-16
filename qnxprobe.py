@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.69"
+QNXPROBE_VERSION = "1.70"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -18717,11 +18717,9 @@ def _md_sb1(blob, at, minor, lbs=SECTOR):
                             f"{max_dev} its role table holds" if raid_disks > max_dev else None))
 
 
-def md_superblocks(fh, base, size, lbs=SECTOR):
-    """[MdSuper] for every md superblock that checks out on the member at `base`
-    of `size` bytes, at the places the kernel looks for each version. `lbs` is
-    the member's logical block size (512 unless the image says otherwise)."""
-    out = []
+def _md_places(size):
+    """[(metadata version, byte offset)] where the kernel looks for each md
+    superblock on a member of `size` bytes, each a 4096-byte read that fits."""
     sectors = size // SECTOR
     places = []
     if sectors >= 2 * (MD_RESERVED // SECTOR):
@@ -18729,9 +18727,15 @@ def md_superblocks(fh, base, size, lbs=SECTOR):
     if sectors > 16:
         places.append(("1.0", ((sectors - 16) & ~7) * SECTOR))
     places += [("1.1", 0), ("1.2", 4096)]
-    for version, at in places:
-        if at < 0 or at + 4096 > size:
-            continue
+    return [(version, at) for version, at in places if 0 <= at and at + 4096 <= size]
+
+
+def md_superblocks(fh, base, size, lbs=SECTOR):
+    """[MdSuper] for every md superblock that checks out on the member at `base`
+    of `size` bytes, at the places the kernel looks for each version. `lbs` is
+    the member's logical block size (512 unless the image says otherwise)."""
+    out = []
+    for version, at in _md_places(size):
         blob = read_at(fh, base + at, 4096)
         sb = _md_sb090(blob, at) if version == "0.90" else _md_sb1(blob, at, int(version[2]), lbs)
         if sb is not None and sb.bblog is not None and not _md_bad_blocks(fh, base, sb):
@@ -20399,6 +20403,984 @@ def raid_open(paths, passwords=(), private_keys=()):
     return rs
 
 
+# --- the other members of a RAID set, found beside one of them -----------------
+#
+# Given one member image, raid_siblings() looks in the same folder for the other
+# members by what each file records about itself, never by its name: an md
+# member by the array uuid in its superblock, an LVM2 physical volume by the
+# volume group id in its metadata and its own id among the physical volumes
+# that metadata lists. Every file in the folder is accounted for in the result:
+# added (and the identity that matched), part of a set opened from another
+# file, rejected (opened, and why it is not used), or skipped (not opened, and
+# why). Nothing is added without being named.
+
+RAID_SIBLING_MAX_CANDIDATES = 256      # files opened per search; the rest are named, not opened
+RAID_SIBLING_MIN_BYTES = 2048          # the four 512-byte sectors an LVM2 label may sit in (LvmPv)
+RAID_SIBLING_READ_BUDGET = 64 << 20    # bytes read from any one other file before it is given up
+
+
+class _SiblingBudget(Exception):
+    """A candidate asked for more bytes than the search reads from one file."""
+
+
+class _BudgetReader:
+    """A read-only view of an open image that refuses any read that would take
+    it past `budget` bytes in all, so a hostile file (a metadata area that says
+    it is gigabytes long) costs at most the budget."""
+
+    def __init__(self, fh, budget):
+        self._fh = fh
+        self.size = image_size(fh)
+        self.left = budget
+        self.spent = 0
+        self.over = False
+
+    def seek(self, offset, whence=0):
+        return self._fh.seek(offset, whence)
+
+    def tell(self):
+        return self._fh.tell()
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = max(0, self.size - self._fh.tell())
+        if n > self.left:
+            self.over = True
+            raise _SiblingBudget(f"a read of {n:,} bytes would pass the {self.spent + self.left:,} "
+                                 "bytes this search reads from one file")
+        self.left -= n
+        data = self._fh.read(n)
+        self.spent += len(data)
+        return data
+
+
+def _raid_identity_scan(fh):
+    """[(where, MdSuper or None, LvmPv or None, [problems], (base, size))] for each place a
+    member may begin on one open image, the whole image and each partition its
+    tables give (_raid_places), read with the same functions raid_assemble()
+    uses, so a match here is a member there. `problems` is [(code, text)]
+    naming RAID metadata that is present and does not check out
+    ("bad-metadata"), and RAID metadata of a kind this does not read
+    ("foreign-metadata"). A superblock found both from the whole image and from a
+    partition that ends where the image does belongs to the partition."""
+    size = image_size(fh)
+    gpt = parse_gpt(fh)
+    lbs = gpt.sector_size if gpt is not None else SECTOR      # as raid_assemble()
+    out, md_at = [], {}
+    for plabel, base, psize in _raid_places(fh, size):
+        psize = min(psize, size - base)
+        where = plabel.strip()
+        sb = md_member(fh, base, psize, lbs)
+        pv = _lvm_pv(fh, base, psize)
+        problems = []
+        if sb is None:
+            for version, at in _md_places(psize):
+                head = read_at(fh, base + at, 4)
+                if len(head) == 4 and MD_SB_MAGIC in struct.unpack("<I", head) + struct.unpack(">I", head):
+                    problems.append(("bad-metadata",
+                                     f"{where}: an md superblock magic at byte {base + at:,} (where "
+                                     f"metadata {version} puts it) whose superblock does not check "
+                                     "out (checksum or fields)"))
+            foreign = raid_foreign(fh, base, psize) if plabel == "whole image" else None
+            if foreign:
+                problems.append(("foreign-metadata",
+                                 f"{where}: {foreign} RAID metadata, which this does not read"))
+        if pv is None:
+            for sector in range(4):
+                if read_at(fh, base + sector * SECTOR, 8) == LVM_LABEL_ID:
+                    problems.append(("bad-metadata",
+                                     f"{where}: an LVM2 label in sector {sector} that lvm2 would "
+                                     "not accept (its sector number, checksum or type)"))
+                    break
+        if sb is not None:
+            key = base + sb.at
+            if key in md_at:
+                prev = md_at[key]
+                if psize < prev[1]:
+                    out[prev[0]] = (out[prev[0]][0], None) + out[prev[0]][2:]
+                else:
+                    sb = None
+            if sb is not None:
+                md_at[key] = (len(out), psize)
+        out.append((where, sb, pv, problems, (base, psize)))
+    return out
+
+
+def _md_member_key(sb):
+    """What names one device of an md array: its array uuid with, for metadata
+    1.x, the device uuid each member's superblock records (dev_uuid), and for
+    0.90, which records none, its device number."""
+    return ("md", sb.uuid, sb.dev_uuid if sb.major == 1 else sb.dev_number)
+
+
+def _md_identity(sb, where):
+    role = sb.role if isinstance(sb.role, int) else (sb.role or "spare")
+    out = {"kind": "md", "where": where, "array_uuid": sb.uuid_text(), "name": sb.name,
+           "metadata": sb.version, "level": MD_LEVELS.get(sb.level, sb.level),
+           "raid_disks": sb.raid_disks, "role": role, "events": sb.events}
+    if sb.major == 1:
+        out["device_uuid"] = ":".join(sb.dev_uuid[i:i + 4].hex() for i in range(0, 16, 4))
+    else:
+        out["device_number"] = sb.dev_number
+    return out
+
+
+def _lvm_listed(vg):
+    """{pv id without dashes: (pv name, pv id as written)} that a volume group
+    section lists."""
+    out = {}
+    for name, rec in (vg.get("physical_volumes") or {}).items():
+        if isinstance(rec, dict) and rec.get("id"):
+            out[_lvm_id(rec["id"])] = (name, rec["id"])
+    return out
+
+
+def _lvm_identity(pv, where, vg=None, listed=None):
+    """The identity of one physical volume: its own id, and the volume group
+    `vg` (name, section, seqno) it is matched to, its own metadata's when None."""
+    vg = vg or pv.vg
+    out = {"kind": "lvm", "where": where, "pv_uuid": pv.uuid}
+    if listed and _lvm_id(pv.uuid) in listed:
+        out["pv_name"], out["pv_uuid"] = listed[_lvm_id(pv.uuid)]
+    if vg:
+        out.update(vg_name=vg[0], vg_uuid=vg[1].get("id"), seqno=vg[2])
+    out["own_metadata"] = pv.vg is not None
+    return out
+
+
+class RaidSiblings:
+    """What raid_siblings() found. `start` is the image given; `folder` the
+    folder searched (that folder only); `given` the files the image given and
+    `also_given` are read from (a split set's segments, an acquisition's
+    files); `identities` the md arrays and LVM volume groups the image given
+    holds members of, which are what is looked for; `checked` a record per
+    other entry of the folder, in the order they were looked at, each
+    {"path", "status", "code", "why"} with status "added", "part-of",
+    "rejected" or "skipped", and for an added file "files" (every file read
+    for it) and "identities" (each member it holds that matched); `missing`
+    the members those identities name that no file given or found holds;
+    `warnings` what an examiner must see first (a newer copy, or one as new
+    with other bytes, of a member the image given holds); `ambiguous` each
+    member two or more files hold, as new as each other, with different bytes
+    ({"key", "files", "identity"}), none of which is used; `error` why the
+    image given could not be searched from, else None. An added record may
+    carry "not_searched": members of other arrays or volume groups in the
+    same file, which the run reads with it but were not looked for."""
+
+    def __init__(self, start, folder):
+        self.start, self.folder = start, folder
+        self.given, self.identities, self.checked, self.missing = [], [], [], []
+        self.error = None
+        self.notes, self.warnings, self.ambiguous = [], [], []
+        self.read_budget = RAID_SIBLING_READ_BUDGET
+
+    @property
+    def added(self):
+        return [c for c in self.checked if c["status"] == "added"]
+
+    @property
+    def rejected(self):
+        return [c for c in self.checked if c["status"] in ("rejected", "skipped")]
+
+    def paths(self):
+        """The image given, then each file added, as raid_open() takes them."""
+        return [self.start] + [c["path"] for c in self.added]
+
+    def describe(self):
+        return {"start": self.start, "folder": self.folder, "given": list(self.given),
+                "identities": list(self.identities), "checked": list(self.checked),
+                "missing": list(self.missing), "error": self.error, "notes": list(self.notes),
+                "warnings": list(self.warnings), "ambiguous": list(self.ambiguous),
+                "read_budget": self.read_budget}
+
+    def lines(self):
+        name = os.path.basename(self.start)
+        out = [f"folder    {self.folder} (this folder only, not its subfolders)"]
+        if len(self.given) > 1:
+            out.append(f"given     {name}, read from {len(self.given)} files: "
+                       + ", ".join(os.path.basename(g) for g in self.given))
+        if self.error:
+            out.append(f"NOT SEARCHED: {self.error}")
+            return out
+        for ident in self.identities:
+            out.append("looked for " + _sibling_identity_words(ident, short=False))
+        for warning in self.warnings:
+            out.append(f"WARNING   {warning}")
+        for note in self.notes:
+            out.append(f"note      {note}")
+        for c in self.checked:
+            label = {"added": "added", "part-of": "part of", "rejected": "not used",
+                     "skipped": "skipped"}[c["status"]]
+            text = f"{label:<9} {os.path.basename(c['path'])}: {c['why']}"
+            if c["status"] == "added" and len(c.get("files") or ()) > 1:
+                text += " (read from " + ", ".join(os.path.basename(f) for f in c["files"]) + ")"
+            out.append(text)
+            for other in c.get("not_searched") or ():
+                out.append(f"  also    {other}: not an identity of the image given, so it was "
+                           "not searched for; it is read with this file all the same")
+        for m in self.missing:
+            out.append(f"missing   {m['why']}")
+        if not self.identities:
+            return out
+        opened = sum(1 for c in self.checked if c["status"] in ("added", "rejected"))
+        out.append(f"checked   {len(self.checked)} other entries in the folder, opened "
+                   f"{opened}, added {len(self.added)}; at most {self.read_budget:,} bytes "
+                   "read from each file opened")
+        return out
+
+
+def _sibling_identity_words(ident, short=True):
+    if ident["kind"] == "md":
+        words = f"md member of array {ident['array_uuid']}"
+        if ident.get("name"):
+            words += f" ({ident['name']})"
+        if ident.get("where") not in (None, "", "whole image"):
+            words = f"{ident['where']}: {words}"
+        if short:
+            role = ident["role"]
+            words += (f", role {role}" if isinstance(role, int) else f", {role}")
+            words += f", metadata {ident['metadata']}, events {ident['events']:,}"
+            words += (f", device uuid {ident['device_uuid']}" if "device_uuid" in ident
+                      else f", device number {ident['device_number']}")
+        else:
+            words = (f"md array {ident['array_uuid']}"
+                     + (f" ({ident['name']})" if ident.get("name") else "")
+                     + f", {ident['level']} of {ident['raid_disks']} members, metadata "
+                     f"{ident['metadata']}")
+        return words
+    if short:
+        words = f"LVM2 physical volume {ident.get('pv_name') or ''} (id {ident['pv_uuid']})".replace("  ", " ")
+        if ident.get("where") not in (None, "", "whole image"):
+            words = f"{ident['where']}: {words}"
+        words += f" of volume group {ident.get('vg_name')} (id {ident.get('vg_uuid')})"
+        if not ident.get("own_metadata"):
+            words += ", which carries no volume group metadata of its own; its id is listed in the group's"
+        return words
+    return (f"LVM2 volume group {ident['vg_name']} (id {ident['vg_uuid']}), seqno "
+            f"{ident['seqno']}, {ident['pvs']} physical volume(s) listed")
+
+
+def _sibling_image_files(fh, path):
+    """Every file an open image is read from, as absolute paths."""
+    files = list(getattr(fh, "paths", None) or [])
+    return [os.path.abspath(f) for f in files] or [os.path.abspath(path)]
+
+
+def _sibling_inode(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _sibling_open(path, passwords, private_keys):
+    segments = [] if acquisition_format(path) else split_segments(path)
+    return open_image_trying(path, segments, passwords, private_keys)
+
+
+class _SiblingChanged(Exception):
+    """A file of the folder did not open, or is not, when opened, the regular
+    file it was when listed. `code` says which ("unreadable", "not-regular",
+    "changed"). Not an OSError, so read_at() does not turn it into a short read."""
+
+    def __init__(self, text, code="changed"):
+        super().__init__(text)
+        self.code = code
+
+
+def _sibling_fd_open(path, expect=None):
+    """(file object, (device, inode), size) for `path`, opened without
+    blocking and without following a final symbolic link, and checked through
+    the descriptor itself: anything that is not a regular file, or not the
+    file `expect` names, is refused before a byte is read. A pipe opened this
+    way returns at once instead of waiting for a writer, so a file swapped for
+    one after it was listed cannot hang the search."""
+    import stat
+    flags = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_BINARY", 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise _SiblingChanged(f"it did not open ({type(exc).__name__}: {exc})",
+                              "unreadable") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _SiblingChanged("when opened it was not a regular file (a device, pipe or "
+                                  "socket), so nothing was read from it", "not-regular")
+        if expect is not None and (st.st_dev, st.st_ino) != tuple(expect):
+            raise _SiblingChanged("when opened it was a different file from the one listed "
+                                  "(another device and inode), so nothing was read from it")
+        return os.fdopen(fd, "rb"), (st.st_dev, st.st_ino), st.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class _SiblingSegments(SegmentedImage):
+    """A split raw set read as SegmentedImage reads it, each segment opened by
+    _sibling_fd_open() and held to the device and inode it had when first
+    opened (and the candidate's own to the one it had when listed)."""
+
+    def __init__(self, paths, first=None):
+        super().__init__(paths)
+        self._ino = {}
+        if first is not None:
+            self._ino[0] = first
+
+    def _handle(self, i):
+        fh = self._open.get(i)
+        if fh is not None:
+            self._open.move_to_end(i)
+            return fh
+        fh, ino, size = _sibling_fd_open(self.paths[i], self._ino.get(i))
+        if size != self.sizes[i]:
+            fh.close()
+            raise _SiblingChanged(f"{os.path.basename(self.paths[i])} changed size while it "
+                                  "was looked at")
+        self._ino[i] = ino
+        self._open[i] = fh
+        while len(self._open) > self.MAX_OPEN:
+            self._open.popitem(last=False)[1].close()
+        return fh
+
+
+def _sibling_kind(fh, size, name):
+    """"container" when the first or last 512 bytes, read through the open
+    descriptor, carry a signature of a container open_image() hands to the
+    vendored reader (the ones acquisition_format() and virtual_disk_kind()
+    test), "split" for a name ending in a number, else "raw"."""
+    head = read_at(fh, 0, 512)
+    tail = read_at(fh, max(0, size - 512), 512)
+    text = head[3:] if head.startswith(b"\xef\xbb\xbf") else head
+    if (head[:8] in (EWF_SIGNATURE, EWF2_SIGNATURE, AFF_SIGNATURE, L01_SIGNATURE, LX01_SIGNATURE,
+                     AD1_SIGNATURE[:8], DMG_ENCRYPTED_SIGNATURE, ADCRYPT_SIGNATURE, VHDX_SIGNATURE)
+            or head[:4] in (b"AFF\x00", SPARSEIMAGE_SIGNATURE, ZIP_SIGNATURE, VMDK_SPARSE_MAGIC,
+                            VMDK_COWD_MAGIC, QCOW_MAGIC)
+            or text[:len(VMDK_DESCRIPTOR_START)].lower() == VMDK_DESCRIPTOR_START.lower()
+            or VHD_COOKIE in (tail[:8], tail[1:9], head[:8])
+            or tail[:4] == UDIF_TRAILER):
+        return "container"
+    _stem, dot, suffix = name.rpartition(".")
+    if dot and suffix.isascii() and suffix.isdigit():
+        return "split"
+    return "raw"
+
+
+def _sibling_open_candidate(full, kind, listed, passwords, private_keys):
+    """(open image, [files it is read from]) for one file of the folder, opened
+    as `kind` says. A raw file is read only through the descriptor opened and
+    checked by _sibling_fd_open(); a split set through _SiblingSegments. An
+    acquisition container is read by its reader, which opens its files by name:
+    just before that, the file is checked to be the regular file it was when
+    listed, and every entry of the folder whose name starts with its stem
+    (where a container's other files are) to be a regular file or a folder."""
+    import stat
+    if kind == "split":
+        try:
+            segments = split_segments(full)
+        except SplitImageError as exc:
+            raise _SiblingChanged(f"it did not open (SplitImageError: {exc})",
+                                  "unreadable") from None
+        if segments:
+            image = _SiblingSegments(segments, listed if segments[0] == full else None)
+            return image, [os.path.abspath(p) for p in segments]
+        kind = "raw"
+    if kind == "raw":
+        fh, _ino, _size = _sibling_fd_open(full, listed)
+        return fh, [os.path.abspath(full)]
+    st = os.lstat(full)
+    if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != tuple(listed):
+        raise _SiblingChanged("it changed after it was listed (not the same regular file), "
+                              "so it was not handed to its reader")
+    folder, name = os.path.split(full)
+    stem = name.split(".", 1)[0]
+    for entry in os.listdir(folder):
+        if entry.startswith(stem):
+            est = os.lstat(os.path.join(folder, entry))
+            if not (stat.S_ISREG(est.st_mode) or stat.S_ISDIR(est.st_mode)):
+                raise _SiblingChanged(f"{entry}, beside it under the same name, is not a "
+                                      "regular file, and its reader opens a container's "
+                                      "files by name, so it was not opened")
+    image = _sibling_open(full, passwords, private_keys)
+    if _sibling_inode(full) != tuple(listed):
+        image.close()
+        raise _SiblingChanged("it changed while its reader opened it")
+    return image, _sibling_image_files(image, full)
+
+
+def _sibling_scan_file(opener, budget):
+    """(files, regions, error) for one image opened by `opener()`, which
+    returns (image, files): _raid_identity_scan() of it within the read
+    budget (None for no limit), or why it could not be opened or read."""
+    try:
+        fh, files = opener()
+    except ImagePasswordError as exc:
+        return None, None, ("unreadable", f"it did not open: {exc} (give its password or "
+                                          "key to use it)")
+    except _SiblingChanged as exc:
+        return None, None, (exc.code, str(exc))
+    except Exception as exc:                           # pylint: disable=broad-except
+        return None, None, ("unreadable", f"it did not open ({type(exc).__name__}: {exc})")
+    try:
+        view = _BudgetReader(fh, budget) if budget is not None else fh
+        try:
+            regions = _raid_identity_scan(view)
+        except _SiblingBudget as exc:
+            return files, None, ("over-budget", f"not read past the search's limit: {exc}")
+        except _SiblingChanged as exc:
+            return files, None, (exc.code, str(exc))
+        except Exception as exc:                       # pylint: disable=broad-except
+            return files, None, ("unreadable", f"its RAID metadata could not be read "
+                                               f"({type(exc).__name__}: {exc})")
+        if getattr(view, "over", False):
+            return files, None, ("over-budget", "not read past the search's limit of "
+                                                f"{budget:,} bytes from one file")
+        return files, regions, None
+    finally:
+        try:
+            fh.close()
+        except Exception:                              # pylint: disable=broad-except
+            pass
+
+
+def _sibling_same_bytes(open_a, span_a, open_b, span_b, step=1 << 20):
+    """True when two members hold the same bytes over their whole region
+    (the partition or image the superblock or label was found on): equal
+    length, then compared a MiB at a time to the first difference. Each
+    opener returns (image, files). False when either cannot be read."""
+    if span_a[1] != span_b[1]:
+        return False
+    try:
+        a, _fa = open_a()
+    except Exception:                                  # pylint: disable=broad-except
+        return False
+    try:
+        b, _fb = open_b()
+    except Exception:                                  # pylint: disable=broad-except
+        a.close()
+        return False
+    try:
+        off, size = 0, span_a[1]
+        while off < size:
+            n = min(step, size - off)
+            x, y = read_at(a, span_a[0] + off, n), read_at(b, span_b[0] + off, n)
+            if len(x) != n or x != y:
+                return False
+            off += n
+        return True
+    except Exception:                                  # pylint: disable=broad-except
+        return False
+    finally:
+        a.close()
+        b.close()
+
+
+def raid_siblings(path, passwords=(), private_keys=(), also_given=(),
+                  max_candidates=RAID_SIBLING_MAX_CANDIDATES,
+                  min_bytes=RAID_SIBLING_MIN_BYTES, read_budget=RAID_SIBLING_READ_BUDGET,
+                  _ignore=()):
+    """A RaidSiblings for the image at `path`: the other members of the md
+    arrays and LVM2 volume groups it holds members of, found in its folder by
+    the identity each file records. Never raises for a file it cannot read; an
+    image given that cannot be opened is said in `error`.
+
+    The rule: an md member is added when its superblock checks out at a place
+    the kernel looks (md_member(), as raid_assemble() reads it) and its array
+    uuid is one the image given holds. An LVM2 physical volume is added when
+    its label is one lvm2 accepts and its own id is listed under
+    physical_volumes in the newest metadata (highest seqno) of a volume group
+    the image given holds, and its own metadata, when it has any, names that
+    group's id.
+
+    One file per member (the same md array and device uuid, 0.90's device
+    number, or the same physical volume id). A member the image given or
+    `also_given` holds is never taken from another file; a newer copy of it
+    (md events, lvm2 metadata seqno), or one as new whose bytes differ, is
+    named in `warnings`. Of other files holding one member, the newest is
+    used, as md keeps the newer of two members claiming one role (mdadm
+    Assemble.c 841-843); when the newest are as new as each other, they are
+    compared over the member's whole region: byte for byte the same, the
+    first looked at is used and the others named as copies of it; otherwise
+    none is used, each is rejected as "ambiguous-member", and the member is
+    reported missing (mdadm refuses two 0.90 members with one role and equal
+    events, Assemble.c 820-838; this applies that to 1.x and LVM too).
+
+    A file that is the same file as one given or one looked at already (same
+    device and inode) is not opened. Only the folder itself is searched;
+    symbolic links, folders and anything that is not a regular file are
+    skipped and named. Every other file is opened without blocking and checked
+    through its descriptor (_sibling_fd_open), and raw files and split sets
+    are read only through descriptors so checked; an acquisition container is
+    checked again just before its reader opens it by name
+    (_sibling_open_candidate). Containers are opened first, then split sets,
+    then the rest, each by name; a file one of them is read from is named as
+    part of it. At most `max_candidates` files are opened (the first by name;
+    the rest are named, not opened), and at most `read_budget` bytes read from
+    each through qnxprobe's own reads (the image given is read as it needs,
+    and so are two copies of a member compared byte for byte). `_ignore` turns
+    a rule off, for the self-test's controls only."""
+    import stat
+    start = os.path.abspath(path)
+    res = RaidSiblings(start, os.path.dirname(start))
+    res.read_budget = read_budget
+    ign = set(_ignore)
+
+    def given_opener(image_path):
+        def opener():
+            image = _sibling_open(image_path, passwords, private_keys)
+            return image, _sibling_image_files(image, image_path)
+        return opener
+
+    try:
+        fh = _sibling_open(path, passwords, private_keys)
+    except Exception as exc:                           # pylint: disable=broad-except
+        res.error = f"{os.path.basename(start)} did not open ({type(exc).__name__}: {exc})"
+        res.given = [start]
+        return res
+    try:
+        res.given = _sibling_image_files(fh, path)
+        try:
+            # read in full where it needs: the examiner named this image
+            start_regions = _raid_identity_scan(fh)
+        except Exception as exc:                       # pylint: disable=broad-except
+            res.error = (f"the RAID metadata of {os.path.basename(start)} could not be read "
+                         f"({type(exc).__name__}: {exc})")
+            return res
+    finally:
+        try:
+            fh.close()
+        except Exception:                              # pylint: disable=broad-except
+            pass
+
+    # What is present already: the image given, and any the caller also has.
+    present_files = set(res.given)
+    present_inodes = {}
+    for f in res.given:
+        ino = _sibling_inode(f)
+        if ino is not None:
+            present_inodes.setdefault(ino, f)
+    held = {}                         # member key: (file holding it, score, span, opener)
+    present_regions = []              # (file, where, sb, pv, span, opener)
+    for where, sb, pv, _p, span in start_regions:
+        present_regions.append((start, where, sb, pv, span, given_opener(path)))
+    for other in also_given:
+        other_abs = os.path.abspath(other)
+        files, regions, err = _sibling_scan_file(given_opener(other), None)
+        for f in files or [other_abs]:
+            present_files.add(f)
+            ino = _sibling_inode(f)
+            if ino is not None:
+                present_inodes.setdefault(ino, f)
+        if err is None:
+            for where, sb, pv, _p, span in regions:
+                present_regions.append((other_abs, where, sb, pv, span, given_opener(other)))
+    for owner, _where, sb, pv, span, opener in present_regions:
+        if sb is not None:
+            held.setdefault(_md_member_key(sb), (owner, sb.events, span, opener))
+        if pv is not None:
+            held.setdefault(("lvm", _lvm_id(pv.uuid)), (owner, pv.vg[2] if pv.vg else -1,
+                                                        span, opener))
+
+    md_targets = collections.OrderedDict()            # array uuid: first MdSuper seen
+    for _w, sb, _pv, _p, _s in start_regions:
+        if sb is not None and sb.uuid not in md_targets:
+            md_targets[sb.uuid] = sb
+    vg_targets = collections.OrderedDict()            # vg id: (name, section, seqno), newest
+    start_pv_ids = set()
+    for _w, _sb, pv, _p, _s in start_regions:
+        if pv is None:
+            continue
+        start_pv_ids.add(_lvm_id(pv.uuid))
+        if pv.vg:
+            vid = pv.vg[1].get("id")
+            if vid not in vg_targets or pv.vg[2] > vg_targets[vid][2]:
+                vg_targets[vid] = pv.vg
+    for _w, _sb, _pv, problems, _s in start_regions:
+        res.notes += [text for _code, text in problems]
+
+    if not md_targets and not any(pv is not None for _w, _sb, pv, _p, _s in start_regions):
+        res.notes.append(f"{os.path.basename(start)} holds no md member or LVM2 physical "
+                         "volume this reads, so nothing was looked for")
+        return res
+
+    # The folder's entries, by name; each one is accounted for.
+    try:
+        names = sorted(os.listdir(res.folder))
+    except OSError as exc:
+        res.error = f"the folder could not be listed ({type(exc).__name__}: {exc})"
+        return res
+    entries = []
+    for name in names:
+        full = os.path.join(res.folder, name)
+        if full in present_files:
+            continue
+        try:
+            st = os.lstat(full)
+        except OSError as exc:
+            res.checked.append({"path": full, "status": "skipped", "code": "unreadable",
+                                "why": f"it could not be looked at ({type(exc).__name__}: {exc})"})
+            continue
+        if stat.S_ISLNK(st.st_mode) and "symlink" not in ign:
+            res.checked.append({"path": full, "status": "skipped", "code": "symlink",
+                                "why": "a symbolic link, which this does not follow"})
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+        if stat.S_ISDIR(st.st_mode):
+            if "directory" not in ign:
+                res.checked.append({"path": full, "status": "skipped", "code": "directory",
+                                    "why": "a folder; only this folder is searched, not "
+                                           "its subfolders"})
+                continue
+            try:
+                for inner in sorted(os.listdir(full)):
+                    inner_full = os.path.join(full, inner)
+                    if os.path.isfile(inner_full) and not os.path.islink(inner_full):
+                        entries.append((inner_full, os.stat(inner_full)))
+            except OSError:
+                pass
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            res.checked.append({"path": full, "status": "skipped", "code": "not-regular",
+                                "why": "not a regular file (a device, pipe or socket), "
+                                       "which this does not open"})
+            continue
+        entries.append((full, st))
+    candidates = []
+    for full, st in entries:
+        ino = (st.st_dev, st.st_ino)
+        if ino in present_inodes and "same_file" not in ign:
+            res.checked.append({"path": full, "status": "skipped", "code": "same-file",
+                                "why": f"the same file as {os.path.basename(present_inodes[ino])} "
+                                       "(same device and inode), which is already given"})
+            continue
+        if st.st_size < min_bytes and "size" not in ign:
+            res.checked.append({"path": full, "status": "skipped", "code": "too-small",
+                                "why": f"{st.st_size:,} bytes, smaller than the {min_bytes:,} an "
+                                       "LVM2 label or an md superblock needs"})
+            continue
+        candidates.append((full, ino))
+    for full, _ino in candidates[max_candidates:]:
+        res.checked.append({"path": full, "status": "skipped", "code": "over-limit",
+                            "why": f"not opened: this search opens at most {max_candidates:,} "
+                                   "files"})
+    # What each is, from its own bytes read through a checked descriptor.
+    kinds = []
+    for full, ino in candidates[:max_candidates]:
+        try:
+            fh, _i, size = _sibling_fd_open(full, ino)
+        except _SiblingChanged as exc:
+            res.checked.append({"path": full, "status": "skipped", "code": exc.code,
+                                "why": str(exc)})
+            continue
+        try:
+            kind = _sibling_kind(fh, size, os.path.basename(full))
+        finally:
+            fh.close()
+        _stem, _dot, suffix = os.path.basename(full).rpartition(".")
+        rank = (0 if kind == "container" else
+                1 if kind == "split" and int(suffix) in (0, 1) else 2)
+        kinds.append((rank, os.path.basename(full), full, ino, kind))
+    kinds.sort()
+
+    def candidate_opener(full, kind, ino):
+        return lambda: _sibling_open_candidate(full, kind, ino, passwords, private_keys)
+
+    # Open and read each, in that order; a file another one's image is read
+    # from is part of that one.
+    consumed = {}
+    scanned = []
+    seen_inodes = {}
+    for _rank, _name, full, ino, kind in kinds:
+        if ino in seen_inodes and "same_file" not in ign:
+            res.checked.append({"path": full, "status": "skipped", "code": "same-file",
+                                "why": f"the same file as {os.path.basename(seen_inodes[ino])} "
+                                       "(same device and inode), looked at already"})
+            continue
+        seen_inodes.setdefault(ino, full)
+        if full in consumed:
+            res.checked.append({"path": full, "status": "part-of", "code": "segment",
+                                "why": f"one of the files {os.path.basename(consumed[full])} is "
+                                       "read from, looked at with it"})
+            continue
+        opener = candidate_opener(full, kind, ino)
+        files, regions, err = _sibling_scan_file(opener, read_budget)
+        files = files or [full]
+        rec = {"path": full, "files": files}
+        clash = None
+        for f in files:
+            if f != full:
+                consumed.setdefault(f, full)
+            fino = _sibling_inode(f)
+            if f in present_files or (fino in present_inodes and "same_file" not in ign):
+                clash = present_inodes.get(fino, f)
+        if clash is not None:
+            rec.update(status="skipped", code="same-file",
+                       why=f"its image is read from {os.path.basename(clash)}, a file already given")
+            res.checked.append(rec)
+            continue
+        if err is not None:
+            rec.update(status="rejected", code=err[0], why=err[1])
+            res.checked.append(rec)
+            continue
+        res.checked.append(rec)
+        scanned.append((rec, regions, opener))
+
+    # A start whose physical volume carries no metadata: the volume groups
+    # whose metadata lists it.
+    for _rec, regions, _o in scanned:
+        for _w, _sb, pv, _p, _s in regions:
+            if pv is not None and pv.vg and start_pv_ids & set(_lvm_listed(pv.vg[1])):
+                vid = pv.vg[1].get("id")
+                if vid not in vg_targets or pv.vg[2] > vg_targets[vid][2]:
+                    vg_targets[vid] = pv.vg
+    # The newest copy of each volume group's metadata among the files that name it.
+    for _rec, regions, _o in scanned:
+        for _w, _sb, pv, _p, _s in regions:
+            if pv is not None and pv.vg and pv.vg[1].get("id") in vg_targets:
+                vid = pv.vg[1].get("id")
+                if pv.vg[2] > vg_targets[vid][2]:
+                    vg_targets[vid] = pv.vg
+    listed = {vid: _lvm_listed(vg[1]) for vid, vg in vg_targets.items()}
+
+    # Each file's members that match, before any is chosen.
+    hits_of = []
+    for rec, regions, opener in scanned:
+        hits, other, bad = [], [], []
+        for index, (where, sb, pv, problems, span) in enumerate(regions):
+            bad += problems
+            if sb is not None:
+                if sb.uuid in md_targets or "identity" in ign:
+                    hits.append((_md_member_key(sb), _md_identity(sb, where), "md-array-uuid",
+                                 sb.events, "events", span, index))
+                else:
+                    other.append(("different-array",
+                                  f"{where}: an md member of a different array, "
+                                  f"{sb.uuid_text()}" + (f" ({sb.name})" if sb.name else "")))
+            if pv is not None:
+                vid = pv.vg[1].get("id") if pv.vg else None
+                pid = _lvm_id(pv.uuid)
+                group = None
+                if vid is not None and (vid in vg_targets or "identity" in ign):
+                    group = vg_targets.get(vid, pv.vg)
+                    if pid not in listed.get(vid, _lvm_listed(pv.vg[1])) and "pv_listed" not in ign:
+                        other.append(("pv-not-listed",
+                                      f"{where}: an LVM2 physical volume (id {pv.uuid}) whose own "
+                                      f"metadata names volume group {pv.vg[0]} (id {vid}), but the "
+                                      f"newest metadata of that group (seqno {group[2]}) does not "
+                                      "list its id"))
+                        group = None
+                elif vid is None:
+                    for tid, ids in listed.items():
+                        if pid in ids:
+                            group = vg_targets[tid]
+                            break
+                    if group is None:
+                        other.append(("pv-not-listed",
+                                      f"{where}: an LVM2 physical volume (id {pv.uuid}) with no "
+                                      "volume group metadata of its own, whose id no volume group "
+                                      "looked for lists"))
+                else:
+                    other.append(("different-vg",
+                                  f"{where}: an LVM2 physical volume of a different volume group, "
+                                  f"{pv.vg[0]} (id {vid})"))
+                if group is not None:
+                    hits.append((("lvm", pid), _lvm_identity(pv, where, group, _lvm_listed(group[1])),
+                                 "lvm-vg-pv", pv.vg[2] if pv.vg else -1, "metadata seqno", span,
+                                 index))
+        hits_of.append((rec, hits, other, bad, opener))
+
+    # Which file each member is taken from (see the docstring).
+    by_key = collections.OrderedDict()
+    for order, (rec, hits, _o, _b, opener) in enumerate(hits_of):
+        for key, ident, _code, score, unit, span, _i in hits:
+            by_key.setdefault(key, []).append((order, rec, score, unit, span, opener, ident))
+    verdict = {}                    # (order, key): ("use", None) or (code, why)
+    for key, holders in by_key.items():
+        if "duplicate" in ign:
+            for h in holders:
+                verdict[(h[0], key)] = ("use", None)
+            continue
+        if key in held:
+            owner, gscore, gspan, gopen = held[key]
+            gname = os.path.basename(owner)
+            for order, rec, score, unit, span, opener, ident in holders:
+                name = os.path.basename(rec["path"])
+                if score > gscore:
+                    res.warnings.append(
+                        f"a newer copy of the member you gave is beside it: {name}, {unit} "
+                        f"{score:,} > {gscore:,} in {gname}; {gname} is used as given, and "
+                        f"its copy of that member is stale ({_sibling_identity_words(ident)})")
+                    why = (f"a newer copy ({unit} {score:,}) of the member {gname} holds "
+                           f"({unit} {gscore:,}); {gname} is used as given")
+                elif score == gscore and _sibling_same_bytes(gopen, gspan, opener, span):
+                    why = f"a byte-for-byte copy of the member {gname} holds, which is used"
+                elif score == gscore:
+                    res.warnings.append(
+                        f"{name} holds the member {gname} holds, as new ({unit} {score:,}) "
+                        f"but with different bytes; {gname} is used as given "
+                        f"({_sibling_identity_words(ident)})")
+                    why = (f"the member {gname} holds, as new ({unit} {score:,}) but with "
+                           f"different bytes; {gname} is used as given")
+                else:
+                    why = (f"an older copy ({unit} {score:,}) of the member {gname} holds "
+                           f"({unit} {gscore:,}), which is used")
+                verdict[(order, key)] = ("duplicate-member",
+                                         f"{why} ({_sibling_identity_words(ident)})")
+            continue
+        top = max(h[2] for h in holders)
+        tops = [h for h in holders if h[2] == top]
+        first = tops[0]
+        same = all(_sibling_same_bytes(first[5], first[4], h[5], h[4]) for h in tops[1:])
+        names = ", ".join(os.path.basename(h[1]["path"]) for h in tops)
+        if len(tops) > 1 and not same:
+            names = ", ".join(os.path.basename(h[1]["path"]) for h in tops)
+            res.ambiguous.append({"key": list(key), "files": [h[1]["path"] for h in tops],
+                                  "identity": first[6]})
+        for order, rec, score, unit, span, opener, ident in holders:
+            fname = os.path.basename(first[1]["path"])
+            words = _sibling_identity_words(ident)
+            if len(tops) > 1 and not same and score == top:
+                verdict[(order, key)] = ("ambiguous-member",
+                                         f"{names} each hold this member, as new as each other "
+                                         f"({unit} {top:,}) but with different bytes, so none "
+                                         f"of them is used and the member counts as missing "
+                                         f"({words})")
+            elif score < top:
+                verdict[(order, key)] = ("duplicate-member",
+                                         f"an older copy ({unit} {score:,}) of the member "
+                                         + (f"{fname} holds ({unit} {top:,}), which is used"
+                                            if same or len(tops) == 1 else
+                                            f"whose newest copies differ ({names})")
+                                         + f" ({words})")
+            elif order == first[0]:
+                verdict[(order, key)] = ("use", None)
+            else:
+                verdict[(order, key)] = ("duplicate-member",
+                                         f"a byte-for-byte copy of the member {fname} holds, "
+                                         f"which is used ({words})")
+
+    used_regions = {}
+    for order, (rec, hits, other, bad, _op) in enumerate(hits_of):
+        matched, dup, amb = [], [], []
+        for key, ident, code, _score, _unit, _span, index in hits:
+            v = verdict[(order, key)]
+            if v[0] == "use":
+                matched.append((key, ident, code, index))
+            elif v[0] == "ambiguous-member":
+                amb.append(v[1])
+            else:
+                dup.append(v[1])
+        not_searched = [t for c, t in other if c in ("different-array", "different-vg")]
+        if matched:
+            used_regions[order] = [m[3] for m in matched]
+            rec.update(status="added", code=matched[0][2],
+                       identities=[m[1] for m in matched],
+                       why="; ".join(_sibling_identity_words(m[1]) for m in matched)
+                       + ("; also " + "; ".join(amb + dup) if amb or dup else ""))
+            if not_searched:
+                rec["not_searched"] = not_searched
+        elif amb:
+            rec.update(status="rejected", code="ambiguous-member", why="; ".join(amb + dup))
+        elif dup:
+            rec.update(status="rejected", code="duplicate-member", why="; ".join(dup))
+        elif other:
+            rec.update(status="rejected", code=other[0][0], why="; ".join(t for _c, t in other))
+        elif bad:
+            codes = [code for code, _t in bad]
+            rec.update(status="rejected",
+                       code="bad-metadata" if "bad-metadata" in codes else codes[0],
+                       why="; ".join(text for _c, text in bad))
+        else:
+            rec.update(status="rejected", code="no-raid-metadata",
+                       why="no md superblock or LVM2 label that checks out, on the whole "
+                           "image or any partition its tables give")
+
+    # What is still missing: the members no file given or used holds.
+    have = [(sb, pv) for _o, _w, sb, pv, _s, _op in present_regions]
+    for order, (rec, regions, _op) in enumerate(scanned):
+        for index in used_regions.get(order, []):
+            have.append((regions[index][1], regions[index][2]))
+    amb_md = {}
+    amb_lvm = {}
+    for a in res.ambiguous:
+        names = ", ".join(os.path.basename(f) for f in a["files"])
+        if a["identity"]["kind"] == "md":
+            amb_md.setdefault(a["identity"]["array_uuid"], []).append(
+                f"role {a['identity']['role']} (in {names}, which differ)")
+        else:
+            amb_lvm.setdefault(a["identity"]["vg_uuid"], []).append(
+                f"{a['identity'].get('pv_name') or a['identity']['pv_uuid']} (in {names}, "
+                "which differ)")
+    for uuid_, first in md_targets.items():
+        sbs = [sb for sb, _pv in have if sb is not None and sb.uuid == uuid_]
+        active = [sb for sb in sbs if sb.role is not None]
+        fresh = max(active or sbs or [first], key=lambda s: s.events)
+        roles = {sb.role for sb in sbs if isinstance(sb.role, int)}
+        gone = [r for r in range(fresh.raid_disks) if r not in roles]
+        ident = _md_identity(fresh, "")
+        res.identities.append(ident)
+        if gone:
+            extra = amb_md.get(ident["array_uuid"])
+            res.missing.append({"kind": "md", "array_uuid": ident["array_uuid"], "roles": gone,
+                                "why": f"array {ident['array_uuid']}: role(s) "
+                                       f"{', '.join(map(str, gone))} of {fresh.raid_disks} are in "
+                                       "no file given or used"
+                                       + (f"; ambiguous: {'; '.join(extra)}" if extra else "")})
+    for vid, vg in vg_targets.items():
+        ids = listed[vid]
+        res.identities.append({"kind": "lvm", "vg_name": vg[0], "vg_uuid": vid, "seqno": vg[2],
+                               "pvs": len(ids)})
+        found_ids = {_lvm_id(pv.uuid) for _sb, pv in have if pv is not None}
+        gone = [g for k, g in sorted(ids.items(), key=lambda kv: kv[1][0]) if k not in found_ids]
+        if gone:
+            extra = amb_lvm.get(vid)
+            res.missing.append({"kind": "lvm", "vg_uuid": vid, "pvs": [list(g) for g in gone],
+                                "why": f"volume group {vg[0]}: physical volume(s) "
+                                       + ", ".join(f"{n} (id {i})" for n, i in gone)
+                                       + " are in no file given or used"
+                                       + (f"; ambiguous: {'; '.join(extra)}" if extra else "")})
+    if start_pv_ids and not vg_targets:
+        res.notes.append("the LVM2 physical volume(s) given carry no volume group metadata, "
+                         "and no file here has metadata that lists them")
+    return res
+
+
+def _cli_find_members(paths, passwords, private_keys, say=print):
+    """--find-members: the images given, then each file the search beside each
+    of them added, named before anything is read; each is then read exactly as
+    if it had been given."""
+    images = list(paths)
+    found = []
+    for path in paths:
+        res = raid_siblings(path, passwords, private_keys,
+                            also_given=[other for other in images if other != path])
+        found.append(res)
+        for rec in res.added:
+            ino = _sibling_inode(rec["path"])
+            if not any(ino == _sibling_inode(other) for other in images):
+                images.append(rec["path"])
+    raid_siblings_report(found, say=say)
+    return images
+
+
+def raid_siblings_report(found, say=print):
+    """Print what raid_siblings() found for each image, before the run reads them."""
+    for res in found:
+        say("=" * 78)
+        say(f"RAID members beside {os.path.basename(res.start)}, by recorded identity "
+            "(--find-members)")
+        say("=" * 78)
+        for ln in res.lines():
+            say("  " + ln)
+        say("")
+
+
 def raid_unread(arr, images_given=None):    # pylint: disable=unused-argument
     """True when `arr` counts as not read for the exit status: it has every
     member it needs among the images given, and is still not read. An image
@@ -20835,7 +21817,659 @@ def _raid_self_checks():
 
     return (out + _raid_hostile_checks(md, assemble, blob)
             + _raid_review_checks(md, lvm, blob) + _raid_review2_checks(md, lvm, blob)
-            + _raid_review3_checks(md, lvm, blob, doc) + _raid_review4_checks(md, blob))
+            + _raid_review3_checks(md, lvm, blob, doc) + _raid_review4_checks(md, blob)
+            + _raid_sibling_checks(md, lvm, blob))
+
+
+def _sibling_write(path, data):
+    """Write `data` to `path`, leaving runs of zeros as holes where the
+    filesystem keeps them, so the member images cost little disk."""
+    step = 1 << 20
+    zero = bytes(step)
+    with open(path, "wb") as fh:
+        for off in range(0, len(data), step):
+            chunk = data[off:off + step]
+            if chunk == zero[:len(chunk)]:
+                fh.seek(off + len(chunk))
+            else:
+                fh.seek(off)
+                fh.write(chunk)
+        fh.truncate(len(data))
+
+
+def _sibling_rm(top):
+    """Remove a folder this self-test made, links unfollowed. (The CI build
+    replaces shutil.rmtree with a no-op to keep its fixtures; these are not
+    among them.)"""
+    for root, dirs, files in os.walk(top, topdown=False):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            try:
+                os.remove(os.path.join(root, name))
+            except OSError:
+                pass
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(top)
+    except OSError:
+        pass
+
+
+def _md_resum090(blob, at):
+    """`blob` with the 0.90 superblock at `at` given its checksum again
+    (calc_sb_csum)."""
+    words = list(struct.unpack_from("<1024I", blob, at))
+    words[32 + 6] = 0
+    total = sum(words)
+    total = (total & 0xffffffff) + (total >> 32)
+    struct.pack_into("<I", blob, at + (32 + 6) * 4, total & 0xffffffff)
+    return blob
+
+
+def _lvm_label_resum(blob, base, sector):
+    """`blob` with the LVM2 label in `sector` of the region at `base` given its
+    checksum again (calc_crc over the label from byte 20)."""
+    at = base + sector * SECTOR
+    struct.pack_into("<I", blob, at + 16, lvm_crc(bytes(blob[at + 20:at + SECTOR])))
+    return blob
+
+
+def _sibling_dispositions(res, top):
+    """{path relative to the folder: "status:code"} for one raid_siblings() result."""
+    return {os.path.relpath(c["path"], top): f"{c['status']}:{c['code']}" for c in res.checked}
+
+
+def _raid_sibling_checks(md, lvm, blob):
+    """The members of each md set and of the LVM RAID set across five images,
+    put in a folder of their own with decoys beside them, are found from each
+    member by recorded identity, and only they; each rule is shown to matter
+    by turning it off (the control) and seeing the check fail."""
+    import gzip
+    import io
+    import tempfile
+    out = []
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    with gzip.open(os.path.join(here, "fat12-fixture.img.gz"), "rb") as gz:
+        fs_image = gz.read()
+    # A folder of its own inside the temporary one: the CI build replaces
+    # mkdtemp with one shared folder whose top-level images it counts.
+    parent = tempfile.mkdtemp(prefix="qnxprobe-siblings-")
+    top = os.path.join(parent, "raid-siblings")
+    os.makedirs(top, exist_ok=True)
+
+    def examine(m):
+        return (m.get("examine") or "") + (m.get("examine_assembled") or "")
+
+    def mdadm_uuid(m):
+        exp = m.get("examine_export") or m.get("examine_assembled_export") or {}
+        return (exp.get("MD_UUID") or "").lower()
+
+    def mdadm_role(m):
+        text = examine(m)
+        role = re.search(r"Device Role : Active device (\d+)", text)
+        if role is None:
+            role = re.search(r"^this\s+\d+\s+\d+\s+\d+\s+(\d+)", text, re.M)
+        return int(role.group(1)) if role else None
+
+    def mdadm_disks(entry):
+        for m in entry["members"]:
+            exp = m.get("examine_export") or m.get("examine_assembled_export") or {}
+            if exp.get("MD_DEVICES"):
+                return int(exp["MD_DEVICES"])
+        return None
+
+    made = {"symlink": True, "hardlink": True}
+
+    def decoys(folder, other, corrupt, copy_of, link_to, extra=()):
+        """Write the decoys beside the members; {relative name: expected disposition}."""
+        exp = {}
+        _sibling_write(os.path.join(folder, "decoy-other.img"), other[1])
+        exp["decoy-other.img"] = other[0]
+        _sibling_write(os.path.join(folder, "decoy-corrupt.img"), corrupt)
+        exp["decoy-corrupt.img"] = "rejected:bad-metadata"
+        for name, data, want in extra:
+            _sibling_write(os.path.join(folder, name), data)
+            exp[name] = want
+        _sibling_write(os.path.join(folder, "fs.img"), fs_image)
+        exp["fs.img"] = "rejected:no-raid-metadata"
+        with open(os.path.join(folder, "notes.txt"), "w", encoding="utf-8") as fh:
+            fh.write("case notes, not an image\n")
+        exp["notes.txt"] = "skipped:too-small"
+        try:
+            os.symlink(link_to, os.path.join(folder, "link.img"))
+            exp["link.img"] = "skipped:symlink"
+        except (OSError, NotImplementedError, AttributeError):
+            made["symlink"] = False
+        os.makedirs(os.path.join(folder, "sub"))
+        with open(os.path.join(folder, link_to), "rb") as fh:
+            _sibling_write(os.path.join(folder, "sub", os.path.basename(link_to)), fh.read())
+        exp["sub"] = "skipped:directory"
+        try:
+            os.link(os.path.join(folder, link_to), os.path.join(folder, "zz-hardlink.img"))
+            exp["zz-hardlink.img"] = "skipped:same-file"
+        except (OSError, NotImplementedError, AttributeError):
+            made["hardlink"] = False
+        with open(os.path.join(folder, copy_of), "rb") as fh:
+            _sibling_write(os.path.join(folder, "zz-copy.img"), fh.read())
+        exp["zz-copy.img"] = "rejected:duplicate-member"
+        for name in ("zz-hole.001", "zz-hole.003"):          # a split set with a hole
+            _sibling_write(os.path.join(folder, name), b"\1" * 4096)
+            exp[name] = "rejected:unreadable"
+        return exp
+
+    def expect(member_files, start, base_exp, added):
+        want = dict(base_exp)
+        for f in member_files:
+            if f != start:
+                want[f] = "added:" + added
+        return want
+
+    def sb_place(data):
+        """(byte offset of the md superblock the assembly uses, version) on a
+        member image, the innermost region first, by the assembly's own reads."""
+        fh = io.BytesIO(data)
+        for _l, base, size in sorted(_raid_places(fh, len(data)), key=lambda r: r[2]):
+            sb = md_member(fh, base, min(size, len(data) - base))
+            if sb is not None:
+                return base + sb.at, sb.version
+        return None, None
+
+    try:
+        # --- every md set ----------------------------------------------------
+        sets_ok = sets_n = starts = hash_ok = hash_n = alone_red = alone_n = 0
+        uuid_ok = missing_ok = same_level = resum_red = resum_n = 0
+        bad_sets, bad_hash = [], []
+        readable = {n for n, a in md.items()
+                    if not str(a["sysfs"].get("metadata_version", "")).startswith("external")
+                    and not any("Reshape pos'n" in (m.get("examine") or "") for m in a["members"])}
+        native = [n for n, a in sorted(md.items())
+                  if not str(a["sysfs"].get("metadata_version", "")).startswith("external")]
+        ctl_folder = ctl_exp = ctl_start = None
+        for name in native:
+            entry = md[name]
+            members = [m for m in entry["members"] if m["file"]]
+            folder = os.path.join(top, name)
+            os.makedirs(folder)
+            files = []
+            for m in members:
+                fname = m["file"][:-3]
+                _sibling_write(os.path.join(folder, fname), blob(m["file"]))
+                files.append(fname)
+            level = entry["sysfs"].get("level")
+            partners = [n for n in native if n != name and md[n]["sysfs"].get("level") == level]
+            same_level += bool(partners)
+            partner = md[(partners or [n for n in native if n != name])[0]]
+            pdata = blob(next(m["file"] for m in partner["members"] if m["file"]))
+            corrupt = bytearray(blob(members[0]["file"]))
+            at, version = sb_place(bytes(corrupt))
+            corrupt[at + 32] ^= 0xff
+            extra = []
+            if name == "md-r5-ls":
+                # an older copy of member 2 (one event behind), named to be
+                # looked at first: member 2 itself, the newer, is used
+                older = bytearray(blob(members[2]["file"]))
+                ev, = struct.unpack_from("<Q", older, 4096 + 200)
+                struct.pack_into("<Q", older, 4096 + 200, ev - 1)
+                extra = [("a-older-copy.img", bytes(_md_resum(older, 4096)),
+                          "rejected:duplicate-member")]
+            base_exp = decoys(folder, ("rejected:different-array", pdata), bytes(corrupt),
+                              files[-1], files[1 % len(files)], extra=extra)
+            sets_n += 1
+            fine = True
+            want_missing = sorted(set(range(mdadm_disks(entry) or 0))
+                                  - {mdadm_role(m) for m in members})
+            first = None
+            for m, f in zip(members, files):
+                starts += 1
+                res = raid_siblings(os.path.join(folder, f))
+                got = _sibling_dispositions(res, folder)
+                # the member files mdadm puts in this array, by its own --examine
+                same = [g for mm, g in zip(members, files) if mdadm_uuid(mm) == mdadm_uuid(m)]
+                want = expect(same, f, base_exp, "md-array-uuid")
+                ok = got == want
+                ids = [i for c in res.added for i in c["identities"]]
+                uuid_ok += ok and bool(ids) and all(i["array_uuid"] == mdadm_uuid(m) for i in ids)
+                gone = [r for x in res.missing for r in x.get("roles", [])]
+                missing_ok += ok and gone == want_missing
+                fine &= ok
+                if name == "md-r5-ls" and ctl_folder is None:
+                    ctl_folder, ctl_exp, ctl_start = folder, want, os.path.join(folder, f)
+                if f == files[0]:
+                    first = res
+            sets_ok += fine
+            if not fine:
+                bad_sets.append(name)
+            # The decoy differs from member 0 only by its checksum: given its
+            # checksum again it is a copy of member 0, and no longer rejected
+            # as bad metadata (the control for the checksum rule).
+            fixed = bytearray(corrupt)
+            if version == "0.90":
+                _md_resum090(fixed, at)
+            else:
+                _md_resum(fixed, at)
+            _sibling_write(os.path.join(folder, "decoy-corrupt.img"), bytes(fixed))
+            res = raid_siblings(os.path.join(folder, files[1 % len(files)]))
+            resum_n += 1
+            # (named before member 0, it is the copy used, and member 0 the
+            # duplicate; either way it is a member again)
+            # (the name byte changed differs from member 0, so as new as it,
+            # the two are ambiguous; named before member 0 it may be used)
+            resum_red += _sibling_dispositions(res, folder).get("decoy-corrupt.img") in (
+                "rejected:duplicate-member", "added:md-array-uuid", "rejected:ambiguous-member")
+            _sibling_write(os.path.join(folder, "decoy-corrupt.img"), bytes(corrupt))
+            if name in readable:
+                hash_n += 1
+                with raid_open(first.paths() if first is not None else []) as rs:
+                    arr = [a for a in rs.arrays if getattr(a, "sb", None) is not None
+                           and a.sb.uuid_text() == mdadm_uuid(members[0])]
+                    got = _raid_sha(arr[0].image) if len(arr) == 1 and arr[0].image is not None else None
+                    good = got == (entry["device_sha256"], entry["device_size"])
+                hash_ok += good
+                if not good:
+                    bad_hash.append(name)
+                if level in ("linear", "raid0"):
+                    # the control: the start alone does not read to those bytes
+                    alone_n += 1
+                    with raid_open([os.path.join(folder, files[0])]) as rs:
+                        alone_red += all(a.image is None for a in rs.arrays)
+            if folder != ctl_folder:
+                _sibling_rm(folder)
+        out.append((f"from each member of each md set ({starts} members of {sets_n} sets), the "
+                    "other members in its folder are added and each decoy is not used, for the "
+                    "reason it is there (a member of another array, a copy whose superblock "
+                    "checksum fails, a filesystem image, a small text file, a symbolic link, a "
+                    "subfolder holding a member, a hard link, a byte copy of a member, a split "
+                    f"set with a hole) ({sets_ok} of {sets_n}"
+                    + (f"; not: {', '.join(bad_sets)}" if bad_sets else "") + ")",
+                    sets_ok == sets_n and sets_n >= 49))
+        out.append((f"every member added holds the array uuid mdadm --examine gives the start "
+                    f"({uuid_ok} of {starts} starts)", uuid_ok == starts))
+        out.append((f"the roles reported missing are those no member file holds by mdadm "
+                    f"--examine ({missing_ok} of {starts} starts)", missing_ok == starts))
+        out.append((f"the decoy from another array is of the same level wherever the fixtures "
+                    f"hold one ({same_level} of {sets_n} sets)", same_level >= sets_n - 3))
+        out.append((f"each md array read from the members found reads to the bytes the kernel "
+                    f"presented, by sha256 and size ({hash_ok} of {hash_n}"
+                    + (f"; not: {', '.join(bad_hash)}" if bad_hash else "") + ")",
+                    hash_ok == hash_n and hash_n >= 45))
+        out.append((f"the control: a linear or RAID0 member given alone is not read as its "
+                    f"array ({alone_red} of {alone_n})", alone_red == alone_n and alone_n >= 5))
+        out.append((f"the control for the checksum rule: each corrupted copy given its checksum "
+                    f"again is no longer rejected as bad metadata but as a copy of a member "
+                    f"({resum_red} of {resum_n})", resum_red == resum_n))
+
+        # A DDF member names no md array: nothing is looked for.
+        ddf = md.get("md-ddf")
+        if ddf:
+            folder = os.path.join(top, "md-ddf")
+            os.makedirs(folder)
+            ddf_files = []
+            for m in ddf["members"]:
+                if m["file"]:
+                    _sibling_write(os.path.join(folder, m["file"][:-3]), blob(m["file"]))
+                    ddf_files.append(m["file"][:-3])
+            res = raid_siblings(os.path.join(folder, ddf_files[0]))
+            out.append(("a DDF member names no array this reads: nothing is looked for or added, "
+                        "and its DDF metadata is named",
+                        not res.checked and not res.identities
+                        and any("DDF" in n for n in res.notes)))
+            _sibling_rm(folder)
+
+        # --- the rules, each turned off: the comparison above fails ------------
+        if ctl_folder is not None:
+            red = {}
+            for rule in ("identity", "symlink", "directory", "same_file", "duplicate", "size"):
+                if (rule == "symlink" and not made["symlink"]) or \
+                        (rule == "same_file" and not made["hardlink"]):
+                    continue
+                res = raid_siblings(ctl_start, _ignore=(rule,))
+                red[rule] = _sibling_dispositions(res, ctl_folder) != ctl_exp
+            res = raid_siblings(ctl_start)
+            same = _sibling_dispositions(res, ctl_folder) == ctl_exp
+            out.append(("the control: with each rule turned off in turn (array uuid, symbolic "
+                        "link, subfolder, same file, a second copy of a member, size) the same "
+                        f"comparison fails ({sum(red.values())} of {len(red)})"
+                        + ("" if made["symlink"] and made["hardlink"] else
+                           "; links not made on this platform"),
+                        same and all(red.values()) and len(red) >= 4))
+            # A cap and a read limit: files past them are named, never used.
+            res = raid_siblings(ctl_start, max_candidates=2)
+            codes = collections.Counter(c["code"] for c in res.checked)
+            out.append(("past the number of files a search opens, the rest are named as not "
+                        "opened, and the members among them are reported missing",
+                        sum(1 for c in res.checked if c["status"] in ("added", "rejected")) == 2
+                        and codes["over-limit"] >= 5
+                        # the two opened, by name: the older copy of member 2 (the only
+                        # file opened that holds member 2, so it is the one added) and
+                        # the corrupted copy
+                        and [os.path.basename(c["path"]) for c in res.added] == ["a-older-copy.img"]
+                        and [r for x in res.missing for r in x.get("roles", [])] == [1, 3]))
+            res = raid_siblings(ctl_start, read_budget=4096)
+            opened = [c for c in res.checked if c["status"] in ("added", "rejected")]
+            out.append(("with a read limit too small for any file, every file that opens is "
+                        "rejected as over the limit (the split set with a hole does not open) "
+                        "and none is added",
+                        len(opened) >= 8 and not res.added and all(
+                            c["code"] == ("unreadable" if os.path.basename(c["path"]).startswith(
+                                "zz-hole.") else "over-budget") for c in opened)))
+
+            # Members in other containers: a fixed VHD (read by the vendored
+            # reader) and a split raw set, found and assembled from the others.
+            ls = md["md-r5-ls"]
+            folder = os.path.join(top, "containers")
+            os.makedirs(folder)
+            data = [blob(m["file"]) for m in ls["members"]]
+            _sibling_write(os.path.join(folder, "a-member0.img"), data[0])
+
+            def vhd_footer(size):
+                f = bytearray(512)
+                struct.pack_into(">8sIIQIIII", f, 0, b"conectix", 2, 0x00010000,
+                                 0xFFFFFFFFFFFFFFFF, 0, 0, 0, 0)
+                struct.pack_into(">QQHBBI", f, 40, size, size, 30, 4, 17, 2)
+                f[68:84] = bytes(range(16))
+                struct.pack_into(">I", f, 64, (~sum(f)) & 0xFFFFFFFF)
+                return bytes(f)
+            _sibling_write(os.path.join(folder, "b-member1.vhd"), data[1] + vhd_footer(len(data[1])))
+            half = len(data[2]) // 2
+            _sibling_write(os.path.join(folder, "c-member2.001"), data[2][:half])
+            _sibling_write(os.path.join(folder, "c-member2.002"), data[2][half:])
+            _sibling_write(os.path.join(folder, "d-member3.img"), data[3])
+            res = raid_siblings(os.path.join(folder, "a-member0.img"))
+            got = _sibling_dispositions(res, folder)
+            split = next((c for c in res.added if c["path"].endswith("c-member2.001")), None)
+            if ewfprobe is None:
+                out.append(("members in a VHD and a split raw set are found (needs the vendored "
+                            "ewfprobe for the VHD)", None))
+            else:
+                ok = (got == {"b-member1.vhd": "added:md-array-uuid",
+                              "c-member2.001": "added:md-array-uuid",
+                              "c-member2.002": "part-of:segment",
+                              "d-member3.img": "added:md-array-uuid"}
+                      and split is not None and len(split["files"]) == 2)
+                with raid_open(res.paths()) as rs:
+                    arr = [a for a in rs.arrays if a.image is not None]
+                    ok &= len(arr) == 1 and _raid_sha(arr[0].image) == (ls["device_sha256"],
+                                                                         ls["device_size"])
+                res2 = raid_siblings(os.path.join(folder, "c-member2.002"))
+                ok &= (len(res2.given) == 2 and _sibling_dispositions(res2, folder) == {
+                    "a-member0.img": "added:md-array-uuid", "b-member1.vhd": "added:md-array-uuid",
+                    "d-member3.img": "added:md-array-uuid"})
+                out.append(("members in a fixed VHD and in a split raw set are found, the split "
+                            "set's second segment is named as part of it, the array read from "
+                            "them reads to the kernel's bytes, and a search from that second "
+                            "segment reads the whole set as the image given", ok))
+            _sibling_rm(folder)
+            _sibling_rm(ctl_folder)
+
+        # --- the LVM RAID set across five images ------------------------------
+        folder = os.path.join(top, "lvm-raid-multi")
+        os.makedirs(folder)
+        files = []
+        for i in range(5):
+            files.append(f"lvm-raid-multi-{i}.img")
+            _sibling_write(os.path.join(folder, files[-1]), blob(f"lvm-raid-multi-{i}.img.gz"))
+        one = bytearray(blob("lvm-raid-multi-1.img.gz"))
+        pv = LvmPv(io.BytesIO(bytes(one)), 0)
+        label_at = pv.label_sector * SECTOR
+        offset_xl, = struct.unpack_from("<I", one, label_at + 20)
+        corrupt = bytearray(one)
+        corrupt[label_at + offset_xl] ^= 0x01          # the PV id, under the label checksum
+        forged = bytearray(corrupt)
+        _lvm_label_resum(forged, 0, pv.label_sector)   # a PV id its group does not list
+        base_exp = decoys(folder, ("rejected:different-vg",
+                                          blob("lvm-raid-single-0.img.gz")),
+                          bytes(corrupt), files[4], files[1],
+                          extra=[("decoy-forged.img", bytes(forged), "rejected:pv-not-listed"),
+                                 # pv1 under the group's previous seqno, named to be looked
+                                 # at first: the image with the newer metadata is used
+                                 ("a-older-pv1.img", _lvm_text_change(
+                                     bytes(one), lambda t: t.replace("seqno = 7", "seqno = 6", 1)),
+                                  "rejected:duplicate-member")])
+        ok_n = hash_ok = 0
+        lvm_names = sorted(n for n in lvm if n.startswith("lvm-raid-multi-"))
+        for f in files:
+            res = raid_siblings(os.path.join(folder, f))
+            want = expect(files, f, base_exp, "lvm-vg-pv")
+            ok = (_sibling_dispositions(res, folder) == want and not res.missing
+                  and all(i["vg_uuid"] == pv.vg[1].get("id") for c in res.added
+                          for i in c["identities"]))
+            ok_n += ok
+            with raid_open(res.paths()) as rs:
+                got = 0
+                for arr in rs.arrays:
+                    entry = lvm.get("lvm-raid-multi-" + arr.label.split("/")[1])
+                    if entry is not None and arr.image is not None:
+                        got += _raid_sha(arr.image) == (entry["device_sha256"], entry["device_size"])
+                hash_ok += got == len(lvm_names) >= 3
+        out.append((f"from each of the five LVM RAID member images, the other four are added "
+                    f"by volume group id and a physical volume id its metadata lists, and each "
+                    f"decoy is not used for the reason it is there (a physical volume of another "
+                    f"group, a label whose checksum fails, a physical volume id the group does "
+                    f"not list, and the others above) ({ok_n} of 5)", ok_n == 5))
+        out.append((f"each LVM RAID volume read from the images found reads to the kernel's "
+                    f"bytes ({hash_ok} of 5 starts, {len(lvm_names)} volumes each)", hash_ok == 5))
+        start = os.path.join(folder, files[0])
+        with raid_open([start]) as rs:
+            alone = not any(a.image is not None for a in rs.arrays)
+        want = expect(files, files[0], base_exp, "lvm-vg-pv")
+        red = {}
+        for rule in ("identity", "pv_listed", "duplicate"):
+            res = raid_siblings(start, _ignore=(rule,))
+            red[rule] = _sibling_dispositions(res, folder) != want
+        fixed = bytearray(corrupt)
+        _lvm_label_resum(fixed, 0, pv.label_sector)    # the label checks out again
+        _sibling_write(os.path.join(folder, "decoy-corrupt.img"), bytes(fixed))
+        res = raid_siblings(start)
+        red["checksum"] = _sibling_dispositions(res, folder) != want
+        out.append((f"the control: one LVM image alone reads no volume, and with the group id, "
+                    f"the physical volume listing, the second-copy rule or the label checksum "
+                    f"turned off the comparison fails ({sum(red.values())} of {len(red)})",
+                    alone and all(red.values())))
+    finally:
+        _sibling_rm(top)
+    out.append(("the member search checks leave no temporary folder behind, their own "
+                "parent included", _selftest_parent_gone(parent, "qnxprobe-siblings-")
+                and not os.path.exists(top)))
+    return out + _raid_sibling_review_checks(md, blob)
+
+
+def _selftest_parent_gone(parent, prefix):
+    """Remove a temporary folder a self-check made with mkdtemp(prefix=...),
+    once it is empty. A folder whose name does not start with that prefix is
+    not one mkdtemp made for this check (the CI build replaces mkdtemp with
+    one shared folder it keeps), and is left alone. True when nothing of this
+    check's is left: the folder is gone, or was never this check's own."""
+    if not os.path.basename(os.path.normpath(parent)).startswith(prefix):
+        return True
+    try:
+        os.rmdir(parent)
+    except OSError:
+        pass
+    return not os.path.exists(parent)
+
+
+def _raid_sibling_review_checks(md, blob):
+    """The cases an independent review of the sibling search raised: a file
+    swapped for a pipe after it is listed, two copies of one member as new as
+    each other, a newer copy of the member given, and an added file that also
+    holds a member of another array."""
+    import io
+    import tempfile
+    import threading
+    out = []
+    parent = tempfile.mkdtemp(prefix="qnxprobe-siblings-review-")
+    top = os.path.join(parent, "raid-siblings-review")
+    os.makedirs(top, exist_ok=True)
+
+    def folder_of(name, files):
+        d = os.path.join(top, name)
+        os.makedirs(d)
+        for fname, data in files:
+            _sibling_write(os.path.join(d, fname), bytes(data))
+        return d
+
+    def disp(res, d):
+        return _sibling_dispositions(res, d)
+
+    ls = md["md-r5-ls"]
+    ls_data = [blob(m["file"]) for m in ls["members"]]
+    try:
+        # --- a file swapped for a pipe after it is listed ---------------------
+        if not hasattr(os, "mkfifo"):
+            out.append(("a file swapped for a pipe after it is listed is not read and does not "
+                        "hang the search (no pipes on this platform)", None))
+        else:
+            vhd = bytearray(ls_data[3]) + bytes(512)
+            struct.pack_into(">8sIIQIIII", vhd, len(ls_data[3]), b"conectix", 2, 0x00010000,
+                             0xFFFFFFFFFFFFFFFF, 0, 0, 0, 0)
+            d = folder_of("swap", [("m0.img", ls_data[0]), ("m1.img", ls_data[1]),
+                                   ("m2.img", ls_data[2]), ("x-swap.img", bytes(8192)),
+                                   ("y-swap.vhd", vhd)])
+            victims = {os.path.join(d, "x-swap.img"), os.path.join(d, "y-swap.vhd")}
+            real_lstat = os.lstat
+
+            def swapping_lstat(name, *a, **k):
+                st = real_lstat(name, *a, **k)
+                if name in victims:           # swapped right after it is looked at
+                    victims.discard(name)
+                    os.remove(name)
+                    os.mkfifo(name)
+                return st
+            box = {}
+
+            def run():
+                box["res"] = raid_siblings(os.path.join(d, "m0.img"))
+            os.lstat = swapping_lstat
+            try:
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                worker.join(60)
+            finally:
+                os.lstat = real_lstat
+            res = box.get("res")
+            got = disp(res, d) if res is not None else {}
+            out.append(("two files swapped for pipes after they are listed (one of them a VHD) "
+                        "are opened without blocking, refused through their descriptors as not "
+                        "regular files, and the search goes on",
+                        not worker.is_alive() and got.get("x-swap.img") == "skipped:not-regular"
+                        and got.get("y-swap.vhd") == "skipped:not-regular"
+                        and [os.path.basename(c["path"]) for c in res.added] == ["m1.img", "m2.img"]))
+
+        # --- two copies of one member, as new as each other --------------------
+        e090 = md["md-r5ls-090"]
+        d090 = [blob(m["file"]) for m in e090["members"]]
+        changed = bytearray(d090[2])
+        changed[1 << 20:(1 << 20) + 4096] = b"\x55" * 4096
+        d = folder_of("tie090", [("m0.img", d090[0]), ("m1.img", d090[1]), ("m3.img", d090[3]),
+                                 ("copyA-m2.img", d090[2]), ("copyB-m2.img", changed)])
+        res = raid_siblings(os.path.join(d, "m0.img"))
+        got = disp(res, d)
+        with raid_open(res.paths()) as rs:
+            arr = [a for a in rs.arrays if a.image is not None]
+            digest = _raid_sha(arr[0].image) if len(arr) == 1 else None
+        out.append(("two copies of a 0.90 member as new as each other with different bytes: "
+                    "neither is used, both are named as ambiguous, the role is reported missing, "
+                    "and the RAID5 array is rebuilt without it to the kernel's bytes",
+                    got.get("copyA-m2.img") == got.get("copyB-m2.img") == "rejected:ambiguous-member"
+                    and [r for x in res.missing for r in x.get("roles", [])] == [2]
+                    and "ambiguous" in res.missing[0]["why"] and len(res.ambiguous) == 1
+                    and digest == (e090["device_sha256"], e090["device_size"])))
+        # the same from copyA: the image given is used, and the other copy is a warning
+        res = raid_siblings(os.path.join(d, "copyA-m2.img"))
+        out.append(("given one of those copies, it is used as given, and the other copy, as new "
+                    "with different bytes, is named and raised as a warning",
+                    disp(res, d).get("copyB-m2.img") == "rejected:duplicate-member"
+                    and len(res.warnings) == 1 and "copyB-m2.img" in res.warnings[0]
+                    and "different bytes" in res.warnings[0]))
+
+        changed12 = bytearray(ls_data[2])
+        changed12[(1 << 20) + 8192:(1 << 20) + 12288] = b"\xaa" * 4096
+        d = folder_of("tie12", [("m0.img", ls_data[0]), ("m1.img", ls_data[1]),
+                                ("m3.img", ls_data[3]), ("copyA-m2.img", ls_data[2]),
+                                ("copyB-m2.img", ls_data[2]), ("copyC-m2.img", changed12)])
+        res = raid_siblings(os.path.join(d, "m0.img"))
+        amb = disp(res, d)
+        os.remove(os.path.join(d, "copyC-m2.img"))
+        res2 = raid_siblings(os.path.join(d, "m0.img"))
+        same = disp(res2, d)
+        with raid_open(res2.paths()) as rs:
+            arr = [a for a in rs.arrays if a.image is not None]
+            digest = _raid_sha(arr[0].image) if len(arr) == 1 else None
+        out.append(("for metadata 1.2 too: three copies as new as each other, one with other "
+                    "bytes, are all ambiguous; two byte-for-byte copies give one member, the "
+                    "first looked at, the other named as its copy, and the array reads to the "
+                    "kernel's bytes",
+                    all(amb.get(f) == "rejected:ambiguous-member"
+                        for f in ("copyA-m2.img", "copyB-m2.img", "copyC-m2.img"))
+                    and same.get("copyA-m2.img") == "added:md-array-uuid"
+                    and same.get("copyB-m2.img") == "rejected:duplicate-member"
+                    and "byte-for-byte" in next(c["why"] for c in res2.checked
+                                                if c["path"].endswith("copyB-m2.img"))
+                    and digest == (ls["device_sha256"], ls["device_size"])))
+
+        pvs = [blob(f"lvm-raid-multi-{i}.img.gz") for i in range(5)]
+        pv1b = bytearray(pvs[1])
+        pv1b[8 << 20:(8 << 20) + 4096] = b"\x33" * 4096
+        d = folder_of("tielvm", [("pv0.img", pvs[0]), ("pv2.img", pvs[2]), ("pv3.img", pvs[3]),
+                                 ("pv4.img", pvs[4]), ("copyA-pv1.img", pvs[1]),
+                                 ("copyB-pv1.img", pv1b)])
+        res = raid_siblings(os.path.join(d, "pv0.img"))
+        got = disp(res, d)
+        out.append(("two copies of an LVM2 physical volume with the same metadata seqno and "
+                    "different bytes: neither is used, and the physical volume is reported "
+                    "missing as ambiguous",
+                    got.get("copyA-pv1.img") == got.get("copyB-pv1.img") == "rejected:ambiguous-member"
+                    and len(res.missing) == 1 and res.missing[0]["pvs"][0][0] == "pv1"
+                    and "ambiguous" in res.missing[0]["why"]))
+
+        # --- a newer copy of the member given -------------------------------------
+        older = bytearray(ls_data[2])
+        ev, = struct.unpack_from("<Q", older, 4096 + 200)
+        struct.pack_into("<Q", older, 4096 + 200, ev - 1)
+        _md_resum(older, 4096)
+        d = folder_of("newer", [("m0.img", ls_data[0]), ("m1.img", ls_data[1]),
+                                ("m2.img", ls_data[2]), ("m3.img", ls_data[3]),
+                                ("old-m2.img", older)])
+        res = raid_siblings(os.path.join(d, "old-m2.img"))
+        lines = res.lines()
+        out.append(("given an older copy of a member while a newer one is beside it, the copy "
+                    "given is used, never replaced, and the newer one is named in a warning "
+                    "that says the copy given is stale",
+                    disp(res, d).get("m2.img") == "rejected:duplicate-member"
+                    and os.path.join(d, "m2.img") not in res.paths()
+                    and len(res.warnings) == 1 and "m2.img" in res.warnings[0]
+                    and "stale" in res.warnings[0]
+                    and any(ln.startswith("WARNING") and "m2.img" in ln for ln in lines)))
+
+        # --- an added file that also holds a member of another array ------------
+        combo = bytearray(pvs[1])
+        r110 = blob(md["md-r1-10"]["members"][0]["file"])
+        old_at = ((len(r110) // SECTOR - 16) & ~7) * SECTOR
+        new_at = ((len(combo) // SECTOR - 16) & ~7) * SECTOR
+        sbb = bytearray(8192)
+        sbb[:4096] = r110[old_at:old_at + 4096]
+        struct.pack_into("<Q", sbb, 144, new_at // SECTOR)
+        _md_resum(sbb, 0)
+        combo[new_at:new_at + 4096] = sbb[:4096]
+        other_uuid = md_member(io.BytesIO(bytes(combo)), 0, len(combo)).uuid_text()
+        d = folder_of("combo", [("pv0.img", pvs[0]), ("pv2.img", pvs[2]), ("pv3.img", pvs[3]),
+                                ("pv4.img", pvs[4]), ("combo-pv1.img", combo)])
+        res = raid_siblings(os.path.join(d, "pv0.img"))
+        rec = next((c for c in res.checked if c["path"].endswith("combo-pv1.img")), {})
+        out.append(("an added file that also holds a member of another array says so, naming "
+                    "that array as not searched for",
+                    rec.get("status") == "added" and any(other_uuid in t for t in rec.get(
+                        "not_searched") or ())
+                    and any("not searched for" in ln and other_uuid in ln for ln in res.lines())))
+    finally:
+        _sibling_rm(top)
+    out.append(("the sibling checks leave no temporary folder behind, their own parent "
+                "included", _selftest_parent_gone(parent, "qnxprobe-siblings-review-")
+                and not os.path.exists(top)))
+    return out
 
 
 def _raid_hostile_checks(md, assemble, blob):
@@ -21704,13 +23338,18 @@ def _raid_review2_checks(md, lvm, blob):
         def free_extents(self):
             return [(self.base, self.size)]
     v["walker"] = Free(v["base"], v["size"])
-    top = os.path.join(tempfile.mkdtemp(prefix="qnxprobe-raid-"), "raid-unallocated")
+    raid_parent = tempfile.mkdtemp(prefix="qnxprobe-raid-")
+    top = os.path.join(raid_parent, "raid-unallocated")
     os.makedirs(top, exist_ok=True)
     said3 = []
     try:
         recs = write_unallocated(f4, f4.size, [v], top, "raid", say=said3.append)
     finally:
         shutil.rmtree(top, ignore_errors=True)
+    # the folder mkdtemp made too (the CI build keeps its own shared one, and
+    # replaces rmtree with a no-op, so there `top` stays and its parent with it)
+    out.append(("the free-space check leaves no temporary folder behind, its parent included",
+                _selftest_parent_gone(raid_parent, "qnxprobe-raid-")))
     out.append(("writing the free space of an LVM RAID volume with an image volume rebuilt "
                 "says how much lies in rebuilt chunks, on no disk, and leaves it out",
                 bool(recs) and recs[0].get("rebuilt_bytes_not_written", 0) > 0
@@ -34170,7 +35809,8 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", nargs="*",
                     help="disk image, partition image, or raw dump to examine; give every "
-                         "member image of a RAID set to read the array")
+                         "member image of a RAID set to read the array, or one of them "
+                         "with --find-members")
     ap.add_argument("--scan-limit", type=int, default=256, metavar="MiB",
                     help="how far to brute scan when no superblock sits at the "
                          "offsets the kernel checks (default: 256)")
@@ -34230,6 +35870,13 @@ if __name__ == "__main__":
                          "to a certificate: the certificate's RSA "
                          "private key, unencrypted, as PEM or DER. Repeatable; each "
                          "image opens with the first one that opens it")
+    ap.add_argument("--find-members", action="store_true",
+                    help="for an image that holds a Linux md member or an LVM2 physical "
+                         "volume: look in its folder (not subfolders) for the other members "
+                         "by the identity each file records (md array uuid; LVM volume group "
+                         "id and a physical volume id its metadata lists), name every file "
+                         "added and why each other file was not, then read them as though "
+                         "they had been given")
     ap.add_argument("--version", action="version",
                     version=f"qnxprobe {QNXPROBE_VERSION}")
     args = ap.parse_args()
@@ -34267,12 +35914,14 @@ if __name__ == "__main__":
                      f"not empty: {args.unallocated}")
         os.makedirs(args.unallocated, exist_ok=True)
     refused = []
+    run_images = (_cli_find_members(args.image, given_passwords, args.private_key)
+                  if args.find_members else list(args.image))
     # RAID members among the images, whole disks or partitions, assembled into
     # arrays (raid_assemble); each array is read after the images, as an image
     # of its own. An image that holds no member is read exactly as before.
-    raidset = raid_open(args.image, given_passwords, args.private_key)
+    raidset = raid_open(run_images, given_passwords, args.private_key)
     try:
-        for p in args.image:
+        for p in run_images:
             try:
                 asked, tries = [], 0
                 while True:
@@ -34319,7 +35968,7 @@ if __name__ == "__main__":
                 print(f"  REFUSED: {exc}")
                 print("=" * 78)
                 refused.append(p)
-        refused += raid_run(raidset, len(args.image), lambda raid_arr: main(
+        refused += raid_run(raidset, len(run_images), lambda raid_arr: main(
             raid_arr.safe_name, scan_limit_mib=args.scan_limit, do_list=args.list,
             list_depth=args.depth, list_max=args.list_max,
             extract=args.extract, only=args.only, zf=zf,
