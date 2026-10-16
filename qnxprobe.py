@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.68"
+QNXPROBE_VERSION = "1.69"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -18039,7 +18039,7 @@ def _lvm_scan(fh, regions, ss=SECTOR):
     for name, vg, seqno in groups.values():
         home = [b for b, pv in pvs.items() if pv.vg and pv.vg[1].get("id") == vg.get("id")]
         try:
-            lines, lvs, maps, spare = _lvm_group(name, vg, seqno, by_uuid, ss, virtual)
+            lines, lvs, maps, spare = _lvm_group(name, vg, seqno, by_uuid, ss, virtual, fh)
         except (TypeError, AttributeError, KeyError, ValueError) as exc:
             # _lvm_vg_shape refuses the shapes known to fail; anything it misses
             # is said here rather than costing the image its other volumes.
@@ -18066,6 +18066,7 @@ class LvmMap:
         self.segments = segments
         self.size = sum(s[1] for s in segments)
         self.copy_name = self.copy_kind = None     # set for a RAID1 or mirror copy (_lvm_copy)
+        self.copy_skipped = ""                     # the copies _lvm_copy passed over, and why
         self._starts = [s[0] for s in segments]
 
     def locate(self, off):
@@ -18117,7 +18118,7 @@ class LvmMap:
         return None
 
 
-def _lvm_group(name, vg, seqno, by_uuid, ss, virtual=None):
+def _lvm_group(name, vg, seqno, by_uuid, ss, virtual=None, fh=None):
     """(report lines, [(lv label, base, size, name)], [(key, LvmMap, label,
     name)] of the volumes that need a map, {pv base: free runs}) for one volume
     group. `virtual` maps a key to the base lvm_image() placed that volume at."""
@@ -18154,13 +18155,14 @@ def _lvm_group(name, vg, seqno, by_uuid, ss, virtual=None):
         segs = sorted((v for k, v in lv.items() if k.startswith("segment") and isinstance(v, dict)),
                       key=lambda s: s.get("start_extent", 0))
         shown = _lvm_shown(lvname, segs)
-        why, lmap = _lvm_layout(segs, where, pv_names, ext, vg.get("logical_volumes") or {})
+        why, lmap = _lvm_layout(segs, where, pv_names, ext, vg.get("logical_volumes") or {},
+                                ctx=_lvm_raid_context(vg, fh))
         total = sum(s.get("extent_count", 0) for s in segs if isinstance(s.get("extent_count"), int)) * ext
         if why:
             lines.append(f"logical volume {shown}, {human(total)}: not read ({why})")
             continue
         label = f"LVM {name}/{lvname}"
-        first = lmap.locate(0)[0]
+        first = lmap.first_at() if hasattr(lmap, "first_at") else lmap.locate(0)[0]
         stem = f"lvm_lba{first // ss}"
         suffix = sanitize_volume_label(f"{name}_{lvname}", 40)
         vname = f"{stem}_{suffix}" if suffix else stem
@@ -18196,23 +18198,33 @@ def _lvm_group(name, vg, seqno, by_uuid, ss, virtual=None):
     return lines, found, maps, spare
 
 
-def _lvm_copy(seg, where, pv_names, ext, lvs, depth):
+def _lvm_copy(seg, where, pv_names, ext, lvs, depth, ctx=None):
     """A RAID1 or mirror segment, read from the first copy whose extents are all
     in the image. lvm2 lists a raid1 segment's copies under raids, metadata and
     image volume in turn (raid.c, out_areas "raid"), and a mirror's under
     mirrors, each with its first extent (mirrored.c, out_areas "mirror"). Every
     copy holds the volume's data from its start, unless the segment records a
     data_offset (raid.c, written while a reshape moves the data), which is not
-    read. Which copies are in sync lives in the RAID metadata, not read here; a
-    copy that fell out of sync is read as it is."""
+    read. For a raid1 segment, a copy that _lvm_raid_legs finds missing (marked
+    REBUILD, on a physical volume marked MISSING or not in the image, or failed,
+    still recovering or behind by its dm-raid superblock) is passed over, and
+    with no good copy the volume is refused. A mirror's copies are read as they
+    are; the same marks are not sourced for that segment type here."""
     if depth > 4:
         return "copies nested too deep", None
     kind = seg["type"]
     if seg.get("data_offset"):
         return f"a {kind} segment with a data offset (written while a reshape moves its data)", None
+    skipped = {}
     if kind == "raid1":
         listed = seg.get("raids") or []
         names = [(listed[i], 0) for i in range(1, len(listed), 2)]
+        why, _imgs, missing_roles, _fresh = _lvm_raid_legs(
+            kind, [n for n, _f in names], [listed[i] for i in range(0, len(listed), 2)],
+            where, pv_names, ext, lvs, depth, dict(ctx or {}, lenient=True))
+        if why:
+            return why, None
+        skipped = {names[r][0]: w for r, w in missing_roles.items()}
     else:
         listed = seg.get("mirrors") or []
         names = [(listed[i], listed[i + 1]) for i in range(0, len(listed) - 1, 2)]
@@ -18222,6 +18234,9 @@ def _lvm_copy(seg, where, pv_names, ext, lvs, depth):
         copy = lvs.get(name) if isinstance(name, str) else None
         if not isinstance(copy, dict) or first:
             reasons.append(f"{name}: not a copy this reads")
+            continue
+        if name in skipped:
+            reasons.append(skipped[name])
             continue
         csegs = sorted((v for k, v in copy.items() if k.startswith("segment") and isinstance(v, dict)),
                        key=lambda c: c.get("start_extent", 0))
@@ -18237,14 +18252,18 @@ def _lvm_copy(seg, where, pv_names, ext, lvs, depth):
             left -= length
         lmap = LvmMap(segs_out)
         lmap.copy_name, lmap.copy_kind = name, kind
+        lmap.copy_skipped = "; ".join(reasons)
         return None, lmap
     return f"a {kind} volume none of whose copies is read ({'; '.join(reasons) or 'none listed'})", None
 
 
 def _lvm_shape_words(lmap):
     """How a volume that needs a map is laid out, in a few words."""
+    if getattr(lmap, "raid_words", None):
+        return lmap.raid_words
     if getattr(lmap, "copy_name", None):
-        return f"{lmap.copy_kind}, read from its copy {lmap.copy_name}"
+        return (f"{lmap.copy_kind}, read from its copy {lmap.copy_name}"
+                + (f" (not from: {lmap.copy_skipped})" if getattr(lmap, "copy_skipped", "") else ""))
     striped = [s for s in lmap.segments if s[2] is not None]
     if striped:
         return (f"striped across {len(striped[0][3])} physical volumes in "
@@ -18252,7 +18271,7 @@ def _lvm_shape_words(lmap):
     return f"in {len(lmap.segments)} separate runs of extents"
 
 
-def _lvm_layout(segs, where, pv_names, ext, lvs=None, depth=0):
+def _lvm_layout(segs, where, pv_names, ext, lvs=None, depth=0, ctx=None):
     """(why not, None) or (None, LvmMap) for an LV's segments: linear and
     striped segments whose every run is on a physical volume in the image, or a
     RAID1 or mirror volume, read from the first of its copies that is.
@@ -18262,7 +18281,9 @@ def _lvm_layout(segs, where, pv_names, ext, lvs=None, depth=0):
     if not segs:
         return "no segments", None
     if len(segs) == 1 and segs[0].get("type") in ("raid1", "mirror") and lvs is not None:
-        return _lvm_copy(segs[0], where, pv_names, ext, lvs, depth)
+        return _lvm_copy(segs[0], where, pv_names, ext, lvs, depth, ctx)
+    if len(segs) == 1 and segs[0].get("type") in LVM_RAID_TYPES and lvs is not None:
+        return _lvm_raid(segs[0], where, pv_names, ext, lvs, depth, ctx)
     out, start = [], 0
     for seg in segs:
         kind = seg.get("type", "")
@@ -18353,6 +18374,10 @@ class LvmImage:
             return b""
         start, end, lmap = span
         want = end - self._pos if n is None or n < 0 else min(n, end - self._pos)
+        if hasattr(lmap, "read_via"):                  # an LVM RAID volume (RaidLvMap)
+            out = lmap.read_via(self._fh, self._pos - start, want)
+            self._pos += len(out)
+            return out
         out = bytearray()
         for at, length in lmap.image_runs(self._pos - start, want):
             self._fh.seek(at)
@@ -18423,6 +18448,3530 @@ def identify_lvm(fh, base, size=None):
     if base not in notes:
         return None
     return "lvm2 pv", notes[base][1:] + [f"id {pv.uuid}"]
+
+
+# ---------------------------------------------------------------------------
+# RAID: Linux md arrays and LVM RAID volumes, inside one image or across several
+# ---------------------------------------------------------------------------
+# What a RAID member holds and how an array lays its data out is the Linux
+# kernel's own (git.kernel.org torvalds/linux, tag v7.0, commit
+# 028ef9c96e96197026887c0f092424679298aae8) and mdadm's (tag mdadm-4.5, commit
+# 8f0c7692d48414ff7b3fe927ce75799c65ef24b1):
+#
+#   include/uapi/linux/raid/md_p.h
+#     44-47    MD_RESERVED_BYTES, MD_NEW_SIZE_SECTORS: a 0.90 superblock sits in the
+#              last 64 KiB-aligned 64 KiB of the member
+#     95-98    the 1.x roles: 0xffff spare, 0xfffe faulty, 0xfffd journal, below
+#              0xff00 a slot in the array
+#     109      MD_SB_MAGIC 0xa92b4efc
+#     131-209  mdp_superblock_s, the 0.90 superblock, in the writing host's byte order
+#     225-304  mdp_superblock_1, the 1.x superblock, little-endian
+#     306-343  the 1.x feature_map bits
+#     388-402  r5l_meta_block, R5LOG_MAGIC 0x6433c509, the RAID5/6 write journal
+#   drivers/md/md.c
+#     1054-1058  calc_dev_sboffset: where a 0.90 superblock is
+#     1249-1281  md_csum_fold, calc_sb_csum: the 0.90 checksum
+#     1353-1450  super_90_load: magic, version 0.90 or 0.91, checksum, data at 0
+#     1471-1590  super_90_validate: level 0 has no layout (1519-1520); a member
+#                more than one event behind the freshest is refused (1550-1554);
+#                a member's state in its own disks[] table gives its role
+#     1774-1794  calc_sb_1_csum
+#     1796-1977  super_1_load: 1.0 at the end (8 KiB to 12 KiB from it, 4 KiB
+#                aligned), 1.1 at 0, 1.2 at 4 KiB (1814-1826); super_offset must
+#                name that place; data_offset, data_size
+#     1979-2180  super_1_validate: RAID0 without the layout feature has no
+#                layout (2060-2061); a member more than one event behind the
+#                freshest is refused (2087); one event behind takes its role from
+#                the freshest superblock (2111-2133)
+#   drivers/md/md-linear.c 113-150   members end to end, in role order
+#   drivers/md/raid0.c     65-298    strip zones; 304-352 find_zone, map_sector;
+#                          560-590   the original and alternate layouts
+#   drivers/md/raid10.c    581-642   __raid10_find_phys; 3712-3760 raid10_size,
+#                          calc_sectors; 3763-3815 setup_geo
+#   drivers/md/raid5.c     124-161   raid6_d0, raid6_idx_to_slot; 1603-1640
+#                          set_syndrome_sources; 2946-3149 raid5_compute_sector;
+#                          7309-7321 raid5_size
+#   drivers/md/raid5-cache.c 1722-1752 r5l_recovery_read_meta_block; 2941-3000
+#                          r5l_load_log; 3079 the checksum seed
+#   drivers/md/dm-raid.c   294-313   the dm-raid types lvm2 asks for and the md
+#                          level and layout each is (raid4 is RAID5 with parity
+#                          first, raid10 is near)
+#   drivers/md/dm-raid.c   1953-1975 the dm-raid superblock at the start of each
+#                          metadata volume: failed_devices, array_resync_offset
+#   drivers/md/md.c        1890-1920 a 1.x member's bad block log; md.h 300-312 its
+#                          sectors count from the device's start
+#   lib/raid6/mktables.c   21-34, 108-171  GF(2^8) over 0x11d, exp/inv/exi tables
+#   lib/raid6/recov.c      19-89     two data blocks, or data and P, from P and Q
+#   lib/raid6/int.uc       79-100    the Q syndrome, highest data slot first
+#   mdadm util.c 1259-1300 guess_super_type: of several superblocks on one device
+#                          the one with the latest creation time
+#   mdadm super-ddf.c 145, 977-1000   the DDF anchor, 0xDE11DE11 in the last sector
+#   mdadm super-intel.c 38, 4594      the Intel IMSM anchor, two sectors from the end
+# lvm2 (tag v2_03_43, commit 7b0bce6909611966bdc1e17c2408e1ec3b0f8c17; every key and
+# flag below is the same in v2_03_31, commit 3a6e221c569eb253fa38a772b15e53b5de65b5d1,
+# the lvm2 that wrote the fixtures: raid.c 45-185 and 197-229, libdm-deptree.c 86-103):
+#   lib/raid/raid.c 45-190, 202-224   a raid segment's device_count, stripe_size,
+#                          data_offset and its raids list of metadata and image
+#                          volumes in turn
+#   libdm/libdm-deptree.c 92-109      "raid5" is raid5_ls and "raid6" is raid6_zr
+#   lib/format_text/flags.c 50-51, 65-66  MISSING on a physical volume, NOTSYNCED and
+#                          REBUILD on a logical volume
+# GPT partition types named here, not read: util-linux v2.41.6 (commit
+# 02822c9374fc72d38baf8a1f859eb0813970bf3f) include/pt-gpt-partnames.h 37-41,
+# 72, 193-194, and Microsoft's PARTITION_INFORMATION_GPT documentation.
+#
+# Every array is read only from members whose superblocks agree on the array
+# and whose event counts are the freshest or one behind it, as the kernel
+# assembles it. With every member there, each level is a mapping. A RAID4/5
+# array missing one member, and a RAID6 array missing one or two, has the
+# missing chunks rebuilt from parity, but only when its superblocks say it was
+# stopped clean. What is refused is named: a reshape in progress, a write
+# journal that holds writes not yet on the members, a missing journal device,
+# too many missing members, a layout this does not read, and metadata this does
+# not read (DDF, Intel IMSM, Windows LDM and Storage Spaces, Apple RAID).
+
+MD_SB_MAGIC = 0xa92b4efc
+MD_RESERVED = 64 * 1024                                    # md_p.h 44
+MD_ROLE_SPARE, MD_ROLE_FAULTY, MD_ROLE_JOURNAL, MD_ROLE_MAX = 0xffff, 0xfffe, 0xfffd, 0xff00
+MD_DISK_FAULTY, MD_DISK_ACTIVE, MD_DISK_SYNC = 0, 1, 2      # md_p.h 74-76
+MD_SB_CLEAN, MD_SB_BITMAP_PRESENT = 0, 8                    # md_p.h 114, 118
+MD_FEATURE = {1: "bitmap", 2: "recovery offset", 4: "reshape active", 8: "bad blocks",
+              16: "replacement", 32: "reshape backwards", 64: "new offset",
+              128: "recovery bitmap", 256: "clustered", 512: "journal", 1024: "PPL",
+              2048: "multiple PPLs", 4096: "RAID0 layout"}
+MD_FEATURE_ALL = sum(MD_FEATURE)
+MD_MAX_SECTOR = (1 << 64) - 1
+MD_LEVELS = {-1: "linear", 0: "raid0", 1: "raid1", 4: "raid4", 5: "raid5", 6: "raid6",
+             10: "raid10", -4: "multipath", -5: "faulty", -1000000: "container"}
+# raid5.h 727-764 and mdadm maps.c 28-70: each layout number and mdadm's name for it
+MD_R5_LAYOUTS = {0: "left-asymmetric", 1: "right-asymmetric", 2: "left-symmetric",
+                 3: "right-symmetric", 4: "parity-first", 5: "parity-last"}
+MD_R6_LAYOUTS = {**MD_R5_LAYOUTS, 8: "ddf-zero-restart", 9: "ddf-N-restart",
+                 10: "ddf-N-continue", 16: "left-asymmetric-6", 17: "right-asymmetric-6",
+                 18: "left-symmetric-6", 19: "right-symmetric-6", 20: "parity-first-6"}
+R5LOG_MAGIC = 0x6433c509
+# dm-raid.c 294-313: the md level and layout each lvm2 RAID segment type runs as;
+# libdm-deptree.c 108-109: "raid5" and "raid6" are raid5_ls and raid6_zr.
+LVM_RAID_TYPES = {"raid4": (5, 4), "raid5_n": (5, 5), "raid5_ls": (5, 2), "raid5": (5, 2),
+                  "raid5_rs": (5, 3), "raid5_la": (5, 0), "raid5_ra": (5, 1),
+                  "raid6_zr": (6, 8), "raid6": (6, 8), "raid6_nr": (6, 9), "raid6_nc": (6, 10),
+                  "raid6_n_6": (6, 5), "raid6_ls_6": (6, 18), "raid6_rs_6": (6, 19),
+                  "raid6_la_6": (6, 16), "raid6_ra_6": (6, 17), "raid10": (10, None)}
+# GPT partition types of RAID and volume managers this tool does not read
+RAID_GPT_TYPES = {"5808c8aa-7e8f-42e0-85d2-e1e90434cfb3": "Windows LDM metadata",
+                  "af9b60a0-1431-4f62-bc68-3311714a69ad": "Windows LDM data",
+                  "e75caf8f-f680-4cee-afa3-b001e56efc2d": "Windows Storage Spaces",
+                  "52414944-0000-11aa-aa11-00306543ecac": "Apple RAID",
+                  "52414944-5f4f-11aa-aa11-00306543ecac": "Apple RAID offline"}
+RAID_JOURNAL_WALK_MAX = 4096           # meta blocks looked at past the journal's tail
+
+
+class MdSuper:
+    """One md superblock, as read from one member. Offsets and sizes are bytes
+    from the start of the member; `role` is the slot this superblock gives its
+    own device (None for a spare, "faulty", "journal")."""
+
+    def __init__(self, **kw):
+        self.uuid = b""
+        self.version = self.at = self.name = self.level = self.layout = None
+        self.major = self.minor = self.ctime = self.utime = self.chunk = self.raid_disks = None
+        self.dev_size = self.events = self.state = self.role = self.raw_role = None
+        self.dev_number = self.data_offset = self.data_size = self.feature_map = None
+        self.roles = self.reshape_position = self.delta_disks = self.bitmap = None
+        self.resync_offset = self.recovery_offset = self.journal_tail = None
+        self.refused = self.bad_blocks = self.dev_uuid = None
+        self.new_level = self.new_layout = None
+        self.bblog = None                    # (shift, sectors, offset) of a 1.x bad block log
+        self.bblog_cut = False               # the image ends inside that log
+        self.bad_ranges = []                 # [(first byte, end)] it lists, on the member
+        self.disks = []                      # 0.90: [(number, raid_disk, state)] per slot
+        self.max_dev = 0
+        for key, value in kw.items():
+            setattr(self, key, value)
+
+    def uuid_text(self):
+        """As mdadm prints it: four groups of eight hex digits; for 0.90 each
+        group is one of its four native words (set_uuid0..3)."""
+        return ":".join(self.uuid[i:i + 4].hex() for i in range(0, 16, 4))
+
+    def clean(self):
+        return self.resync_offset == MD_MAX_SECTOR if self.major == 1 else bool(self.state & 1)
+
+
+def _md_csum_fold(c):
+    c = (c & 0xffff) + (c >> 16)
+    return (c & 0xffff) + (c >> 16)
+
+
+def _md_sb090(blob, at):
+    """The 0.90 superblock in `blob` (4096 bytes read at byte `at` of the member),
+    or None. Its byte order is the writing host's (md_p.h 131-175): the
+    little-endian form is read; a big-endian one is parsed far enough to be
+    grouped with its array and is then refused, since no fixture holds one."""
+    if len(blob) < 4096:
+        return None
+    if struct.unpack_from("<I", blob, 0)[0] == MD_SB_MAGIC:
+        e = "<"
+    elif struct.unpack_from(">I", blob, 0)[0] == MD_SB_MAGIC:
+        e = ">"
+    else:
+        return None
+    w = struct.unpack_from(f"{e}1024I", blob, 0)
+    if w[1] != 0 or w[2] not in (90, 91) or w[10] <= 0:
+        return None
+    total = sum(w) - w[32 + 6]                     # calc_sb_csum, sb_csum as zero
+    total = (total & 0xffffffff) + (total >> 32)
+    if _md_csum_fold(total & 0xffffffff) != _md_csum_fold(w[32 + 6]):
+        return None
+    level = struct.unpack_from(f"{e}i", blob, 7 * 4)[0]
+    # events_lo then events_hi on a little-endian host, the other way round on a
+    # big-endian one (md_p.h 163-172)
+    events = (w[32 + 8] << 32) | w[32 + 7] if e == "<" else (w[32 + 7] << 32) | w[32 + 8]
+    disks = [w[128 + 32 * i:128 + 32 * i + 5] for i in range(27)]   # MD_SB_DISKS, md_p.h 66
+    this = w[992:997]
+    number = this[0]
+    own = disks[number] if number < 27 else this
+    if own[4] & (1 << MD_DISK_FAULTY):
+        role = "faulty"
+    elif own[4] & (1 << MD_DISK_SYNC):
+        role = own[3]
+    else:
+        role = None
+    reshape = struct.unpack_from(f"{e}Q", blob, (32 + 12) * 4)[0] if w[2] >= 91 else None
+    sb = MdSuper(version="0.90", major=0, minor=w[2], at=at,
+                   uuid=struct.pack(">4I", w[5], w[13], w[14], w[15]),
+                   name="", ctime=w[6], utime=w[32], level=level, layout=w[64],
+                   chunk=w[65], raid_disks=w[10], dev_size=w[8] * 1024, events=events,
+                   state=w[33], role=role, dev_number=number,
+                   data_offset=0, data_size=None, feature_map=0, roles=None,
+                   reshape_position=reshape,
+                   delta_disks=struct.unpack_from(f"{e}i", blob, (32 + 15) * 4)[0] if reshape is not None else 0,
+                   bitmap=bool(w[33] & (1 << MD_SB_BITMAP_PRESENT)), resync_offset=None,
+                   recovery_offset=None, journal_tail=None, bad_blocks=False,
+                   disks=[(d[0], d[3], d[4]) for d in disks], max_dev=27,
+                   refused=None if e == "<" else (
+                       "a 0.90 superblock in big-endian byte order (written by a big-endian "
+                       "host), which this does not read"))
+    if sb.refused is None and sb.raid_disks > 27:
+        sb.refused = (f"its superblock records {sb.raid_disks:,} members, more than the 27 a "
+                      "0.90 superblock holds")
+    return sb
+
+
+def _md_sb1(blob, at, minor, lbs=SECTOR):
+    """The 1.x superblock in `blob` (4096 bytes read at byte `at`), or None:
+    magic, major version 1, max_dev, super_offset equal to where it was read,
+    no feature bit the kernel does not know, and the checksum (super_1_load)."""
+    if len(blob) < 256:
+        return None
+    magic, major, feature_map, _pad0 = struct.unpack_from("<4I", blob, 0)
+    if magic != MD_SB_MAGIC or major != 1:
+        return None
+    max_dev, = struct.unpack_from("<I", blob, 220)
+    super_offset, = struct.unpack_from("<Q", blob, 144)
+    if max_dev > (4096 - 256) // 2 or super_offset * SECTOR != at or feature_map & ~MD_FEATURE_ALL:
+        return None
+    n = 256 + max_dev * 2
+    body = bytearray(blob[:n])
+    stored = struct.unpack_from("<I", body, 216)[0]
+    body[216:220] = b"\0\0\0\0"
+    total = sum(struct.unpack_from(f"<{n // 4}I", body, 0))
+    if n % 4 == 2:
+        total += struct.unpack_from("<H", body, n - 2)[0]
+    if ((total & 0xffffffff) + (total >> 32)) & 0xffffffff != stored:
+        return None
+    (ctime, level, layout, size, chunk, raid_disks, _bitmap_offset, new_level, reshape_pos,
+     delta, new_layout, _new_chunk, _new_offset) = struct.unpack_from("<QiIQIIIIQiIIi", blob, 64)
+    data_offset, data_size, _so, recovery_offset, dev_number = struct.unpack_from("<QQQQI", blob, 128)
+    if data_size < 10:
+        return None
+    # 1.1 and 1.2 keep their data past the superblock and its role table
+    # (md.c 1872-1882): sb_size rounded up to the device's logical block size,
+    # `lbs`, which an image says only through a GPT header found at 4096; for
+    # any other image 512 bytes is assumed.
+    sb_size = -(-(max_dev * 2 + 256) // lbs) * lbs
+    if minor and data_offset * SECTOR < at + sb_size:
+        return None
+    bb_shift, bb_size, bb_offset = struct.unpack_from("<BHi", blob, 185)
+    utime, events, resync_offset = struct.unpack_from("<QQQ", blob, 192)
+    roles = list(struct.unpack_from(f"<{max_dev}H", blob, 256))
+    raw = roles[dev_number] if dev_number < max_dev else MD_ROLE_SPARE
+    role = (None if raw == MD_ROLE_SPARE else "faulty" if raw == MD_ROLE_FAULTY
+            else "journal" if raw == MD_ROLE_JOURNAL else raw if raw < MD_ROLE_MAX else None)
+    return MdSuper(version=f"1.{minor}", major=1, minor=minor, at=at, uuid=bytes(blob[16:32]),
+                   name=blob[32:64].split(b"\0", 1)[0].decode("utf-8", "replace"),
+                   ctime=ctime & ((1 << 40) - 1), utime=utime & ((1 << 40) - 1), level=level,
+                   layout=layout, chunk=chunk * SECTOR, raid_disks=raid_disks,
+                   dev_size=size * SECTOR, events=events, state=0, role=role, raw_role=raw,
+                   dev_number=dev_number, data_offset=data_offset * SECTOR,
+                   data_size=data_size * SECTOR, feature_map=feature_map, roles=roles,
+                   reshape_position=reshape_pos if feature_map & 4 else None,
+                   delta_disks=delta if feature_map & 4 else 0,
+                   bitmap=bool(feature_map & 1), resync_offset=resync_offset,
+                   recovery_offset=recovery_offset if feature_map & 2 else None,
+                   journal_tail=recovery_offset if raw == MD_ROLE_JOURNAL else None,
+                   bad_blocks=bool(feature_map & 8), max_dev=max_dev,
+                   bblog=(bb_shift, bb_size, bb_offset) if feature_map & 8 else None,
+                   dev_uuid=bytes(blob[168:184]), new_level=new_level, new_layout=new_layout,
+                   refused=(f"its superblock records {raid_disks:,} members, more than the "
+                            f"{max_dev} its role table holds" if raid_disks > max_dev else None))
+
+
+def md_superblocks(fh, base, size, lbs=SECTOR):
+    """[MdSuper] for every md superblock that checks out on the member at `base`
+    of `size` bytes, at the places the kernel looks for each version. `lbs` is
+    the member's logical block size (512 unless the image says otherwise)."""
+    out = []
+    sectors = size // SECTOR
+    places = []
+    if sectors >= 2 * (MD_RESERVED // SECTOR):
+        places.append(("0.90", ((sectors & ~(MD_RESERVED // SECTOR - 1)) - MD_RESERVED // SECTOR) * SECTOR))
+    if sectors > 16:
+        places.append(("1.0", ((sectors - 16) & ~7) * SECTOR))
+    places += [("1.1", 0), ("1.2", 4096)]
+    for version, at in places:
+        if at < 0 or at + 4096 > size:
+            continue
+        blob = read_at(fh, base + at, 4096)
+        sb = _md_sb090(blob, at) if version == "0.90" else _md_sb1(blob, at, int(version[2]), lbs)
+        if sb is not None and sb.bblog is not None and not _md_bad_blocks(fh, base, sb):
+            continue
+        if sb is not None:
+            out.append(sb)
+    return out
+
+
+def _md_bad_blocks(fh, base, sb):
+    """Read a 1.x member's bad block log into sb.bad_ranges (byte ranges on the
+    member), as super_1_load does (md.c 1890-1920): at most one page, at
+    bblog_offset sectors from the superblock (metadata reads are relative to
+    sb_start, md.c 1180-1181), entries of sector << 10 | count, both scaled by
+    bblog_shift, ending at an entry of all ones. False when the kernel would
+    refuse the superblock for it (a log longer than a page, or at offset 0)."""
+    shift, sectors, offset = sb.bblog
+    if sectors > 4096 // SECTOR or offset == 0:
+        return False
+    raw = read_at(fh, base + sb.at + offset * SECTOR, sectors * SECTOR)
+    if len(raw) < sectors * SECTOR:
+        # md would fail to load it (sync_page_io, md.c 1907-1909): the member is
+        # left out and says why, rather than read with fewer entries
+        sb.bblog_cut = True
+        return True
+    out = []
+    for i in range(len(raw) // 8):
+        bb, = struct.unpack_from("<Q", raw, 8 * i)
+        if bb == (1 << 64) - 1:
+            break
+        start, count = (bb >> 10) << shift, (bb & 0x3ff) << shift
+        if count:
+            out.append((start * SECTOR, (start + count) * SECTOR))
+    sb.bad_ranges = out
+    return True
+
+
+def md_member(fh, base, size, lbs=SECTOR):
+    """The superblock mdadm would use on this member: of several, the one made
+    last (util.c guess_super_type), else None."""
+    found = md_superblocks(fh, base, size, lbs)
+    if not found:
+        return None
+    return max(found, key=lambda s: s.ctime)          # max keeps the first of equals
+
+
+def raid_foreign(fh, base, size):
+    """The name of RAID metadata at the end of this region that is not md's and
+    is not read here, else None: DDF's anchor in the last sector (super-ddf.c
+    977-1000; the last 4096-byte sector too, for a 4Kn disk), Intel IMSM's two
+    sectors from the end (super-intel.c 4594, sector_size * 2, for 512 and 4096)."""
+    for ss in (SECTOR, 4096):
+        if size < 2 * ss:
+            continue
+        if read_at(fh, base + size - ss, 4) == b"\xde\x11\xde\x11":
+            return "DDF"
+        if read_at(fh, base + size - 2 * ss, 24) == b"Intel Raid ISM Cfg Sig. ":
+            return "Intel IMSM (RST)"
+    return None
+
+
+def identify_md(fh, base, size=None):
+    """("linux md member", lines) for a member of an md array whose data is not a
+    filesystem at the start of the region, ("raid member", lines) for DDF or
+    IMSM metadata, else None. A RAID1 member with its superblock at the end
+    (metadata 0.90 or 1.0) holds the filesystem itself from its first byte, so
+    it is left to the filesystem identifiers, as before."""
+    if size is None:
+        size = image_size(fh) - base
+    sb = md_member(fh, base, size)
+    if sb is None:
+        foreign = raid_foreign(fh, base, size)
+        if foreign:
+            return "raid member", [f"a member of a {foreign} RAID set, whose metadata this "
+                                   "does not read"]
+        return None
+    if getattr(sb, "refused", None):
+        return "linux md member", [f"Linux md member: {sb.refused}"]
+    if sb.major == 0 or sb.minor == 0:
+        if sb.level == 1 and sb.data_offset == 0:
+            return None
+    role = sb.role if isinstance(sb.role, int) else (sb.role or "spare")
+    lines = [f"Linux md member, metadata {sb.version}, {MD_LEVELS.get(sb.level, sb.level)}, "
+             f"array {sb.uuid_text()}" + (f" ({sb.name})" if sb.name else ""),
+             f"role {role} of {sb.raid_disks}, events {sb.events:,}, data from byte "
+             f"{sb.data_offset:,}; read as part of its array when the other members are "
+             "given with it"]
+    return "linux md member", lines
+
+
+# --- GF(2^8) for RAID6 (lib/raid6/mktables.c) ----------------------------------
+
+def _gf_mul(a, b):
+    v = 0
+    while b:
+        if b & 1:
+            v ^= a
+        a = ((a << 1) ^ (0x1d if a & 0x80 else 0)) & 0xff
+        b >>= 1
+    return v
+
+
+_GF = {}
+
+
+def _gf_tables():
+    """(exp, inv) tables: exp[i] = 2**i, inv[x] = x**254, mktables.c 108-150."""
+    if not _GF:
+        exp, v = [], 1
+        for _ in range(256):
+            exp.append(v)
+            v = _gf_mul(v, 2)
+            if v == 1:
+                v = 0
+        inv = [0] * 256
+        for x in range(256):
+            r, a, b = 1, x, 254
+            while b:
+                if b & 1:
+                    r = _gf_mul(r, a)
+                a = _gf_mul(a, a)
+                b >>= 1
+            inv[x] = r
+        _GF["exp"], _GF["inv"], _GF["mul"] = exp, inv, {}
+    return _GF["exp"], _GF["inv"]
+
+
+def _gf_scale(c, data):
+    """Every byte of data multiplied by c in GF(2^8)."""
+    _gf_tables()
+    table = _GF["mul"].get(c)
+    if table is None:
+        table = _GF["mul"][c] = bytes(_gf_mul(c, x) for x in range(256))
+    return data.translate(table)
+
+
+def _xor(blocks, n):
+    acc = 0
+    for b in blocks:
+        acc ^= int.from_bytes(b, "little")
+    return acc.to_bytes(n, "little")
+
+
+# --- the layouts ---------------------------------------------------------------
+
+class RaidGeometry:
+    """How an array of `n` members lays out its data. `level` is "linear", 0, 1,
+    4, 5, 6 or 10 (5 also for dm-raid's raid4, layout 4); `chunk` in bytes;
+    `dev_bytes` the size each member gives the array (md's dev_sectors);
+    `member_bytes` per role, which linear and RAID0 use. `size` is the
+    array's length (linear_conf, raid0_size, raid1_size, raid5_size,
+    raid10_size). `why` is set instead when the layout is not one this reads."""
+
+    def __init__(self, level, n, chunk, layout, dev_bytes, member_bytes=None):
+        self.level, self.n, self.chunk, self.layout = level, n, chunk, layout
+        self.dev_bytes, self.member_bytes = dev_bytes, member_bytes or []
+        self.why, self.size, self.zones, self.ends = None, 0, [], []
+        self.nc = self.fc = 1                  # RAID10's near and far copies
+        self.fo, self.far_set, self.stride = False, n, 0
+        try:
+            self._setup()
+        except (ValueError, ZeroDivisionError, IndexError) as exc:
+            self.why = self.why or f"its geometry does not hold together ({exc})"
+
+    def _setup(self):
+        level, n, chunk = self.level, self.n, self.chunk
+        if n < 1:
+            self.why = "no members"
+            return
+        if level == "linear":
+            # md-linear.c 113-150: each member, rounded down to the chunk when
+            # there is one, after the last, in role order
+            at = 0
+            for b in self.member_bytes:
+                at += b - b % chunk if chunk else b
+                self.ends.append(at)
+            self.size = at
+            return
+        if level != 1 and (not chunk or chunk % SECTOR):
+            self.why = f"a chunk of {chunk} bytes"
+            return
+        if level == 0:
+            self._raid0()
+        elif level == 1:
+            self.size = self.dev_bytes
+        elif level in (4, 5, 6):
+            maxdeg = 2 if level == 6 else 1
+            if level == 5 and self.layout not in MD_R5_LAYOUTS:
+                self.why = f"RAID5 layout {self.layout}, which is not one md defines"
+                return
+            if level == 6 and self.layout not in MD_R6_LAYOUTS:
+                self.why = f"RAID6 layout {self.layout}, which is not one md defines"
+                return
+            if n <= maxdeg:
+                self.why = f"{n} members, too few for {MD_LEVELS[level]}"
+                return
+            self.size = (self.dev_bytes - self.dev_bytes % chunk) * (n - maxdeg)
+        elif level == 10:
+            self._raid10()
+        else:
+            self.why = f"level {MD_LEVELS.get(level, level)}"
+
+    def _raid0(self):
+        """create_strip_zones (raid0.c 65-298): members rounded down to the chunk;
+        one zone per distinct size, each over the members still longer than the
+        last zone's end on the smallest."""
+        chunk = self.chunk
+        sizes = [b - b % chunk for b in self.member_bytes]
+        distinct = sorted(set(sizes))
+        start, end = 0, 0
+        for s in distinct:
+            devs = [r for r, b in enumerate(sizes) if b > start]
+            end += (s - start) * len(devs)
+            self.zones.append((end, start, devs))
+            start = s
+        if len(self.zones) > 1 and len(self.zones[1][2]) > 1:
+            if self.layout not in (1, 2):
+                self.why = ("a RAID0 array of members of different sizes that records no "
+                            "layout (made before Linux 5.4), whose zone layout is not "
+                            "settled by its metadata")
+                return
+        else:
+            self.layout = 1
+        self.size = end
+
+    def _raid10(self):
+        """setup_geo and calc_sectors (raid10.c 3732-3815)."""
+        layout, n, chunk = self.layout, self.n, self.chunk
+        if layout >> 17:
+            self.why = (f"a RAID10 layout with far sets (layout 0x{layout:x}), which this "
+                        "does not read")
+            return
+        if layout >> 19 or chunk & (chunk - 1) or chunk < 4096:
+            self.why = f"a RAID10 layout 0x{layout:x} with a {chunk}-byte chunk"
+            return
+        nc, fc, fo = layout & 255, (layout >> 8) & 255, bool(layout & (1 << 16))
+        if nc * fc < 2 or nc * fc > n:
+            self.why = (f"a RAID10 layout 0x{layout:x} with {nc * fc} copies over {n} members, "
+                        "which md does not run (raid10.c 3848: at least two, at most one a member)")
+            return
+        self.nc, self.fc, self.fo, self.far_set = nc, fc, fo, n
+        chunks = self.dev_bytes // chunk // fc * n // nc
+        self.size = chunks * chunk
+        per_dev = -(-chunks * nc * fc // n)
+        self.stride = chunk if fo else per_dev // fc * chunk
+
+    def copies10(self, off):
+        """[(role, member offset)] of each copy of array byte `off`, and the bytes
+        that follow it in this chunk (__raid10_find_phys, raid10.c 581-642)."""
+        chunk = self.chunk
+        c, within = divmod(off, chunk)
+        c *= self.nc
+        stripe, dev = divmod(c, self.n)
+        if self.fo:
+            stripe *= self.fc
+        sector = within + stripe * chunk
+        out = []
+        n, fs = self.n, self.far_set
+        last_start = (n // fs - 1) * fs
+        last_size = fs + n % fs
+        for _ in range(self.nc):
+            d, s = dev, sector
+            out.append((d, s))
+            for _f in range(1, self.fc):
+                group = d // fs
+                d += self.nc
+                if n % fs and d > last_start:
+                    d = (d - last_start) % last_size + last_start
+                else:
+                    d = d % fs + fs * group
+                s += self.stride
+                out.append((d, s))
+            dev += 1
+            if dev >= n:
+                dev = 0
+                sector += chunk
+        return out, chunk - within
+
+    def place(self, off):
+        """For array byte `off`: (role, member offset, run) for linear and RAID0."""
+        if self.level == "linear":
+            i = bisect.bisect_right(self.ends, off)
+            start = self.ends[i - 1] if i else 0
+            return i, off - start, self.ends[i] - off
+        for zi, (end, dev_start, devs) in enumerate(self.zones):
+            if off < end:
+                zoff = off - (self.zones[zi - 1][0] if zi else 0)
+                s = off if self.layout == 1 else zoff          # raid0.c 566-571
+                within = s % self.chunk
+                role = devs[(s // self.chunk) % len(devs)]
+                row = zoff // (self.chunk * len(devs))
+                run = min(self.chunk - within, end - off)
+                return role, dev_start + row * self.chunk + within, run
+        raise ValueError(f"byte {off:,} is past the array")
+
+    def stripe(self, off):
+        """For RAID4/5/6: (data role, parity role, Q role or -1, member offset,
+        run, ddf) for array byte `off` (raid5_compute_sector, raid5.c 2946-3149)."""
+        chunk, n, algo = self.chunk, self.n, self.layout
+        cnum, within = divmod(off, chunk)
+        data_disks = n - (2 if self.level == 6 else 1)
+        stripe, dd = divmod(cnum, data_disks)
+        s2 = stripe
+        pd = qd = -1
+        ddf = False
+        if self.level == 4:
+            pd = data_disks
+        elif self.level == 5:
+            if algo == 0:
+                pd = data_disks - s2 % n
+                dd += dd >= pd
+            elif algo == 1:
+                pd = s2 % n
+                dd += dd >= pd
+            elif algo == 2:
+                pd = data_disks - s2 % n
+                dd = (pd + 1 + dd) % n
+            elif algo == 3:
+                pd = s2 % n
+                dd = (pd + 1 + dd) % n
+            elif algo == 4:
+                pd = 0
+                dd += 1
+            elif algo == 5:
+                pd = data_disks
+        else:
+            if algo in (0, 1, 8, 9):
+                if algo == 9:
+                    s2 += 1
+                pd = (n - 1 - s2 % n) if algo in (0, 9) else s2 % n
+                qd = pd + 1
+                if pd == n - 1:
+                    dd += 1
+                    qd = 0
+                elif dd >= pd:
+                    dd += 2
+                ddf = algo in (8, 9)
+            elif algo in (2, 3):
+                pd = (n - 1 - s2 % n) if algo == 2 else s2 % n
+                qd = (pd + 1) % n
+                dd = (pd + 2 + dd) % n
+            elif algo == 4:
+                pd, qd = 0, 1
+                dd += 2
+            elif algo == 5:
+                pd, qd = data_disks, data_disks + 1
+            elif algo == 10:
+                pd = n - 1 - s2 % n
+                qd = (pd + n - 1) % n
+                dd = (pd + 1 + dd) % n
+                ddf = True
+            elif algo in (16, 17, 18, 19):
+                pd = (data_disks - s2 % (n - 1)) if algo in (16, 18) else s2 % (n - 1)
+                if algo in (16, 17):
+                    dd += dd >= pd
+                else:
+                    dd = (pd + 1 + dd) % (n - 1)
+                qd = n - 1
+            elif algo == 20:
+                pd = 0
+                dd += 1
+                qd = n - 1
+        return dd, pd, qd, stripe * chunk + within, chunk - within, ddf
+
+
+def _raid6_slots(n, pd, qd, ddf):
+    """{member: slot} for the data members of one RAID6 stripe and the number of
+    syndrome slots (raid6_d0, raid6_idx_to_slot, set_syndrome_sources)."""
+    d0 = 0 if ddf or qd == n - 1 else qd + 1
+    slots, count, i = {}, 0, d0
+    for _ in range(n):
+        if ddf:
+            slot = count
+            count += 1
+            if i not in (pd, qd):
+                slots[i] = slot
+        elif i not in (pd, qd):
+            slots[i] = count
+            count += 1
+        i = (i + 1) % n
+    return slots
+
+
+class _RaidMemberFailed(OSError):
+    """A member's read failed during a rebuild; `role` says which."""
+
+    def __init__(self, role, why):
+        super().__init__(why)
+        self.role = role
+
+
+class RaidReader:
+    """Reads an array's bytes from its members. `members` is {role: (fh, byte
+    offset of that member's data)}; a role that is not there is missing. `bad`
+    is {role: [(start, end)]}, byte ranges of a member's data that its bad
+    block log lists (super_1_load, md.c 1890-1920): md does not read those, and
+    neither does this. A range listed on one member is read from another copy
+    (RAID1, RAID10) or rebuilt from parity (RAID4/5/6), as for a missing
+    member; with neither, the read fails."""
+
+    def __init__(self, geom, members, bad=None, clean=True):
+        self.g, self.m = geom, members
+        self.bad = {r: sorted(v) for r, v in (bad or {}).items() if v}
+        self.clean = clean        # stopped clean: parity may be trusted to rebuild a failed read
+        self.last_error = None
+
+    def unreadable(self, limit=1 << 20):
+        """[(role, first byte, end)] of each listed bad range whose array bytes
+        neither another copy nor parity can supply, found by reading every
+        array chunk the range touches (strictly); None when the ranges touch
+        more than `limit` chunks to check."""
+        g, out, probes = self.g, [], 0
+        chunk = g.chunk or (1 << 16)
+        for role, ranges in self.bad.items():
+            for s, e in ranges:
+                s, e = max(0, s), min(e, g.dev_bytes if g.level != 1 else g.size)
+                if s >= e:
+                    continue
+                spans = []
+                if g.level == 1:
+                    spans = [(s, e - s)]
+                elif g.level in (4, 5, 6):
+                    dd = g.n - (2 if g.level == 6 else 1)
+                    for row in range(s // chunk, (e - 1) // chunk + 1):
+                        spans.append((row * dd * chunk, dd * chunk))
+                else:                                   # RAID10: the chunks with a copy there
+                    cands = set()
+                    for at in sorted({s} | set(range((s // chunk + 1) * chunk, e, chunk))):
+                        for f in range(g.fc):
+                            row = (at - f * g.stride) // chunk if not g.fo else (at // chunk - f)
+                            if row < 0 or (g.fo and row % g.fc):
+                                continue
+                            stripe = row // g.fc if g.fo else row
+                            for st in (stripe - 1, stripe):
+                                lo = max(0, st * g.n // g.nc - 1)
+                                cands.update(range(lo, (st + 1) * g.n // g.nc + 2))
+                    spans = [(c * chunk, chunk) for c in sorted(cands)]
+                for a, n in spans:
+                    probes += 1
+                    if probes > limit:
+                        return None
+                    a, n = max(0, a), min(n, g.size - max(0, a))
+                    if n <= 0:
+                        continue
+                    try:
+                        self.read(a, n, strict=True)
+                    except OSError:
+                        out.append((role, s, e))
+                        break
+        return out
+
+    def _member(self, role, off, n):
+        """`n` bytes of member `role`'s data from `off`, read directly (not
+        through read_at, whose shortfall tally belongs to the array's reader),
+        tried a second time before the member counts as failed there."""
+        fh, base = self.m[role]
+        for _attempt in range(2):
+            try:
+                fh.seek(base + off)
+                data = fh.read(n)
+            except OSError:
+                continue
+            if len(data) == n:
+                return data
+        raise OSError(f"member {role} does not read at byte {off:,}")
+
+    def _has(self, role, at, n):
+        """True when member `role` is there and no listed bad range touches
+        [at, at + n) on it."""
+        if role not in self.m:
+            return False
+        return not any(s < at + n and at < e for s, e in self.bad.get(role, ()))
+
+    def _edge(self, role, at):
+        """Bytes from `at` on member `role` to where its listed bad ranges next
+        begin or end, so a read is cut there."""
+        out = None
+        for s, e in self.bad.get(role, ()):
+            for edge in (s, e):
+                if edge > at and (out is None or edge - at < out):
+                    out = edge - at
+        return out
+
+    def _cut(self, take, places):
+        """`take` shortened so that no member at [(role, offset)] crosses a
+        listed bad range's edge."""
+        if not self.bad:
+            return take
+        for role, at in places:
+            edge = self._edge(role, at)
+            if edge is not None:
+                take = min(take, edge)
+        return take
+
+    def read(self, off, n, strict=False):
+        """The bytes from array byte `off`. Where a piece cannot be read (no
+        copy, nor parity to rebuild it from) the read stops there and returns
+        what came before it, so a caller sees a short read, which extraction
+        counts and names (EOF_SHORTFALL, .SHORT), never zeros; `strict` raises
+        OSError instead."""
+        out = bytearray()
+        try:
+            self._read(off, n, out)
+        except OSError as exc:
+            self.last_error = f"array byte {off + len(out):,}: {exc}"
+            if strict:
+                raise
+        return bytes(out)
+
+    def _read(self, off, n, out):
+        g = self.g
+        n = max(0, min(n, g.size - off))
+        while n > 0:
+            if g.level in ("linear", 0):
+                role, at, run = g.place(off)
+                take = self._cut(min(run, n), [(role, at)])
+                if not self._has(role, at, take):
+                    raise OSError(f"array byte {off:,} lies in a bad block range of member {role}")
+                out += self._member(role, at, take)
+            elif g.level == 1:
+                # in pieces of at most 64 KiB, so a read that fails on every copy
+                # ends at that piece and what came before it is kept
+                take = self._cut(min(n, 1 << 16), [(r, off) for r in self.m])
+                out += self._first_copy([(r, off) for r in sorted(self.m)], take, off)
+            elif g.level == 10:
+                copies, run = g.copies10(off)
+                take = self._cut(min(run, n), copies)
+                out += self._first_copy(copies, take, off)
+            else:
+                dd, pd, qd, at, run, ddf = g.stripe(off)
+                take = self._cut(min(run, n), [(r, at) for r in range(g.n)])
+                got = None
+                if self._has(dd, at, take):
+                    try:
+                        got = self._member(dd, at, take)
+                    except OSError:                    # md reads around a failed read too
+                        if not self.clean:
+                            # parity of an array not stopped clean may be out of
+                            # step: no rebuild, the read ends short here
+                            raise OSError(f"member {dd} does not read at byte {at:,}, and the "
+                                          "array was not stopped clean, so it is not rebuilt "
+                                          "from parity") from None
+                        got = None
+                out += got if got is not None else self._rebuild(
+                    dd, pd, qd, at, take, ddf, skip={dd})
+            off += take
+            n -= take
+
+    def _first_copy(self, copies, take, off):
+        """The first of `copies` [(member, offset)] that is there, lists no bad
+        range over the bytes and reads without an error, as md tries another
+        mirror when a read fails (raid1.c, raid10.c read_balance)."""
+        for role, at in copies:
+            if self._has(role, at, take):
+                try:
+                    return self._member(role, at, take)
+                except OSError:
+                    continue
+        raise OSError(f"no copy of array byte {off:,} can be read")
+
+    def _rebuild(self, want, pd, qd, at, n, ddf, skip=frozenset()):
+        """The `n` bytes at member offset `at` of member `want`, missing, with
+        a bad range there or failing to read, from the others in its stripe:
+        XOR with P (raid5), or from P and Q (lib/raid6/recov.c). A member that
+        fails to read here is left out and the rebuild tried without it."""
+        try:
+            return self._rebuild_from(want, pd, qd, at, n, ddf, set(skip))
+        except _RaidMemberFailed as exc:
+            if exc.role in skip:
+                raise OSError(str(exc)) from None
+            return self._rebuild(want, pd, qd, at, n, ddf, set(skip) | {exc.role})
+
+    def _read_or_flag(self, role, at, n):
+        try:
+            return self._member(role, at, n)
+        except OSError as exc:
+            raise _RaidMemberFailed(role, str(exc)) from None
+
+    def _rebuild_from(self, want, pd, qd, at, n, ddf, skip):
+        g = self.g
+        here = {r for r in range(g.n) if r != want and r not in skip and self._has(r, at, n)}
+        if g.level != 6:
+            others = [r for r in range(g.n) if r not in (want, qd)]
+            if not set(others) <= here:
+                raise OSError("more than one member of the stripe missing")
+            return _xor([self._read_or_flag(r, at, n) for r in others], n)
+        exp, inv = _gf_tables()
+        slots = _raid6_slots(g.n, pd, qd, ddf)
+        data = {r: self._read_or_flag(r, at, n) for r in slots if r in here}
+        lost_data = sorted((slots[r], r) for r in slots if r not in here)
+        if pd in here and len(lost_data) == 1:
+            return _xor([self._read_or_flag(pd, at, n)] + list(data.values()), n)
+        if qd not in here:
+            raise OSError("too many members of the stripe missing")
+        q = self._read_or_flag(qd, at, n)
+        qx = _xor([q] + [_gf_scale(exp[slots[r]], d) for r, d in data.items()], n)
+        if len(lost_data) == 1:                         # data and P (recov.c 59-83)
+            a = lost_data[0][0]
+            return _gf_scale(inv[exp[a]], qx)
+        if len(lost_data) == 2 and pd in here:          # two data (recov.c 19-56)
+            (a, ra), (b, _rb) = lost_data
+            px = _xor([self._read_or_flag(pd, at, n)] + list(data.values()), n)
+            db = _xor([_gf_scale(inv[exp[b - a] ^ 1], px), _gf_scale(inv[exp[a] ^ exp[b]], qx)], n)
+            return db if want != ra else _xor([db, px], n)
+        raise OSError("too many members of the stripe missing")
+
+
+class RaidImage:
+    """An assembled array (or a logical volume read across several images) as a
+    read-only image: seek, tell, read and size, like any image open_image()
+    returns, so volumes(), main(), the walkers, extraction and free space read
+    it unchanged. `read_fn(off, n)` gives its bytes. Closing it closes nothing:
+    its members belong to the RaidSet that opened them."""
+
+    def __init__(self, read_fn, size, label, info=None):
+        self._read, self.size, self.label = read_fn, size, label
+        self.raid_info = info or {}
+        self._pos = 0
+
+    def seek(self, off, whence=0):
+        self._pos = off if whence == 0 else self._pos + off if whence == 1 else self.size + off
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def read(self, n=-1):
+        if self._pos >= self.size:
+            return b""
+        want = self.size - self._pos if n is None or n < 0 else min(n, self.size - self._pos)
+        data = self._read(self._pos, want)
+        self._pos += len(data)
+        return data
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _ConcatImage:
+    """Several images read as one address space, each starting on a GiB past
+    the end of the one before, so a volume group spread over several images is
+    read with the same code as one inside a single image."""
+
+    def __init__(self, parts):
+        self.parts, at = [], 0
+        for label, fh, size in parts:
+            self.parts.append((at, size, fh, label))
+            at = ((at + size + (1 << 30) - 1) >> 30 << 30) + (1 << 30)
+        self.size = at
+        self._pos = 0
+
+    def seek(self, off, whence=0):
+        self._pos = off if whence == 0 else self._pos + off if whence == 1 else self.size + off
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def read(self, n=-1):
+        for start, size, fh, _label in self.parts:
+            if start <= self._pos < start + size:
+                want = start + size - self._pos if n is None or n < 0 else min(n, start + size - self._pos)
+                fh.seek(self._pos - start)
+                got = fh.read(want)
+                self._pos += len(got)
+                return got
+        return b""
+
+
+# --- assembly ------------------------------------------------------------------
+
+class MdArray:
+    """One md array assembled from the members found: what its superblocks say,
+    which member holds which role, what is missing or left out and why, and,
+    when it can be read, `image`, a RaidImage of its bytes."""
+
+    def __init__(self, sb):
+        self.sb = sb                      # the freshest superblock
+        self.uuid = sb.uuid_text()
+        self.members, self.left_out, self.notes = [], [], []
+        self.missing, self.image, self.refused = [], None, None
+        self.geom = None
+        self.incomplete = False   # too few members given to read it, whatever became of them
+        self.not_given = []       # roles no image given claims
+        self.same_as = None       # a RAID1 member whose own listing shows the same bytes
+
+    @property
+    def level_name(self):
+        return MD_LEVELS.get(self.sb.level, f"level {self.sb.level}")
+
+    @property
+    def label(self):
+        return f"md array {self.sb.name or self.uuid}"
+
+    @property
+    def safe_name(self):
+        """The name the array is read under: a run's header, volumes.json's
+        image, the prefix of its extraction folders and free-space files."""
+        stem = sanitize_volume_label(self.sb.name, 32) if self.sb.name else ""
+        return f"md_{stem}_{self.uuid[:8]}" if stem else f"md_{self.uuid[:8]}"
+
+    def layout_name(self):
+        sb = self.sb
+        if sb.level == 5:
+            return MD_R5_LAYOUTS.get(sb.layout, f"layout {sb.layout}")
+        if sb.level == 6:
+            return MD_R6_LAYOUTS.get(sb.layout, f"layout {sb.layout}")
+        if sb.level == 10:
+            nc, fc = sb.layout & 255, (sb.layout >> 8) & 255
+            kind = "offset" if sb.layout & (1 << 16) else "far"
+            return (f"near={nc}" if fc == 1 else f"{kind}={fc}" if nc == 1
+                    else f"near={nc}, {kind}={fc}")
+        if sb.level == 0 and self.geom is not None and len(self.geom.zones) > 1:
+            return {1: "original", 2: "alternate"}.get(self.geom.layout, "none recorded")
+        return ""
+
+    def lines(self):
+        sb = self.sb
+        head = (f"{self.label}: {self.level_name}"
+                + (f" {self.layout_name()}" if self.layout_name() else "")
+                + (f", {human(sb.chunk)} chunks" if sb.chunk and sb.level not in (1,) else "")
+                + f", metadata {sb.version}, uuid {self.uuid}, {sb.raid_disks} member(s), "
+                f"events {sb.events:,}, {'clean' if sb.clean() else 'NOT clean'}")
+        out = [head]
+        for m in sorted(self.members, key=lambda x: x["role"]):
+            out.append(f"  role {m['role']}: {m['where']} (events {m['events']:,}, data from "
+                       f"byte {m['data_offset']:,}" + (f", {m['note']}" if m.get("note") else "") + ")")
+        for m in self.left_out:
+            out.append(f"  left out: {m['where']}: {m['why']}")
+        for r in self.missing:
+            out.append(f"  role {r}: missing")
+        out += [f"  {n}" for n in self.notes]
+        if self.refused:
+            out.append(f"  NOT READ: {self.refused}")
+        elif self.image is not None:
+            out.append(f"  read as an image of {self.image.size:,} bytes ({human(self.image.size)})")
+        return out
+
+    def describe(self):
+        sb = self.sb
+        return {"kind": "md", "uuid": self.uuid, "name": sb.name, "metadata": sb.version,
+                "level": self.level_name, "layout": self.layout_name() or None,
+                "chunk_bytes": sb.chunk or None, "raid_disks": sb.raid_disks,
+                "events": sb.events, "clean": sb.clean(),
+                "members": [{"role": m["role"], "where": m["where"], "events": m["events"],
+                             "data_offset": m["data_offset"]} for m in sorted(self.members, key=lambda x: x["role"])],
+                "missing_roles": list(self.missing),
+                "left_out": [{"where": m["where"], "why": m["why"]} for m in self.left_out],
+                "notes": list(self.notes), "refused": self.refused,
+                "bytes": self.image.size if self.image is not None else None}
+
+
+def _md_journal_pending(fh, base, jsb, array_uuid, geom, clean):
+    """None when the RAID5/6 write journal on member `jsb` (at `base`) holds no
+    write the members may lack, else why. The log is walked as the kernel
+    replays it when the array starts (raid5-cache.c): from the meta block at the
+    journal's tail, each block valid by magic, version, position, sequence and
+    a CRC32C seeded with one over the array uuid (r5l_load_log 2941-3000,
+    r5l_recovery_read_meta_block 1722-1752); a block whose data pages fail
+    their checksums is passed over (r5c_recovery_flush_log 2226-2246). Per
+    stripe, data logged after its parity is a write held only in the journal
+    (r5l_recovery_load_data 1800-1820 marks it caching, load_parity 1822-1846
+    clears that), and a flush payload says the stripe is on the members. A
+    stripe whose data and parity are both logged is rewritten by the kernel
+    from the log; on an array stopped clean those writes had finished, so the
+    members hold them."""
+    seed = xfs_crc32c(array_uuid, 0xFFFFFFFF)                 # raid5-cache.c 3079
+    data = base + jsb.data_offset
+    ring = jsb.data_size // 4096 * 4096
+    pos = (jsb.journal_tail or 0) * SECTOR
+    if not ring:
+        return "its write journal device holds no log"
+    if pos >= ring or pos % 4096:
+        pos = 0
+    maxdeg = 2 if geom.level == 6 else 1
+    state, seq, blocks = {}, None, 0
+    for _ in range(RAID_JOURNAL_WALK_MAX):
+        mb = bytearray(read_at(fh, data + pos, 4096))
+        if len(mb) < 4096:
+            return "its write journal could not be read"
+        magic, crc, version, _p1, _p2, meta_size, mseq, position = struct.unpack_from("<IIBBHIQQ", mb, 0)
+        mb[4:8] = b"\0\0\0\0"
+        if (magic != R5LOG_MAGIC or version != 1 or position * SECTOR != pos
+                or (seq is not None and mseq != seq) or meta_size > 4096
+                or xfs_crc32c(bytes(mb), seed) != crc):
+            break                        # the log ends here
+        blocks += 1
+        payloads, off, total, page_at, good = [], 32, 4096, (pos + 4096) % ring, True
+        while off + 8 <= meta_size:
+            ptype, _flags, psize = struct.unpack_from("<HHI", mb, off)
+            if ptype == 2:                                    # R5LOG_PAYLOAD_FLUSH
+                count = psize // 8
+                if off + 8 + 8 * count > meta_size:
+                    return (f"its write journal has a meta block at journal byte {pos:,} whose "
+                            "payloads run past the block")
+                payloads.append(("flush", [struct.unpack_from("<Q", mb, off + 8 + 8 * i)[0]
+                                           for i in range(count)]))
+                off += 8 + psize
+                continue
+            if ptype not in (0, 1):
+                return f"its write journal holds a payload of type {ptype}, which this does not read"
+            pages = psize >> 3
+            if off + 16 + 4 * pages > meta_size or pages * 4096 > ring:
+                return (f"its write journal has a meta block at journal byte {pos:,} whose "
+                        "payloads run past the block")
+            location, = struct.unpack_from("<Q", mb, off + 8)
+            sums = struct.unpack_from(f"<{pages}I", mb, off + 16)
+            for i in range(pages):
+                page = read_at(fh, data + (page_at + i * 4096) % ring, 4096)
+                if xfs_crc32c(page, seed) != sums[i]:
+                    good = False
+            payloads.append(("data" if ptype == 0 else "parity", location))
+            span = 4096 if ptype == 0 else 4096 * maxdeg
+            page_at = (page_at + psize * SECTOR) % ring
+            total += span
+            off += 16 + 4 * pages
+        if good:
+            for kind, what in payloads:
+                if kind == "flush":
+                    for s in what:
+                        state.pop(s, None)
+                elif kind == "data":
+                    state[geom.stripe(what * SECTOR)[3] // SECTOR] = "data"
+                else:
+                    state[what] = "parity"
+        seq = mseq + 1
+        pos = (pos + total) % ring
+    else:
+        return "its write journal runs on further than this follows"
+    only = sum(1 for v in state.values() if v == "data")
+    logged = len(state) - only
+    if only:
+        return (f"its write journal holds data for {only} stripe(s) not yet written to the "
+                "members (a write-back journal)")
+    if logged and not clean:
+        return (f"its write journal holds {logged} stripe(s) that the kernel would rewrite "
+                "onto the members, and the array was not stopped clean")
+    return None, blocks, logged
+
+
+def _md_assemble(found):
+    """[MdArray] from `found`, [(where, fh, base, size, MdSuper)], every member
+    seen, grouped by array uuid as the kernel's analyze_sbs and validate_super
+    do. Each array is judged on its own: a fault in one is said on that array
+    and never costs the others."""
+    groups = collections.OrderedDict()
+    for item in found:
+        groups.setdefault(item[4].uuid, []).append(item)
+    arrays = []
+    for _uuid, items in groups.items():
+        active = [it for it in items if it[4].role is not None]
+        fresh = max(active or items, key=lambda it: it[4].events)[4]
+        arr = MdArray(fresh)
+        arrays.append(arr)
+        try:
+            journal = _md_roles(arr, items)
+            _md_judge(arr, journal)
+        except Exception as exc:                       # pylint: disable=broad-except
+            arr.image = None
+            arr.refused = f"its metadata could not be used ({type(exc).__name__}: {exc})"
+    return arrays
+
+
+def _md_roles(arr, items):
+    """Fill arr.members, arr.left_out and arr.missing from the members found, as
+    the kernel's validate_super does; return the journal member, if any, as
+    (fh, base, MdSuper, where)."""
+    sb = arr.sb
+    roles = {}
+    journal = journal_sb = None
+    if sb.refused:
+        arr.left_out = [{"where": w, "events": s.events, "data_offset": s.data_offset,
+                         "why": "its array is not read"} for w, _f, _b, _z, s in items]
+        # too few members here to read it even if its superblock were usable
+        have = len({it[4].dev_number for it in items})
+        allowed = {1: max(0, (sb.raid_disks or 1) - 1), 4: 1, 5: 1, 6: 2}.get(sb.level, 0)
+        arr.incomplete = have < (sb.raid_disks or 0) - allowed
+        return None
+    for where, fh, base, size, s in items:
+        rec = {"where": where, "events": s.events, "data_offset": s.data_offset}
+        if (s.level, s.layout if s.level != 0 else 0, s.chunk, s.raid_disks) != \
+                (sb.level, sb.layout if sb.level != 0 else 0, sb.chunk, sb.raid_disks):
+            arr.left_out.append(dict(rec, why="its superblock gives the array a different "
+                                     "level, layout, chunk or member count"))
+            continue
+        role = s.role
+        if s is not sb and s.events + 1 == sb.events and role is not None:
+            # One event behind: its own superblock may predate its being marked
+            # faulty, so its role is the freshest superblock's (md.c 2111-2133;
+            # for 0.90, the freshest disks[] entry of its device number, whose
+            # state must still say in sync).
+            if s.major == 1:
+                if s.dev_number >= sb.max_dev:
+                    arr.left_out.append(dict(rec, why=f"device number {s.dev_number}, past the "
+                                             f"freshest superblock's {sb.max_dev} (md.c 2125-2130)"))
+                    continue
+                raw = sb.roles[s.dev_number]
+                role = (raw if raw < MD_ROLE_MAX else "faulty" if raw == MD_ROLE_FAULTY
+                        else "journal" if raw == MD_ROLE_JOURNAL else None)
+            else:
+                entry = sb.disks[s.dev_number] if s.dev_number < len(sb.disks) else None
+                if entry is None or entry[2] & (1 << MD_DISK_FAULTY) or not entry[2] & (1 << MD_DISK_SYNC):
+                    arr.left_out.append(dict(rec, why="one event behind, and the freshest "
+                                             "superblock no longer has it in sync"))
+                    continue
+                role = entry[1]
+            rec["note"] = "one event behind, its role from the freshest superblock"
+        if role is not None and s.events + 1 < sb.events:
+            arr.left_out.append(dict(rec, why=f"stale: events {s.events:,}, the array is at "
+                                     f"{sb.events:,} (a member failed or removed, whose data "
+                                     "stopped being kept)"))
+            continue
+        if role is None:
+            arr.left_out.append(dict(rec, why="a spare, which holds no data of the array"))
+            continue
+        if role == "faulty":
+            arr.left_out.append(dict(rec, why="marked faulty"))
+            continue
+        if role == "journal":
+            if not s.feature_map & 512:
+                arr.left_out.append(dict(rec, why="a journal device whose own superblock has no "
+                                         "journal feature (md.c 2146-2150)"))
+                continue
+            if journal_sb is None or journal_sb.events < s.events:
+                journal, journal_sb = (fh, base, s, where), s
+            continue
+        if s.bblog_cut:
+            arr.left_out.append(dict(rec, why="its bad block log runs past the end of the image, "
+                                     "so md would not load it (md.c 1907-1909)"))
+            continue
+        if s.feature_map & 2 or s.feature_map & 16:
+            arr.left_out.append(dict(rec, why="still being rebuilt (recovery offset "
+                                     f"{(s.recovery_offset or 0) * SECTOR:,})"))
+            continue
+        if role >= sb.raid_disks:
+            arr.left_out.append(dict(rec, why=f"role {role}, past the array's {sb.raid_disks} members"))
+            continue
+        need = s.data_offset + (sb.dev_size if sb.level not in (0, -1) else
+                                (s.data_size if s.data_size is not None else s.at))
+        if size < need:
+            arr.left_out.append(dict(rec, why=f"the image holds {size:,} bytes of it and the "
+                                     f"array needs {need:,} (a member image cut short)"))
+            continue
+        if role in roles:
+            if roles[role]["events"] >= s.events:
+                arr.left_out.append(dict(rec, why=f"role {role} again, held by {roles[role]['where']}"))
+                continue
+            arr.left_out.append(dict(roles[role], why=f"role {role} again, held by {where}"))
+        roles[role] = dict(rec, role=role, fh=fh, base=base, size=size, sb=s)
+    arr.members = list(roles.values())
+    arr.missing = [r for r in range(sb.raid_disks) if r not in roles]
+    # Incomplete means too few members were GIVEN, whatever became of them: the
+    # roles no image given claims, by its own superblock or the freshest role
+    # table. A member given and left out (stale, faulty, cut short) still
+    # counts as given. RAID10's copies are checked against its layout in
+    # _md_judge.
+    given = set()
+    for _w, _f, _b, _z, s in items:
+        role = s.role
+        if not isinstance(role, int) and s.major == 1 and sb.roles and s.dev_number < len(sb.roles):
+            raw = sb.roles[s.dev_number]
+            role = raw if raw < MD_ROLE_MAX else None
+        if isinstance(role, int):
+            given.add(role)
+    arr.not_given = [r for r in range(sb.raid_disks) if r not in given]
+    copies = (sb.layout & 255) * ((sb.layout >> 8) & 255) if sb.level == 10 else 0
+    allowed = {-1: 0, 0: 0, 1: sb.raid_disks - 1, 4: 1, 5: 1, 6: 2, 10: max(0, copies - 1)}
+    arr.incomplete = len(arr.not_given) > allowed.get(sb.level, 0)
+    return journal
+
+
+def _md_judge(arr, journal):
+    """Decide whether `arr` is read, and build its image when it is."""
+    sb = arr.sb
+    level = sb.level
+    if getattr(sb, "refused", None):
+        arr.refused = sb.refused
+        return
+    if sb.feature_map & 1024 or sb.feature_map & 2048:
+        arr.notes.append("a partial parity log (PPL): it matters only for an array stopped "
+                         "unclean, which is not rebuilt here")
+    if sb.bitmap:
+        arr.notes.append("a write-intent bitmap, which marks regions to resync when a member "
+                         "is re-added; no stale member is read here")
+    if sb.feature_map & 256:
+        arr.refused = "a clustered md array, whose state is shared with other nodes"
+        return
+    if sb.reshape_position is not None and sb.reshape_position != MD_MAX_SECTOR:
+        arr.refused = (f"a reshape is in progress (reshape position {sb.reshape_position * SECTOR:,} "
+                       f"bytes, members changing by {sb.delta_disks:+d}): part of the array is "
+                       "in the old layout and part in the new")
+        return
+    if level not in (-1, 0, 1, 4, 5, 6, 10):
+        arr.refused = f"md level {arr.level_name}, which this does not read"
+        return
+    if level in (4, 5, 6) and (sb.chunk < 4096 or sb.chunk & (sb.chunk - 1)):
+        arr.refused = (f"a {sb.chunk:,}-byte chunk, which md does not run a RAID{level} array "
+                       "with (raid5.c 7492-7497: a power of two, at least a page)")
+        return
+    sizes = []
+    for r in range(sb.raid_disks):
+        m = next((x for x in arr.members if x["role"] == r), None)
+        if m is None:
+            sizes.append(0)
+        else:
+            s = m["sb"]
+            sizes.append(s.data_size if s.data_size is not None else s.at)
+    geom = RaidGeometry("linear" if level == -1 else level, sb.raid_disks, sb.chunk,
+                        sb.layout if not (level == 0 and not sb.feature_map & 4096) else -1,
+                        sb.dev_size, sizes)
+    if level == 0 and geom.layout == -1 and len(geom.zones) <= 1:
+        geom.layout = 1
+    arr.geom = geom
+    if geom.why:
+        arr.refused = geom.why
+        return
+    lost = len(arr.missing)
+    allowed = {-1: 0, 0: 0, 1: sb.raid_disks - 1, 4: 1, 5: 1, 6: 2}.get(level)
+    if level == 10:
+        # the copies of chunk c fall on the same members as those of c + n
+        # (__raid10_find_phys), so n chunks show every pattern
+        def short_of_copies(gone):
+            return bool(gone) and not all(
+                any(r not in gone for r, _o in geom.copies10(c * geom.chunk)[0])
+                for c in range(sb.raid_disks))
+        too_few = short_of_copies(set(arr.missing))
+        arr.incomplete = (too_few if set(arr.not_given) == set(arr.missing)
+                          else short_of_copies(set(arr.not_given)))
+    else:
+        too_few = lost > allowed
+    if sb.feature_map & 512 or journal:
+        if journal is None:
+            arr.refused = ("it has a write journal, and no usable journal device is among the "
+                           "members given (one left out is named above)")
+            return
+        fh, base, jsb, where = journal
+        got = _md_journal_pending(fh, base, jsb, sb.uuid, geom, sb.clean())
+        if isinstance(got, str):
+            arr.refused = got
+            return
+        _none, blocks, logged = got
+        arr.notes.append(f"a write journal on {where}: {blocks} log block(s) past its tail"
+                         + (f", {logged} logged stripe(s) whose writes finished before the "
+                            "array was stopped clean" if logged else "")
+                         + "; nothing in it is missing from the members")
+    if lost:
+        left = lost - len(arr.not_given)
+        how = (f" ({left} given and left out above, {len(arr.not_given)} not given)"
+               if left else "")
+        if too_few and level == 10:
+            arr.refused = (f"{lost} of {sb.raid_disks} members missing{how}, and with them every "
+                           "copy of some chunks")
+            return
+        if too_few:
+            arr.refused = (f"{lost} of {sb.raid_disks} members missing{how}; {arr.level_name} can "
+                           f"lose at most {allowed}")
+            return
+        if level in (4, 5, 6) and not sb.clean():
+            arr.refused = ("members missing from an array that was not stopped clean: its "
+                           "parity may not match its data, so a missing member cannot be "
+                           "rebuilt from it")
+            return
+        if level in (4, 5, 6):
+            arr.notes.append(f"{lost} member(s) missing: their chunks are rebuilt from parity")
+    if not sb.clean():
+        arr.notes.append("not stopped clean: copies or parity may disagree in the region "
+                         "being resynced; data is read from the members as they are")
+    # A member's bad block log lists ranges md does not read from it
+    # (super_1_load, md.c 1890-1920): read elsewhere, or not at all.
+    bad = {}
+    for m in arr.members:
+        ranges = [(s - m["data_offset"], e - m["data_offset"]) for s, e in m["sb"].bad_ranges
+                  if e > m["data_offset"]]
+        if ranges:
+            bad[m["role"]] = ranges
+            shown = ", ".join(f"{max(0, s):,}-{e:,}" for s, e in ranges[:6])
+            arr.notes.append(f"member {m['where']} (role {m['role']}) lists {len(ranges)} bad "
+                             f"block range(s), bytes of its data {shown}"
+                             + (" ..." if len(ranges) > 6 else "")
+                             + "; those are read from another copy or rebuilt from parity, "
+                             "and the array is refused if any of them can be read from neither")
+    if bad:
+        if level in (-1, 0):
+            arr.refused = (f"a member lists bad blocks, and {arr.level_name} keeps no other "
+                           "copy to read them from")
+            return
+        if level in (4, 5, 6) and not sb.clean():
+            arr.refused = ("a member lists bad blocks, and the array was not stopped clean, "
+                           "so they cannot be rebuilt from parity")
+            return
+    members = {m["role"]: (m["fh"], m["base"] + m["data_offset"]) for m in arr.members}
+    reader = RaidReader(geom, members, bad, clean=sb.clean())
+    if bad:
+        lost_ranges = reader.unreadable()
+        if lost_ranges is None:
+            arr.refused = ("its members' bad block ranges cover more chunks than this checks, so "
+                           "whether every one can be read from elsewhere is not settled")
+            return
+        if lost_ranges:
+            where = {m["role"]: m["where"] for m in arr.members}
+            arr.refused = ("a bad block range that neither another copy nor parity can supply: "
+                           + "; ".join(f"member {where[r]} (role {r}), bytes {max(0, s):,}-{e:,} "
+                                       "of its data" for r, s, e in lost_ranges[:6])
+                           + (" ..." if len(lost_ranges) > 6 else ""))
+            return
+    arr.image = RaidImage(reader.read, geom.size, arr.label, None)
+    if level == 1 and not bad:
+        first = min(arr.members, key=lambda m: m["role"])
+        if first["data_offset"] == 0:
+            arr.same_as = first["where"]
+    arr.image.raid_info = arr.describe()
+
+
+# --- LVM RAID ------------------------------------------------------------------
+
+DM_RAID_MAGIC = 0x64526D44                   # dm-raid.c 1953, "DmRd"
+
+
+class RaidLvMap(LvmMap):
+    """Where each byte of an LVM RAID4/5/6/10 volume lies in the image: the md
+    layout dm-raid runs it as (dm-raid.c 294-313) over the maps of its image
+    volumes, in the order lvm2 lists them. `images` has None for an image
+    volume that is missing or not to be read; its bytes are then read from the
+    other copy (RAID10) or rebuilt from parity (read_via)."""
+
+    def __init__(self, kind, geom, images, size, words, clean=False):
+        super().__init__([])
+        self.kind, self.geom, self.images, self.size = kind, geom, images, size
+        self.raid_words = words
+        self.clean = clean        # the dm-raid superblock says in sync, and not NOTSYNCED
+        self._readers = {}
+
+    def locate(self, off):
+        """(image offset, bytes that follow) for volume byte `off`, from an image
+        volume that holds it; (None, run) where it has to be rebuilt."""
+        g = self.geom
+        if g.level == 10:
+            copies, run = g.copies10(off)
+            have = [c for c in copies if self.images[c[0]] is not None]
+            if not have:
+                return None, min(run, self.size - off)
+            role, at = have[0]
+        else:
+            role, _pd, _qd, at, run, _ddf = g.stripe(off)
+            if self.images[role] is None:
+                return None, min(run, self.size - off)
+        img_off, here = self.images[role].locate(at)
+        return img_off, min(run, here, self.size - off)
+
+    def first_at(self):
+        """The image offset of the volume's first byte that lies in an image
+        volume (its first chunk may have to be rebuilt), for its name."""
+        off = 0
+        while off < self.size:
+            at, here = self.locate(off)
+            if at is not None:
+                return at
+            off += here
+        return 0
+
+    def image_runs(self, off, n):
+        """As LvmMap's, leaving out what has to be rebuilt (it lies nowhere)."""
+        out, end = [], min(off + n, self.size)
+        while off < end:
+            at, here = self.locate(off)
+            take = min(here, end - off)
+            if at is not None:
+                if out and out[-1][0] + out[-1][1] == at:
+                    out[-1] = (out[-1][0], out[-1][1] + take)
+                else:
+                    out.append((at, take))
+            off += take
+        return out
+
+    def read_via(self, fh, off, n):
+        """`n` bytes from volume byte `off`, read from `fh` (the image the maps
+        point into), rebuilt where an image volume is missing."""
+        reader = self._readers.get(id(fh))
+        if reader is None:
+            members = {}
+            for role, m in enumerate(self.images):
+                if m is None:
+                    continue
+                members[role] = (RaidImage(
+                    lambda o, k, mm=m: b"".join((fh.seek(a), fh.read(ln))[1]
+                                                for a, ln in mm.image_runs(o, k)),
+                    m.size, f"image {role}"), 0)
+            reader = self._readers[id(fh)] = RaidReader(self.geom, members, clean=self.clean)
+        # a piece that cannot be read ends the read short (RaidReader.read), so
+        # read_at counts the shortfall and extraction names the file .SHORT
+        return reader.read(off, max(0, min(n, self.size - off)))
+
+    def missing(self, size):
+        return sum(m.missing(size) for m in self.images if m is not None)
+
+    def describe(self):
+        return [{"raid": self.kind, "stripe_size": self.geom.chunk, "length": self.size,
+                 "images": [m.describe() if m is not None else {"missing": True}
+                            for m in self.images]}]
+
+    def contiguous(self):
+        return None
+
+
+def _lvm_raid_context(vg, fh):
+    """What _lvm_raid needs beyond a segment: the image to read RAID metadata
+    volumes from, and the physical volumes lvm2 marks MISSING (flags.c 50-51,
+    under status or flags)."""
+    marked = set()
+    for name, rec in (vg.get("physical_volumes") or {}).items():
+        if isinstance(rec, dict) and "MISSING" in ((rec.get("status") or []) + (rec.get("flags") or [])):
+            marked.add(name)
+    return {"fh": fh, "missing_pvs": marked}
+
+
+def _lvm_seg_pvs(lv):
+    """The physical volume names an LV's segments name."""
+    out = set()
+    for k, v in lv.items():
+        if k.startswith("segment") and isinstance(v, dict):
+            areas = (v.get("stripes") or []) + (v.get("mirrors") or [])
+            out |= {areas[i] for i in range(0, len(areas), 2) if isinstance(areas[i], str)}
+    return out
+
+
+def _dm_raid_sb(fh, rmeta):
+    """(events, failed_devices, array_resync_offset) from the dm-raid
+    superblock at the start of a RAID metadata volume (dm-raid.c 1954-1975),
+    else None."""
+    if fh is None or rmeta is None:
+        return None
+    at, _here = rmeta.locate(0)
+    raw = read_at(fh, at, 48)
+    if len(raw) < 48 or struct.unpack_from("<I", raw, 0)[0] != DM_RAID_MAGIC:
+        return None
+    events, failed, disk_rec, resync = struct.unpack_from("<QQQQ", raw, 16)
+    return events, failed, resync, disk_rec
+
+
+def _lvm_raid_legs(kind, names, metas, where, pv_names, ext, lvs, depth, ctx):
+    """(why not, [map or None per image volume], {role: why missing}, freshest
+    dm-raid superblock or None) for the image volumes `names` of an LVM RAID
+    segment, with their metadata volumes `metas` (raid.c 166-180). An image
+    volume is missing when lvm2 marks it REBUILD (flags.c 66) or its physical
+    volume MISSING (flags.c 50-51), when that physical volume is not in the
+    image, and, from the dm-raid superblocks in the metadata volumes
+    (dm-raid.c 1954-1975): when the freshest one lists it as failed
+    (2408-2453), when its own disk_recovery_offset says it is still being
+    recovered (2499-2508: not MaxSector means not in sync), or when its own
+    events are more than one behind the freshest's. dm-raid itself takes the
+    array's state from the freshest superblock alone (super_load 2232-2234);
+    leaving out a device whose superblock fell behind is md's rule for its own
+    superblocks (md.c 2087), applied here as the stricter reading."""
+    ctx = ctx or {}
+    images, why_missing, metamaps = [], {}, []
+    for role, name in enumerate(names):
+        lv = lvs.get(name) if isinstance(name, str) else None
+        if not isinstance(lv, dict):
+            return f"a {kind} segment naming {name}, which is not a volume of the group", None, None, None
+        csegs = sorted((v for k, v in lv.items() if k.startswith("segment") and isinstance(v, dict)),
+                       key=lambda c: c.get("start_extent", 0))
+        why, cmap = _lvm_layout(csegs, where, pv_names, ext, lvs, depth + 1, ctx)
+        on_missing = _lvm_seg_pvs(lv) & ctx.get("missing_pvs", set())
+        if "REBUILD" in (lv.get("status") or []):
+            why_missing[role] = f"{name} is marked REBUILD"
+        elif on_missing:
+            why_missing[role] = f"{name} is on {', '.join(sorted(on_missing))}, marked MISSING"
+        elif why and "not in this image" in why:
+            why_missing[role] = f"{name} is {why}"
+        elif why and "nest more than four deep" in why:
+            return why, None, None, None      # said once, not once per level of nesting
+        elif why and ctx.get("lenient"):
+            why_missing[role] = f"{name}: {why}"   # a raid1 copy: the next one is tried
+        elif why:
+            return f"a {kind} volume whose image volume {name} is not read ({why})", None, None, None
+        images.append(None if role in why_missing else cmap)
+        mlv = lvs.get(metas[role]) if role < len(metas) and isinstance(metas[role], str) else None
+        mmap = None
+        if isinstance(mlv, dict) and role not in why_missing:
+            msegs = sorted((v for k, v in mlv.items() if k.startswith("segment") and isinstance(v, dict)),
+                           key=lambda c: c.get("start_extent", 0))
+            _w, mmap = _lvm_layout(msegs, where, pv_names, ext, lvs, depth + 1)
+        metamaps.append(mmap)
+    sbs = [_dm_raid_sb(ctx.get("fh"), m) for m in metamaps]
+    fresh = max((s for s in sbs if s is not None), default=None)
+    if fresh is not None:
+        for role, name in enumerate(names):
+            if role in why_missing:
+                continue
+            own = sbs[role] if role < len(sbs) else None
+            if own is None:
+                why_missing[role] = (f"{name}'s metadata volume holds no dm-raid superblock, so "
+                                     "dm-raid would take it as a new device and rebuild it "
+                                     "(super_load, dm-raid.c 2207-2222)")
+            elif fresh[1] >> role & 1:
+                why_missing[role] = f"{name} is listed as failed in the dm-raid superblock"
+            elif own is not None and own[3] != MD_MAX_SECTOR:
+                why_missing[role] = (f"{name} is still being recovered (its dm-raid superblock's "
+                                     f"disk_recovery_offset is {own[3] * SECTOR:,} bytes)")
+            elif own is not None and own[0] + 1 < fresh[0]:
+                why_missing[role] = (f"{name}'s dm-raid superblock is at events {own[0]:,}, the "
+                                     f"freshest at {fresh[0]:,}")
+            if role in why_missing:
+                images[role] = None
+    return None, images, why_missing, fresh
+
+
+def _lvm_raid(seg, where, pv_names, ext, lvs, depth, ctx=None):
+    """(why not, None) or (None, RaidLvMap) for an LVM RAID4/5/6/10 segment: each
+    image volume named in its raids list (raid.c 166-180 at v2_03_43, 161-175
+    at v2_03_31) read through its own map. An image volume lvm2 marks REBUILD
+    (flags.c 66), one on a physical volume marked MISSING or not in the image,
+    and one dm-raid's superblock lists as failed, is missing: a RAID10 volume is
+    read from the other copy, and a RAID4/5/6 one rebuilt from parity when the
+    dm-raid superblock says the array is in sync and lvm2 does not mark the
+    volume NOTSYNCED (flags.c 65); otherwise the volume is refused."""
+    kind = seg.get("type")
+    if depth > 4:
+        return (f"a {kind} segment whose image volumes nest more than four deep, or name "
+                "the volume itself"), None
+    level, layout = LVM_RAID_TYPES[kind]
+    if seg.get("data_offset"):
+        return f"a {kind} segment with a data offset (written while a reshape moves its data)", None
+    listed = seg.get("raids") or []
+    names = [listed[i] for i in range(1, len(listed), 2)]
+    metas = [listed[i] for i in range(0, len(listed), 2)]
+    count = seg.get("device_count")
+    if not isinstance(count, int) or count != len(names) or count < 2 or count > 64:
+        return f"a {kind} segment whose image volumes do not match its device count", None
+    chunk = (seg.get("stripe_size") or 0) * SECTOR
+    top = next((lv for lv in lvs.values() if isinstance(lv, dict)
+                and any(v is seg for v in lv.values())), {})
+    why, images, why_missing, fresh = _lvm_raid_legs(kind, names, metas, where, pv_names,
+                                                     ext, lvs, depth, ctx)
+    if why:
+        return why, None
+    present = [m for m in images if m is not None]
+    if not present:
+        return f"a {kind} volume none of whose image volumes is read", None
+    per = min(m.size for m in present)
+    if level == 10:
+        copies = seg.get("data_copies") or 2
+        layout = copies | (1 << 8)                     # dm-raid: raid10 is near
+    geom = RaidGeometry(level, count, chunk, layout, per)
+    if geom.why:
+        return f"a {kind} segment: {geom.why}", None
+    size = seg.get("extent_count", 0) * ext
+    if size > geom.size:
+        return f"a {kind} volume longer than its image volumes hold", None
+    words = f"{kind} across {count} image volumes in {human(chunk)} stripes"
+    lost = sorted(why_missing)
+    if lost:
+        said = "; ".join(why_missing[r] for r in lost)
+        if level == 10:
+            if not all(any(images[r] is not None for r, _o in geom.copies10(c * chunk)[0])
+                       for c in range(count)):
+                return f"a {kind} volume missing every copy of some chunks ({said})", None
+            words += f", read from the other copies ({said})"
+        else:
+            if len(lost) > (2 if level == 6 else 1):
+                return f"a {kind} volume with {len(lost)} image volumes missing ({said})", None
+            if "NOTSYNCED" in (top.get("status") or []):
+                return (f"a {kind} volume lvm2 marks NOTSYNCED (its parity was never "
+                        f"computed), with an image volume missing ({said})"), None
+            if fresh is None or fresh[2] != MD_MAX_SECTOR:
+                return (f"a {kind} volume with an image volume missing ({said}) whose dm-raid "
+                        "superblock does not say the array is in sync, so it is not rebuilt "
+                        "from parity"), None
+            words += f", rebuilt from parity ({said})"
+    else:
+        words += ", read with all of them present"
+    in_sync = (fresh is not None and fresh[2] == MD_MAX_SECTOR
+               and "NOTSYNCED" not in (top.get("status") or []))
+    return None, RaidLvMap(kind, geom, images, size, words, clean=in_sync)
+
+
+# --- several images ------------------------------------------------------------
+
+class RaidSet:
+    """What raid_assemble() found across the images given: `arrays`, each an
+    MdArray or an LVM volume read across images (both with `label`, `lines()`,
+    `describe()`, `refused` and `image`), `members` {image label: [lines]} for
+    every image that holds a RAID member, and `foreign` [(image label, line)]
+    for metadata this does not read."""
+
+    def __init__(self):
+        self.arrays, self.members, self.foreign, self._owned = [], {}, [], []
+
+    def close(self):
+        for fh in self._owned:
+            try:
+                fh.close()
+            except Exception:                              # pylint: disable=broad-except
+                pass
+        self._owned = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class LvmSpanned:
+    """An LVM logical volume whose physical volumes lie in more than one of the
+    images given, read across them."""
+
+    def __init__(self, label, image, how, why=None, absent=(), incomplete=None):
+        self.label, self.image, self.how, self.refused = label, image, how, why
+        # `absent`: the physical volumes its metadata names under this volume
+        # that are not among the images given. It is incomplete only when the
+        # legs on them are more than its level can lose (_lvm_lv_incomplete),
+        # as for md: a leg given but unusable (REBUILD, a failed device) counts
+        # as given, and a refusal for the group's own marks is not incomplete.
+        self.absent = sorted(absent)
+        self.incomplete = bool(self.absent) if incomplete is None else incomplete
+        self.members, self.left_out, self.sb, self.same_as = [], [], None, None
+        self.safe_name = "lvm_" + sanitize_volume_label(label[len("LVM "):], 48)
+
+    def lines(self):
+        out = [f"{self.label}: {self.how}"]
+        if self.refused:
+            out.append(f"  NOT READ: {self.refused}")
+        else:
+            out.append(f"  read as an image of {self.image.size:,} bytes ({human(self.image.size)})")
+        return out
+
+    def describe(self):
+        return {"kind": "lvm", "label": self.label, "how": self.how, "refused": self.refused,
+                "bytes": self.image.size if self.image is not None else None}
+
+
+def _raid_places(fh, size):
+    """[(label, base, size)] where a RAID member may begin on one image: the
+    whole image and each partition its tables give."""
+    try:
+        regions, _names, containers, protective, _ss = table_regions(fh)
+    except Exception:                                  # pylint: disable=broad-except
+        regions, containers, protective = [], set(), set()
+    out = [("whole image", 0, size)]
+    out += [r for r in regions if r[0] not in containers and r[0] not in protective
+            and r[1] < size and r[2]]
+    return out
+
+
+def raid_assemble(images):
+    """A RaidSet for `images`, [(label, fh)] of images already open (each what
+    open_image() returns): the md members on each, whole disk or partition,
+    assembled into arrays by array uuid and role; the LVM volume groups whose
+    physical volumes lie in more than one of the images, their logical volumes
+    read across them (a group inside one image is read by volumes() as
+    before); and RAID metadata this does not read, by name. An image that
+    holds no member of anything is not changed by this; read it as before."""
+    rs = RaidSet()
+    found, parts = [], []
+    for label, fh in images:
+        size = image_size(fh)
+        parts.append((label, fh, size))
+        gpt = parse_gpt(fh)
+        lbs = gpt.sector_size if gpt is not None else SECTOR      # disk_sector_size()
+        for _idx, pname, tguid, first, _last in (gpt or []):
+            kind = RAID_GPT_TYPES.get(tguid.lower())
+            if kind:
+                rs.foreign.append((label, f"GPT partition {_idx} ({pname or 'no name'}) at LBA "
+                                          f"{first:,} is a {kind} partition, which this does not read"))
+        hits = {}
+        for plabel, base, psize in _raid_places(fh, size):
+            psize = min(psize, size - base)
+            where = label if plabel == "whole image" else f"{label} {plabel}"
+            try:
+                sb = md_member(fh, base, psize, lbs)
+                foreign = None if sb is not None else raid_foreign(fh, base, psize)
+            except (struct.error, ValueError, OSError) as exc:
+                rs.foreign.append((label, f"{where}: its RAID metadata could not be read "
+                                          f"({type(exc).__name__}: {exc})"))
+                continue
+            if sb is not None:
+                # The same superblock seen from the whole disk and from a
+                # partition that ends where the disk does (0.90 or 1.0 at the
+                # end): the member is the partition, the innermost region.
+                key = base + sb.at
+                if key not in hits or psize < hits[key][3]:
+                    hits[key] = (where, fh, base, psize, sb)
+                continue
+            if foreign and plabel == "whole image":
+                rs.foreign.append((label, f"{where}: a {foreign} RAID member, whose metadata "
+                                          "this does not read"))
+        for where, fh_, base, psize, sb in sorted(hits.values(), key=lambda h: h[2]):
+            found.append((where, fh_, base, psize, sb))
+            rs.members.setdefault(label, []).append(
+                f"{where}: md member of {sb.uuid_text()}"
+                + (f" ({sb.name})" if sb.name else "")
+                + f", metadata {sb.version}")
+    rs.arrays += _md_assemble(found)
+    if len(parts) > 1:
+        try:
+            rs.arrays += _lvm_spanned(parts, rs)
+        except Exception as exc:                       # pylint: disable=broad-except
+            rs.foreign.append(("", "LVM volume groups across the images were not read "
+                                   f"({type(exc).__name__}: {exc})"))
+    return rs
+
+
+def _lvm_spanned(parts, rs):
+    """The logical volumes of each volume group whose physical volumes are in
+    more than one of `parts`, read through one address space over them all."""
+    cat = _ConcatImage(parts)
+    regions, owner = [], {}
+    for start, size, fh, label in cat.parts:
+        for plabel, base, psize in _raid_places(fh, size):
+            regions.append((f"{label} {plabel}", start + base, min(psize, size - base)))
+            owner[start + base] = label
+    pvs, first, kept = {}, {}, []
+    for reg in regions:
+        _l, base, psize = reg
+        pv = _lvm_pv(cat, base, psize)
+        if pv is not None:
+            # the same physical volume given twice (the same image, or two
+            # copies of one disk) is read once, and the second named
+            key = _lvm_id(pv.uuid)
+            if key in first:
+                rs.members.setdefault(owner[base], []).append(
+                    f"{_l}: the same LVM2 physical volume (id {pv.uuid}) as {first[key]}, "
+                    "which is the one read")
+                continue
+            first[key] = _l
+            if pv.vg:
+                pvs.setdefault(pv.vg[1].get("id"), set()).add(owner[base])
+        kept.append(reg)
+    regions = kept
+    spanned = {vid for vid, labels in pvs.items() if len(labels) > 1}
+    if not spanned:
+        return []
+    present = set(first)                 # the ids of the physical volumes given
+    found, notes, remap, _free = _lvm_scan(cat, regions)
+    out = []
+    names = {}
+    for _l, base, psize in regions:
+        pv = _lvm_pv(cat, base, psize)
+        if pv is not None and pv.vg and pv.vg[1].get("id") in spanned:
+            names[pv.vg[0]] = pv.vg[1].get("id")
+            rs.members.setdefault(owner[base], []).append(
+                f"{_l}: LVM2 physical volume of volume group {pv.vg[0]}, which spans several images")
+    for vlabel, base, vsize, _name in found:
+        group = vlabel[len("LVM "):].split("/", 1)[0]
+        if group not in names:
+            continue
+        img = RaidImage(lambda o, n, b=base: (cat.seek(b + o), cat.read(n))[1], vsize, vlabel)
+        out.append(LvmSpanned(vlabel, img, "linear, read across the images"))
+    for _key, lmap, vlabel, _name in remap:
+        group = vlabel[len("LVM "):].split("/", 1)[0]
+        if group not in names:
+            continue
+
+        def rd(o, n, m=lmap):
+            if hasattr(m, "read_via"):
+                return m.read_via(cat, o, n)
+            buf = bytearray()
+            for at, length in m.image_runs(o, n):
+                cat.seek(at)
+                got = cat.read(length)
+                buf += got
+                if len(got) < length:
+                    break
+            return bytes(buf)
+        how = getattr(lmap, "raid_words", None) or _lvm_shape_words(lmap)
+        out.append(LvmSpanned(vlabel, RaidImage(rd, lmap.size, vlabel), how))
+    said = set()
+    for base, lines in notes.items():
+        pv = _lvm_pv(cat, base, None)
+        if pv is None or not pv.vg or pv.vg[1].get("id") not in spanned:
+            continue
+        for ln in lines:
+            if ln.startswith("logical volume ") and ": not read (" in ln and ln not in said:
+                said.add(ln)
+                lv = ln[len("logical volume "):].split(",", 1)[0]
+                vg = pv.vg[1]
+                out.append(LvmSpanned(f"LVM {pv.vg[0]}/{lv}", None, "not read",
+                                      why=ln.split(": not read (", 1)[1][:-1],
+                                      absent=_lvm_absent_pvs(vg, lv, present),
+                                      incomplete=_lvm_lv_incomplete(vg, lv, present)))
+    return out
+
+
+def _lvm_lv_incomplete(vg, lvname, present):
+    """True when too few of logical volume `lvname`'s legs were given to read
+    it, whatever became of the legs given: for a RAID segment, more legs on
+    physical volumes not among `present` than its level can lose (raid4 and
+    raid5 one, raid6 two, raid10 its data copies less one, raid1 all but one);
+    for anything else, any physical volume it names not given."""
+    lv = (vg.get("logical_volumes") or {}).get(lvname)
+    segs = [v for k, v in (lv or {}).items() if k.startswith("segment") and isinstance(v, dict)]
+    if len(segs) != 1 or segs[0].get("type") not in tuple(LVM_RAID_TYPES) + ("raid1",):
+        return bool(_lvm_absent_pvs(vg, lvname, present))
+    seg = segs[0]
+    listed = seg.get("raids") or []
+    legs = [listed[i] for i in range(1, len(listed), 2)]
+    gone = sum(1 for leg in legs if isinstance(leg, str) and _lvm_absent_pvs(vg, leg, present))
+    kind = seg["type"]
+    if kind == "raid1":
+        tolerate = len(legs) - 1
+    elif kind == "raid10":
+        tolerate = (seg.get("data_copies") or 2) - 1
+    else:
+        tolerate = 2 if LVM_RAID_TYPES[kind][0] == 6 else 1
+    return gone > tolerate
+
+
+def _lvm_absent_pvs(vg, lvname, present):
+    """The physical volumes the metadata names under logical volume `lvname`
+    (its segments' areas, and those of the image, metadata and copy volumes
+    they name, to any depth, each looked at once) whose ids are not among
+    `present`."""
+    pvs = vg.get("physical_volumes") or {}
+    lvs = vg.get("logical_volumes") or {}
+    seen, todo, absent = set(), [lvname], set()
+    while todo and len(seen) < 4096:
+        name = todo.pop()
+        if name in seen or not isinstance(lvs.get(name), dict):
+            continue
+        seen.add(name)
+        for key, seg in lvs[name].items():
+            if not (key.startswith("segment") and isinstance(seg, dict)):
+                continue
+            for listed in ("stripes", "mirrors", "raids"):
+                for item in seg.get(listed) or []:
+                    if not isinstance(item, str):
+                        continue
+                    if item in pvs:
+                        if _lvm_id(pvs[item].get("id", "")) not in present:
+                            absent.add(item)
+                    else:
+                        todo.append(item)
+    return absent
+
+
+def raid_open(paths, passwords=(), private_keys=()):
+    """raid_assemble() over the images at `paths`, each opened read-only as
+    main() opens it. An image that will not open is left out here (main()
+    says why when it reads it)."""
+    images = []
+    owned = []
+    for img_path in paths:
+        try:
+            segments = [] if acquisition_format(img_path) else split_segments(img_path)
+            fh = open_image_trying(img_path, segments, passwords, private_keys)
+        except Exception:                              # pylint: disable=broad-except
+            continue
+        owned.append(fh)
+        images.append((os.path.basename(os.path.normpath(img_path)), fh))
+    try:
+        rs = raid_assemble(images)
+    except Exception as exc:                           # pylint: disable=broad-except
+        # Whatever went wrong is said, and the images are still read one by one.
+        rs = RaidSet()
+        rs.foreign.append(("", f"RAID members were not assembled ({type(exc).__name__}: {exc})"))
+    rs._owned = owned                                  # pylint: disable=protected-access
+    return rs
+
+
+def raid_unread(arr, images_given=None):    # pylint: disable=unused-argument
+    """True when `arr` counts as not read for the exit status: it has every
+    member it needs among the images given, and is still not read. An image
+    that holds part of an array, given alone or beside unrelated images, is a
+    member, and leaves the exit status as it was before this read RAID."""
+    if arr.image is not None:
+        return False
+    return not getattr(arr, "incomplete", False)
+
+
+def _raid_report_lines(arr, images_given):
+    """The report lines for one array or spanned volume."""
+    lines = arr.lines()
+    if arr.image is None and not raid_unread(arr, images_given):
+        lines = [ln for ln in lines if not ln.startswith("  NOT READ: ")]
+        if isinstance(arr, LvmSpanned):
+            lines.append(f"  not read from the images given: its physical volume(s) "
+                         f"{', '.join(arr.absent)} are not among them; give those images to "
+                         f"read it ({arr.refused})")
+        else:
+            parts = [m["where"] != m["where"].split(" ", 1)[0]
+                     for m in list(arr.members) + list(arr.left_out)]
+            if images_given == 1 and any(parts):
+                # its members are partitions of the one image given: nothing
+                # else to give; what is wrong with them is named above
+                lines.append(f"  not read: {len(arr.members)} of {arr.sb.raid_disks} members on "
+                             "this image's partitions can be used, and role(s) "
+                             f"{', '.join(map(str, arr.not_given)) or 'none'} are on none of "
+                             "them; the members left out above say why the others cannot")
+            else:
+                lines.append(f"  not read from the images given: role(s) "
+                             f"{', '.join(map(str, arr.not_given))} of {arr.sb.raid_disks} are "
+                             "in none of them; give the other member images with them to read "
+                             "the array")
+    if getattr(arr, "same_as", None):
+        lines.append(f"  not read again: its data starts at the first byte of {arr.same_as}, "
+                     "whose listing above shows the same bytes")
+    elif arr.image is not None:
+        lines.append(f"  read below as {arr.safe_name}")
+    return lines
+
+
+def raid_run(rs, images_given, run_main, say=print):
+    """The command line's RAID step: the report, then `run_main(arr)` for each
+    array or spanned volume that is read. Returns the labels that count as not
+    read for the exit status (raid_unread). A fault in one array's report or
+    read is said and never stops the others."""
+    unread = []
+    try:
+        raid_report(rs, say=say, images_given=images_given)
+    except Exception as exc:                           # pylint: disable=broad-except
+        say(f"  the RAID report could not be printed ({type(exc).__name__}: {exc})")
+    for arr in rs.arrays:
+        try:
+            if arr.image is None:
+                if raid_unread(arr, images_given):
+                    unread.append(arr.label)
+                continue
+            if getattr(arr, "same_as", None):
+                continue
+            run_main(arr)
+        except Exception as exc:                       # pylint: disable=broad-except
+            say("=" * 78)
+            say(getattr(arr, "safe_name", "an array"))
+            say(f"  REFUSED: {type(exc).__name__}: {exc}")
+            say("=" * 78)
+            unread.append(getattr(arr, "label", "an array"))
+    return unread
+
+
+def raid_report(rs, say=print, images_given=2):
+    """Print what raid_assemble() found: each image's RAID members, each array
+    or spanned volume with its members, what is missing or left out, and what
+    is not read and why. Prints nothing when nothing was found."""
+    if not (rs.arrays or rs.foreign or rs.members):
+        return
+    say("=" * 78)
+    say(f"RAID: {len(rs.arrays)} array(s) or spanned volume(s) assembled from the images given")
+    say("=" * 78)
+    for lines in rs.members.values():
+        for ln in lines:
+            say(f"  member  {ln}")
+    for arr in rs.arrays:
+        say("")
+        try:
+            for ln in _raid_report_lines(arr, images_given):
+                say("  " + ln)
+        except Exception as exc:                       # pylint: disable=broad-except
+            # one array's report never stops the others being reported or read
+            say(f"  {getattr(arr, 'label', 'an array')}: its report could not be printed "
+                f"({type(exc).__name__}: {exc})")
+    for _label, ln in rs.foreign:
+        say(f"  NOT READ: {ln}")
+    say("")
+
+
+def _raid_files_match(image, hashes, listing):
+    """(files matched, files expected, listing agrees) for the one filesystem
+    volumes() finds on `image`, against the source tree's sha256 and listing."""
+    import hashlib
+    vols = [v for v in volumes(image, image.size) if v.get("walker")]
+    if len(vols) != 1:
+        return 0, len(hashes), False
+    w = vols[0]["walker"]
+    have = {p: (node, size) for p, node, size, _m in collect(w, w.root) if size is not None}
+    matched = 0
+    for path, digest in hashes.items():
+        got = have.get(path)
+        if got is None:
+            continue
+        h = hashlib.sha256()
+        for chunk in w.read_file(got[0], got[1]):
+            h.update(chunk)
+        matched += h.hexdigest() == digest
+    files = {p: s for p, (_n, s) in have.items() if not p.startswith("lost+found/")}
+    dirs = {p.rsplit("/", 1)[0] for p in files if "/" in p}
+    dirs |= {d.rsplit("/", i)[0] for d in list(dirs) for i in range(1, d.count("/") + 1)}
+    want_files = {p: s for p, (s, k) in listing.items() if k == "f"}
+    want_dirs = {p for p, (_s, k) in listing.items() if k == "d"}
+    return matched, len(hashes), files == want_files and dirs == want_dirs
+
+
+def _raid_sha(image):
+    import hashlib
+    h = hashlib.sha256()
+    off = 0
+    while off < image.size:
+        image.seek(off)
+        got = image.read(min(1 << 20, image.size - off))
+        if not got:
+            return None, off               # a read that ends early is no digest of the array
+        h.update(got)
+        off += len(got)
+    return h.hexdigest(), off
+
+
+def _md_resum(blob, at):
+    """`blob` (a member image, bytearray) with the 1.x superblock at `at` given
+    a checksum again after a test changed it (calc_sb_1_csum)."""
+    max_dev, = struct.unpack_from("<I", blob, at + 220)
+    n = 256 + max_dev * 2
+    struct.pack_into("<I", blob, at + 216, 0)
+    total = sum(struct.unpack_from(f"<{n // 4}I", blob, at))
+    if n % 4 == 2:
+        total += struct.unpack_from("<H", blob, at + n - 2)[0]
+    struct.pack_into("<I", blob, at + 216, ((total & 0xffffffff) + (total >> 32)) & 0xffffffff)
+    return blob
+
+
+def _raid_self_checks():
+    """[(label, passed)] for the RAID reader, from the arrays mdadm, lvm2 and the
+    kernel wrote (tools/make_raid_fixtures.sh) and what they reported about them
+    while assembled (raid-fixtures.json). No fixture folder is one SKIP."""
+    import gzip
+    import io
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures", "raid")
+    man = os.path.join(here, "raid-fixtures.json")
+    if not os.path.isfile(man):
+        return [("the RAID fixtures are not beside this script (tests/fixtures/raid), so the "
+                 "RAID reader was not checked against them", None)]
+    with open(man, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    hashes, listing = collections.defaultdict(dict), collections.defaultdict(dict)
+    with open(os.path.join(here, "raid-trees.sha256"), encoding="utf-8") as fh:
+        for line in fh:
+            digest, path = line.rstrip("\n").split("  ", 1)
+            arr, rel = path.split("/", 1)
+            hashes[arr][rel] = digest
+    with open(os.path.join(here, "raid-trees.list"), encoding="utf-8") as fh:
+        for line in fh:
+            path, size, kind = line.rstrip("\n").split("\t")
+            arr, rel = path.split("/", 1)
+            listing[arr][rel] = (int(size), kind)
+    cache = {}
+
+    def blob(name):
+        if name not in cache:
+            with gzip.open(os.path.join(here, name), "rb") as gz:
+                cache[name] = gz.read()
+        return cache[name]
+
+    def assemble(entry, skip=(), change=None):
+        imgs = []
+        for i, m in enumerate(entry["members"]):
+            if not m["file"] or i in skip:
+                continue
+            data = blob(m["file"])
+            if change is not None:
+                data = change(i, bytearray(data))
+            imgs.append((m["file"], io.BytesIO(bytes(data))))
+        return raid_assemble(imgs)
+
+    out = []
+    md = {n: a for n, a in doc["arrays"].items() if a.get("kind") == "md" and not a.get("skipped")}
+    lvm = {n: a for n, a in doc["arrays"].items() if a.get("kind") == "lvm" and not a.get("skipped")}
+
+    # Every array mdadm built is assembled from its member images alone, and
+    # read back to the bytes the kernel presented while it ran it.
+    read_ok, file_ok, list_ok, role_ok, nfiles, bad = 0, 0, 0, 0, 0, []
+    # The arrays md runs itself; the reshape is not known data (its bytes were
+    # moving while they were hashed) and DDF is external metadata, not read.
+    readable = [n for n, a in md.items()
+                if not str(a["sysfs"].get("metadata_version", "")).startswith("external")
+                and not any("Reshape pos'n" in (m.get("examine") or "") for m in a["members"])]
+    for name in sorted(readable):
+        entry = md[name]
+        rs = assemble(entry)
+        arr = rs.arrays[0] if len(rs.arrays) == 1 else None
+        if arr is None or arr.image is None:
+            bad.append(name)
+            continue
+        digest, n = _raid_sha(arr.image)
+        if digest == entry["device_sha256"] and n == entry["device_size"] == arr.image.size:
+            read_ok += 1
+        else:
+            bad.append(name)
+        got, want, same = _raid_files_match(arr.image, hashes[name], listing[name])
+        nfiles += want
+        file_ok += got == want and want > 0
+        list_ok += same
+        # each kept member holds the role mdadm --examine gives it; a stale
+        # member is left out as stale; a member created missing is missing
+        # a member on a partition is named by its image and the partition
+        roles = {m["where"].split(" ", 1)[0]: m["role"] for m in arr.members}
+        stale = {m["where"].split(" ", 1)[0] for m in arr.left_out if m["why"].startswith("stale")}
+        fine, held = True, set()
+        for m in entry["members"]:
+            # the stopped image's own examine, or (a member on a partition, which
+            # mdadm examined through its partition device) the assembled one
+            text = (m.get("examine") or "") + (m.get("examine_assembled") or "")
+            if m["status"] in ("omitted", "journal"):
+                continue
+            if m["status"] == "stale":
+                fine &= m["file"] in stale
+                continue
+            role = re.search(r"Device Role : Active device (\d+)", text)
+            if role is None:
+                this = re.search(r"^this\s+\d+\s+\d+\s+\d+\s+(\d+)", text, re.M)
+                role = this
+            fine &= role is not None and roles.get(m["file"]) == int(role.group(1))
+            if role is not None:
+                held.add(int(role.group(1)))
+        # the roles no kept member holds are the missing ones (mdadm need not
+        # leave missing the slot it was given "missing" in: md-r6-missing1's
+        # last device was rebuilt into slot 1, leaving slot 4 missing)
+        fine &= set(arr.missing) == set(range(arr.sb.raid_disks)) - held
+        role_ok += fine
+    out.append((f"each md array mdadm built reads back from its member images to the "
+                f"bytes the kernel presented, by sha256 and size ({read_ok} of {len(readable)}"
+                + (f"; not: {', '.join(bad)}" if bad else "") + ")",
+                read_ok == len(readable) and len(readable) >= 45))
+    out.append((f"every file in every md array's ext4 reads back to the sha256 of its source "
+                f"({file_ok} of {len(readable)} arrays, {nfiles} files)", file_ok == len(readable)))
+    out.append((f"each md array's listing is the source tree's ({list_ok} of {len(readable)})",
+                list_ok == len(readable)))
+    out.append((f"each member holds the role mdadm --examine gives it, stale members are left "
+                f"out as stale and the roles no member holds are missing ({role_ok} of "
+                f"{len(readable)} arrays)", role_ok == len(readable)))
+    levels = collections.Counter(a["sysfs"].get("level") for n, a in md.items() if n in readable)
+    out.append((f"the arrays read cover linear, RAID0, RAID1, RAID4, RAID5, RAID6 and RAID10 "
+                f"({', '.join(f'{k} {v}' for k, v in sorted(levels.items()))}) and metadata "
+                f"0.90, 1.0, 1.1 and 1.2",
+                {"linear", "raid0", "raid1", "raid4", "raid5", "raid6", "raid10"} <= set(levels)
+                and {a["sysfs"].get("metadata_version") for n, a in md.items() if n in readable}
+                >= {"0.90", "1.0", "1.1", "1.2"}))
+
+    # The control: the same comparison fails when one RAID5 layout is read as
+    # another, so a passing hash is evidence of the layout, not of the code path.
+    ls = md["md-r5-ls"]
+    arr = assemble(ls).arrays[0]
+    wrong = RaidGeometry(5, 4, arr.geom.chunk, 0, arr.geom.dev_bytes)
+    wrong_img = RaidImage(RaidReader(wrong, {m["role"]: (m["fh"], m["base"] + m["data_offset"])
+                                             for m in arr.members}).read, wrong.size, "control")
+    wrong_digest, wrong_n = _raid_sha(wrong_img)
+    out.append(("read as left-asymmetric, the left-symmetric RAID5 array reads in full and does "
+                "not hash to what the kernel presented (the control)",
+                wrong_digest is not None and wrong_n == wrong.size == ls["device_size"]
+                and wrong_digest != ls["device_sha256"]))
+
+    # Parity: each full array with redundancy, read with every member left out
+    # in turn (and every pair for RAID6), still reads to the kernel's bytes,
+    # rebuilt from the parity mdadm's own check found consistent.
+    tried, ok = 0, 0
+    for name in sorted(readable):
+        entry = md[name]
+        level = entry["sysfs"].get("level")
+        if any(m["status"] != "kept" for m in entry["members"]) or level not in (
+                "raid1", "raid4", "raid5", "raid6", "raid10"):
+            continue
+        n = len(entry["members"])
+        sets = [(i,) for i in range(n)]
+        if level == "raid6":
+            sets += [(i, j) for i in range(n) for j in range(i + 1, n)]
+        for skip in sets:
+            rs = assemble(entry, skip=set(skip))
+            arr = rs.arrays[0] if rs.arrays else None
+            if arr is None or arr.image is None:
+                if level == "raid10":
+                    continue
+                tried += 1
+                continue
+            tried += 1
+            ok += _raid_sha(arr.image)[0] == entry["device_sha256"]
+    out.append((f"with one member of each full RAID1/4/5/10 array left out, and one or two "
+                f"of each RAID6, every array still reads to the kernel's bytes ({ok} of "
+                f"{tried} member sets)", ok == tried and tried >= 150))
+
+    # The md signature where each metadata version puts it, checked from the
+    # raw bytes beside the reader: the positive control for a survey.
+    seen, right = collections.Counter(), 0
+    total = 0
+    for name, entry in md.items():
+        for m in entry["members"]:
+            if not m["file"]:
+                continue
+            data = blob(m["file"])
+            text = m.get("examine") or ""
+            base, size = 0, len(data)
+            if "Magic : a92b4efc" not in text:
+                # a member on a partition, which mdadm examined through its
+                # partition device: the partition's own offsets
+                text = m.get("examine_assembled") or ""
+                parts = table_regions(io.BytesIO(data))[0]
+                gpt = [r for r in parts if r[0].startswith("GPT")]
+                if not gpt:
+                    continue
+                base, size = gpt[0][1], gpt[0][2]
+            ver = re.search(r"Version : (\S+)", text)
+            ver = ver.group(1) if ver else ""
+            if ver.startswith("0.90"):
+                at = (size & ~(MD_RESERVED - 1)) - MD_RESERVED
+                ver = "0.90"
+            else:
+                so = re.search(r"Super Offset : (\d+) sectors", text)
+                if so is None:
+                    continue
+                at = int(so.group(1)) * SECTOR
+            total += 1
+            found = md_superblocks(io.BytesIO(data), base, size)
+            if data[base + at:base + at + 4] == b"\xfc\x4e\x2b\xa9" and any(
+                    s.at == at and s.version == ver for s in found):
+                right += 1
+                seen[ver] += 1
+    out.append((f"the md signature is found where each metadata version puts it, as mdadm "
+                f"--examine places it, on every member image ({right} of {total}: "
+                + ", ".join(f"{k} {v}" for k, v in sorted(seen.items())) + ")",
+                right == total and set(seen) == {"0.90", "1.0", "1.1", "1.2"}))
+
+    # A reshape in progress is refused by name, never read.
+    rs = assemble(md["md-r5-reshape"])
+    arr = rs.arrays[0] if rs.arrays else None
+    out.append(("an array stopped during a reshape is not read, and says a reshape is in "
+                "progress", arr is not None and arr.image is None
+                and "reshape is in progress" in (arr.refused or "")))
+
+    # DDF members are named, not read; a member is identified as one.
+    ddf = doc["arrays"].get("md-ddf")
+    if ddf and not ddf.get("skipped"):
+        rs = assemble(ddf)
+        out.append(("the members of a DDF set are each named as DDF and not read",
+                    not rs.arrays and len(rs.foreign) == 3
+                    and all("DDF" in ln for _l, ln in rs.foreign)))
+    member = blob(md["md-r5-ls"]["members"][0]["file"])
+    mirror = blob(md["md-r1-090"]["members"][0]["file"])
+    out.append(("an md member reads as one in identify_fs(), and a RAID1 member whose "
+                "superblock is at its end still reads as the filesystem it starts with",
+                identify_fs(io.BytesIO(member), 0, len(member))[0] == "linux md member"
+                and (identify_fs(io.BytesIO(mirror), 0, len(mirror))[0] or "").startswith("ext")))
+
+    # LVM RAID inside one image: volumes() reads each, as the kernel presented it.
+    single = blob("lvm-raid-single-0.img.gz")
+    vols = volumes(io.BytesIO(single), len(single))
+    fh = lvm_image(io.BytesIO(single), len(single))
+    got, files, total, good = 0, 0, 0, set()
+    for v in vols:
+        if not v["label"].startswith("LVM qpraid1/"):
+            continue
+        name = "lvm-raid-single-" + v["label"].split("/")[1]
+        entry = lvm.get(name)
+        if entry is None:
+            continue
+        total += 1
+        sub = RaidImage(lambda o, n, b=v["base"]: (fh.seek(b + o), fh.read(n))[1], v["size"], name)
+        same_bytes = _raid_sha(sub) == (entry["device_sha256"], entry["device_size"])
+        got += same_bytes
+        m, w, same = _raid_files_match(sub, hashes[name], listing[name])
+        files += m == w and same
+        if same_bytes and m == w and same:
+            good.add(name)
+    want = sum(1 for n in lvm if n.startswith("lvm-raid-single-"))
+    out.append((f"each LVM RAID4/5/6/10 volume inside one image reads to the bytes the kernel "
+                f"presented, and its files and listing to its source ({got} and {files} of "
+                f"{want})", got == files == total == want and want >= 10))
+    r10 = lvm.get("lvm-raid-single-r10")
+    out.append(("the LVM RAID10 volume inside one image (raid10, two stripes, two copies, "
+                "near) is read through its four image volumes to the kernel's bytes, its files "
+                "and its listing", r10 is not None and "lvm-raid-single-r10" in good))
+
+    # LVM RAID across five images: raid_assemble() reads each volume.
+    multi = [(f"lvm-raid-multi-{i}", io.BytesIO(blob(f"lvm-raid-multi-{i}.img.gz"))) for i in range(5)]
+    rs = raid_assemble(multi)
+    got = files = 0
+    for arr in rs.arrays:
+        name = "lvm-raid-multi-" + arr.label.split("/")[1]
+        entry = lvm.get(name)
+        if entry is None or arr.image is None:
+            continue
+        got += _raid_sha(arr.image) == (entry["device_sha256"], entry["device_size"])
+        m, w, same = _raid_files_match(arr.image, hashes[name], listing[name])
+        files += m == w and same
+    want = sum(1 for n in lvm if n.startswith("lvm-raid-multi-"))
+    out.append((f"each LVM RAID5/6/10 volume across five member images reads to the kernel's "
+                f"bytes, and its files and listing to its source ({got} and {files} of {want})",
+                got == files == want == len(rs.arrays) and want >= 3))
+    alone = volumes(io.BytesIO(blob("lvm-raid-multi-0.img.gz")))
+    out.append(("one of those images read alone says its volumes are on physical volumes "
+                "not in the image", any("not in this image" in (v.get("note") or "") for v in alone)))
+
+    # main() reads an array as an image of its own, and extracts it under the
+    # array's name.
+    import contextlib
+    arr = assemble(md["md-r6-missing2"]).arrays[0]
+    zbuf = io.BytesIO()
+    say = io.StringIO()
+    with zipfile.ZipFile(zbuf, "w") as zout, contextlib.redirect_stdout(say):
+        main(arr.safe_name, extract="(memory)", zf=zout, manifest=[], image=arr.image,
+             name_prefix=arr.safe_name + "_", image_info={"raid": arr.describe()})
+    with zipfile.ZipFile(io.BytesIO(zbuf.getvalue())) as zin:
+        names = zin.namelist()
+    out.append(("main() reads an assembled array given as an image, and extracts its files "
+                "under the array's name",
+                f"{arr.safe_name}_lba0" in say.getvalue()
+                and any(n.startswith(arr.safe_name + "_lba0") and n.endswith("/hello.txt") for n in names)))
+
+    return (out + _raid_hostile_checks(md, assemble, blob)
+            + _raid_review_checks(md, lvm, blob) + _raid_review2_checks(md, lvm, blob)
+            + _raid_review3_checks(md, lvm, blob, doc) + _raid_review4_checks(md, blob))
+
+
+def _raid_hostile_checks(md, assemble, blob):
+    """Member sets that are damaged, incomplete or changed after mdadm wrote
+    them: each is read or refused as the kernel's own rules say, and a refusal
+    names its reason."""
+    import io
+    out = []
+    ls = md["md-r5-ls"]
+    at12 = 4096
+
+    def one(rs):
+        return rs.arrays[0] if len(rs.arrays) == 1 else None
+
+    def flip(target):
+        def change(i, b):
+            if i == target:
+                b[at12 + 100] ^= 0x40
+            return b
+        return change
+    arr = one(assemble(ls, change=flip(2)))
+    out.append(("a member whose superblock fails its checksum is not a member, and the "
+                "array is read with that member rebuilt",
+                arr is not None and 2 in arr.missing and arr.image is not None
+                and _raid_sha(arr.image)[0] == ls["device_sha256"]))
+
+    def dirty(_i, b):
+        struct.pack_into("<Q", b, at12 + 208, 0)
+        return _md_resum(b, at12)
+    arr = one(assemble(ls, skip={1}, change=dirty))
+    full = one(assemble(ls, change=dirty))
+    out.append(("a degraded RAID5 array not stopped clean is refused, since its parity may "
+                "not match; with every member it is read and says it was not stopped clean",
+                arr is not None and arr.image is None and "not stopped clean" in (arr.refused or "")
+                and full is not None and full.image is not None
+                and any("not stopped clean" in n for n in full.notes)))
+
+    arr = one(assemble(ls, skip={0, 2}))
+    r0 = one(assemble(md["md-r0"], skip={1}))
+    n2 = one(assemble(md["md-r10n2"], skip={0, 1}))
+    out.append(("too many members missing is refused with the count: two of a RAID5, one of "
+                "a RAID0, and both copies of a RAID10 near=2 chunk",
+                arr is not None and "2 of 4 members missing" in (arr.refused or "")
+                and r0 is not None and "1 of 3 members missing" in (r0.refused or "")
+                and n2 is not None and "every copy" in (n2.refused or "")))
+
+    jr = md["md-r5-journal"]
+    arr = one(assemble(jr, skip={3}))
+    out.append(("an array with a write journal is refused when the journal device is not "
+                "given", arr is not None and arr.image is None
+                and "no usable journal device" in (arr.refused or "")))
+
+    def write_back(i, b):
+        # the logged stripe's parity payload made a data payload: a stripe whose
+        # data is held only in the journal (r5l_recovery_load_data)
+        if i != 3:
+            return b
+        jsb = md_member(io.BytesIO(bytes(b)), 0, len(b))
+        pos = jsb.data_offset + (jsb.journal_tail or 0) * SECTOR
+        meta_size, = struct.unpack_from("<I", b, pos + 12)
+        off = pos + 32
+        while off < pos + meta_size:
+            ptype, _f, psize = struct.unpack_from("<HHI", b, off)
+            if ptype == 1:
+                struct.pack_into("<H", b, off, 0)
+            off += 8 + psize if ptype == 2 else 16 + 4 * (psize >> 3)
+        struct.pack_into("<I", b, pos + 4, 0)
+        seed = xfs_crc32c(jsb.uuid, 0xFFFFFFFF)
+        struct.pack_into("<I", b, pos + 4, xfs_crc32c(bytes(b[pos:pos + 4096]), seed))
+        return b
+    arr = one(assemble(jr, change=write_back))
+    out.append(("a write journal holding a stripe's data with no parity after it (a write "
+                "only in the journal) is refused by name",
+                arr is not None and arr.image is None and "not yet written" in (arr.refused or "")))
+
+    def behind(target, by):
+        def change(i, b):
+            if i == target:
+                ev, = struct.unpack_from("<Q", b, at12 + 200)
+                struct.pack_into("<Q", b, at12 + 200, ev - by)
+                _md_resum(b, at12)
+            return b
+        return change
+    one_b = one(assemble(ls, change=behind(1, 1)))
+    two_b = one(assemble(ls, change=behind(1, 2)))
+    out.append(("a member one event behind is read, its role taken from the freshest "
+                "superblock; two behind it is left out as stale and the array rebuilt",
+                one_b is not None and one_b.image is not None and not one_b.missing
+                and any("one event behind" in m.get("note", "") for m in one_b.members)
+                and two_b is not None and 1 in two_b.missing
+                and any(m["why"].startswith("stale") for m in two_b.left_out)
+                and _raid_sha(two_b.image)[0] == ls["device_sha256"]))
+
+    def cut(i, b):
+        return b[:2 << 20] if i == 3 else b
+    arr = one(assemble(ls, change=cut))
+    out.append(("a member image cut short is left out with how much of it is there, and "
+                "the array rebuilt without it",
+                arr is not None and 3 in arr.missing
+                and any("cut short" in m["why"] for m in arr.left_out)
+                and _raid_sha(arr.image)[0] == ls["device_sha256"]))
+
+    twice = [(m["file"], io.BytesIO(blob(m["file"]))) for m in ls["members"]]
+    twice.append(("again", io.BytesIO(blob(ls["members"][0]["file"]))))
+    arr = one(raid_assemble(twice))
+    out.append(("the same member given twice is used once and the second named",
+                arr is not None and not arr.missing and arr.image is not None
+                and any("again" in m["why"] for m in arr.left_out)))
+
+    def big_endian(_i, b):
+        at = (len(b) & ~(MD_RESERVED - 1)) - MD_RESERVED
+        words = struct.unpack_from("<1024I", b, at)
+        struct.pack_into(">1024I", b, at, *words)
+        return b
+    arr = one(assemble(md["md-r1-090"], change=big_endian))
+    out.append(("a 0.90 superblock in big-endian byte order is named and not read",
+                arr is not None and arr.image is None and "big-endian" in (arr.refused or "")))
+
+    def far_sets(_i, b):
+        lay, = struct.unpack_from("<I", b, at12 + 76)
+        struct.pack_into("<I", b, at12 + 76, lay | (1 << 17))
+        return _md_resum(b, at12)
+    arr = one(assemble(md["md-r10f2"], change=far_sets))
+    out.append(("a RAID10 layout with far sets, which no fixture holds, is refused by name",
+                arr is not None and arr.image is None and "far sets" in (arr.refused or "")))
+
+    def no_layout(_i, b):
+        fm, = struct.unpack_from("<I", b, at12 + 8)
+        struct.pack_into("<I", b, at12 + 8, fm & ~4096)
+        return _md_resum(b, at12)
+    arr = one(assemble(md["md-r0-orig"], change=no_layout))
+    out.append(("a RAID0 array of members of different sizes that records no layout is "
+                "refused by name", arr is not None and arr.image is None
+                and "records no layout" in (arr.refused or "")))
+
+    def other_level(i, b):
+        if i == 2:
+            struct.pack_into("<i", b, at12 + 72, 1)
+            _md_resum(b, at12)
+        return b
+    arr = one(assemble(ls, change=other_level))
+    out.append(("a member whose superblock gives the array another level is left out, "
+                "and the array rebuilt without it",
+                arr is not None and 2 in arr.missing
+                and any("different level" in m["why"] for m in arr.left_out)
+                and _raid_sha(arr.image)[0] == ls["device_sha256"]))
+
+    def clustered(_i, b):
+        fm, = struct.unpack_from("<I", b, at12 + 8)
+        struct.pack_into("<I", b, at12 + 8, fm | 256)
+        return _md_resum(b, at12)
+    arr = one(assemble(ls, change=clustered))
+    out.append(("a clustered md array is refused by name",
+                arr is not None and arr.image is None and "clustered" in (arr.refused or "")))
+
+    imsm = bytearray(1 << 20)
+    imsm[-1024:-1000] = b"Intel Raid ISM Cfg Sig. "
+    rs = raid_assemble([("imsm", io.BytesIO(bytes(imsm)))])
+    named = []
+    for guid, kind in RAID_GPT_TYPES.items():
+        disk = _gpt_test_image(SECTOR, bytes(64 << 10), 2048, "member", guid)
+        got = raid_assemble([("gpt", io.BytesIO(bytes(disk)))])
+        named.append(any(kind in ln for _l, ln in got.foreign))
+    out.append(("an Intel IMSM anchor, and GPT partitions of Windows LDM, Storage Spaces and "
+                "Apple RAID, are named and not read (constructed, no fixture holds them)",
+                any("Intel IMSM" in ln for _l, ln in rs.foreign) and all(named)
+                and not rs.arrays))
+    plain = raid_assemble([("plain", io.BytesIO(bytes(4 << 20)))])
+    out.append(("an image with no RAID member gives no array, member or name",
+                not plain.arrays and not plain.members and not plain.foreign))
+    return out
+
+
+def _lvm_text_change(img, change):
+    """`img` (a disk image, bytes) with the volume group text in every metadata
+    area of every physical volume on it passed through `change(text)`, each
+    copy's checksums made good again (raw_locn at 40, header CRC at 0)."""
+    import io
+    out = bytearray(img)
+    fh = io.BytesIO(bytes(img))
+    regions = [("whole", 0, len(img))] + [r[:3] for r in table_regions(fh)[0]]
+    for _label, base, size in regions:
+        pv = _lvm_pv(fh, base, size)
+        if pv is None or not pv.vg:
+            continue
+        for moff, _n in pv.metadata_areas:
+            at = base + moff
+            h = bytearray(out[at:at + LVM_MDA_HEADER_SIZE])
+            o, n, _c, f = struct.unpack_from("<QQII", h, 40)
+            text = bytes(out[at + o:at + o + n]).split(b"\0", 1)[0].decode()
+            new = change(text).encode() + b"\0"
+            out[at + o:at + o + len(new)] = new
+            struct.pack_into("<QQII", h, 40, o, len(new), lvm_crc(new), f)
+            struct.pack_into("<I", h, 0, lvm_crc(bytes(h[4:])))
+            out[at:at + LVM_MDA_HEADER_SIZE] = h
+    return bytes(out)
+
+
+def _lvm_extents(img, lvname):
+    """[(image offset, length)] of logical volume `lvname`'s extents on the
+    disk image `img`, from its volume group metadata, for a test to change."""
+    import io
+    fh = io.BytesIO(bytes(img))
+    regions = [r[:3] for r in table_regions(fh)[0]]
+    vg, bases = None, {}
+    for _label, base, size in regions:
+        pv = _lvm_pv(fh, base, size)
+        if pv is not None and pv.vg:
+            vg = pv.vg[1]
+            bases[_lvm_id(pv.uuid)] = base
+    ext = vg["extent_size"] * SECTOR
+    pvs = {n: (bases[_lvm_id(r["id"])], r["pe_start"] * SECTOR)
+           for n, r in vg["physical_volumes"].items()}
+    out = []
+    for k, seg in vg["logical_volumes"][lvname].items():
+        if k.startswith("segment") and isinstance(seg, dict):
+            stripes = seg["stripes"]
+            for i in range(0, len(stripes), 2):
+                base, pe_start = pvs[stripes[i]]
+                out.append((base + pe_start + stripes[i + 1] * ext,
+                            seg["extent_count"] // seg["stripe_count"] * ext))
+    return out
+
+
+def _lvm_spoil(img, lvname):
+    """`img` with every byte of `lvname`'s extents overwritten, as a stale or
+    failed image volume's would be wrong."""
+    out = bytearray(img)
+    for at, n in _lvm_extents(img, lvname):
+        out[at:at + n] = b"\xaa" * n
+    return bytes(out)
+
+
+def _lvm_status_add(text, lv, flag):
+    """`text` with `flag` added to the status list of logical volume `lv`."""
+    head = re.search(r"\n(\s*)" + re.escape(lv) + r" \{\s*\n(?:.*\n)*?\s*status = \[", text)
+    if head is None:
+        raise ValueError(f"no status list for {lv}")
+    return text[:head.end()] + f'"{flag}", ' + text[head.end():]
+
+
+def _raid_review_checks(md, lvm, blob):
+    """The cases an independent review found, each built from a fixture and
+    checked against what the kernel or lvm2 would do with it."""
+    import io
+    out = []
+    at12 = 4096
+
+    def one(rs):
+        return rs.arrays[0] if len(rs.arrays) == 1 else None
+
+    def sets(name, change=None, skip=()):
+        entry = md[name]
+        bufs = [bytearray(blob(m["file"])) for m in entry["members"] if m["file"]]
+        names = [m["file"] for m in entry["members"] if m["file"]]
+        if change is not None:
+            change(bufs)
+        return [(n, io.BytesIO(bytes(b))) for i, (n, b) in enumerate(zip(names, bufs))
+                if i not in skip]
+
+    # A bad block log (md.c 1890-1920): the range it lists on a member is read
+    # from the other copy or rebuilt from parity, never from that member.
+    def bad_range(member, sector):
+        def change(bufs):
+            b = bufs[member]
+            fm, = struct.unpack_from("<I", b, at12 + 8)
+            bbo, = struct.unpack_from("<i", b, at12 + 188)
+            do, = struct.unpack_from("<Q", b, at12 + 128)
+            bad = do + sector
+            entries = struct.pack("<Q", (bad << 10) | 8) + b"\xff" * 8
+            b[at12 + bbo * SECTOR:at12 + bbo * SECTOR + len(entries)] = entries
+            struct.pack_into("<I", b, at12 + 8, fm | 8)
+            _md_resum(b, at12)
+            b[bad * SECTOR:bad * SECTOR + 4096] = b"\xaa" * 4096    # what a failed write left
+        return change
+    r1 = one(raid_assemble(sets("md-r1", bad_range(0, 3000))))
+    r5 = one(raid_assemble(sets("md-r5-ls", bad_range(1, 1000))))
+    lin = one(raid_assemble(sets("md-linear", bad_range(0, 100))))
+    out.append(("a range a member's bad block log lists is read from the other RAID1 copy, "
+                "or rebuilt from RAID5 parity, never from that member, and the member and "
+                "range are named; on a linear array, with no other copy, it is refused",
+                r1 is not None and r1.image is not None
+                and _raid_sha(r1.image)[0] == md["md-r1"]["device_sha256"]
+                and any("bad block" in n for n in r1.notes)
+                and r5 is not None and r5.image is not None
+                and _raid_sha(r5.image)[0] == md["md-r5-ls"]["device_sha256"]
+                and lin is not None and lin.image is None and "bad blocks" in (lin.refused or "")))
+
+    # A 0.90 member one event behind that the freshest superblocks mark faulty
+    # (md.c 2111-2133, the freshest table decides) is left out, so a chunk
+    # written after it failed reads as written, rebuilt from parity.
+    name = "md-r5ls-090"
+    base = sets(name)
+    arr0 = one(raid_assemble(base))
+    g = arr0.geom
+    off = next(o for o in range(0, g.size, g.chunk) if g.stripe(o)[0] == 3 and o > 1 << 20)
+    _dd, pd, _qd, mo, _run, _ddf = g.stripe(off)
+
+    def failed3(bufs):
+        size = len(bufs[0])
+        at = (size & ~(MD_RESERVED - 1)) - MD_RESERVED
+        old = bytes(bufs[3][mo:mo + g.chunk])
+        new = bytes(x ^ 0x5A for x in old)
+        bufs[pd][mo:mo + g.chunk] = bytes(p ^ o ^ n for p, o, n in
+                                          zip(bufs[pd][mo:mo + g.chunk], old, new))
+        for i in (0, 1, 2):
+            b = bufs[i]
+            ev = struct.unpack_from("<I", b, at + 39 * 4)[0] | struct.unpack_from("<I", b, at + 40 * 4)[0] << 32
+            ev += 1
+            struct.pack_into("<II", b, at + 39 * 4, ev & 0xffffffff, ev >> 32)
+            for k in range(27):
+                slot = at + (128 + 32 * k) * 4
+                _num, _maj, _mnr, rd, st = struct.unpack_from("<5I", b, slot)
+                if rd == 3 and st & 6:
+                    struct.pack_into("<I", b, slot + 16, 1)
+            struct.pack_into("<I", b, at + 38 * 4, 0)
+            w = struct.unpack_from("<1024I", b, at)
+            t = sum(w)
+            struct.pack_into("<I", b, at + 38 * 4, ((t & 0xffffffff) + (t >> 32)) & 0xffffffff)
+        failed3.new = new[:16]
+    arr = one(raid_assemble(sets(name, failed3)))
+    arr.image.seek(off)
+    out.append(("a 0.90 member one event behind, which the freshest superblocks mark faulty, "
+                "is left out, and a chunk written on it after it failed reads as written "
+                "(rebuilt from parity)",
+                3 in arr.missing and arr.image.read(16) == failed3.new
+                and any("no longer has it in sync" in m["why"] for m in arr.left_out)))
+
+    # 0.90 members on MBR partitions that run to the end of their disks: the
+    # member is the partition (innermost region), not the whole disk.
+    def mbr(name):
+        disks = []
+        for m in md[name]["members"]:
+            data = bytearray(2048 * SECTOR) + blob(m["file"])
+            struct.pack_into("<B3sB3sII", data, 446, 0, b"\0\0\0", 0xfd, b"\0\0\0", 2048,
+                             len(blob(m["file"])) // SECTOR)
+            data[510:512] = b"\x55\xaa"
+            disks.append((m["file"], io.BytesIO(bytes(data))))
+        return one(raid_assemble(disks))
+    ok = []
+    for name in ("md-r1-090", "md-r5ls-090"):
+        arr = mbr(name)
+        ok.append(arr is not None and arr.image is not None
+                  and all(m["base"] == 2048 * SECTOR for m in arr.members)
+                  and _raid_sha(arr.image)[0] == md[name]["device_sha256"])
+    out.append(("0.90 members on MBR partitions that end where their disks end are read "
+                "from the partitions, a RAID1 and a RAID5 alike, to the kernel's bytes", all(ok)))
+
+    # raid_disks past what the superblock can hold is refused before anything
+    # is sized by it.
+    def members_count(n):
+        def change(bufs):
+            for b in bufs:
+                struct.pack_into("<I", b, at12 + 92, n)
+                _md_resum(b, at12)
+        return change
+    t0 = time.time()
+    big = one(raid_assemble(sets("md-r5-ls", members_count(4000000000))))
+    took = time.time() - t0
+    out.append(("an array whose superblock records more members than its role table holds is "
+                "refused at once, named (4,000,000,000 members)",
+                big is not None and big.image is None and "more than the" in (big.refused or "")
+                and took < 10))
+
+    # RAID10's missing-member check looks at n chunks, once each, not n chunks
+    # times copies times a scan of the missing list. 950 of 1,900 members of a
+    # near=2 array (every other one), each a copy of a fixture member's
+    # superblock on an image of zeros: every chunk still has a copy.
+    class Zeros:
+        """An image of `size` bytes that holds `head` at its start and zeros after."""
+
+        def __init__(self, head, size):
+            self.head, self.size, self.pos = head, size, 0
+
+        def seek(self, off, whence=0):
+            self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
+            return self.pos
+
+        def tell(self):
+            return self.pos
+
+        def read(self, n=-1):
+            n = self.size - self.pos if n is None or n < 0 else min(n, self.size - self.pos)
+            out = self.head[self.pos:self.pos + n]
+            out += bytes(max(0, n - len(out)))
+            self.pos += n
+            return out
+    tmpl = bytearray(blob(md["md-r10n2"]["members"][0]["file"])[:8192])
+    struct.pack_into("<I", tmpl, at12 + 92, 1900)
+    struct.pack_into("<I", tmpl, at12 + 220, 1920)
+    struct.pack_into("<1900H", tmpl, at12 + 256, *range(1900))
+    many = []
+    for k in range(0, 1900, 2):
+        b = bytearray(tmpl)
+        struct.pack_into("<I", b, at12 + 160, k)
+        _md_resum(b, at12)
+        many.append((f"m{k}", Zeros(bytes(b), len(blob(md["md-r10n2"]["members"][0]["file"])))))
+    looked = [0]
+    real = RaidGeometry.copies10
+
+    def counted(self, off):
+        looked[0] += 1
+        return real(self, off)
+    RaidGeometry.copies10 = counted
+    try:
+        w10 = one(raid_assemble(many))
+    finally:
+        RaidGeometry.copies10 = real
+    out.append((f"a RAID10 near=2 array of 1,900 members with every other one given is read, "
+                f"its copies checked by looking at each of 1,900 chunks once ({looked[0]:,})",
+                w10 is not None and w10.image is not None and len(w10.missing) == 950
+                and looked[0] <= 1900))
+
+    # A journal meta block whose payloads claim more than the block holds is
+    # refused on that array alone; another array in the same run still reads.
+    jr = md["md-r5-journal"]
+    jidx = [m["file"] for m in jr["members"] if m["file"]].index("md-r5-journal-j.img.gz")
+
+    def long_payload(bufs):
+        b = bufs[jidx]
+        jsb = md_member(io.BytesIO(bytes(b)), 0, len(b))
+        pos = jsb.data_offset + (jsb.journal_tail or 0) * SECTOR
+        struct.pack_into("<I", b, pos + 36, 8 * 5000)
+        struct.pack_into("<I", b, pos + 4, 0)
+        seed = xfs_crc32c(jsb.uuid, 0xFFFFFFFF)
+        struct.pack_into("<I", b, pos + 4, xfs_crc32c(bytes(b[pos:pos + 4096]), seed))
+    rs = raid_assemble(sets("md-r5-journal", long_payload) + sets("md-r1"))
+    jarr = next((a for a in rs.arrays if a.sb.raid_disks == 3), None)
+    r1arr = next((a for a in rs.arrays if a.sb.level == 1), None)
+    out.append(("a journal meta block whose payloads run past it refuses that array by name, "
+                "and an unrelated array in the same run still reads",
+                jarr is not None and "run past the block" in (jarr.refused or "")
+                and r1arr is not None and r1arr.image is not None
+                and _raid_sha(r1arr.image)[0] == md["md-r1"]["device_sha256"]))
+
+    # A stale journal device is left out (md.c 2082-2088), and so is a journal
+    # device for an array without the journal feature (md.c 2146-2150).
+    def stale_journal(bufs):
+        b = bufs[jidx]
+        ev, = struct.unpack_from("<Q", b, at12 + 200)
+        struct.pack_into("<Q", b, at12 + 200, ev - 5)
+        _md_resum(b, at12)
+
+    def no_feature(bufs):
+        # the journal device's own superblock without the journal feature
+        # (md.c 2146: the device's own sb is what is tested)
+        b = bufs[jidx]
+        fm, = struct.unpack_from("<I", b, at12 + 8)
+        struct.pack_into("<I", b, at12 + 8, fm & ~512)
+        _md_resum(b, at12)
+    st = one(raid_assemble(sets("md-r5-journal", stale_journal)))
+    nf = one(raid_assemble(sets("md-r5-journal", no_feature)))
+    out.append(("a journal device more than one event behind is left out as stale and the "
+                "array refused for want of its journal; so is a journal device whose own "
+                "superblock has no journal feature",
+                st is not None and st.image is None
+                and any(m["where"].startswith("md-r5-journal-j") and m["why"].startswith("stale")
+                        for m in st.left_out)
+                and nf is not None and nf.image is None
+                and any("own superblock has no journal" in m["why"] for m in nf.left_out)))
+
+    # The kernel's own refusals: a RAID5 chunk that is not a power of two, a
+    # RAID10 layout of one copy, a 1.2 data offset inside the superblock, and a
+    # member one event behind whose device number is past the freshest table.
+    def chunk(bufs):
+        for b in bufs:
+            struct.pack_into("<I", b, at12 + 88, 96)
+            _md_resum(b, at12)
+
+    def one_copy(bufs):
+        for b in bufs:
+            struct.pack_into("<I", b, at12 + 76, 0x101)
+            _md_resum(b, at12)
+
+    def inside(bufs):
+        struct.pack_into("<Q", bufs[0], at12 + 128, 8)
+        _md_resum(bufs[0], at12)
+
+    def far_number(bufs):
+        # the freshest superblocks hold a 64-entry role table; the member one
+        # event behind is device 100 in its own 128-entry one
+        for i in (0, 1, 3):
+            struct.pack_into("<I", bufs[i], at12 + 220, 64)
+            _md_resum(bufs[i], at12)
+        b = bufs[2]
+        ev, = struct.unpack_from("<Q", b, at12 + 200)
+        struct.pack_into("<Q", b, at12 + 200, ev - 1)
+        struct.pack_into("<I", b, at12 + 160, 100)
+        struct.pack_into("<H", b, at12 + 256 + 200, 2)
+        _md_resum(b, at12)
+    ch = one(raid_assemble(sets("md-r5-ls", chunk)))
+    oc = one(raid_assemble(sets("md-r10n2", one_copy)))
+    ins = raid_assemble(sets("md-r5-ls", inside))
+    fn = one(raid_assemble(sets("md-r5-ls", far_number)))
+    out.append(("the kernel's refusals hold: a RAID5 chunk that is not a power of two, a "
+                "RAID10 layout of one copy, a 1.2 data offset inside its superblock (that "
+                "member is not one), and a member one event behind whose device number is "
+                "past the freshest superblock's table",
+                ch is not None and ch.image is None and "power of two" in (ch.refused or "")
+                and oc is not None and oc.image is None and "1 copies" in (oc.refused or "")
+                and len(ins.arrays) == 1 and 0 in ins.arrays[0].missing
+                and fn is not None and any("device number" in m["why"] for m in fn.left_out)))
+
+    # The device uuid as mdadm --examine prints it (md_p.h: device_uuid at 168).
+    member = md["md-r5-ls"]["members"][0]
+    dev = md_member(io.BytesIO(blob(member["file"])), 0, len(blob(member["file"])))
+    want = re.search(r"Device UUID : (\S+)", member.get("examine") or "")
+    out.append(("a 1.x member's device uuid is read from where mdadm --examine finds it",
+                want is not None and dev is not None
+                and ":".join(dev.dev_uuid[i:i + 4].hex() for i in range(0, 16, 4)) == want.group(1)))
+
+    # A degraded RAID1 not stopped clean says so.
+    def unclean(bufs):
+        for b in bufs:
+            struct.pack_into("<Q", b, at12 + 208, 0)
+            _md_resum(b, at12)
+    dr1 = one(raid_assemble(sets("md-r1", unclean, skip={1})))
+    out.append(("a degraded RAID1 not stopped clean is read and says it was not stopped clean",
+                dr1 is not None and dr1.image is not None
+                and any("not stopped clean" in n for n in dr1.notes)))
+
+    # One image holding part of an array is a member, not a failure; a RAID1
+    # member whose data starts at its first byte is not read twice.
+    lone = one(raid_assemble(sets("md-r5-ls", skip={1, 2, 3})))
+    say = []
+    raid_report(raid_assemble(sets("md-r5-ls", skip={1, 2, 3})), say=say.append, images_given=1)
+    r1090 = one(raid_assemble(sets("md-r1-090", skip={1})))
+    say2 = []
+    raid_report(raid_assemble(sets("md-r1-090", skip={1})), say=say2.append, images_given=1)
+    whole = one(raid_assemble(sets("md-r5-reshape")))
+    out.append(("one image holding one member of a RAID5 does not count as an array not read, "
+                "and says to give the others; a whole array refused does; a lone RAID1 member "
+                "whose data starts at its first byte is not read a second time",
+                lone is not None and not raid_unread(lone, 1)
+                and any("give the other member images" in s for s in say)
+                and not any("NOT READ" in s for s in say)
+                and whole is not None and raid_unread(whole, 4)
+                and r1090 is not None and r1090.same_as is not None
+                and any("not read again" in s for s in say2)))
+
+    # 4Kn: the IMSM anchor two 4096-byte sectors from the end, DDF's in the last.
+    imsm = bytearray(1 << 20)
+    imsm[-8192:-8192 + 24] = b"Intel Raid ISM Cfg Sig. "
+    ddf = bytearray(1 << 20)
+    ddf[-4096:-4092] = b"\xde\x11\xde\x11"
+    out.append(("on a 4096-byte-sector disk the IMSM and DDF anchors are found and named",
+                raid_foreign(io.BytesIO(bytes(imsm)), 0, len(imsm)) == "Intel IMSM (RST)"
+                and raid_foreign(io.BytesIO(bytes(ddf)), 0, len(ddf)) == "DDF"))
+
+    # LVM: lvm2's own marks on an image volume or a physical volume, a
+    # self-referencing raid segment, and a physical volume given twice.
+    single = blob("lvm-raid-single-0.img.gz")
+
+    def lvm_reads(img):
+        vols = volumes(io.BytesIO(img), len(img))
+        fh = lvm_image(io.BytesIO(img), len(img))
+        got = {}
+        for v in vols:
+            if v["label"].startswith("LVM qpraid1/"):
+                lv = v["label"].split("/")[1]
+                sub = RaidImage(lambda o, n, b=v["base"]: (fh.seek(b + o), fh.read(n))[1], v["size"], lv)
+                got[lv] = _raid_sha(sub) == (lvm["lvm-raid-single-" + lv]["device_sha256"],
+                                             lvm["lvm-raid-single-" + lv]["device_size"])
+        notes = " ".join(v.get("note") or "" for v in vols)
+        return got, notes
+    spoiled = _lvm_spoil(single, "r5ls_rimage_1")
+    rb, _rb_notes = lvm_reads(_lvm_text_change(spoiled, lambda t: _lvm_status_add(t, "r5ls_rimage_1", "REBUILD")))
+    out.append(("an LVM RAID5 image volume lvm2 marks REBUILD (its bytes spoiled here) is not "
+                "read; its chunks are rebuilt from parity, and the volume reads to the kernel's "
+                "bytes", rb.get("r5ls") is True and len(rb) == 10))
+
+    # dm-raid's own superblock lists an image as failed (failed_devices, dm-raid.c 1962)
+    def failed_bit(img):
+        out_img = bytearray(img)
+        for i in range(3):
+            for at, _n in _lvm_extents(img, f"r5ls_rmeta_{i}"):
+                if struct.unpack_from("<I", out_img, at)[0] == DM_RAID_MAGIC:
+                    f, = struct.unpack_from("<Q", out_img, at + 24)
+                    struct.pack_into("<Q", out_img, at + 24, f | 1 << 2)
+        return bytes(out_img)
+    fb, _fb_notes = lvm_reads(failed_bit(_lvm_spoil(single, "r5ls_rimage_2")))
+    out.append(("an LVM RAID5 image volume dm-raid's superblock lists as failed (its bytes "
+                "spoiled here) is rebuilt from parity, to the kernel's bytes",
+                fb.get("r5ls") is True and len(fb) == 10))
+    ns, ns_notes = lvm_reads(_lvm_text_change(single, lambda t: _lvm_status_add(
+        _lvm_status_add(t, "r5ls_rimage_1", "REBUILD"), "r5ls", "NOTSYNCED")))
+    out.append(("an LVM RAID5 volume lvm2 marks NOTSYNCED, with an image volume to rebuild, is "
+                "refused by name",
+                "r5ls" not in ns and "NOTSYNCED" in ns_notes and len(ns) == 9))
+
+    def pv_missing(text):
+        head = re.search(r"\n\s*pv1 \{\s*\n(?:.*\n)*?\s*status = \[", text)
+        return text[:head.end()] + '"MISSING", ' + text[head.end():]
+    # pv1's extents spoiled, its label and metadata kept (so it is the MISSING
+    # mark, not the physical volume's absence, that is tested)
+    # the image volumes on pv1 spoiled, their metadata volumes kept whole, so it
+    # is the MISSING mark, not a missing dm-raid superblock, that is tested
+    pv1 = single
+    vgtext = None
+    for _l, base, size in [r[:3] for r in table_regions(io.BytesIO(single))[0]]:
+        pv = _lvm_pv(io.BytesIO(single), base, size)
+        if pv is not None and pv.vg:
+            vgtext = pv.vg[1]
+    for lvname, lvrec in (vgtext or {}).get("logical_volumes", {}).items():
+        if "_rimage_" in lvname and "pv1" in _lvm_seg_pvs(lvrec):
+            pv1 = _lvm_spoil(pv1, lvname)
+    pm, _pm_notes = lvm_reads(_lvm_text_change(pv1, pv_missing))
+    out.append(("with a physical volume lvm2 marks MISSING, every RAID volume with an image "
+                "volume on it is read from its other copies or rebuilt from parity, to the "
+                "kernel's bytes", len(pm) == 10 and all(pm.values())))
+    ref = _lvm_text_change(single, lambda t: t.replace('"r4_rimage_0"', '"r4"', 1))
+    try:
+        sr, sr_notes = lvm_reads(ref)
+        selfref = "r4" not in sr and "nest more than four deep" in sr_notes and len(sr) == 9 \
+            and all(sr.values())
+    except RecursionError:
+        selfref = False
+    out.append(("a raid segment naming its own volume is refused by name and the group's other "
+                "volumes still read", selfref))
+
+    multi = [(f"lvm-raid-multi-{i}", blob(f"lvm-raid-multi-{i}.img.gz")) for i in range(5)]
+    tot = good = 0
+    for skip in range(5):
+        rs = raid_assemble([(n, io.BytesIO(b)) for i, (n, b) in enumerate(multi) if i != skip])
+        for a in rs.arrays:
+            entry = lvm["lvm-raid-multi-" + a.label.split("/")[1]]
+            tot += 1
+            good += a.image is not None and _raid_sha(a.image) == (entry["device_sha256"],
+                                                                    entry["device_size"])
+    out.append((f"with any one of the five images not given, every LVM RAID volume across them "
+                f"is still read to the kernel's bytes, from parity or the other copy ({good} of "
+                f"{tot})", good == tot == 15))
+    dup = raid_assemble([(n, io.BytesIO(b)) for n, b in multi] + [("copy", io.BytesIO(multi[0][1]))])
+    out.append(("one of those images given twice is read once, and the second named",
+                len(dup.arrays) == 3 and all(a.image is not None for a in dup.arrays)
+                and any("the same LVM2 physical volume" in ln for ln in dup.members.get("copy", []))))
+    return out
+
+
+def _raid_review2_checks(md, lvm, blob):
+    """The cases a second review found: bad block ranges nothing can supply,
+    reads that fail, dm-raid recovery and events, LVM raid1 copies, the exit
+    status, members on one image's partitions, the logical block size, a cut
+    bad block log, and free space in rebuilt chunks."""
+    import io
+    import contextlib
+    out = []
+    at12 = 4096
+
+    def one(rs):
+        return rs.arrays[0] if len(rs.arrays) == 1 else None
+
+    def setbad(b, entries, shift=0):
+        fm, = struct.unpack_from("<I", b, at12 + 8)
+        bbo, = struct.unpack_from("<i", b, at12 + 188)
+        raw = b"".join(struct.pack("<Q", (s << 10) | c) for s, c in entries) + b"\xff" * 8
+        b[at12 + bbo * SECTOR:at12 + bbo * SECTOR + len(raw)] = raw
+        struct.pack_into("<B", b, at12 + 185, shift)
+        struct.pack_into("<I", b, at12 + 8, fm | 8)
+        _md_resum(b, at12)
+
+    def spoil(b, s, c, shift=0):
+        b[(s << shift) * SECTOR:((s + c) << shift) * SECTOR] = b"\xaa" * ((c << shift) * SECTOR)
+
+    def run(name, plan, skip=()):
+        files = [m["file"] for m in md[name]["members"] if m["file"]]
+        bufs = [bytearray(blob(f)) for f in files]
+        for i, ents, sh in plan:
+            setbad(bufs[i], ents, sh)
+            for s, c in ents:
+                spoil(bufs[i], s, c, sh)
+        arr = one(raid_assemble([(f, io.BytesIO(bytes(b))) for k, (f, b) in enumerate(zip(files, bufs))
+                                 if k not in skip]))
+        if arr is None or arr.image is None:
+            return "refused", (arr.refused if arr is not None else "")
+        return ("ok" if _raid_sha(arr.image)[0] == md[name]["device_sha256"] else "WRONG"), ""
+    do = 2048
+    readable = [run("md-r5-ls", [(1, [(do + 1030, 200)], 0)]),
+                run("md-r5-ls", [(1, [(do - 16, 40)], 0)]),
+                run("md-r5-ls", [(2, [((do + 2048) >> 3, 10)], 3)]),
+                run("md-r5-ls", [(1, [(do + 1000, 8)], 0), (2, [(do + 3000, 8)], 0)]),
+                run("md-r6-ls", [(1, [(do + 1000, 8)], 0), (2, [(do + 1000, 8)], 0)]),
+                run("md-r10n2", [(0, [(do + 1000, 8)], 0)]),
+                run("md-r10f2", [(0, [(do + 3000, 200)], 0)]),
+                run("md-r1", [(0, [(do + 1000, 8)], 0), (1, [(do + 1008, 8)], 0)])]
+    lost = [run("md-r5-ls", [(1, [(do + 1000, 8)], 0), (2, [(do + 1004, 8)], 0)]),
+            run("md-r5-ls", [(1, [(do + 1000, 8)], 0)], skip={3}),
+            run("md-r6-ls", [(1, [(do + 1000, 8)], 0), (2, [(do + 1000, 8)], 0)], skip={4}),
+            run("md-r10n2", [(0, [(do + 1000, 8)], 0), (1, [(do + 1000, 8)], 0)]),
+            run("md-r1", [(0, [(do + 1000, 8)], 0), (1, [(do + 1000, 8)], 0)])]
+    out.append((f"bad block ranges another copy or parity can supply read to the kernel's bytes "
+                f"({sum(r[0] == 'ok' for r in readable)} of {len(readable)}: across chunks, "
+                "over the data offset, shifted, on two members apart, RAID6 two at once, RAID10 "
+                "near and far, RAID1 side by side); ranges nothing can supply refuse the array "
+                f"and name member and range ({sum(r[0] == 'refused' and 'bad block range' in r[1] for r in lost)} "
+                f"of {len(lost)}: RAID5 two overlapping, RAID5 one with a member missing, RAID6 two "
+                "with a member missing, RAID10 and RAID1 both copies)",
+                all(r[0] == "ok" for r in readable)
+                and all(r[0] == "refused" and "bad block range" in r[1] and "role" in r[1] for r in lost)))
+
+    # A read that fails in the RAID read paths ends short, so extraction names
+    # the file .SHORT: a RAID1 reader whose copies are both bad, built past the
+    # refusal above, and an LVM RAID5 map with two image volumes gone.
+    entry = md["md-r1"]
+    arr = one(raid_assemble([(m["file"], io.BytesIO(blob(m["file"]))) for m in entry["members"]]))
+    members = {m["role"]: (m["fh"], m["base"] + m["data_offset"]) for m in arr.members}
+    arr.image.seek(0)
+    hit = arr.image.read(arr.image.size).find(b"md-r1 block 00000100\n")   # inside blocks.bin
+    both = {0: [(hit, hit + 4096)], 1: [(hit, hit + 4096)]}
+    bad_img = RaidImage(RaidReader(arr.geom, members, both).read, arr.geom.size, "both bad")
+    zbuf, said, man = io.BytesIO(), io.StringIO(), []
+    with zipfile.ZipFile(zbuf, "w") as zout, contextlib.redirect_stdout(said):
+        main("both_bad", extract="(memory)", zf=zout, manifest=man, image=bad_img)
+    with zipfile.ZipFile(io.BytesIO(zbuf.getvalue())) as zin:
+        names = zin.namelist()
+    shorts = sum(int(v.get("short", 0) or 0) for v in man)
+    single = blob("lvm-raid-single-0.img.gz")
+    vols = volumes(io.BytesIO(single), len(single))
+    fh = lvm_image(io.BytesIO(single), len(single))
+    r5 = next(v for v in vols if v["label"] == "LVM qpraid1/r5ls")
+    lmap = fh.lvm_map_for(r5["base"])
+    broken = RaidLvMap(lmap.kind, lmap.geom, [lmap.images[0], None, None], lmap.size, "test")
+    got = broken.read_via(fh, 0, lmap.size)
+    out.append(("a RAID read that neither a copy nor parity can supply comes back short, so "
+                "the file is named .SHORT and counted short, not filled with zeros; an LVM RAID "
+                "read with too many image volumes gone comes back short too",
+                any(".SHORT-" in n for n in names) and shorts >= 1
+                and len(got) < lmap.size))
+
+    # dm-raid: an image volume still being recovered, or whose superblock fell
+    # behind, is read from parity, not as it is.
+    def rmeta_set(img, lv, field, value):
+        out_img = bytearray(img)
+        for at, _n in _lvm_extents(img, lv):
+            if struct.unpack_from("<I", out_img, at)[0] == DM_RAID_MAGIC:
+                struct.pack_into("<Q", out_img, at + field, value)
+        return bytes(out_img)
+
+    def lvm_r5ls(img):
+        vols2 = volumes(io.BytesIO(img), len(img))
+        f2 = lvm_image(io.BytesIO(img), len(img))
+        v = next((x for x in vols2 if x["label"] == "LVM qpraid1/r5ls"), None)
+        if v is None:
+            return False, vols2
+        sub = RaidImage(lambda o, n, b=v["base"]: (f2.seek(b + o), f2.read(n))[1], v["size"], "r5ls")
+        return _raid_sha(sub) == (lvm["lvm-raid-single-r5ls"]["device_sha256"],
+                                  lvm["lvm-raid-single-r5ls"]["device_size"]), vols2
+    spoiled = _lvm_spoil(single, "r5ls_rimage_1")
+    rec_ok, _v = lvm_r5ls(rmeta_set(spoiled, "r5ls_rmeta_1", 32, 0))
+    ev = None
+    for at, _n in _lvm_extents(single, "r5ls_rmeta_0"):
+        if struct.unpack_from("<I", single, at)[0] == DM_RAID_MAGIC:
+            ev, = struct.unpack_from("<Q", single, at + 16)
+    beh_ok, _v = lvm_r5ls(rmeta_set(spoiled, "r5ls_rmeta_1", 16, max(0, (ev or 2) - 2)))
+    out.append(("an LVM RAID5 image volume whose dm-raid superblock says it is still being "
+                "recovered, or is two events behind the freshest, is rebuilt from parity (its "
+                "bytes spoiled here), to the kernel's bytes", rec_ok and beh_ok))
+
+    # LVM raid1: a copy lvm2 marks REBUILD (spoiled here) is passed over for the
+    # next; with every copy marked, the volume is refused.
+    lf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures",
+                           "lvm-fixture.img.gz")
+    if os.path.isfile(lf_path):
+        import gzip
+        with gzip.open(lf_path, "rb") as gz:
+            lf = gz.read()
+
+        def mirror(img):
+            vols3 = volumes(io.BytesIO(img), len(img))
+            f3 = lvm_image(io.BytesIO(img), len(img))
+            v = next((x for x in vols3 if x["label"].endswith("/mirror")), None)
+            if v is None:
+                return None, " ".join(x.get("note") or "" for x in vols3)
+            sub = RaidImage(lambda o, n, b=v["base"]: (f3.seek(b + o), f3.read(n))[1], v["size"], "m")
+            return _raid_sha(sub)[0], ""
+        before, _n = mirror(lf)
+        first = _lvm_text_change(_lvm_spoil(lf, "mirror_rimage_0"),
+                                 lambda t: _lvm_status_add(t, "mirror_rimage_0", "REBUILD"))
+        after, _n = mirror(first)
+        both_marked = _lvm_text_change(first, lambda t: _lvm_status_add(t, "mirror_rimage_1", "REBUILD"))
+        none, notes = mirror(both_marked)
+        out.append(("an LVM raid1 copy lvm2 marks REBUILD (spoiled here) is passed over and the "
+                    "other copy read, to the same bytes; with both marked the volume is refused "
+                    "by name", before is not None and after == before and none is None
+                    and "marked REBUILD" in notes))
+    else:
+        out.append(("the LVM fixture is not beside this script, so the raid1 copy check did "
+                    "not run", None))
+
+    # Exit status: a member given alone, or beside an unrelated image, is a
+    # member; a refused superblock with members missing is too; a complete set
+    # still refused is not read.
+    ls = md["md-r5-ls"]
+    lone = one(raid_assemble([(ls["members"][0]["file"], io.BytesIO(blob(ls["members"][0]["file"]))),
+                              ("other", io.BytesIO(bytes(1 << 20)))]))
+    be = bytearray(blob(md["md-r5ls-090"]["members"][0]["file"]))     # one of four
+    at90 = (len(be) & ~(MD_RESERVED - 1)) - MD_RESERVED
+    words = struct.unpack_from("<1024I", be, at90)
+    struct.pack_into(">1024I", be, at90, *words)
+    be_lone = one(raid_assemble([("be", io.BytesIO(bytes(be)))]))
+    whole = one(raid_assemble([(m["file"], io.BytesIO(blob(m["file"])))
+                               for m in md["md-r5-reshape"]["members"] if m["file"]]))
+    out.append(("one member beside an unrelated image, and a lone member whose superblock is "
+                "refused, leave the exit status alone; a complete set still refused does not",
+                lone is not None and not raid_unread(lone)
+                and be_lone is not None and be_lone.image is None and not raid_unread(be_lone)
+                and whole is not None and raid_unread(whole)))
+
+    # Members on the partitions of one image: the report names what is wrong
+    # with them, it does not ask for more images.
+    disk = bytearray(1 << 20)
+    parts = [blob(ls["members"][i]["file"]) for i in (0, 1)]
+    for i, part in enumerate(parts):
+        start = len(disk) // SECTOR
+        struct.pack_into("<B3sB3sII", disk, 446 + 16 * i, 0, b"\0\0\0", 0xfd, b"\0\0\0",
+                         start, len(part) // SECTOR)
+        disk += part
+    disk[510:512] = b"\x55\xaa"
+    said2 = []
+    rs = raid_assemble([("disk", io.BytesIO(bytes(disk)))])
+    raid_report(rs, say=said2.append, images_given=1)
+    out.append(("members that are partitions of the one image given are not told to give "
+                "other images; the report says how many of them can be used",
+                any("on this image's partitions" in s for s in said2)
+                and not any("give the other member images" in s for s in said2)))
+
+    # A 1.2 data offset just past a 512-byte superblock is inside a 4096-byte
+    # logical block's (md.c 1872-1882 rounds to the device's block size).
+    b = bytearray(blob(ls["members"][0]["file"]))
+    struct.pack_into("<Q", b, at12 + 128, 9)
+    _md_resum(b, at12)
+    small = md_superblocks(io.BytesIO(bytes(b)), 0, len(b), 512)
+    large = md_superblocks(io.BytesIO(bytes(b)), 0, len(b), 4096)
+    out.append(("a 1.2 data offset one sector past the superblock is accepted with 512-byte "
+                "logical blocks and refused with 4096-byte ones",
+                any(s.version == "1.2" for s in small) and not any(s.version == "1.2" for s in large)))
+
+    # A bad block log the image ends inside: the member is left out and says why.
+    cut = bytearray(blob(ls["members"][0]["file"]))
+    setbad(cut, [(2048 + 100, 8)])
+    bbo, = struct.unpack_from("<i", cut, at12 + 188)
+    cut = cut[:at12 + bbo * SECTOR + 1024]
+    rs = raid_assemble([("cut", io.BytesIO(bytes(cut)))] +
+                       [(m["file"], io.BytesIO(blob(m["file"]))) for m in ls["members"][1:]])
+    arr = one(rs)
+    out.append(("a member whose bad block log runs past the end of its image is left out and "
+                "says so, never read with fewer entries",
+                arr is not None and any("bad block log runs past" in m["why"] for m in arr.left_out)))
+
+    # Free space of an LVM RAID volume with an image volume rebuilt: what lies
+    # in rebuilt chunks is said and not written. One .bin is written, into a
+    # folder of this check's own.
+    import shutil
+    import tempfile
+    rb_img = _lvm_text_change(spoiled, lambda t: _lvm_status_add(t, "r5ls_rimage_1", "REBUILD"))
+    vols4 = volumes(io.BytesIO(rb_img), len(rb_img))
+    f4 = lvm_image(io.BytesIO(rb_img), len(rb_img))
+    v = dict(next(x for x in vols4 if x["label"] == "LVM qpraid1/r5ls"))
+
+    class Free:
+        """A stand-in reader that reports the whole volume as free."""
+
+        def __init__(self, base, size):
+            self.base, self.size = base, size
+
+        def free_extents(self):
+            return [(self.base, self.size)]
+    v["walker"] = Free(v["base"], v["size"])
+    top = os.path.join(tempfile.mkdtemp(prefix="qnxprobe-raid-"), "raid-unallocated")
+    os.makedirs(top, exist_ok=True)
+    said3 = []
+    try:
+        recs = write_unallocated(f4, f4.size, [v], top, "raid", say=said3.append)
+    finally:
+        shutil.rmtree(top, ignore_errors=True)
+    out.append(("writing the free space of an LVM RAID volume with an image volume rebuilt "
+                "says how much lies in rebuilt chunks, on no disk, and leaves it out",
+                bool(recs) and recs[0].get("rebuilt_bytes_not_written", 0) > 0
+                and any("rebuilt from parity, on no disk" in s for s in said3)))
+    return out
+
+
+def _raid_review3_checks(md, lvm, blob, doc):
+    """The cases a third review found, and a sweep of the command line's RAID
+    step over every subset of the member images of several sets."""
+    import io
+    import contextlib
+    out = []
+    at12 = 4096
+
+    def one(rs):
+        return rs.arrays[0] if len(rs.arrays) == 1 else None
+
+    # The sweep: raid_run() with main() (the command line's own RAID step,
+    # report included) over every non-empty subset of the images of one set
+    # per level and of the five images of the volume group across images. What
+    # should be read is worked out here from the level alone (and, for LVM,
+    # from where lvs said each image volume was), not from the reader.
+    def expect_md(level, n, have):
+        lost = n - len(have)
+        if level == "raid1":
+            return bool(have)
+        if level == "raid10":                          # near=2: members 0,1 and 2,3 hold copies
+            return all(any(r in have for r in pair) for pair in ((0, 1), (2, 3)))
+        return lost <= (2 if level == "raid6" else 1)
+    loops = doc["lvm"]["lvm-raid-multi"]["loops"]
+    pv_of = {}
+    for seg in doc["lvm"]["lvm-raid-multi"]["report"]["segments"]["report"][0]["seg"]:
+        name = seg["lv_name"].strip("[]")
+        if "_rimage_" in name:
+            pv_of[name] = loops.index(seg["seg_pe_ranges"].split(":")[0])
+
+    def expect_lvm(lv, have):
+        legs = sorted((k, pv) for k, pv in pv_of.items() if k.startswith(lv + "_rimage_"))
+        gone = [i for i, (_k, pv) in enumerate(legs) if pv not in have]
+        if lv == "r10":
+            return all(any(r not in gone for r in pair) for pair in ((0, 1), (2, 3)))
+        return len(gone) <= (2 if lv == "r6" else 1)
+
+    def runner(ran):
+        """main() as the command line calls it for an array, noting each one run."""
+        def run_main(arr):
+            main(arr.safe_name, image=arr.image, name_prefix=arr.safe_name + "_",
+                 image_info={"raid": arr.describe()})
+            ran.append(arr)
+        return run_main
+
+    def sweep(images, expect):
+        """(subsets tried, subsets where all held) for `images` [(name, bytes)]."""
+        tried = held = 0
+        for k in range(1, len(images) + 1):
+            for subset in itertools.combinations(range(len(images)), k):
+                tried += 1
+                rs = raid_assemble([(images[i][0], io.BytesIO(images[i][1])) for i in subset])
+                said = io.StringIO()
+                ran = []
+                run_main = runner(ran)
+                try:
+                    with contextlib.redirect_stdout(said):
+                        unread = raid_run(rs, len(subset), run_main, say=print)
+                except Exception:                      # pylint: disable=broad-except
+                    continue
+                if "could not be printed" in said.getvalue() or "REFUSED:" in said.getvalue():
+                    continue                           # a fault the safety net caught is still a fault
+                want = expect(set(subset))
+                got = {a.label.split("/")[-1] if a.label.startswith("LVM ") else "md": a for a in ran}
+                ok = not unread and set(got) == {k for k, v in want.items() if v[0]}
+                for key, arr in got.items():
+                    ok &= _raid_sha(arr.image) == want[key][1]
+                held += ok
+        return tried, held
+    results = []
+    for name, level in (("md-r1", "raid1"), ("md-r5-ls", "raid5"), ("md-r6-ls", "raid6"),
+                        ("md-r10n2", "raid10"), ("md-r5ls-090", "raid5")):
+        entry = md[name]
+        images = [(m["file"], blob(m["file"])) for m in entry["members"] if m["file"]]
+        n = len(images)
+        results.append(sweep(images, lambda have, e=entry, lv=level, n=n: {
+            "md": (expect_md(lv, n, have), (e["device_sha256"], e["device_size"]))}))
+    multi = [(f"lvm-raid-multi-{i}", blob(f"lvm-raid-multi-{i}.img.gz")) for i in range(5)]
+    results.append(sweep(multi, lambda have: {
+        lv: (len(have) > 1 and expect_lvm(lv, have),
+             (lvm["lvm-raid-multi-" + lv]["device_sha256"], lvm["lvm-raid-multi-" + lv]["device_size"]))
+        for lv in ("r5", "r6", "r10")}))
+    tried = sum(t for t, _h in results)
+    held = sum(h for _t, h in results)
+    out.append((f"the command line's RAID step, report included, over every subset of the member "
+                f"images of a RAID1, RAID5, RAID6, RAID10 and 0.90 RAID5 set and of the five "
+                f"images of the volume group across images: nothing escapes, exactly the arrays "
+                f"and volumes the subset can hold are read, each to the kernel's bytes, and none "
+                f"counts against the exit status ({held} of {tried} subsets)",
+                held == tried and tried == 3 + 15 + 31 + 15 + 15 + 31))
+
+    # Exit status, decided by what was given: two stale members given with the
+    # other two count; an LVM volume refused for its own metadata with every
+    # image given counts; one refused for images not given does not.
+    files = [m["file"] for m in md["md-r5-ls"]["members"]]
+    bufs = [bytearray(blob(f)) for f in files]
+    for i in (1, 2):
+        ev, = struct.unpack_from("<Q", bufs[i], at12 + 200)
+        struct.pack_into("<Q", bufs[i], at12 + 200, ev - 2)
+        _md_resum(bufs[i], at12)
+    stale = one(raid_assemble([(f, io.BytesIO(bytes(b))) for f, b in zip(files, bufs)]))
+    marked = [(n, _lvm_text_change(b, lambda t: _lvm_status_add(
+        _lvm_status_add(t, "r5_rimage_0", "REBUILD"), "r5_rimage_1", "REBUILD"))) for n, b in multi]
+    rs_all = raid_assemble([(n, io.BytesIO(b)) for n, b in marked])
+    rs_few = raid_assemble([(n, io.BytesIO(b)) for n, b in multi[2:]])
+    r5_all = next((a for a in rs_all.arrays if a.label.endswith("/r5")), None)
+    r5_few = next((a for a in rs_few.arrays if a.label.endswith("/r5")), None)
+    out.append(("every member given, two of them stale, counts as an array not read and says "
+                "they were given and left out; an LVM volume refused for its own marks with "
+                "every image given counts, and one refused for images not given does not",
+                stale is not None and raid_unread(stale) and "2 given and left out" in (stale.refused or "")
+                and r5_all is not None and r5_all.image is None and raid_unread(r5_all)
+                and r5_few is not None and r5_few.image is None and not raid_unread(r5_few)
+                and r5_few.absent == ["pv0", "pv1"]))
+
+    # A metadata volume with no dm-raid superblock is a new device to dm-raid:
+    # its image volume is rebuilt, not read.
+    single = blob("lvm-raid-single-0.img.gz")
+    img = bytearray(_lvm_spoil(single, "r5ls_rimage_1"))
+    for at, _n in _lvm_extents(single, "r5ls_rmeta_1"):
+        if struct.unpack_from("<I", img, at)[0] == DM_RAID_MAGIC:
+            struct.pack_into("<I", img, at, 0)
+    vols = volumes(io.BytesIO(bytes(img)), len(img))
+    fh = lvm_image(io.BytesIO(bytes(img)), len(img))
+    v = next((x for x in vols if x["label"] == "LVM qpraid1/r5ls"), None)
+    nomagic = v is not None and _raid_sha(RaidImage(
+        lambda o, k, b=v["base"]: (fh.seek(b + o), fh.read(k))[1], v["size"], "r5ls")) == (
+        lvm["lvm-raid-single-r5ls"]["device_sha256"], lvm["lvm-raid-single-r5ls"]["device_size"])
+    out.append(("an LVM image volume whose metadata volume holds no dm-raid superblock (its bytes "
+                "spoiled here) is rebuilt from parity, to the kernel's bytes", nomagic))
+
+    # A member whose reads fail (a damaged container chunk) is read around,
+    # from the other copy or parity, as md does; with nothing to read around
+    # it the read ends short, and a short read is no digest.
+    class Flaky(io.BytesIO):
+        """A member image whose reads fail inside one byte range."""
+
+        def __init__(self, data, lo, hi):
+            super().__init__(data)
+            self.lo, self.hi = lo, hi
+
+        def read(self, n=-1):
+            pos = self.tell()
+            end = pos + (n if n is not None and n >= 0 else 1 << 62)
+            if pos < self.hi and end > self.lo:
+                raise OSError("simulated read error")
+            return super().read(n)
+
+    def flaky(name, which, lo, hi):
+        imgs = [(m["file"], Flaky(blob(m["file"]), lo, hi) if i in which else io.BytesIO(blob(m["file"])))
+                for i, m in enumerate(md[name]["members"]) if m["file"]]
+        return one(raid_assemble(imgs))
+    lo = (2048 << 9) + 300000
+    r1 = flaky("md-r1", {0}, lo, lo + 10000)
+    r5 = flaky("md-r5-ls", {1}, (2048 << 9) + 100000, (2048 << 9) + 110000)
+    r1b = flaky("md-r1", {0, 1}, lo, lo + 10000)
+    r1b.image.seek(0)
+    part = r1b.image.read(r1b.image.size)
+    out.append(("a member whose reads fail over a range is read around, from the other RAID1 "
+                "copy or RAID5 parity, to the kernel's bytes; with both RAID1 copies failing the "
+                "read ends short before the range and gives no digest",
+                _raid_sha(r1.image)[0] == md["md-r1"]["device_sha256"]
+                and _raid_sha(r5.image)[0] == md["md-r5-ls"]["device_sha256"]
+                and 0 < len(part) <= 300000 and _raid_sha(r1b.image)[0] is None))
+    return out
+
+
+def _raid_review4_checks(md, blob):
+    """The cases a fourth review found: a read-around on an array not stopped
+    clean, the LVM exit rule by legs, and a member read retried once."""
+    import io
+    out = []
+    at12 = 4096
+
+    def one(rs):
+        return rs.arrays[0] if len(rs.arrays) == 1 else None
+
+    class Flaky(io.BytesIO):
+        """A member image whose reads fail inside [lo, hi); with `every` 2, only
+        every other read there fails (a read a retry would serve)."""
+
+        def __init__(self, data, lo, hi, every=1):
+            super().__init__(data)
+            self.lo, self.hi, self.every, self.calls = lo, hi, every, 0
+
+        def read(self, n=-1):
+            pos = self.tell()
+            end = pos + (n if n is not None and n >= 0 else 1 << 62)
+            if pos < self.hi and end > self.lo:
+                self.calls += 1
+                if (self.calls - 1) % self.every == 0:    # the 1st, 3rd, ... read fails
+                    raise OSError("simulated read error")
+            return super().read(n)
+
+    # RAID5 not stopped clean, a data chunk's parity out of step: when the data
+    # member fails to read there, the read ends short rather than rebuild from
+    # that parity. md reads an unclean mirror from its first readable copy and
+    # moves to the next when that read fails (raid1-10.c 278-289, raid1.c
+    # 589-612), and so does this.
+    files = [m["file"] for m in md["md-r5-ls"]["members"]]
+    bufs = [bytearray(blob(f)) for f in files]
+    for b in bufs:
+        struct.pack_into("<Q", b, at12 + 208, 0)
+        _md_resum(b, at12)
+    a0 = one(raid_assemble([(f, io.BytesIO(bytes(b))) for f, b in zip(files, bufs)]))
+    off = 1 << 20
+    dd, pd, _qd, mo, _run, _ddf = a0.geom.stripe(off)
+    do = 2048 * SECTOR
+    bufs[pd][do + mo:do + mo + 4096] = bytes(x ^ 0xFF for x in bufs[pd][do + mo:do + mo + 4096])
+    arr = one(raid_assemble([(f, Flaky(bytes(b), do + mo, do + mo + 4096) if i == dd
+                              else io.BytesIO(bytes(b))) for i, (f, b) in enumerate(zip(files, bufs))]))
+    arr.image.seek(off)
+    got = arr.image.read(16)
+    r1files = [m["file"] for m in md["md-r1"]["members"]]
+    r1bufs = [bytearray(blob(f)) for f in r1files]
+    for b in r1bufs:
+        struct.pack_into("<Q", b, at12 + 208, 0)
+        _md_resum(b, at12)
+    lo = do + 300000
+    mirror = one(raid_assemble([(f, Flaky(bytes(b), lo, lo + 10000) if i == 0 else io.BytesIO(bytes(b)))
+                                for i, (f, b) in enumerate(zip(r1files, r1bufs))]))
+    out.append(("on a RAID5 array not stopped clean, a data member that fails to read is not "
+                "rebuilt from parity that may be out of step: the read ends short there; an "
+                "unclean RAID1 copy that fails is read from the next copy, as md does",
+                got == b"" and _raid_sha(arr.image)[0] is None
+                and _raid_sha(mirror.image)[0] == md["md-r1"]["device_sha256"]))
+
+    # The LVM exit rule by legs: four of the five images given (pv0 not), r5's
+    # leg on pv1 marked REBUILD. One leg absent is within raid5's tolerance, so
+    # the volume counts as complete, and refused it counts as not read.
+    multi = [(f"lvm-raid-multi-{i}", blob(f"lvm-raid-multi-{i}.img.gz")) for i in range(5)]
+    marked = [(n, _lvm_text_change(b, lambda t: _lvm_status_add(t, "r5_rimage_1", "REBUILD")))
+              for n, b in multi[1:]]
+    rs = raid_assemble([(n, io.BytesIO(b)) for n, b in marked])
+    r5 = next((a for a in rs.arrays if a.label.endswith("/r5")), None)
+    out.append(("an LVM volume with one leg's image not given and another leg marked REBUILD "
+                "has every leg it needs given, so refused it counts as not read",
+                r5 is not None and r5.image is None and r5.absent == ["pv0"] and raid_unread(r5)))
+
+    # A member read that fails once and serves on a second try (RAID0, so
+    # nothing else could serve it) reads in full.
+    files0 = [m["file"] for m in md["md-r0"]["members"]]
+    once = one(raid_assemble([(f, Flaky(blob(f), do + 100000, do + 140000, every=2) if i == 1
+                               else io.BytesIO(blob(f))) for i, f in enumerate(files0)]))
+    import hashlib
+    whole = b""
+    if once is not None:
+        once.image.seek(0)
+        whole = once.image.read(once.image.size)          # one read, not resumed after a short one
+    out.append(("a member read that fails once and serves when tried again is read in full, in "
+                "one read, on a RAID0 array where nothing else could serve it",
+                once is not None and len(whole) == once.image.size
+                and hashlib.sha256(whole).hexdigest() == md["md-r0"]["device_sha256"]))
+    return out
 
 
 def _luks2_rewritten(img, change, both=True):
@@ -21400,6 +24949,13 @@ def identify_fs(fh, base, size=None):
         if found:
             return found
 
+    # A Linux md RAID member (or a DDF or IMSM one): its superblock where the
+    # kernel looks for each metadata version, with its checksum. Its array is
+    # read from all its members together (raid_assemble), not from this region.
+    found = identify_md(fh, base, size)
+    if found:
+        return found
+
     # A LUKS container: its magic at the start of the region. What it holds is
     # read, once a passphrase opens it (unlock_luks), as a region of its own.
     found = identify_luks(fh, base, size)
@@ -22184,6 +25740,10 @@ def volumes(fh, size=None):
                     vol["note"] = (f"a LUKS container, opened: its data is listed as LUKS {lk.label}"
                                    if lk is not None and lk.mk is not None else
                                    (lk.locked_note() if lk is not None else "LUKS-encrypted and not read"))
+            elif kind in ("linux md member", "raid member"):
+                vol["note"] = ("a RAID member: its array is read from all its members "
+                               "together (raid_assemble, or several images on the command "
+                               "line), not from this region alone")
             elif kind == "lvm2 pv":
                 # The logical volumes not read are said here too, where a caller
                 # that prints only the note (the LEAPP run log) will show them.
@@ -22311,8 +25871,16 @@ def write_unallocated(fh, size, vols, out_dir, image_name, only=None, say=print)
             # A logical volume read through a map: its reader's runs are offsets
             # in the volume, placed past the image's end, so each becomes the
             # runs of the image it lies on.
+            in_volume = sum(n for _o, n in runs)
             runs = [run for off, n in runs
                     for run in lmap.image_runs(off - vol["base"], n)]
+            rebuilt = in_volume - sum(n for _o, n in runs)
+            if hasattr(lmap, "read_via") and rebuilt > 0:
+                # an LVM RAID volume with an image volume missing: free space in
+                # its chunks lies on no disk, it is rebuilt, so it has no runs
+                rec["rebuilt_bytes_not_written"] = rebuilt
+                say(f"    {vol.get('label') or name}: {rebuilt:,} bytes of its free space lie in "
+                    "chunks rebuilt from parity, on no disk, and are not written")
         reported = sum(n for _o, n in runs)
         rec["runs_reported"], rec["bytes_reported"] = len(runs), reported
         if not runs:
@@ -22418,12 +25986,16 @@ def _cli_passwords(files, env_names):
 def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
          extract=None, only=None, zf=None, do_triage=False, exclude=None,
          reporter=None, manifest=None, passwords=(), key_files=(), private_keys=(),
-         unallocated=None, unallocated_log=None):
+         unallocated=None, unallocated_log=None, image=None, name_prefix="", image_info=None):
     # a set that is not whole raises SplitImageError; an acquisition's reader joins
     # its own files (an AD-encrypted raw set is numbered like a split image, and its
-    # files are ciphertext until the reader decrypts them)
-    segments = [] if acquisition_format(path) else split_segments(path)
-    image = open_image_trying(path, segments, passwords, private_keys)
+    # files are ciphertext until the reader decrypts them). An image already open
+    # (an assembled RAID array, raid_assemble) is read as given, `path` naming it.
+    if image is None:
+        segments = [] if acquisition_format(path) else split_segments(path)
+        image = open_image_trying(path, segments, passwords, private_keys)
+    else:
+        segments = []
     # A BitLocker volume the passwords (as passwords or recovery passwords) or the
     # startup key files open is read decrypted in place; the rest stay locked and
     # the report says so.
@@ -22452,6 +26024,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
     # what volumes.json ties each volume to: the one file, or the first
     # segment of the set, with every segment and its size beside it
     image_rec = {"image": os.path.basename(segments[0] if segments else path)}
+    if image_info:
+        image_rec.update(image_info)
     if segments or ewf_parts:
         # A joined raw set records its own segment sizes; a reader over a
         # container need not, so they are measured here rather than required.
@@ -22792,7 +26366,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     print(f"        could not walk this filesystem: {exc}")
 
             if zf is not None and base is not None and wanted:
-                vol = vol_names.get(base) or f"lba{base // ss}"
+                vol = name_prefix + (vol_names.get(base) or f"lba{base // ss}")
                 print(f"\n      EXTRACTING to {extract}  as {vol}/")
                 try:
                     w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
@@ -22906,7 +26480,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     except Exception as exc:
                         print(f"        could not walk this filesystem: {exc}")
                 if zf is not None and kind and kind.startswith("ext") and wanted:
-                    stem = vol_names.get(b) or f"lba{b // ss}"
+                    stem = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
                     suffix = sanitize_volume_label(ext_name) if ext_name else ""
                     vol = (f"{stem}_{suffix}"
                            if suffix and not stem.endswith(f"_{suffix}") else stem)
@@ -22962,7 +26536,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         except Exception as exc:
                             print(f"        could not walk this filesystem: {exc}")
                     if zf is not None:
-                        vol = vol_names.get(b) or f"lba{b // ss}"
+                        vol = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
                         print(f"        EXTRACTING to {extract}  as {vol}/")
                         try:
                             w = walker_for(kind, fh, b, sz)
@@ -23023,7 +26597,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             except Exception as exc:
                                 print(f"        could not walk this filesystem: {exc}")
                         if zf is not None:
-                            vol = vol_names.get(b) or f"lba{b // ss}"
+                            vol = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
                             print(f"        EXTRACTING to {extract}  as {vol}/")
                             try:
                                 ents = collect(w, w.root)
@@ -27889,6 +31463,12 @@ def self_test():
             lvm_checks += _refs_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
+        # RAID: arrays mdadm, lvm2 and the kernel wrote, read back to the bytes the
+        # kernel presented while it ran them (tools/make_raid_fixtures.sh).
+        try:
+            lvm_checks += _raid_self_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the RAID checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
             if cond is None:
                 print(f"  [SKIP] {label}")
@@ -30200,6 +33780,10 @@ examples:
   # several at once
   qnxprobe.py *.img *.bin
 
+  # the members of a Linux md RAID set, or the disks of an LVM volume group:
+  # each image is read, then each array or spanned volume assembled from them
+  qnxprobe.py disk0.img disk1.img disk2.img disk3.img
+
   # a single partition already carved out
   qnxprobe.py partition2.dd
 
@@ -30575,16 +34159,18 @@ if __name__ == "__main__":
                     "APFS and XFS filesystems, the Linux flash filesystems SquashFS, JFFS2, "
                     "UBI/UBIFS and YAFFS1/YAFFS2, QNX IFS boot images, and the U-Boot "
                     "environment and Belkin libnvram stores a flash chip carries, out of "
-                    "raw disk images and flash dumps, the linear and striped logical "
-                    "volumes of an LVM2 physical volume included: identify each by its own "
-                    "on-disk structure rather "
+                    "raw disk images and flash dumps, the logical volumes of an LVM2 "
+                    "physical volume (linear, striped, RAID1, RAID4/5/6/10) and Linux md "
+                    "RAID arrays (linear, RAID0/1/4/5/6/10, from members given together) "
+                    "included: identify each by its own on-disk structure rather "
                     "than trusting a partition type byte, list, and extract to a "
                     "zip with a provenance manifest. No mounting, no admin "
                     "rights, standard library only.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", nargs="*",
-                    help="disk image, partition image, or raw dump to examine")
+                    help="disk image, partition image, or raw dump to examine; give every "
+                         "member image of a RAID set to read the array")
     ap.add_argument("--scan-limit", type=int, default=256, metavar="MiB",
                     help="how far to brute scan when no superblock sits at the "
                          "offsets the kernel checks (default: 256)")
@@ -30681,6 +34267,10 @@ if __name__ == "__main__":
                      f"not empty: {args.unallocated}")
         os.makedirs(args.unallocated, exist_ok=True)
     refused = []
+    # RAID members among the images, whole disks or partitions, assembled into
+    # arrays (raid_assemble); each array is read after the images, as an image
+    # of its own. An image that holds no member is read exactly as before.
+    raidset = raid_open(args.image, given_passwords, args.private_key)
     try:
         for p in args.image:
             try:
@@ -30729,7 +34319,18 @@ if __name__ == "__main__":
                 print(f"  REFUSED: {exc}")
                 print("=" * 78)
                 refused.append(p)
+        refused += raid_run(raidset, len(args.image), lambda raid_arr: main(
+            raid_arr.safe_name, scan_limit_mib=args.scan_limit, do_list=args.list,
+            list_depth=args.depth, list_max=args.list_max,
+            extract=args.extract, only=args.only, zf=zf,
+            do_triage=args.triage, exclude=args.exclude,
+            reporter=reporter, manifest=manifest, passwords=given_passwords,
+            key_files=args.bitlocker_key, private_keys=args.private_key,
+            unallocated=args.unallocated, unallocated_log=unalloc_log,
+            image=raid_arr.image, name_prefix=raid_arr.safe_name + "_",
+            image_info={"raid": raid_arr.describe()}))
     finally:
+        raidset.close()
         if zf is not None:
             # The provenance record. For a standalone image the directory names
             # are otherwise the only statement of where a file came from; this
