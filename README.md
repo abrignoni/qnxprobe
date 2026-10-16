@@ -2414,9 +2414,62 @@ needs, a 1.1 or 1.2 superblock whose data offset falls inside the superblock (md
 (md.c 2125-2130), and a second copy of a member already used are all left out and named. When a 0.90 or 1.0
 superblock is found both from the whole disk and from a partition that ends where the disk
 does, the member is the partition. A physical volume given twice (the same image, or two
-copies of one disk) is read once and the second named. A RAID1 member whose superblock is at its end
+copies of one disk) is read once and the second named. Since 1.71 a volume group spread over several images is
+matched by its id, never by its name: two groups that share a name (a default such as
+`vg0`) are each read through their own physical volumes only, and their volumes are
+labelled with the start of each group's id (`LVM qpraid2@uxxMPS/r5`), with a member line
+naming the shared name. Up to 1.70 they were matched by name: on the self-test's ten
+images below, 1.70 lists the six volumes under three labels, each twice. The
+self-test gives the five LVM RAID images with a copy of them rewritten to another group
+id and other physical volume ids (checksums made good): all six volumes read to the
+kernel's bytes under six labels, and with the second group given only in part, none of
+its volumes is read through the first group's disks. A RAID1 member whose superblock is at its end
 (metadata 0.90 or 1.0) starts with the filesystem itself, so read alone it is listed as
-that filesystem, as before; every other member read alone is listed as `linux md member`.
+that filesystem, as before; every other member read alone is listed as `linux md member`
+and not walked. That includes the first member of a linear array: md lays a linear array
+out as its members one after another (linear_conf), so a filesystem made on the array
+continues on the next member (the fixture's 9 MiB ext4 starts on a first member holding
+2 MiB of it), and walking that member alone would read a filesystem cut short.
+
+A DDF or Intel IMSM (RST) member is different, because its array is never assembled here.
+Since 1.71 the level its own metadata records decides whether the member is walked on its
+own, the same rule as for md: only a mirror holds the whole of its data on one disk.
+
+- The level is read as mdadm-4.5 reads it, checksums included. For DDF (`ddf_levels()`,
+  super-ddf.c): the anchor in the last sector; the primary or the secondary header, chosen
+  as mdadm chooses (the secondary when the primary does not load, or when its seq is newer
+  and it is not open); and each virtual disk configuration record, with their CRCs. A
+  record of RAID1 with more than one secondary element is not a mirror: mdadm writes its
+  RAID10 that way (RAID1 over two-disk sets, spanned), and it reads here as `RAID10`. For
+  IMSM (`imsm_levels()`, super-intel.c): the metadata ending two sectors from the end of
+  the disk, with its checksum, and each volume's map, level 1 with two members being RAID1
+  and with more RAID10.
+- A mirror is walked only in its normal state. For DDF, the virtual disk's record must say
+  optimal (no degraded, morphing or inconsistent state), and this disk's own physical
+  disk record (found by the guid in its disk data) must say online and not failed,
+  rebuilding, in transition or missing. For IMSM, the volume's map must be in its normal
+  state and not migrating; a degraded map is not walked, because which member it lost is a
+  disk number this one disk cannot be matched to without the drive's serial number.
+- When every array the metadata records is such a mirror, the member's filesystem or
+  partitions are walked as any other, and a line under each (and the volume's `note`)
+  says it is a mirror member whose array is not assembled.
+- For any other level (RAID0, RAID5, RAID10, concatenation and the rest), for a mirror
+  not in its normal state, and when the metadata cannot be read or its checksum does not
+  match, the region is a `raid member` and is not walked. Its note names the level and
+  state (or why it was not read), says its array is not assembled, and names what it
+  starts with (`it starts with ext4`). On the DDF fixture, a RAID5, two members start with
+  an ext4 superblock. qnxprobe 1.67, which walked them, lists one with
+  `spec hello.txt 3,096.3 PiB 2017-04-03` (measured on md-ddf-2): that is what this rule
+  keeps out.
+- The rule covers everything found on such a disk, not only its partitions: a logical
+  volume of an LVM2 physical volume on it, what an opened LUKS or BitLocker volume on it
+  holds, and a qnx6 volume. The disk's metadata is read from the image's own bytes, never
+  through an opened volume's decrypted view of them.
+- A partitioned disk whose own end carries the metadata (the IMSM case, where the
+  partition table of a RAID0 or RAID5 volume sits on its first member) gets a `RAID` line
+  in the report.
+- A region in which nothing is recognised is a `raid member`, unless its metadata records
+  a mirror in its normal state, when it is read as any region is.
 
 Not read, each named with why:
 
@@ -2442,9 +2495,9 @@ Not read, each named with why:
   RAID4/5/6 array not stopped clean, and a bad block range nothing can supply (above);
 - an LVM raid segment whose image volumes nest more than four deep or name the volume
   itself (the group's other volumes are still read);
-- metadata this does not read: DDF and Intel IMSM (RST) members by their anchors at the
-  end of the disk, and GPT partitions of Windows LDM, Windows Storage Spaces and Apple RAID
-  by their type.
+- arrays of metadata this does not assemble: DDF and Intel IMSM (RST) members by their
+  anchors at the end of the disk (a mirror member is still read on its own, above), and GPT
+  partitions of Windows LDM, Windows Storage Spaces and Apple RAID by their type.
 
 A write-intent bitmap and a partial parity log (PPL) are noted and not used: the bitmap
 marks regions to resync when a stale member is added back, and no stale member is read; a
@@ -2795,7 +2848,8 @@ dedicated Q (raid6_ls_6 and the rest; md's own versions of those layouts are in 
 fixtures and read through the same code), an array
 whose members are partitions of one image, an LVM volume group on an md array, and free
 space read from an array (the fixtures hold ext4, whose free space is not reported). IMSM
-and DDF are named only; their arrays are not read.
+and DDF arrays are not assembled; only a mirror's members are read, one by one, each
+saying so. No fixture holds IMSM metadata: the self-test builds it.
 
 ## XFS
 
@@ -3578,6 +3632,16 @@ GF(2^8) over 0x11d, exp/inv/exi tables          lib/raid6/mktables.c 21-34, 108-
 two data, or data and P, from P and Q           lib/raid6/recov.c 19-89
 several superblocks: the newest ctime           mdadm util.c 1259-1300
 DDF anchor 0xDE11DE11 in the last sector        mdadm super-ddf.c 145, 977-1000
+DDF header, vd_config prl, RAID level codes      mdadm super-ddf.c 107-118, 160-221, 334-372,
+                                                815-880, 1058-1080, 1240-1290, 1484-1496
+DDF secondary level, RAID10 as RAID1 spanned    mdadm super-ddf.c 138-142, 665-678
+DDF header choice (primary or secondary)        mdadm super-ddf.c 1079-1091
+DDF disk and virtual disk states                mdadm super-ddf.c 232-316, 404-413, 1100-1123,
+                                                1235-1239, 2620
+DDF CRC: crc field as 0xffffffff, CRC-32 table  mdadm super-ddf.c 571-585, crc32.c
+step from 0, no inversion
+IMSM metadata, checksum, volume level, map      mdadm super-intel.c 38, 146-307, 441-445,
+state                                           888-905, 941-952, 1354-1363, 4577-4685
 IMSM "Intel Raid ISM Cfg Sig. " 2 sectors back  mdadm super-intel.c 38, 4594 (512 and
                                                 4096-byte sectors)
 lvm2 RAID segment keys, raids list              lvm2 lib/raid/raid.c 45-190, 202-224
@@ -3640,7 +3704,9 @@ above are in this README only for now.)
   "LVM2" above).
 - **RAID: Linux md and LVM RAID only.** Arrays are assembled from the member images given
   together; a degraded parity array is rebuilt only when it was stopped clean, and an
-  array mid-reshape is refused. DDF, Intel IMSM (RST), Windows LDM and Storage Spaces, and
+  array mid-reshape is refused. DDF and Intel IMSM (RST) arrays are not assembled: a
+  member is walked on its own only when its metadata, read and checked, records RAID1, and
+  otherwise is named with the level and not walked. Windows LDM and Storage Spaces, and
   Apple RAID members are named and not read (see "RAID" above).
 - **LUKS: AES only, and only what a passphrase opens.** A LUKS container with another
   cipher, with dm-integrity, with a keyslot that is not of the luks2 type, or being

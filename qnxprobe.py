@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.70"
+QNXPROBE_VERSION = "1.71"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -18797,20 +18797,320 @@ def raid_foreign(fh, base, size):
     return None
 
 
+DDF_LEVELS = {0x00: "RAID0", 0x01: "RAID1", 0x03: "RAID3", 0x04: "RAID4", 0x05: "RAID5",
+              0x06: "RAID6", 0x0f: "JBOD", 0x11: "RAID1E", 0x15: "RAID5E", 0x1f: "CONCAT",
+              0x25: "RAID5EE"}          # mdadm-4.5 super-ddf.c 107-118, ddf_level 1484-1496
+
+
+def _ddf_crc_ok(blob):
+    """The CRC of a DDF structure, as mdadm's calc_crc (super-ddf.c 571-585):
+    over it with its crc field (bytes 4-8) read as 0xffffffff, by mdadm's
+    crc32 (crc32.c), the CRC-32 table step from 0 with no inversion before
+    or after."""
+    if len(blob) < 8:
+        return False
+    body = bytes(blob[:4]) + b"\xff\xff\xff\xff" + bytes(blob[8:])
+    raw = (binascii.crc32(body, 0xffffffff) ^ 0xffffffff) & 0xffffffff
+    return raw == struct.unpack_from(">I", blob, 4)[0]
+
+
+DDF_SECONDARY = {0x00: "striped", 0x01: "mirrored", 0x02: "concatenated",
+                 0x03: "spanned"}        # mdadm-4.5 super-ddf.c 138-142 (SRL)
+DDF_VD_STATES = {0x0: "optimal", 0x1: "degraded", 0x2: "deleted", 0x3: "missing",
+                 0x4: "failed", 0x5: "partially optimal"}   # super-ddf.c 305-315
+
+
+def _ddf_header(fh, base, size):
+    """(header, lba) of the DDF header mdadm-4.5 uses on this region, or None
+    (super-ddf.c): the anchor in the last 512-byte sector with its CRC and
+    revision (1058-1068); each of the primary and secondary headers loaded
+    only when inside the region, with its CRC, and matching the anchor's guid,
+    revision, primary_lba, secondary_lba and pad2, of its own type
+    (load_ddf_header 815-845); the secondary used when the primary did not
+    load, or its seq is newer and it is not open, or the seqs are equal and
+    only the primary is open (1079-1091)."""
+    if size < 1024:
+        return None
+    anchor = read_at(fh, base + size - 512, 512)
+    if (len(anchor) < 512 or anchor[:4] != b"\xde\x11\xde\x11" or not _ddf_crc_ok(anchor)
+            or anchor[32:40] not in (b"01.00.00", b"01.02.00")):
+        return None
+    loaded = {}
+    for field, kind in ((96, 1), (104, 2)):
+        lba, = struct.unpack_from(">Q", anchor, field)
+        if lba >= size // 512 - 1:
+            continue
+        hdr = read_at(fh, base + lba * 512, 512)
+        if (len(hdr) == 512 and hdr[:4] == anchor[:4] and _ddf_crc_ok(hdr)
+                and hdr[8:40] == anchor[8:40] and hdr[96:112] == anchor[96:112]
+                and hdr[112] == kind and hdr[113:116] == anchor[113:116]):
+            loaded[kind] = (hdr, lba)
+    primary, secondary = loaded.get(1), loaded.get(2)
+    if secondary is not None:
+        pseq = struct.unpack_from(">I", primary[0], 40)[0] if primary else None
+        sseq = struct.unpack_from(">I", secondary[0], 40)[0]
+        if (primary is None or (pseq < sseq and not secondary[0][48])
+                or (pseq == sseq and primary[0][48] and not secondary[0][48])):
+            return secondary
+    return primary
+
+
+def _ddf_section(fh, base, header, field, sized):
+    """A section the DDF header names at `field` (offset, length in sectors),
+    as load_section reads it (super-ddf.c 848-880): from the header's own
+    lba, at most 1024 sectors, and with `sized` (its `check`) a length of 2,
+    8, 32, 128 or 512 sectors; None otherwise."""
+    hdr, lba = header
+    off, length = struct.unpack_from(">II", hdr, field)
+    if (sized and length not in (2, 8, 32, 128, 512)) or length > 1024 or not length:
+        return None
+    data = read_at(fh, base + (lba + off) * 512, length * 512)
+    return data if len(data) == length * 512 else None
+
+
+def ddf_records(fh, base, size):
+    """[(guid, level name)] of the virtual disk configuration records the DDF
+    metadata at the end of this region holds, the newest (seqnum) of each
+    guid, each with its CRC (1576); None when the metadata cannot be read.
+    The level is prl (334-372), named as mdadm's ddf_level (1484-1496); a
+    record with more than one secondary element is named by both levels, so
+    mdadm's RAID10, which it writes as RAID1 with sec_elmnt_count disks/2 and
+    srl spanned (layout_md2ddf 665-678), reads as "RAID10" and is no mirror."""
+    header = _ddf_header(fh, base, size)
+    if header is None:
+        return None
+    rec_len, = struct.unpack_from(">H", header[0], 134)
+    conf = _ddf_section(fh, base, header, 216, False)
+    if not rec_len or conf is None:
+        return None
+    newest = {}
+    for at in range(0, len(conf) - rec_len * 512 + 1, rec_len * 512):
+        rec = conf[at:at + rec_len * 512]
+        if rec[:4] != b"\xee\xee\xee\xee" or not _ddf_crc_ok(rec):
+            continue
+        guid, seq = bytes(rec[8:32]), struct.unpack_from(">I", rec, 36)[0]
+        prl, sec_count, srl = rec[67], rec[69], rec[71]
+        name = DDF_LEVELS.get(prl, f"primary RAID level 0x{prl:02x}")
+        if sec_count > 1:
+            name = ("RAID10" if prl == 0x01 and srl in (0x00, 0x03) else
+                    f"{name}, {DDF_SECONDARY.get(srl, f'secondary level 0x{srl:02x}')} over "
+                    f"{sec_count} sets")
+        if guid not in newest or seq > newest[guid][0]:
+            newest[guid] = (seq, name)
+    return [(guid, name) for guid, (_seq, name) in newest.items()]
+
+
+def ddf_levels(fh, base, size):
+    """The RAID level of each virtual disk the DDF metadata at the end of this
+    region records (ddf_records), as names ("RAID5"); a RAID1 whose virtual
+    disk is not optimal, or on which this disk is not online, is named with
+    that state ("RAID1 (degraded)"), and is then no mirror to walk: the
+    virtual disk's state from the virtual disk records (struct virtual_disk
+    280-316, its state 0 with no morphing or inconsistent bit), and this
+    disk's from the physical disk records (phys_disk 232-275) by the guid in
+    its own disk data (disk_data 404-413, matched as 1235-1239), online and
+    not failed, rebuilding, in transition or missing (mdadm reads a disk as
+    usable when online and neither failed nor missing, 2620). None when the metadata
+    cannot be read."""
+    records = ddf_records(fh, base, size)
+    if records is None:
+        return None
+    header = _ddf_header(fh, base, size)
+    out = []
+    virt = phys = disk = None
+    if any(name == "RAID1" for _g, name in records):
+        virt = _ddf_section(fh, base, header, 208, True)
+        phys = _ddf_section(fh, base, header, 200, True)
+        disk = _ddf_section(fh, base, header, 224, False)
+    for guid, name in records:
+        if name != "RAID1":
+            out.append(name)
+            continue
+        states = []
+        vstate = None
+        if virt is not None and virt[:4] == b"\xdd\xdd\xdd\xdd":
+            count, = struct.unpack_from(">H", virt, 10)
+            for i in range(min(count, (len(virt) - 64) // 64)):
+                ent = virt[64 + 64 * i:128 + 64 * i]
+                if bytes(ent[:24]) == guid:
+                    vstate = ent[32]
+        if vstate is None:
+            states.append("its virtual disk record not read")
+        elif vstate & 0x1f:
+            states.append("virtual disk " + DDF_VD_STATES.get(vstate & 0x7, f"state {vstate & 0x7}")
+                          + (", morphing" if vstate & 0x8 else "")
+                          + (", inconsistent" if vstate & 0x10 else ""))
+        pstate = None
+        if (phys is not None and disk is not None and phys[:4] == b"\x22\x22\x22\x22"
+                and disk[:4] == b"\x33\x33\x33\x33"):
+            for i in range((len(phys) - 64) // 64):
+                ent = phys[64 + 64 * i:128 + 64 * i]
+                if bytes(ent[:24]) == bytes(disk[8:32]):
+                    pstate, = struct.unpack_from(">H", ent, 30)
+        if pstate is None:
+            states.append("this disk's record not read")
+        elif not pstate & 0x1 or pstate & (0x2 | 0x4 | 0x8 | 0x40):
+            flags = [w for bit, w in ((0x2, "failed"), (0x4, "rebuilding"),
+                                      (0x8, "in transition"), (0x40, "missing")) if pstate & bit]
+            states.append("this disk " + ", ".join(flags + ([] if pstate & 0x1 else ["not online"])))
+        out.append(name + (f" ({'; '.join(states)})" if states else ""))
+    return out
+
+
+def raid_foreign_article(foreign):
+    """`foreign` (what raid_foreign() names) with its indefinite article:
+    "a DDF", "an Intel IMSM (RST)"."""
+    return ("an " if foreign[:1].upper() in "AEIOU" else "a ") + foreign
+
+
+IMSM_SIGNATURE = b"Intel Raid ISM Cfg Sig. "      # mdadm-4.5 super-intel.c 38
+IMSM_MPB_MAX = 1 << 20      # larger than this is not read (mdadm sets no limit)
+
+
+def imsm_levels(fh, base, size):
+    """(levels, why) for the IMSM metadata at the end of this region: the
+    RAID level of each volume it records ("RAID1", "RAID0", ...), or None and
+    why it was not read. Read as mdadm-4.5 super-intel.c loads it
+    (load_imsm_mpb 4577-4685): the anchor sector two sectors from the end
+    (512 or 4096 bytes), the extended part of the metadata, mpb_size rounded
+    up to sectors (mpb_sectors 441-445), in the sectors before it; the
+    checksum, the sum of the metadata's 32-bit little-endian words less the
+    stored one (__gen_imsm_checksum 888-900); the disk table (imsm_disk, 48
+    bytes, 146-160) at 0xD8, then each volume (imsm_dev 226-277, its
+    imsm_vol 199-224 at byte 80, map 0 at 112: imsm_map 169-197) sized as
+    sizeof_imsm_dev (941-952, sizeof_imsm_map 902-905); and each volume's
+    level as get_imsm_raid_level (1354-1363): level 1 with two members is
+    RAID1, with more RAID10. A volume migrating between two maps, or whose
+    map_state is not NORMAL (169-178: uninitialized, degraded, failed), is
+    named with that and is no mirror to walk: which member a degraded map has
+    lost (failed_disk_num) is a disk number this one disk cannot be matched
+    to without the serial number the controller reads from the drive."""
+    for ss in (SECTOR, 4096):
+        if size < 2 * ss:
+            continue
+        anchor = read_at(fh, base + size - 2 * ss, ss)
+        if anchor[:len(IMSM_SIGNATURE)] == IMSM_SIGNATURE:
+            break
+    else:
+        return None, "no IMSM metadata was found"
+    mpb_size, = struct.unpack_from("<I", anchor, 0x24)
+    if mpb_size < 0xD8 or mpb_size > IMSM_MPB_MAX:
+        return None, f"its metadata gives a size of {mpb_size:,} bytes, which is not read"
+    extra = -(-mpb_size // ss) - 1
+    if extra * ss + 2 * ss > size:
+        return None, "its metadata reaches past the start of the region"
+    buf = anchor + (read_at(fh, base + size - ss * (2 + extra), extra * ss) if extra else b"")
+    if len(buf) < mpb_size:
+        return None, "its metadata could not be read in full"
+    words = struct.unpack_from(f"<{mpb_size // 4}I", buf, 0)
+    stored = words[8]
+    if (sum(words) - stored) & 0xffffffff != stored:
+        return None, "its metadata checksum does not match"
+    num_disks, num_devs = buf[0x38], buf[0x39]
+    at = 0xD8 + 48 * num_disks
+    levels = []
+    for _i in range(num_devs):
+        if at + 164 > mpb_size:
+            return None, "its volume records run past the end of its metadata"
+        migrating = buf[at + 88]
+        level, members = buf[at + 112 + 15], buf[at + 112 + 16]
+        if not members:
+            return None, "a volume record names no member disks"
+        size_ = 164 - 52 + 52 + 4 * (members - 1)
+        if migrating:
+            m1 = at + 112 + 52 + 4 * (members - 1)
+            if m1 + 52 > mpb_size:
+                return None, "its volume records run past the end of its metadata"
+            size_ += 52 + 4 * (buf[m1 + 16] - 1) if buf[m1 + 16] else 52
+        name = ({0: "RAID0", 5: "RAID5", 10: "RAID10"}.get(level) if level != 1 else
+                ("RAID1" if members == 2 else "RAID10")) or f"IMSM RAID level {level}"
+        state = buf[at + 112 + 14]          # map_state (imsm_map 169-197)
+        qualifiers = (["migrating"] if migrating else []) + (
+            [{1: "uninitialized", 2: "degraded", 3: "failed"}.get(state, f"map state {state}")]
+            if state else [])
+        levels.append(name + (f" ({', '.join(qualifiers)})" if qualifiers else ""))
+        at += size_
+    if not levels:
+        return None, "its metadata records no volume"
+    return levels, None
+
+
+def raid_foreign_levels(fh, base, size, foreign):
+    """(levels, why) the DDF or IMSM metadata at the end of this region
+    records (ddf_levels, imsm_levels)."""
+    try:
+        if foreign == "DDF":
+            levels = ddf_levels(fh, base, size)
+            if levels is None:
+                return None, ("its DDF metadata could not be read (an anchor, header or "
+                              "configuration record that does not check out)")
+            if not levels:
+                return None, "its DDF metadata records no virtual disk"
+            return levels, None
+        return imsm_levels(fh, base, size)
+    except (struct.error, ValueError, OSError) as exc:
+        return None, f"its metadata could not be read ({type(exc).__name__}: {exc})"
+
+
+def raid_foreign_mirror(levels):
+    """True when every array the metadata records is a mirror (RAID1): the
+    one case where a single member holds the whole of the data."""
+    return bool(levels) and set(levels) == {"RAID1"}
+
+
+def raid_foreign_note(foreign, levels=None, why=None, found=None, subject="this disk"):
+    """What is said of a region (or, with `subject`, a disk's partitions)
+    that carries DDF or IMSM metadata, whose array this does not assemble.
+    A mirror (raid_foreign_mirror) is read from the one member; anything
+    else is not walked: `found` names what is at its start, not walked."""
+    head = (f"a member of {raid_foreign_article(foreign)} RAID set, whose array is not "
+            "assembled here")
+    verb = "are" if subject.endswith("s") else "is"
+    if raid_foreign_mirror(levels):
+        return (f"{head}: its metadata records RAID1 (a mirror), so this disk alone holds the "
+                f"whole of the array's data, and {subject} {verb} read")
+    named = ", ".join(sorted(set(levels or [])))
+    if levels and all(lv.startswith("RAID1 (") for lv in levels):
+        reason = (f"its metadata records {named}: a mirror not in its normal state, whose copy "
+                  "on this disk may not be current")
+    elif levels:
+        reason = (f"its metadata records {named}, and one member of such an array alone does "
+                  "not hold the whole of its data")
+    else:
+        reason = f"{why}, so whether it is a mirror is not known"
+    return (f"{head}: {reason}; {subject} {verb} not walked"
+            + (f" (it starts with {found})" if found else ""))
+
+
+def raid_foreign_disk(fh, size):
+    """For a disk that ends in DDF or IMSM metadata: {"foreign", "levels",
+    "why", "mirror"}; else None. Read from the image's own bytes: through an
+    opened LUKS or BitLocker volume, or a logical volume map, the end of the
+    disk can read as something else (the wrappers keep the image as _fh)."""
+    while type(fh).__name__ in ("LuksImage", "BitLockerImage", "LvmImage"):
+        fh = object.__getattribute__(fh, "_fh")
+    try:
+        foreign = raid_foreign(fh, 0, size)
+    except (struct.error, ValueError, OSError):
+        foreign = None
+    if not foreign:
+        return None
+    levels, why = raid_foreign_levels(fh, 0, size, foreign)
+    return {"foreign": foreign, "levels": levels, "why": why,
+            "mirror": raid_foreign_mirror(levels)}
+
+
 def identify_md(fh, base, size=None):
     """("linux md member", lines) for a member of an md array whose data is not a
-    filesystem at the start of the region, ("raid member", lines) for DDF or
-    IMSM metadata, else None. A RAID1 member with its superblock at the end
-    (metadata 0.90 or 1.0) holds the filesystem itself from its first byte, so
-    it is left to the filesystem identifiers, as before."""
+    filesystem at the start of the region, else None. A RAID1 member with its
+    superblock at the end (metadata 0.90 or 1.0) holds the filesystem itself
+    from its first byte, so it is left to the filesystem identifiers, as
+    before. DDF and IMSM metadata is not answered here: identify_fs() reads
+    such a region as any other and names its metadata (raid_foreign_note)."""
     if size is None:
         size = image_size(fh) - base
     sb = md_member(fh, base, size)
     if sb is None:
-        foreign = raid_foreign(fh, base, size)
-        if foreign:
-            return "raid member", [f"a member of a {foreign} RAID set, whose metadata this "
-                                   "does not read"]
         return None
     if getattr(sb, "refused", None):
         return "linux md member", [f"Linux md member: {sb.refused}"]
@@ -20228,8 +20528,19 @@ def raid_assemble(images):
                     hits[key] = (where, fh, base, psize, sb)
                 continue
             if foreign and plabel == "whole image":
-                rs.foreign.append((label, f"{where}: a {foreign} RAID member, whose metadata "
-                                          "this does not read"))
+                # A mirror member in its normal state is read on its own (the
+                # report above walks it): named as a member, not as NOT READ.
+                levels, why = raid_foreign_levels(fh, base, psize, foreign)
+                if raid_foreign_mirror(levels):
+                    rs.members.setdefault(label, []).append(
+                        f"{where}: {raid_foreign_article(foreign)} RAID member, whose array this "
+                        "does not assemble: its metadata records RAID1 (a mirror) in its normal "
+                        "state, so this member is read on its own, as a copy of the mirror")
+                else:
+                    rs.foreign.append((label, f"{where}: {raid_foreign_article(foreign)} RAID "
+                                              "member, whose array this does not assemble: "
+                                              + raid_foreign_note(foreign, levels, why, None,
+                                                                  "this disk").split(": ", 1)[1]))
         for where, fh_, base, psize, sb in sorted(hits.values(), key=lambda h: h[2]):
             found.append((where, fh_, base, psize, sb))
             rs.members.setdefault(label, []).append(
@@ -20273,29 +20584,59 @@ def _lvm_spanned(parts, rs):
                 pvs.setdefault(pv.vg[1].get("id"), set()).add(owner[base])
         kept.append(reg)
     regions = kept
-    spanned = {vid for vid, labels in pvs.items() if len(labels) > 1}
+    spanned = [vid for vid, labels in pvs.items() if len(labels) > 1]
     if not spanned:
         return []
     present = set(first)                 # the ids of the physical volumes given
+    # Each volume group is matched and read by its id alone: two groups that
+    # share a name (a default such as "vg0") are two groups, each read through
+    # its own physical volumes, and their labels carry the start of the id.
+    by_region, ids_of_name, group_name = {}, {}, {}
+    for reg in regions:
+        pv = _lvm_pv(cat, reg[1], reg[2])
+        by_region[reg[1]] = pv
+        if pv is not None and pv.vg:
+            ids_of_name.setdefault(pv.vg[0], set()).add(pv.vg[1].get("id"))
+            group_name[pv.vg[1].get("id")] = pv.vg[0]
+    out = []
+    for vid in spanned:
+        name = group_name.get(vid, "")
+        shared = len(ids_of_name.get(name, ())) > 1
+        shown = f"{name}@{_lvm_id(vid)[:6]}" if shared else name
+        listed = set()
+        for pv in by_region.values():
+            if pv is not None and pv.vg and pv.vg[1].get("id") == vid:
+                listed |= {_lvm_id(rec.get("id", "")) for rec in
+                           (pv.vg[1].get("physical_volumes") or {}).values()
+                           if isinstance(rec, dict)}
+        mine = [reg for reg in regions if by_region.get(reg[1]) is not None and (
+            (by_region[reg[1]].vg and by_region[reg[1]].vg[1].get("id") == vid)
+            or (not by_region[reg[1]].vg and _lvm_id(by_region[reg[1]].uuid) in listed))]
+        out += _lvm_spanned_group(cat, mine, vid, name, shown, shared, owner, present, rs)
+    return out
+
+
+def _lvm_spanned_group(cat, regions, vid, name, shown, shared, owner, present, rs):
+    """The logical volumes of the one volume group `vid` (named `name`, shown
+    as `shown`), read from its own physical volumes among `regions`."""
+    def relabel(vlabel):
+        return f"LVM {shown}/" + vlabel[len(f"LVM {name}/"):] if vlabel.startswith(
+            f"LVM {name}/") else vlabel
     found, notes, remap, _free = _lvm_scan(cat, regions)
     out = []
-    names = {}
     for _l, base, psize in regions:
         pv = _lvm_pv(cat, base, psize)
-        if pv is not None and pv.vg and pv.vg[1].get("id") in spanned:
-            names[pv.vg[0]] = pv.vg[1].get("id")
+        if pv is not None and pv.vg and pv.vg[1].get("id") == vid:
             rs.members.setdefault(owner[base], []).append(
-                f"{_l}: LVM2 physical volume of volume group {pv.vg[0]}, which spans several images")
+                f"{_l}: LVM2 physical volume of volume group {name}"
+                + (f" (id {vid}; another volume group among the images has the same name, so "
+                   f"this one is shown as {shown})" if shared else "")
+                + ", which spans several images")
     for vlabel, base, vsize, _name in found:
-        group = vlabel[len("LVM "):].split("/", 1)[0]
-        if group not in names:
-            continue
-        img = RaidImage(lambda o, n, b=base: (cat.seek(b + o), cat.read(n))[1], vsize, vlabel)
-        out.append(LvmSpanned(vlabel, img, "linear, read across the images"))
+        img = RaidImage(lambda o, n, b=base: (cat.seek(b + o), cat.read(n))[1], vsize,
+                        relabel(vlabel))
+        out.append(LvmSpanned(relabel(vlabel), img, "linear, read across the images"))
     for _key, lmap, vlabel, _name in remap:
-        group = vlabel[len("LVM "):].split("/", 1)[0]
-        if group not in names:
-            continue
 
         def rd(o, n, m=lmap):
             if hasattr(m, "read_via"):
@@ -20309,18 +20650,18 @@ def _lvm_spanned(parts, rs):
                     break
             return bytes(buf)
         how = getattr(lmap, "raid_words", None) or _lvm_shape_words(lmap)
-        out.append(LvmSpanned(vlabel, RaidImage(rd, lmap.size, vlabel), how))
+        out.append(LvmSpanned(relabel(vlabel), RaidImage(rd, lmap.size, relabel(vlabel)), how))
     said = set()
     for base, lines in notes.items():
         pv = _lvm_pv(cat, base, None)
-        if pv is None or not pv.vg or pv.vg[1].get("id") not in spanned:
+        if pv is None or not pv.vg or pv.vg[1].get("id") != vid:
             continue
         for ln in lines:
             if ln.startswith("logical volume ") and ": not read (" in ln and ln not in said:
                 said.add(ln)
                 lv = ln[len("logical volume "):].split(",", 1)[0]
                 vg = pv.vg[1]
-                out.append(LvmSpanned(f"LVM {pv.vg[0]}/{lv}", None, "not read",
+                out.append(LvmSpanned(f"LVM {shown}/{lv}", None, "not read",
                                       why=ln.split(": not read (", 1)[1][:-1],
                                       absent=_lvm_absent_pvs(vg, lv, present),
                                       incomplete=_lvm_lv_incomplete(vg, lv, present)))
@@ -21818,7 +22159,8 @@ def _raid_self_checks():
     return (out + _raid_hostile_checks(md, assemble, blob)
             + _raid_review_checks(md, lvm, blob) + _raid_review2_checks(md, lvm, blob)
             + _raid_review3_checks(md, lvm, blob, doc) + _raid_review4_checks(md, blob)
-            + _raid_sibling_checks(md, lvm, blob))
+            + _raid_sibling_checks(md, lvm, blob) + _raid_foreign_checks(md, blob)
+            + _lvm_same_name_checks(lvm, blob))
 
 
 def _sibling_write(path, data):
@@ -22469,6 +22811,361 @@ def _raid_sibling_review_checks(md, blob):
     out.append(("the sibling checks leave no temporary folder behind, their own parent "
                 "included", _selftest_parent_gone(parent, "qnxprobe-siblings-review-")
                 and not os.path.exists(top)))
+    return out
+
+
+def _imsm_test_tail(level, members=2, bad_sum=False, map_state=0):
+    """1024 bytes ending a test disk: an IMSM anchor (one-sector metadata of
+    two disks and one volume of `level`), then the last sector, laid out as
+    mdadm-4.5 super-intel.c reads it (imsm_levels). Constructed: no fixture
+    holds IMSM metadata."""
+    mpb = bytearray(512)
+    mpb[0:32] = (IMSM_SIGNATURE + b"1.0.00").ljust(32, b"\0")
+    size = 0xD8 + 48 * 2 + 164 + 4 * (members - 1)
+    struct.pack_into("<I", mpb, 0x24, size)
+    mpb[0x38], mpb[0x39] = 2, 1
+    dev = 0xD8 + 48 * 2
+    mpb[dev:dev + 16] = b"Volume0".ljust(16, b"\0")
+    mpb[dev + 112 + 15], mpb[dev + 112 + 16] = level, members
+    mpb[dev + 112 + 14] = map_state
+    words = struct.unpack_from(f"<{size // 4}I", mpb, 0)
+    total = (sum(words) - words[8]) & 0xffffffff
+    struct.pack_into("<I", mpb, 0x20, (total + (1 if bad_sum else 0)) & 0xffffffff)
+    return bytes(mpb) + bytes(512)
+
+
+def _ddf_test_edit(img, field=96, record=None, header=None):
+    """`img` (bytearray, a DDF member) with the header the anchor names at
+    `field` (96 primary, 104 secondary) passed through `header(bytearray)`
+    and every virtual disk configuration record under it through
+    `record(bytearray)`, each CRC made good as mdadm's calc_crc."""
+    def resum(blob):
+        struct.pack_into(">I", blob, 4, 0xffffffff)
+        struct.pack_into(">I", blob, 4, (binascii.crc32(bytes(blob), 0xffffffff) ^ 0xffffffff)
+                         & 0xffffffff)
+        return blob
+    lba, = struct.unpack_from(">Q", img, len(img) - 512 + field)
+    at = lba * 512
+    hdr = bytearray(img[at:at + 512])
+    rec_len, = struct.unpack_from(">H", hdr, 134)
+    off, length = struct.unpack_from(">II", hdr, 216)
+    if record is not None:
+        for r in range((lba + off) * 512, (lba + off + length) * 512, rec_len * 512):
+            if img[r:r + 4] == b"\xee\xee\xee\xee":
+                rec = bytearray(img[r:r + rec_len * 512])
+                record(rec)
+                img[r:r + rec_len * 512] = resum(rec)
+    if header is not None:
+        header(hdr)
+        img[at:at + 512] = resum(hdr)
+    return img
+
+
+def _raid_foreign_checks(md, blob):
+    """DDF and IMSM members, whose arrays this does not assemble (1.71): a
+    member is walked only when its metadata, read and checked, records a
+    mirror (RAID1); any other level, or metadata that cannot be read, leaves
+    it named and not walked."""
+    import contextlib
+    import gzip
+    import io
+    import tempfile
+    out = []
+    ddf = md.get("md-ddf")
+    if ddf:
+        data = [blob(m["file"]) for m in ddf["members"] if m["file"]]
+        kinds = [identify_fs(io.BytesIO(d), 0, len(d)) for d in data]
+        vols = [volumes(io.BytesIO(d), len(d)) for d in data]
+        one = [v[0] if len(v) == 1 else {} for v in vols]
+        want = ddf.get("detail_export", {}).get("MD_LEVEL", "").upper()
+        out.append((f"a DDF member whose metadata records {want} is not walked, even when it "
+                    "starts with a filesystem: it is a raid member, and its note names the "
+                    "level, says its array is not assembled, and names what it starts with",
+                    want == "RAID5" and [k for k, _l in kinds] == ["raid member"] * 3
+                    and all(v.get("walker") is None for v in one)
+                    and all(want in (v.get("note") or "") and "not assembled" in v["note"]
+                            for v in one)
+                    and "it starts with ext4" in (one[1].get("note") or "")))
+        levels = [ddf_levels(io.BytesIO(d), 0, len(d)) for d in data]
+        spoiled = bytearray(data[0])
+        anchor = len(spoiled) - 512
+        lba, = struct.unpack_from(">Q", spoiled, anchor + 96)
+        off, = struct.unpack_from(">I", spoiled, lba * 512 + 216)
+        rec = (lba + off) * 512
+        spoiled[rec + 67] ^= 0xff                       # prl, under the record's CRC
+        out.append((f"the RAID level each DDF member's metadata records is read, and is the "
+                    f"level mdadm reported for the array ({want}); a configuration record whose "
+                    f"CRC fails is not used",
+                    bool(want) and all(lv == [want] for lv in levels)
+                    and ddf_levels(io.BytesIO(bytes(spoiled)), 0, len(spoiled)) == []))
+        # The same member with its records changed to RAID1, CRCs made good: walked.
+        def to_raid1(rec):
+            rec[67] = 0x01
+        mirror = _ddf_test_edit(_ddf_test_edit(bytearray(data[1]), 96, to_raid1), 104, to_raid1)
+        mk, _ml = identify_fs(io.BytesIO(bytes(mirror)), 0, len(mirror))
+        mv = volumes(io.BytesIO(bytes(mirror)), len(mirror))
+        names = []
+        if len(mv) == 1 and mv[0].get("walker") is not None:
+            w = mv[0]["walker"]
+            names = [n for n, _i in w.listdir(w.root)]
+        out.append(("the same DDF member with its configuration records changed to RAID1 (CRC "
+                    "made good) is walked as the filesystem it starts with, and its note says "
+                    "its metadata records a mirror",
+                    mk == "ext4" and "hello.txt" in names
+                    and "RAID1 (a mirror)" in (mv[0].get("note") or "")))
+
+        # mdadm's own DDF RAID10: RAID1 over two-disk sets, spanned (layout_md2ddf)
+        def to_raid10(rec):
+            rec[67], rec[69], rec[70], rec[71] = 0x01, 2, 0, 0x03
+            struct.pack_into(">H", rec, 64, 2)
+        r10 = _ddf_test_edit(_ddf_test_edit(bytearray(data[1]), 96, to_raid10), 104, to_raid10)
+        rv = volumes(io.BytesIO(bytes(r10)), len(r10))
+        out.append(("a DDF record of RAID1 over two spanned two-disk sets (how mdadm writes "
+                    "RAID10) reads as RAID10 and is not walked",
+                    ddf_levels(io.BytesIO(bytes(r10)), 0, len(r10)) == ["RAID10"]
+                    and [x.get("kind") for x in rv] == ["raid member"]
+                    and all(x.get("walker") is None for x in rv)
+                    and "RAID10" in (rv[0].get("note") or "")))
+
+        # A RAID1 whose virtual disk is degraded, or on which this disk failed:
+        # not walked, and the state is named.
+        def vd_state(img, value):
+            for field in (96, 104):
+                lba, = struct.unpack_from(">Q", img, len(img) - 512 + field)
+                hdr = img[lba * 512:lba * 512 + 512]
+                off, = struct.unpack_from(">I", hdr, 208)
+                img[(lba + off) * 512 + 64 + 32] = value      # entry 0's state
+            return img
+
+        def pd_failed(img):
+            for field in (96, 104):
+                lba, = struct.unpack_from(">Q", img, len(img) - 512 + field)
+                hdr = img[lba * 512:lba * 512 + 512]
+                poff, = struct.unpack_from(">I", hdr, 200)
+                doff, = struct.unpack_from(">I", hdr, 224)
+                guid = bytes(img[(lba + doff) * 512 + 8:(lba + doff) * 512 + 32])
+                start = (lba + poff) * 512
+                for i in range(64):
+                    e = start + 64 + 64 * i
+                    if bytes(img[e:e + 24]) == guid:
+                        struct.pack_into(">H", img, e + 30, 0x1 | 0x2)
+            return img
+        degraded = vd_state(bytearray(mirror), 0x1)
+        failed = pd_failed(bytearray(mirror))
+        dv = volumes(io.BytesIO(bytes(degraded)), len(degraded))
+        fv = volumes(io.BytesIO(bytes(failed)), len(failed))
+        out.append(("a DDF RAID1 member whose virtual disk is degraded, or which its own record "
+                    "marks failed, is not walked, and its note names the state",
+                    all(x.get("walker") is None for x in dv + fv)
+                    and "virtual disk degraded" in (dv[0].get("note") or "")
+                    and "this disk failed" in (fv[0].get("note") or "")))
+
+        # The header mdadm uses: the secondary when its seq is newer and it is
+        # not open (super-ddf.c 1079-1091).
+        def newer(hdr):
+            struct.pack_into(">I", hdr, 40, struct.unpack_from(">I", hdr, 40)[0] + 1)
+
+        def opened(hdr):
+            newer(hdr)
+            hdr[48] = 1
+        sec = _ddf_test_edit(bytearray(data[1]), 104, to_raid1, newer)
+        sec_open = _ddf_test_edit(bytearray(data[1]), 104, to_raid1, opened)
+        out.append(("the DDF header used is the one mdadm uses: a newer secondary that is not "
+                    "open (its records say RAID1 here), and the primary when the newer "
+                    "secondary is open",
+                    ddf_levels(io.BytesIO(bytes(sec)), 0, len(sec)) == ["RAID1"]
+                    and ddf_levels(io.BytesIO(bytes(sec_open)), 0, len(sec_open)) == ["RAID5"]))
+    lin = md.get("md-linear")
+    if lin:
+        d0 = blob(lin["members"][0]["file"])
+        v = volumes(io.BytesIO(d0), len(d0))
+        out.append(("the first member of an md linear array is not walked alone: the array's "
+                    "filesystem continues on the next member (linear_conf), as 1.70 has it",
+                    [x.get("kind") for x in v] == ["linux md member"]
+                    and all(x.get("walker") is None for x in v)))
+    # IMSM on a partitioned disk, constructed (no fixture): RAID1, RAID0, and
+    # RAID1 with a checksum that does not match.
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    with gzip.open(os.path.join(here, "fat12-fixture.img.gz"), "rb") as gz:
+        fat = gz.read()
+    disk = bytearray(1 << 20) + bytearray(fat) + bytearray(1 << 20)
+    struct.pack_into("<BBBBBBBBII", disk, 446, 0, 0, 0, 0, 0x01, 0, 0, 0, 2048, len(fat) // 512)
+    disk[510:512] = b"\x55\xaa"
+    plain = bytes(disk)
+    disks = {"plain": plain}
+    for name, tail in (("raid1", _imsm_test_tail(1)), ("raid0", _imsm_test_tail(0)),
+                       ("badsum", _imsm_test_tail(1, bad_sum=True))):
+        disks[name] = plain[:-1024] + tail
+    lv = {n: imsm_levels(io.BytesIO(d), 0, len(d)) for n, d in disks.items()}
+    out.append(("the IMSM level is read from its metadata with its checksum: RAID1 and RAID0 "
+                "volumes are named, and a checksum that does not match is said",
+                lv["raid1"] == (["RAID1"], None) and lv["raid0"] == (["RAID0"], None)
+                and lv["badsum"][0] is None and "checksum" in lv["badsum"][1]
+                and lv["plain"][0] is None))
+    rs = raid_assemble([("imsm-disk", io.BytesIO(disks["raid0"]))])
+    rs2 = raid_assemble([("ddf-disk", io.BytesIO(blob(ddf["members"][0]["file"])))]) if ddf else None
+    say_m, say_n = [], []
+    raid_report(raid_assemble([("mirror-disk", io.BytesIO(disks["raid1"]))]), say=say_m.append)
+    raid_report(raid_assemble([("raid0-disk", io.BytesIO(disks["raid0"]))]), say=say_n.append)
+    out.append(("the RAID section names a walked IMSM RAID1 member as a member read on its own "
+                "as a copy of the mirror, not as NOT READ; a RAID0 member stays NOT READ with "
+                "its level",
+                any("member  " in ln and "as a copy of the mirror" in ln for ln in say_m)
+                and not any("NOT READ" in ln for ln in say_m)
+                and any("NOT READ" in ln and "RAID0" in ln and "not walked" in ln for ln in say_n)))
+    out.append(("an IMSM member is named with \"an\", a DDF member with \"a\"",
+                any("an Intel IMSM (RST) RAID member" in ln for _l, ln in rs.foreign)
+                and (rs2 is None or any("a DDF RAID member" in ln for _l, ln in rs2.foreign))))
+    parent = tempfile.mkdtemp(prefix="qnxprobe-foreign-")
+    top = os.path.join(parent, "raid-foreign")
+    os.makedirs(top, exist_ok=True)
+    reports = {}
+    try:
+        for name, data in disks.items():
+            path = os.path.join(top, f"{name}-disk.raw")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            say = io.StringIO()
+            with contextlib.redirect_stdout(say):
+                main(path, do_list=True)
+            reports[name] = say.getvalue()
+    finally:
+        _sibling_rm(top)
+    v = {n: volumes(io.BytesIO(d), len(d)) for n, d in disks.items()}
+    out.append(("a partitioned disk ending in IMSM metadata that records RAID1: its partition "
+                "is walked, and the note and the report say the metadata records a mirror",
+                len(v["raid1"]) == 1 and v["raid1"][0].get("walker") is not None
+                and "RAID1 (a mirror)" in (v["raid1"][0].get("note") or "")
+                and "  RAID     a member of an Intel IMSM (RST) RAID set" in reports["raid1"]
+                and "CONTENTS" in reports["raid1"]))
+    out.append(("one that records RAID0: its partition is a raid member, not walked, named with "
+                "the level and what it starts with, and the report lists no contents",
+                len(v["raid0"]) == 1 and v["raid0"][0].get("walker") is None
+                and v["raid0"][0].get("kind") == "raid member"
+                and "RAID0" in (v["raid0"][0].get("note") or "")
+                and "it starts with fat12" in v["raid0"][0]["note"]
+                and "->  raid member" in reports["raid0"] and "CONTENTS" not in reports["raid0"]))
+    out.append(("one whose IMSM checksum does not match: not walked, and the note says the "
+                "checksum does not match; the same disk without metadata is read with no note "
+                "(the control)",
+                len(v["badsum"]) == 1 and v["badsum"][0].get("walker") is None
+                and "checksum does not match" in (v["badsum"][0].get("note") or "")
+                and "CONTENTS" not in reports["badsum"]
+                and len(v["plain"]) == 1 and v["plain"][0].get("walker") is not None
+                and not v["plain"][0].get("note") and "IMSM" not in reports["plain"]
+                and "CONTENTS" in reports["plain"]))
+    deg = plain[:-1024] + _imsm_test_tail(1, map_state=2)
+    dg = volumes(io.BytesIO(deg), len(deg))
+    out.append(("a partitioned disk whose IMSM RAID1 map is degraded: not walked, and the note "
+                "names the state",
+                imsm_levels(io.BytesIO(deg), 0, len(deg)) == (["RAID1 (degraded)"], None)
+                and len(dg) == 1 and dg[0].get("walker") is None
+                and "RAID1 (degraded)" in (dg[0].get("note") or "")))
+    # Nothing found on such a disk is walked: a whole-disk LVM physical
+    # volume's logical volume included, in volumes() and in an extraction.
+    with gzip.open(os.path.join(here, "lvm-wholedisk.img.gz"), "rb") as gz:
+        pv = gz.read() + bytes(1 << 20)
+    pv0 = pv[:-1024] + _imsm_test_tail(0)
+    lv_plain = [x["label"] for x in volumes(io.BytesIO(pv), len(pv)) if x.get("walker")]
+    lv_raid0 = [x["label"] for x in volumes(io.BytesIO(pv0), len(pv0)) if x.get("walker")]
+    runs = {}
+    for name, img in (("plain", pv), ("raid0", pv0)):
+        zbuf = io.BytesIO()
+        say = io.StringIO()
+        with zipfile.ZipFile(zbuf, "w") as zout, contextlib.redirect_stdout(say):
+            main(f"lvm-{name}", extract="(memory)", zf=zout, manifest=[],
+                 image=io.BytesIO(img), do_list=True)
+        with zipfile.ZipFile(io.BytesIO(zbuf.getvalue())) as zin:
+            runs[name] = (zin.namelist(), say.getvalue())
+    out.append(("on a whole-disk LVM physical volume ending in IMSM RAID0 metadata, the "
+                "logical volume is not walked or extracted either (it is without the "
+                "metadata, the control)",
+                any(lab.startswith("LVM ") for lab in lv_plain) and not lv_raid0
+                and runs["plain"][0] and "CONTENTS" in runs["plain"][1]
+                and not runs["raid0"][0] and "CONTENTS" not in runs["raid0"][1]))
+    # The disk's own end is read from the image itself, not through an opened
+    # LUKS volume whose data covers it.
+    if _BDE_AES is None:
+        out.append(("a whole-disk LUKS volume opened on a disk ending in IMSM RAID0 metadata "
+                    "is not walked (needs the pycryptodome package)", None))
+    else:
+        meta = json.load(open(os.path.join(here, "luks-fixtures.json"), encoding="utf-8"))
+        with gzip.open(os.path.join(here, "luks2-pbkdf2.img.gz"), "rb") as gz:
+            lk = gz.read() + bytes(1 << 20)
+        lk0 = lk[:-1024] + _imsm_test_tail(0)
+        walked = {}
+        for name, img in (("plain", lk), ("raid0", lk0)):
+            ufh, _found = unlock_luks(io.BytesIO(img), len(img), meta["passphrases"][:1])
+            walked[name] = [x["label"] for x in volumes(ufh, len(img)) if x.get("walker")]
+        out.append(("a whole-disk LUKS volume opened on a disk ending in IMSM RAID0 metadata "
+                    "is not walked: the metadata is read from the image itself, not through "
+                    "the decrypted view (without it, the volume is walked: the control)",
+                    bool(walked["plain"]) and not walked["raid0"]))
+    out.append(("the foreign RAID checks leave no temporary folder behind",
+                _selftest_parent_gone(parent, "qnxprobe-foreign-") and not os.path.exists(top)))
+    return out
+
+
+def _lvm_same_name_checks(lvm, blob):
+    """Two LVM volume groups with one name and different ids, given together
+    across images (1.71): each is matched by its id and read on its own."""
+    import io
+    out = []
+    names = sorted(n for n in lvm if n.startswith("lvm-raid-multi-"))
+    imgs = [blob(f"lvm-raid-multi-{i}.img.gz") for i in range(5)]
+    pv0 = _lvm_pv(io.BytesIO(imgs[0]), 0, None)
+    vg = pv0.vg[1]
+    ids = [vg["id"]] + [r["id"] for r in vg["physical_volumes"].values()]
+
+    def flip(x):
+        return ("B" if x[0] != "B" else "C") + x[1:]
+
+    def text(t):
+        for i in ids:
+            t = t.replace(i, flip(i))
+        return t
+
+    def other_group(img):
+        # the same disks under another volume group id and other physical
+        # volume ids, every checksum made good (metadata text and label)
+        out_ = bytearray(_lvm_text_change(img, text))
+        pv = _lvm_pv(io.BytesIO(bytes(out_)), 0, None)
+        at = pv.label_sector * SECTOR
+        off, = struct.unpack_from("<I", out_, at + 20)
+        out_[at + off:at + off + 32] = flip(out_[at + off:at + off + 32].decode()).encode()
+        struct.pack_into("<I", out_, at + 16, lvm_crc(bytes(out_[at + 20:at + SECTOR])))
+        return bytes(out_)
+    other = [other_group(b) for b in imgs]
+    both = [(f"a{i}", io.BytesIO(b)) for i, b in enumerate(imgs)] + \
+           [(f"b{i}", io.BytesIO(b)) for i, b in enumerate(other)]
+    rs = raid_assemble(both)
+    labels = [a.label for a in rs.arrays]
+    good = 0
+    for arr in rs.arrays:
+        entry = lvm.get("lvm-raid-multi-" + arr.label.split("/")[1])
+        good += (entry is not None and arr.image is not None
+                 and _raid_sha(arr.image) == (entry["device_sha256"], entry["device_size"]))
+    out.append((f"two LVM volume groups named alike with different ids, given together across "
+                f"ten images, are each read on their own, told apart by id in their labels, "
+                f"and every volume reads to the kernel's bytes ({good} of {2 * len(names)})",
+                len(labels) == len(set(labels)) == 2 * len(names) == good
+                and sum(1 for lab in labels if "@" in lab.split("/")[0]) == len(labels)
+                and any("same name" in ln for lines in rs.members.values() for ln in lines)))
+    # One group whole and the other with two of its five images: the whole one
+    # reads; the other is its own, and is not read from the first group's disks.
+    rs2 = raid_assemble(both[:5] + both[5:7])
+    a_ok = [a for a in rs2.arrays if a.label.split("/")[0].endswith(
+        "@" + _lvm_id(vg["id"])[:6]) and a.image is not None]
+    b_read = [a for a in rs2.arrays if not a.label.split("/")[0].endswith(
+        "@" + _lvm_id(vg["id"])[:6]) and a.image is not None]
+    out.append(("with one of the two groups whole and two images of the other, the whole one "
+                "reads to the kernel's bytes and none of the other's volumes is read through "
+                "the first group's disks",
+                len(a_ok) == len(names) and not b_read
+                and all(_raid_sha(a.image) == (lvm["lvm-raid-multi-" + a.label.split("/")[1]]
+                                               ["device_sha256"],
+                                               lvm["lvm-raid-multi-" + a.label.split("/")[1]]
+                                               ["device_size"]) for a in a_ok)))
     return out
 
 
@@ -26557,6 +27254,32 @@ def _refs_snapshot_check(w, mine):
 
 
 def identify_fs(fh, base, size=None):
+    """Return (name, [detail lines]) for whatever sits at this partition
+    (_identify_fs). A region that ends in DDF or IMSM metadata (raid_foreign)
+    is read as any other, and a line naming that metadata is added; when
+    nothing else is recognised in it, it is a "raid member"."""
+    kind, lines = _identify_fs(fh, base, size)
+    if kind == "linux md member":
+        return kind, lines
+    if size is None:
+        try:
+            size = image_size(fh) - base
+        except OSError:
+            size = 0
+    try:
+        foreign = raid_foreign(fh, base, size)
+    except (struct.error, ValueError, OSError):
+        foreign = None
+    if not foreign:
+        return kind, lines
+    levels, why = raid_foreign_levels(fh, base, size, foreign)
+    if raid_foreign_mirror(levels):
+        # a mirror member reads as any region would, recognised or not
+        return kind, list(lines) + [raid_foreign_note(foreign, levels, why, subject="this region")]
+    return "raid member", [raid_foreign_note(foreign, levels, why, kind, "this region")]
+
+
+def _identify_fs(fh, base, size=None):
     """Return (name, [detail lines]) for whatever sits at this partition.
 
     size is the region's byte length, needed by the flash filesystems (ETFS/EFS)
@@ -26588,9 +27311,10 @@ def identify_fs(fh, base, size=None):
         if found:
             return found
 
-    # A Linux md RAID member (or a DDF or IMSM one): its superblock where the
-    # kernel looks for each metadata version, with its checksum. Its array is
-    # read from all its members together (raid_assemble), not from this region.
+    # A Linux md RAID member: its superblock where the kernel looks for each
+    # metadata version, with its checksum. Its array is read from all its
+    # members together (raid_assemble), not from this region. (DDF and IMSM
+    # metadata is named by identify_fs() after everything else is tried.)
     found = identify_md(fh, base, size)
     if found:
         return found
@@ -27308,6 +28032,9 @@ def volumes(fh, size=None):
         missing[b] = fh.lvm_map_for(b).missing(size)
     lvm_spare = None
     out, qnx6_labels = [], set()
+    # A disk whose own end carries DDF or IMSM metadata: a mirror's volumes
+    # are read and say so; any other's are named and not walked.
+    disk_raid = raid_foreign_disk(fh, size)
 
     for label, base, rsize in regions:
         best = None
@@ -27379,10 +28106,12 @@ def volumes(fh, size=None):
                     vol["note"] = (f"a LUKS container, opened: its data is listed as LUKS {lk.label}"
                                    if lk is not None and lk.mk is not None else
                                    (lk.locked_note() if lk is not None else "LUKS-encrypted and not read"))
-            elif kind in ("linux md member", "raid member"):
+            elif kind == "linux md member":
                 vol["note"] = ("a RAID member: its array is read from all its members "
                                "together (raid_assemble, or several images on the command "
                                "line), not from this region alone")
+            elif kind == "raid member":
+                vol["note"] = lines[0] if lines else "a member of a RAID set this does not read"
             elif kind == "lvm2 pv":
                 # The logical volumes not read are said here too, where a caller
                 # that prints only the note (the LEAPP run log) will show them.
@@ -27414,7 +28143,32 @@ def volumes(fh, size=None):
         wnote = getattr(vol.get("walker"), "note", None)
         if wnote and "note" not in vol:
             vol["note"] = wnote
+        # a mirror member's own region (identify_fs) is read, and says so
+        if kind != "raid member":
+            mirrored = [ln for ln in lines if ln.startswith("a member of ") and "RAID set" in ln]
+            if mirrored:
+                vol["note"] = f"{vol['note']}; {mirrored[0]}" if vol.get("note") else mirrored[0]
         out.append(vol)
+    # A disk that ends in DDF or IMSM metadata: every volume found on it
+    # (partitions, logical volumes, what an opened LUKS or BitLocker volume
+    # holds, a qnx6 volume) is read from this one disk, so each is walked only
+    # when the metadata records a mirror in its normal state, and says so.
+    if disk_raid is not None:
+        for vol in out:
+            note = vol.get("note") or ""
+            if vol.get("kind") == "raid member" or " RAID set, whose array is not assembled" in note:
+                continue
+            what = ("this volume" if vol.get("label", "").startswith(("LVM ", "LUKS "))
+                    or vol.get("kind") == "qnx6" or vol.get("label") == "whole image"
+                    else "this partition")
+            line = raid_foreign_note(disk_raid["foreign"], disk_raid["levels"], disk_raid["why"],
+                                     None if disk_raid["mirror"] else vol.get("kind"), what)
+            if disk_raid["mirror"]:
+                vol["note"] = f"{note}; {line}" if note else line
+            else:
+                for key in ("walker", "free_extents"):
+                    vol.pop(key, None)
+                vol["kind"], vol["note"] = "raid member", line
     # A volume read through a map has no single place on the disk: its base is
     # where lvm_image() put it, so it has no LBA, and the map says where each
     # run of it is in the image.
@@ -27905,6 +28659,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # Group the copies by volume, then by serial. The highest serial is
         # the active generation; the one below it is the previous committed
         # state, still on disk.
+        # A disk that ends in DDF or IMSM metadata: only a mirror's volumes are
+        # walked (raid_foreign_disk); said once, before the volumes.
+        disk_raid = raid_foreign_disk(fh, size) if sized_regions else None
+        disk_partitioned = not any(lab == "whole image" for lab, _b, _s in sized_regions)
+        raid_kind, raid_levels, raid_why, raid_mirror = (
+            (disk_raid["foreign"], disk_raid["levels"], disk_raid["why"], disk_raid["mirror"])
+            if disk_raid is not None else (None, None, None, False))
         vols = {}
         for off, how, endian, sb, _ in confirmed:
             key = how.rsplit(" +0x", 1)[0]
@@ -27980,6 +28741,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             base = next((b for lab, b, _ in sized_regions
                          if key.startswith(lab)), None)
             wanted = only is None or only.lower() in key.lower()
+            if raid_kind:
+                print("      " + raid_foreign_note(raid_kind, raid_levels, raid_why,
+                                                   None if raid_mirror else "qnx6",
+                                                   "this volume"))
+                wanted = wanted and raid_mirror
 
             if do_triage and base is not None:
                 encf = (0, 0)
@@ -28042,6 +28808,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     print(f"        could not extract this filesystem: {exc}")
             print()
 
+        # A partitioned disk that ends in DDF or IMSM metadata: said once; a
+        # mirror's partitions are read, any other's named and not walked.
+        if raid_kind and disk_partitioned:
+            print("  RAID     " + raid_foreign_note(raid_kind, raid_levels, raid_why, None,
+                                                    "its partitions"))
+            print()
+
         # A type byte is a label, not a fact, so read the partitions that did
         # not turn out to be qnx6 rather than trusting what they claim to be.
         others = [(lab, b, sz) for lab, b, sz in sized_regions
@@ -28055,6 +28828,16 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     print()
                     continue
                 kind, lines = identify_fs(fh, b, sz)
+                if raid_kind and kind != "raid member" and not any(
+                        " RAID set, whose array is not assembled" in ln for ln in lines):
+                    what = ("this volume" if lab.startswith(("LVM ", "LUKS ")) or lab == "whole image"
+                            else "this partition")
+                    note = raid_foreign_note(raid_kind, raid_levels, raid_why,
+                                             None if raid_mirror else kind, what)
+                    if raid_mirror:
+                        lines = list(lines) + [note]
+                    else:
+                        kind, lines = "raid member", [note]
                 print(f"    {lab}   {human(sz)}   ->  {kind or 'not recognised'}")
                 opened = getattr(fh, "bitlocker", {}).get(b)
                 if opened is not None:
