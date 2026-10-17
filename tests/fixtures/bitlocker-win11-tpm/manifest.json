@@ -1,0 +1,173 @@
+{
+ "what": "BitLocker header and FVE metadata of C: on a Windows 11 (build 26200) ARM64 test VM with a virtual TPM 2.0, read from the physical disk below the BitLocker filter, one protector setup per file. Each .bin.gz is volume-header.bin (512 bytes) then metadata-1, -2 and -3 (65,536 bytes each), byte for byte. 'windows' is what manage-bde -protectors -get C: printed for that setup.",
+ "states": {
+  "00-recovery-only": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "db56d3c645e7ac853ddd9e2271dfd75564002b4f48ba413da209558a2bbee082",
+    "metadata-2.bin": "db56d3c645e7ac853ddd9e2271dfd75564002b4f48ba413da209558a2bbee082",
+    "metadata-3.bin": "db56d3c645e7ac853ddd9e2271dfd75564002b4f48ba413da209558a2bbee082"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    }
+   ]
+  },
+  "01-tpm-default": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "596f39fec15975886fb340ac871258b32bafa0bd9ca77cdf005cfaeece74ba37",
+    "metadata-2.bin": "596f39fec15975886fb340ac871258b32bafa0bd9ca77cdf005cfaeece74ba37",
+    "metadata-3.bin": "596f39fec15975886fb340ac871258b32bafa0bd9ca77cdf005cfaeece74ba37"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    },
+    {
+     "type": "TPM",
+     "id": "32A466B4-B820-49F7-8943-64C5F3470128",
+     "pcrs": [
+      7,
+      11
+     ]
+    }
+   ]
+  },
+  "02-tpm-pin": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "99e14bed496a675ad9927aaee8eb47cb584638d6dcb229c558c2c14c43456fcb",
+    "metadata-2.bin": "99e14bed496a675ad9927aaee8eb47cb584638d6dcb229c558c2c14c43456fcb",
+    "metadata-3.bin": "99e14bed496a675ad9927aaee8eb47cb584638d6dcb229c558c2c14c43456fcb"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    },
+    {
+     "type": "TPM And PIN",
+     "id": "EDAE5861-118C-420F-A7AD-2621C766F384",
+     "pcrs": [
+      7,
+      11
+     ]
+    }
+   ]
+  },
+  "03-tpm-startupkey": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "f4958808418b54df1bc43a91758113bc6421c89dacb61201410870b93177dba0",
+    "metadata-2.bin": "f4958808418b54df1bc43a91758113bc6421c89dacb61201410870b93177dba0",
+    "metadata-3.bin": "f4958808418b54df1bc43a91758113bc6421c89dacb61201410870b93177dba0"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    },
+    {
+     "type": "TPM And Startup Key",
+     "id": "C440C605-E352-4EF7-8142-489198D18E43",
+     "pcrs": [
+      7,
+      11
+     ]
+    }
+   ]
+  },
+  "04-tpm-pin-startupkey": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "8af08d4870fb11bbd14cec88e10a69fbe668b3c29968812400a271634a415ca6",
+    "metadata-2.bin": "8af08d4870fb11bbd14cec88e10a69fbe668b3c29968812400a271634a415ca6",
+    "metadata-3.bin": "8af08d4870fb11bbd14cec88e10a69fbe668b3c29968812400a271634a415ca6"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    },
+    {
+     "type": "TPM And PIN And Startup Key",
+     "id": "72A4B2E2-EEAF-4E36-87AF-37CE235789F1",
+     "pcrs": [
+      7,
+      11
+     ]
+    }
+   ]
+  },
+  "05-tpm-pcr-0-2-4-11": {
+   "partition_size": 273220108288,
+   "metadata_offsets": [
+    150364160,
+    1143160832,
+    2233708544
+   ],
+   "sha256": {
+    "volume-header.bin": "fa9b5b81d203517298108d7da3d9d3500441a61104f506ed9d89ade72112c381",
+    "metadata-1.bin": "ded59731e925ecb26acbbcf145e8ecca9accb3681f3e06f6be324d7d294bce5b",
+    "metadata-2.bin": "ded59731e925ecb26acbbcf145e8ecca9accb3681f3e06f6be324d7d294bce5b",
+    "metadata-3.bin": "ded59731e925ecb26acbbcf145e8ecca9accb3681f3e06f6be324d7d294bce5b"
+   },
+   "windows": [
+    {
+     "type": "Numerical Password",
+     "id": "2F8617F2-FB62-46E5-BDFF-9670A41A1F1E",
+     "pcrs": null
+    },
+    {
+     "type": "TPM",
+     "id": "D1B11C46-4015-4DC1-A13A-B8E7AD5EA973",
+     "pcrs": [
+      0,
+      2,
+      4,
+      11
+     ]
+    }
+   ]
+  }
+ }
+}

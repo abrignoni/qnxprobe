@@ -1697,6 +1697,32 @@ key never leaves the device; a recovery password set on the same volume still op
 The window asks for a password or recovery password for each locked volume when it
 loads an image, and takes a `.BEK` file when the answer is left empty.
 
+Since 1.73 a TPM protector's line also gives the PCRs its key is sealed to, as stored,
+and the size of its policy digest: `protector    TPM    id …   PCRs 7, 11 (SHA-256 policy
+digest)`. Those are the platform measurements the TPM must see before it releases the
+key, which say what a change to the firmware, the boot manager or Secure Boot would
+trigger: a recovery prompt. They are the stored selection, not measurements taken from
+any TPM, and nothing is unsealed. The stored entry carries the PCRs twice, a 32-bit
+bitmap first and a selection last; when the two disagree the line says so and names
+neither. The protectors Windows calls "TPM And Startup Key" (`0x0300`) and "TPM And PIN
+And Startup Key" (`0x0700`) are named too; before 1.73 they showed as their code.
+
+Checked against six setups of one Windows 11 (build 26200) test VM's system volume, with
+a virtual TPM 2.0 and Secure Boot on: a recovery password alone, then with a TPM, TPM and
+PIN, TPM and startup key, TPM with PIN and startup key, and a TPM with Secure Boot
+binding turned off. Every protector's kind, id and PCRs equal what `manage-bde -protectors
+-get` printed (PCRs 7, 11 for the first four TPM ones and 0, 2, 4, 11 for the last), and
+in each the bitmap and the selection agree. Their header and metadata, as read from the
+disk below BitLocker, are the self-test's `tests/fixtures/bitlocker-win11-tpm`; reading the
+selection big-endian makes all five TPM checks fail. The TPM layout and the PCR reading
+were ported from a BitLocker artifact ForensikITGmbH wrote for DLEAPP
+([abrignoni/DLEAPP#616](https://github.com/abrignoni/DLEAPP/pull/616)).
+
+From Python, each BitLocker volume in `volumes()`, locked or opened, carries `bitlocker`:
+`BitLocker.facts()`, a dict with the layout, method, description, created time, volume id
+and one dict per protector (`kind`, `code`, `id`, `modified` as a FILETIME, `pcrs` for a TPM
+or None, `pcr_digest`, and `pcrs_disagree`).
+
 From Python:
 
 ```python
@@ -3596,6 +3622,16 @@ moved first sectors, zeroed metadata, the
 encrypted size, unencrypted ranges               libbde/libbde_sector_data.c:274-420
 Encrypt-on-Write map                             libbde/libbde_volume.c:1668
 bytes per sector from the moved header           libbde/libbde_volume.c:1497-1506
+```
+
+A TPM protector's stored key (value type 6), from fox-it/dissect.fve at commit
+`0b3caf20c1e95136cb2eb4494303604e7629616b` (its layout only; no code is taken from it):
+
+```
+FVE_DATUM_TPM_ENC_BLOB: bitmap, three 16-bit-sized parts
+  and an 8-bit-sized PCR selection, sizes big-endian   dissect/fve/bde/c_tpm.py:44-53
+the policy is the selection read little-endian         dissect/fve/bde/information.py:522
+protector codes 0x0300 and 0x0700                      measured: tests/fixtures/bitlocker-win11-tpm
 ```
 
 NTFS reparse points, cloud placeholders and overlay compression, from Microsoft:
