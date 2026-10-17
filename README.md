@@ -1680,7 +1680,9 @@ the volume records about itself: the encryption method, its description (the com
 name, drive label and date Windows wrote when it was encrypted, as stored), when it was
 created, its volume id, and each key protector with its id. The note says what would
 open it, naming the recovery password's protector id, which is the id to quote when
-asking for the recovery key from wherever it was escrowed.
+asking for the recovery key from wherever it was escrowed. Since 1.72 the line saying
+which options take a key is printed only when nothing given was tried against the volume;
+when a password or key file was tried and did not open it, the note says so instead.
 
 A key is one of:
 
@@ -1752,11 +1754,17 @@ its data is read decrypted in place, as a region of its own labelled
 filesystem or LVM2 physical volume inside is identified, listed, walked and extracted
 like any other, also when the container is inside a logical volume that is one run of
 extents. Without a passphrase that opens it, the container is listed as locked and says
-so; a header that does not read, or that names a cipher, a feature or a cost this does
+why: with none given, the report says to give one; with one given that opens no keyslot,
+it says that, and without the pycryptodome package it says AES needs it, given a
+passphrase or not (since 1.72; 1.71 asked for a passphrase in every case). A header that does not read, or that names a cipher, a feature or a cost this does
 not take, is listed as not read and says why, before any passphrase is asked for, and
 costs the image nothing else. Apply `unlock_luks()` before `lvm_image()`, so a physical
 volume inside a container is seen, and after `unlock_bitlocker()` and `unlock_apfs()`; a
-BitLocker or APFS volume inside a LUKS container is therefore not opened. A passphrase
+BitLocker or APFS volume inside a LUKS container is therefore not opened. A container
+inside a logical volume read through a map (split into runs, or striped) is not opened
+either, because `unlock_luks()` runs before `lvm_image()` places that volume; since 1.72
+the report says so, and that a passphrase given was not tried on it, instead of asking for
+one. A passphrase
 is text: key files and binary key material are not taken, and `--password-file` takes
 its first line.
 
@@ -2357,6 +2365,30 @@ disk or a partition. An image that holds no member
 of anything is read exactly as before. Hardware RAID imaged as one logical disk needs
 none of this: it is already one image.
 
+Since 1.72, two paths that open one disk are read once, as the one given first. When
+both are the same file (a hard or symbolic link, another spelling of a path, or the same
+path twice) the other is listed with `the same disk as <the first>, read once`; when the
+other is a later file of a set the first opens (`disk.E03` of an EWF set opened from
+`disk.E01`, or `.002` of a split raw set), it is listed with `read as a segment of the
+EWF set opened from <the first>, not on its own` (or `the split set`). This is decided by
+the device and inode of the file the image is read from first (the first segment of a
+set), not by the bytes, so two different files holding the same bytes are both read. 1.71
+read such a disk twice and left the second out of its array as the same role again.
+
+A split raw set is found by name alone: files named `<stem>.001`, `<stem>.002` ... in one
+folder are always joined as one image. Since 1.72, when a later segment begins as a disk
+does (an md superblock where a member keeps one, or a partition table), the report of the
+set warns that these may be separate disks numbered like a split set, and that copies named
+otherwise (`<stem>-1.img`) are read as separate images. A filesystem at a segment's first
+byte is not taken as a sign: in fixtures cut at 1 MiB or into six pieces, an md member's
+data (ext4) and an XFS allocation group start at a cut. Cut at 1 MiB and at 3 MiB, the 83
+fixture images and the 203 RAID member images (501 sets with more than one segment) give
+the warning on three, each an md member partition that starts exactly at a cut.
+When two images given share a file name in different folders (two acquisitions of one
+disk, say), the RAID section names each by as many of its parent folders as tell them
+apart (`e01/md-r5-ls-1.E01` and `multi-segment/md-r5-ls-1.E01`); 1.71 showed the same
+name for both.
+
 What is read:
 
 - **Linux md (mdadm) arrays**, metadata 0.90, 1.0, 1.1 and 1.2: linear, RAID0 (with the
@@ -2393,8 +2425,11 @@ another leg marked REBUILD. Part of an array
 (one member given alone, or beside images that belong to nothing, or LVM images holding
 too few of a volume's legs) is reported as members, with a line naming the roles
 or physical volumes not given, and leaves the exit status as v1.68 had it. When the members are partitions of
-the one image given, that line instead says how many of them can be used, and the members
-left out above say why the others cannot. Members of metadata this only names (DDF
+the one image given, that line also says how many of them can be used and that the roles
+not given are not on that image; it points at the members left out above only when some
+were. Since 1.72 the line suggests `--find-members` when it was not used, and the RAID
+heading counts as assembled only the arrays that are read (`RAID: 1 array(s) or spanned
+volume(s) found in the images given, 0 of them assembled`); 1.71 counted every array found. Members of metadata this only names (DDF
 and the others below) do not change the exit status. A RAID1 array whose data starts at
 the first byte of the member it is read from (metadata 0.90 or 1.0) is not read a second
 time: that member's own listing above shows the same bytes, and the RAID section says so.
@@ -2589,7 +2624,8 @@ list. Without `--find-members` nothing changes: `--list` prints the same bytes a
 with the same status as 1.69 on each of the 83 other fixture images and the 203 RAID
 member images given alone (the one-image LVM RAID fixture among them), and on each of the
 51 md fixture sets (the DDF set and the set stopped during a reshape among them) and the
-five-image LVM RAID set given in full.
+five-image LVM RAID set given in full. (1.72 changed two lines of the RAID section for
+an array that is not read; see the exit status paragraph above.)
 
 What the search looks at:
 
@@ -2840,6 +2876,24 @@ failing (read from the next copy, as md does); the LVM exit rule by legs (one le
 not given and another marked REBUILD: counts); the layout control now requires a full read
 before comparing digests; and a member read that fails once and serves when tried again
 (read in full, in one read, on RAID0).
+
+And the cases a validation run on 2026-10-16 raised (1.72), each shown to fail on 1.71
+except the left-out guard: roles 0 and 1 of a RAID5 on the partitions of one image (the
+roles not given are named as not on it, `--find-members` is suggested, nothing is called
+left out, and the heading counts no array as assembled), with role 0 on a second partition
+too (the member left out is pointed at); the heading of a set given in full and of one
+member alone, with and without `--find-members`; paths that open one disk (the second
+segment of a split raw set, the same path twice and spelled another way, a hard and a
+symbolic link, the third segment of an EWF set) are read once and the RAID5 they make is
+read with nothing left out, while a byte copy under another name is not merged; two
+images of one member under one file name in two folders (named by the folders that tell
+them apart); the partitions wording chosen from where each member was found, not from a
+space in a file or folder name; and what
+the report says of a LUKS container and a BitLocker volume a wrong passphrase does not
+open, and of a LUKS container without pycryptodome; four member images named `m.001` to
+`m.004` (segments of the set opened from `m.001`, with the warning, while one member split
+in two gets none); and a LUKS container inside a logical volume read through a map, with and
+without a passphrase.
 
 What no fixture exercises as mdadm or lvm2 wrote it (the cases above are changed copies of
 fixtures): a big-endian 0.90 array (refused), a bad block log written by the kernel, a
