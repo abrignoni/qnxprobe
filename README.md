@@ -765,13 +765,14 @@ One walk reaches all of them and each file lands under its volume's name.
 What it reads: the checkpoint with the highest transaction id whose Fletcher-64
 checksum is right, the container and volume object maps, the file-system B-tree,
 directory records, inodes and their extended fields, file extents including sparse
-ones, symbolic links, and files compressed with the `decmpfs` attribute in its zlib
-forms.
+ones, symbolic links, and files compressed with the `decmpfs` attribute: zlib, LZVN,
+LZFSE or stored, in the attribute or in the resource fork (since 1.74; see
+[Compressed files (decmpfs)](#compressed-files-decmpfs) below).
 
 What it does not do: an encrypted volume whose blocks are ciphertext in the image, and
 which no password given opens (see below), is named, marked `encrypted and locked, not
-read`, and not walked, and a file compressed with LZVN or LZFSE is listed with its size
-and refuses to be read. Nothing here reads a snapshot: what is walked is the volume as
+read`, and not walked, and a file compressed with LZBITMAP is listed with its size
+and refuses to be read, naming the method. Nothing here reads a snapshot: what is walked is the volume as
 the newest checkpoint leaves it.
 
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
@@ -1013,13 +1014,14 @@ What it reads: the catalog B-tree in both its index and leaf forms, forks whose
 fragments outgrew the eight extent descriptors a catalog record holds and continue in
 the extents overflow tree, symbolic links, hard links through the private directory
 the volume keeps their indirect nodes in, and files compressed with the `decmpfs`
-attribute in its zlib forms, whether the compressed data sits in the attribute or in
-the resource fork behind a block table. A `--list` names a resource fork that carries
+attribute (zlib, LZVN, LZFSE or stored, since 1.74), whether the compressed data sits
+in the attribute or in the resource fork behind a block table. A `--list` names a resource fork that carries
 anything, because that is content the file's own size does not account for. HFSX, the
 case-sensitive variant, is read the same way and reported as itself.
 
-What it does not do: a file compressed with LZVN or LZFSE is listed with its recorded
-size and refuses to be read, since neither is in the standard library.
+What it does not do: a file compressed with LZBITMAP is listed with its recorded size
+and refuses to be read, naming the method. See
+[Compressed files (decmpfs)](#compressed-files-decmpfs).
 
 Validated against The Sleuth Kit, which reads HFS+ through an entirely separate
 implementation. A 24 MiB volume written by macOS itself and populated through its own
@@ -1037,6 +1039,139 @@ B-tree descent: every entry of a directory shares a parent id, so several index 
 carry that id with different names, and taking the last one that is not greater lands
 on the last leaf of the run. A 400-entry directory came back with 10 children until the
 comparison was strict.
+
+## Compressed files (decmpfs)
+
+macOS compresses many files in place. The data fork is left empty and the content is
+kept in the file's `com.apple.decmpfs` attribute, or in its resource fork in 64 KiB
+blocks behind a table, either compressed or stored as it is. Both the APFS and the HFS+
+walker read these files the same way. Since 1.74 that covers every method in the table
+below except LZBITMAP; before it, only zlib in the attribute was read.
+
+A file is read as compressed only when its BSD flags carry `UF_COMPRESSED`, which is the
+test macOS makes (`decmpfs_file_is_compressed()`, `bsd/kern/decmpfs.c` lines 838 to 862):
+without the flag macOS reads the data fork and ignores the attribute. qnxprobe 1.74 does
+the same, from the inode's BSD flags on APFS and the catalog record's owner flags on
+HFS+, and records each file that carries the attribute without the flag among the
+volume's damage. `--extract` and `volumes.json` always report it; `--list` reports it for
+the files it reaches at the listing depth asked for. 1.73 and earlier decoded the
+attribute whatever the flag said.
+
+| Method | Codec | Where the content is | Read |
+|---|---|---|---|
+| 1 | none | in the attribute, after its 16-byte header | since 1.74 |
+| 3 | zlib | in the attribute | yes |
+| 4 | zlib | in the resource fork | since 1.74 (see below) |
+| 5 | not established | 12 bytes in the attribute | refused by name |
+| 7 | LZVN | in the attribute | since 1.74 |
+| 8 | LZVN | in the resource fork | since 1.74 |
+| 9 | none | in the attribute, after a `0xCC` marker | since 1.74 |
+| 10 | none | in the resource fork, each block after a `0xCC` marker | since 1.74 |
+| 11 | LZFSE | in the attribute | since 1.74 |
+| 12 | LZFSE | in the resource fork | since 1.74 |
+| 13, 14 | LZBITMAP | in the attribute, in the resource fork | refused by name |
+
+Any other method number is refused naming the number. A block whose first byte is
+`0xFF` (zlib and LZFSE) or `0x06` (LZVN) holds its bytes as they are after that byte.
+
+**Where the layouts come from.** xnu defines only method 1 and the 16-byte header
+(`bsd/sys/decmpfs.h` lines 114 to 168 and `bsd/kern/decmpfs.c` lines 2289 to 2342 at
+apple-oss-distributions/xnu `f6217f891ac0bb64f3d375211650a4c1ff8ca1ea`). The other
+methods belong to Apple's closed AppleFSCompression kernel extension; their numbers and
+layouts are the ones documented in libfsapfs's "Apple File System (APFS)" format notes
+(libyal/libfsapfs `cc122619a0fa5cecf7c077742ac62251fb85fb6c`), and each one read here was
+confirmed by having macOS read files built to it (below). A method 4 resource fork is a
+classic resource file: the block count and the (offset, length) pairs sit after the
+resource's own 4-byte length at offset 0x100, and the offsets count from just after that
+length. 1.73 and earlier read the count from 0x100 itself and inflated each block as a
+complete zlib stream; 1.73 refuses both method 4 files of the fixtures below. Of the
+2,425 blocks of 937 method 4 files measured on a Mac running macOS 27, 1,473 do not end
+their zlib stream (934 of them not the file's last block, 539 the last), 923 do and 29
+are stored, and macOS reads all 937 files. Since 1.74 a zlib block must give exactly its
+block's bytes, and its stream is not required to end.
+
+**The decoders.** LZVN and LZFSE are not in the standard library, so both are carried as
+pure-Python decoders written for this file from Apple's reference implementation,
+[lzfse/lzfse](https://github.com/lzfse/lzfse) at `e634ca58b4821d9f3d560cdc6df5dec02ffc93fd`
+(BSD-3-Clause). The C was read, not copied, and each rule is cited by file and line in
+the source. They are stricter than the reference where it is silent: a stream must end
+with its own end marker, a block must give exactly the bytes its header names, an LZFSE
+match may not use more literals than its block decoded, a match may not reach before
+the first byte or repeat a distance never set, and output is capped at what the file's
+header says. Each of those is a refusal that names what was wrong. A file that is refused
+is never returned as empty or short: `--extract` leaves it out of the zip, counts it as
+failed and logs why, which is what it does for every other file it cannot read.
+
+The attribute is held to the 3,802 bytes the kernel reads (`MAX_DECMPFS_XATTR_SIZE`,
+`decmpfs.h` line 71), which also bounds what an attribute-held file can decode to, and
+a size beyond what a file's size (a signed 64-bit `off_t`) can hold is refused. A
+resource fork is read a piece at a time, in order, so a compressed file of gigabytes is
+never held in memory whole, and a block the table says is longer than 128 KiB, twice a
+block's 64 KiB, is refused before it is read: the longest block of 4,712 method 4 and 8
+files measured on a Mac running macOS 27 is 65,537 bytes, a stored block and its marker.
+
+In pure Python, LZVN decodes at about 17 MB/s and LZFSE at about 7 MB/s on the Mac this
+was measured on (one process, 2 MiB of text and of a binary in 64 KiB blocks).
+
+**What it was checked against.**
+
+- *Volumes macOS wrote and read back.* `tools/make_decmpfs_fixture.py` builds a small APFS
+  and a small HFS+ volume with `hdiutil`, compresses files with `ditto --hfsCompression`
+  (which wrote method 8 on macOS 27) and builds a file of every method above by hand
+  with zlib or Apple's libcompression, then reads every file back through the mounted
+  volume, so that macOS's own decompressor decodes it. A hand-built file macOS cannot
+  read is a layout the script got wrong, and the script fails. The listing records what
+  macOS read. Each volume also holds two files that carry an attribute but are not
+  flagged compressed, one with an empty data fork and one with other bytes in it, which
+  macOS reads as their data forks. The self-test reads both volumes: all 23 files of the
+  APFS one and all 11 of the HFS+ one that are not LZBITMAP read as macOS read them, the
+  2 not flagged on each are recorded, and the 2 LZBITMAP files of each are refused by
+  name. 1.73 reads 4 of the APFS volume's 25 files.
+- *LZVN and LZFSE streams from Apple's encoder.* `tools/make_decmpfs_streams.py` writes
+  streams made by libcompression, each decoded back by libcompression, covering raw,
+  LZVN and LZFSE blocks, a stream of two LZFSE blocks, and one block rewritten with the
+  v1 header the reference decoder reads and no encoder here writes. The self-test
+  decodes each, and edits of them must each be refused.
+- *A macOS 11 acquisition.* On `dleapp_macos_bigsur`, 317,238 of 469,676 regular files
+  are compressed: 256,850 with method 8 (21,079,714,167 bytes once decoded), 60,386 with
+  method 9 and 2 with method 5. 1.73 and earlier refuse all of them. 1.74 reads every
+  method 8 and method 9 file to exactly its recorded size, and each matches a second decoding that
+  reads the same block tables and decodes every block with Apple's libcompression. The
+  307,248 of them on the system volume that also appear in `magnet2021_macos_bigsur`, a
+  logical collection of the same macOS build (20D74), have the same SHA-256 there; 398
+  are not in that collection. Every block table held exactly the blocks its file's size
+  needs, and the 813 files with a stored block hold it as one marker byte and exactly
+  the block's bytes. The two method 5 files are refused by name.
+- *The reference decoder.* 6,000 LZVN and LZFSE streams from libcompression, nine in ten
+  of them damaged at random, were decoded by both the reference C decoder (built from
+  the commit above) and this one. Where the reference failed (3,858), this one refused
+  too. Where both returned bytes (2,050), the bytes were the same. Where the reference
+  returned bytes and this one refused (92: 91 LZFSE, 1 LZVN), the reason was one of the
+  checks above, most often a block whose matches use more literals than it decoded
+  (74). The self-test's edit of that kind is decoded by the reference to 20,000 bytes
+  that are not the original. Nothing else was raised.
+
+Each rule above was broken on purpose, one at a time, and the self-test went red for each
+of 13 of them. The other two: a block whose matches use more literals than it decoded is
+also caught by the block's byte count, so the self-test goes red only with both checks
+removed; and the APFS walker's refusal of a compression attribute kept in a stream of
+its own above 3,802 bytes, before it is read, repeats the size check above and has no
+fixture.
+
+**What is and is not exercised on real files.** The corpus images hold only methods 5, 8
+and 9. On a Mac running macOS 27, the files of its application folders compressed with
+method 3 (5,160), 4 (937), 7 (2), 8 (3,775) and 9 (53) all decode to what macOS reads
+through the file system. Methods 1, 10, 11 and 12 were found on neither, so they are
+checked only by the files built by hand and read back by macOS, and LZFSE also by
+libcompression's own streams. `evidencelocker_macos14` holds no file with the attribute
+among its 190,755. `magnet2021_macos_bigsur` and `mvs2026_macbookpro_macos15` are zip
+collections of files, which qnxprobe does not walk.
+
+**LZBITMAP.** Methods 13 and 14 are refused by name because Apple has not published the
+format, and a format is not decoded here from a guess. macOS 27 writes it: a
+partial walk of one macOS 27 system volume found 423 method 14 files beside 102,734
+method 8 ones and 985 method 9 ones. Such a file is listed with its size and left out
+of an extraction with the reason logged.
 
 ## NTFS
 
@@ -3760,7 +3895,9 @@ above are in this README only for now.)
   (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
   encrypted AFF, is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
-  (since 1.45) AD1 logical evidence is refused, since it holds no disk. Other evidence containers
+  (since 1.45) AD1 logical evidence is refused, since it holds no disk. Since 1.74 a folder
+  that is neither a sparse bundle nor an AFD is refused naming it, as any image that will
+  not open is; before, the run ended in a traceback. Other evidence containers
   are not decoded; such a file is read as plain raw bytes, so export the raw image
   from the imaging tool first. A segment set is joined only when it is whole from its first
   segment (see "Split images" above). A lone first segment is read as the file it is,
@@ -3803,6 +3940,12 @@ above are in this README only for now.)
   re-encrypted is named and not read (see "LUKS" above). A detached LUKS2 header is not
   read: the data it describes carries no header to find. A LUKS container inside a
   logical volume read through a map is not opened, and its note says so.
+- **LZBITMAP is recognised but not read.** A Mac file compressed with decmpfs method
+  13 or 14 (LZBITMAP) is listed with its recorded size and refused by name, because
+  Apple has not published the format. macOS 27 writes it: a partial walk of one macOS 27
+  system volume found 423 such files beside 102,734 LZVN ones. Method 5 and any method
+  number not in the table under
+  [Compressed files (decmpfs)](#compressed-files-decmpfs) are refused the same way.
 - **Overlay compression with LZX is recognised but not read.** A file compressed with
   `compact /exe:lzx` is listed with its recorded size and refused by name; the three
   XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
