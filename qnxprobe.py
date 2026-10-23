@@ -7364,13 +7364,24 @@ def _hfs_fork(buf, off):
     return size, extents
 
 
-def _hfs_name(buf, off):
-    """An HFSUniStr255: a length in UTF-16 units, then that many big-endian units."""
+def _hfs_name(buf, off, posix=False):
+    """An HFSUniStr255: a length in UTF-16 units, then that many big-endian units.
+
+    With ``posix``, a catalog name as macOS's POSIX layer shows it: a file created
+    there as "a:b.txt" is stored in the catalog as "a/b.txt" (newfs_hfs and macOS
+    27, measured), and macOS swaps the two characters back, so it is one name,
+    not a folder "a" holding "b.txt"."""
     n = struct.unpack_from(">H", buf, off)[0]
     if n > 255:
         return "", off + 2
     end = off + 2 + n * 2
-    return buf[off + 2:end].decode("utf-16-be", "replace"), end
+    name = buf[off + 2:end].decode("utf-16-be", "replace")
+    if posix:
+        name = name.translate(_HFS_POSIX_SWAP)
+    return name, end
+
+
+_HFS_POSIX_SWAP = str.maketrans({"/": ":", ":": "/"})
 
 
 class _HfsTree:
@@ -7560,7 +7571,7 @@ class HfsPlusWalker:
             kind = struct.unpack_from(">H", data, 0)[0]
             if kind not in (HFSP_FOLDER, HFSP_FILE):
                 continue                        # thread records are not children
-            name, _ = _hfs_name(key, 4)
+            name, _ = _hfs_name(key, 4, posix=True)
             if not name:
                 continue
             child = struct.unpack_from(">I", data, 8)[0]
@@ -7586,7 +7597,7 @@ class HfsPlusWalker:
             if len(data) >= 2 and struct.unpack_from(">H", data, 0)[0] in (
                     HFSP_FOLDER_THREAD, HFSP_FILE_THREAD):
                 owner = struct.unpack_from(">I", data, 4)[0]
-                name, _ = _hfs_name(data, 8)
+                name, _ = _hfs_name(data, 8, posix=True)
                 for child_name, child, rec in self._children(owner):
                     if child_name == name and child == cnid:
                         return rec
@@ -34593,6 +34604,11 @@ def self_test():
         # A name is a count of UTF-16 units and then that many, big endian.
         name_bytes = struct.pack(">H", 3) + "abc".encode("utf-16-be")
         name_ok = _hfs_name(name_bytes, 0) == ("abc", 8)
+        # A catalog name holding '/' is a POSIX name holding ':' ("a:b.txt" made at
+        # the POSIX layer is stored as "a/b.txt"), and the other way round.
+        slash = struct.pack(">H", 7) + "a/b:c.d".encode("utf-16-be")
+        name_ok = name_ok and _hfs_name(slash, 0, posix=True) == ("a:b/c.d", 16) \
+            and _hfs_name(slash, 0) == ("a/b:c.d", 16)
 
         # One B-tree node: a descriptor, two records, and the offset array at the
         # very end that says where they are, counted backwards.
@@ -34731,7 +34747,8 @@ def self_test():
                 ("a volume header with an impossible block size is refused",
                  hfs_refused),
                 ("a fork record yields its size and only its used extents", fork_ok),
-                ("a catalog name decodes from UTF-16 big endian", name_ok),
+                ("a catalog name decodes from UTF-16 big endian, with "
+                 "'/' and ':' swapped as macOS shows it", name_ok),
                 ("a B-tree node's records are found through its offset array",
                  node_ok),
                 ("the allocation file reads back as the runs of free space it "
