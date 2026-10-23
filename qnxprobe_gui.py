@@ -281,6 +281,7 @@ def run_window(initial_paths):
     opts.pack(fill="x", padx=8)
     v_list = tk.BooleanVar(value=False)
     v_triage = tk.BooleanVar(value=False)
+    v_unequal = tk.BooleanVar(value=False)
     v_depth = tk.StringVar(value="2")
     v_max = tk.StringVar(value="400")
     v_scan = tk.StringVar(value="256")
@@ -296,6 +297,10 @@ def run_window(initial_paths):
     ttk.Checkbutton(opts, text="--triage", variable=v_triage).grid(row=0, column=5, sticky="w", padx=(12, 0))
     ttk.Label(opts, text="--scan-limit MiB").grid(row=0, column=6, sticky="e", padx=(12, 0))
     ttk.Entry(opts, textvariable=v_scan, width=6).grid(row=0, column=7, sticky="w")
+    # off by default: a split set whose segments are not one size is refused unless
+    # the examiner says it is whole as it is (since 1.75)
+    ttk.Checkbutton(opts, text="--allow-unequal-segments",
+                    variable=v_unequal).grid(row=0, column=8, sticky="w", padx=(12, 0))
 
     ttk.Label(opts, text="--only").grid(row=1, column=0, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_only, width=24).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
@@ -422,6 +427,8 @@ def run_window(initial_paths):
         except ValueError:
             messagebox.showerror("qnxprobe", "depth, list-max and scan-limit must be whole numbers.")
             return None
+        if v_unequal.get():
+            args += ["--allow-unequal-segments"]
         if v_triage.get():
             args.append("--triage")
         if v_only.get().strip():
