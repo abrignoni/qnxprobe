@@ -497,6 +497,18 @@ class SplitImageError(Exception):
     same stem numbered with a different width."""
 
 
+class SplitSegmentSizeError(SplitImageError):
+    """A numbered segment set whose segments are not one size (split_segments),
+    refused unless the caller allows it. Its own class, so a program that offers no
+    --allow-unequal-segments can say what to do instead: ``segments`` are the paths
+    in order, ``sizes`` their byte counts and ``odd`` the indexes of those that do
+    not fit."""
+
+    def __init__(self, message, segments=(), sizes=(), odd=()):
+        super().__init__(message)
+        self.segments, self.sizes, self.odd = list(segments), list(sizes), list(odd)
+
+
 def split_segments(path, allow_unequal=False):
     """The segment files of the split raw image that path belongs to, in order.
 
@@ -571,13 +583,13 @@ def split_segments(path, allow_unequal=False):
         if odd:
             shown = ", ".join(f"{os.path.basename(run[i])} is {sizes[i]:,} bytes"
                               for i in odd[:3])
-            raise SplitImageError(
+            raise SplitSegmentSizeError(
                 f"{name} is one segment of a split image whose segments are not one "
                 f"size: {os.path.basename(run[0])} is {sizes[0]:,} bytes and {shown}"
                 f"{', ...' if len(odd) > 3 else ''}. Not joined: a segment cut short "
                 f"or padded reads every byte after it at the wrong offset. Compare the "
                 f"segments with the acquisition's own record; if the set is whole as "
-                f"it is, read it with --allow-unequal-segments.")
+                f"it is, read it with --allow-unequal-segments.", run, sizes, odd)
     return run
 
 
@@ -33489,9 +33501,15 @@ def self_test():
         try:
             split_segments(cut_mid[2])
             cut_mid_msg = ""
-        except SplitImageError as exc:
+        except SplitSegmentSizeError as exc:
             cut_mid_msg = str(exc)
-        cut_mid_allowed = split_segments(cut_mid[2], allow_unequal=True) == cut_mid
+        try:
+            split_segments(cut_mid[0])
+            cut_mid_odd = []
+        except SplitSegmentSizeError as exc:
+            cut_mid_odd = [os.path.basename(exc.segments[i]) for i in exc.odd]
+        cut_mid_allowed = (split_segments(cut_mid[2], allow_unequal=True) == cut_mid
+                           and cut_mid_odd == ["qnx4_cutmid.img.002"])
         for sp in even + cut_mid:
             os.remove(sp)
 
