@@ -1019,6 +1019,10 @@ in the attribute or in the resource fork behind a block table. A `--list` names 
 anything, because that is content the file's own size does not account for. HFSX, the
 case-sensitive variant, is read the same way and reported as itself.
 
+Names are given as macOS shows them. The catalog stores a `:` in a name as `/` (a file
+made as `a:b.txt` is stored as `a/b.txt`), and since 1.75 the two are swapped back;
+before, such a name read as a folder `a` holding `b.txt`, which is not on the volume.
+
 What it does not do: a file compressed with LZBITMAP is listed with its recorded size
 and refuses to be read, naming the method. See
 [Compressed files (decmpfs)](#compressed-files-decmpfs).
@@ -3278,7 +3282,14 @@ A set is joined only when it is whole from its first segment. A hole in the numb
 (`.001` and `.003` with no `.002`), a set whose lowest segment is not `.000` or `.001`,
 and segments numbered at two different widths are each refused by name, with exit
 status 1, because a set joined around a hole reads every volume past it at the wrong
-offset and answers wrong rather than empty. A set that simply ends early cannot be
+offset and answers wrong rather than empty. Since 1.75 so is a set whose segments
+before the last are not one size, or whose last segment is larger than the first: a
+segment cut short or padded moves every byte after it the same way, and a cut that
+falls where no volume reaches draws no other warning. A tool that splits at a fixed
+segment size writes no such set. For a set
+known to be whole as it is, `--allow-unequal-segments` (or `allow_unequal=True` to
+`split_segments`, `allow_unequal_segments=True` to `open_image` and `main`) joins it
+anyway. A set that simply ends early cannot be
 told from a small disk by its numbering; that case is caught the other way, by the
 partition table reaching past the joined size, which draws the
 `IMAGE IS SHORTER THAN ITS PARTITION TABLE` warning described under "What it does not
