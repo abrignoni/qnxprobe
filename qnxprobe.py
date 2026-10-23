@@ -33481,6 +33481,7 @@ def self_test():
                           and read_at(si, len(whole) - 10, 100) == whole[-10:]
                           and read_at(si, len(whole) + 5, 10) == b"")
         whole_set = split_segments(seg[1], allow_unequal=True) == seg
+        step = -(-len(whole) // 3)
         # Segments of unequal size (these are, so every join above is proven at an
         # unaligned boundary) are refused unless the caller says the set is whole:
         # one cut short reads every byte after it at the wrong offset. Segments of
@@ -33491,7 +33492,6 @@ def self_test():
         except SplitImageError as exc:
             unequal_msg = str(exc)
         even = [os.path.join(d, f"qnx4_even.img.{i + 1:03d}") for i in range(3)]
-        step = -(-len(whole) // 3)
         for i, sp in enumerate(even):
             open(sp, "wb").write(whole[i * step:(i + 1) * step])
         even_joined = split_segments(even[0]) == even
@@ -33527,9 +33527,15 @@ def self_test():
         w_body, w_files, w_man, _ = run_extract(wp, "split_whole")
         s1_body, s1_files, s1_man, s1_rep = run_extract(seg[0], "split_first")
         s2_body, s2_files, s2_man, s2_rep = run_extract(seg[1], "split_second")
-        os.remove(wp)                        # the three segments stay as the fixture
+        os.remove(wp)
         names = [os.path.basename(p) for p in seg]
         sizes = [bounds[i + 1] - bounds[i] for i in range(3)]
+        # The three segments stay as the fixture the build's discovery check opens
+        # (since 1.75 as segments of one size, the shape a split acquisition has, so
+        # they join without --allow-unequal-segments)
+        for i, sp in enumerate(seg):
+            open(sp, "wb").write(whole[i * step:(i + 1) * step])
+        fixture_joins = split_segments(seg[0]) == seg
 
         def refusal(path):
             try:
@@ -33580,8 +33586,9 @@ def self_test():
                  "is said to be whole",
                  "not one size" in unequal_msg and names[0] in unequal_msg
                  and "--allow-unequal-segments" in unequal_msg),
-                ("a set of one segment size with a shorter last segment joins",
-                 even_joined),
+                ("a set of one segment size with a shorter last segment joins, and "
+                 "the split set left as a fixture is one",
+                 even_joined and fixture_joins),
                 ("a middle segment cut short by 16 KiB is refused naming it, and "
                  "joins only when allowed",
                  "qnx4_cutmid.img.002" in cut_mid_msg and cut_mid_allowed)):
