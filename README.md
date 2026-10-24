@@ -412,6 +412,46 @@ and differ on 4 entries of 313,652 on one acquisition where the volume's own
 index and records disagree, and on 3 on another. `NtfsWalker.listing` says which
 and what is known about why. `collect()` is unchanged.
 
+### Per-file times on ext, APFS and HFS+
+
+Since 1.76, `times(node)` on the ext2/3/4, APFS and HFS+ walkers gives a file's or
+folder's times in the shape the Btrfs walker already used: a dict of `modified`,
+`accessed`, `changed` and `created`, each `(seconds, nanoseconds)` since 1970-01-01
+UTC or `None` where the volume holds no value, and `None` for a node with no inode or
+record. `entry()` is unchanged.
+
+| | modified | accessed | changed | created | also |
+| --- | --- | --- | --- | --- | --- |
+| ext | `i_mtime` | `i_atime` | `i_ctime` | `i_crtime`, only when `i_extra_isize` covers it | |
+| APFS | `mod_time` | `access_time` | `change_time` | `create_time` | |
+| HFS+ | `contentModDate` | `accessDate` | `attributeModDate` | `createDate` | `backup`: `backupDate` |
+
+- ext is read the way the kernel reads it (`fs/ext4/ext4.h` and `fs/ext4/inode.c` at
+  v7.3, c03c1a14507dfaf8b856c2608f9ac216021fc222): signed 32-bit seconds, plus the
+  nanoseconds and the two epoch bits of each `*_extra` field when it fits in
+  128 + `i_extra_isize` bytes. A stored 0 is 1970-01-01, as the kernel reads it. An
+  inode whose `i_extra_isize` the kernel rejects gives `None`, and an
+  `EXT4_EA_INODE_FL` inode gives `None` for the three fields it reuses. debugfs
+  (e2fsprogs 1.47.4) reads the base unsigned, so it shows a different date than the
+  kernel for a time before 1970 and for one the kernel writes between 2038 and 2106.
+- APFS is `j_inode_val_t` (Apple File System Reference, 2020-06-22, pages 74-75),
+  nanoseconds since 1970 UTC, as stored, 0 included.
+- HFS+ is the catalog folder and file record (TN1150), seconds since 1904 GMT; the
+  volume header's createDate, the one local-time date, is not read. TN1150 says the
+  Mac OS X BSD APIs return `attributeModDate` as `st_ctime`. A hard link gives its
+  indirect node's dates. A stored 0 is `None`, because Apple's driver writes 0 for an
+  unset time (`to_hfs_time` in `core/MacOSStubs.c`, hfs-715.120.4), and a record
+  flagged `kHFSCatExpandedTimesMask` stores Unix seconds instead, as `to_bsd_time`
+  reads them. A date before 1970 is given as TN1150 counts it; macOS itself shows it
+  as 1970-01-01.
+
+The self-test checks these against known data no qnxprobe code produced:
+`ext-times.json` (debugfs's stored fields decoded by the kernel's rule,
+`tools/make_ext_times_fixture.sh`) and `mac-times.json` (macOS's own `getattrlist`
+reading of APFS and HFS+ images it wrote, `tools/make_times_fixtures.sh`). The
+expanded-times flag is checked on a copy of one record with the bit set by hand,
+since macOS wrote none.
+
 ## FAT32 and exFAT: a cluster chain shorter than the size
 
 A FAT32 or exFAT directory entry records a file's size, and the allocation table records
