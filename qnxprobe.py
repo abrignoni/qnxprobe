@@ -1348,6 +1348,10 @@ EXT_F = dict(inodes_count=0, blocks_count=4, free_blocks=12, first_data_block=20
 EXT_INCOMPAT_EXTENTS  = 0x0040   # ext4.h
 EXT_COMPAT_HAS_JOURNAL = 0x0004  # ext4.h
 EXT_VALID_FS = 0x0001            # ext4.h
+EXT_GOOD_OLD_INODE_SIZE = 128    # ext4.h EXT4_GOOD_OLD_INODE_SIZE
+EXT4_EPOCH_BITS = 2              # ext4.h; the low bits of an i_*time_extra field
+EXT4_EPOCH_MASK = (1 << EXT4_EPOCH_BITS) - 1
+EXT4_EA_INODE_FL = 0x200000      # ext4.h; the inode holds an extended attribute value
 
 
 def _e(sb, k, n=4):
@@ -7361,6 +7365,10 @@ HFSP_FOLDER, HFSP_FILE, HFSP_FOLDER_THREAD, HFSP_FILE_THREAD = 1, 2, 3, 4
 
 # HFS+ counts seconds from 1904-01-01; this is the gap to the Unix epoch.
 HFSP_EPOCH_DELTA = 2082844800
+# A catalog file or folder record's flags bit saying its dates are Unix seconds
+# rather than seconds since 1904 (kHFSCatExpandedTimesMask, core/hfs_format.h in
+# Apple's hfs-715.120.4, 124b970fd5390f1c2cd6f985478616a04f6eeb1f).
+HFSP_CAT_EXPANDED_TIMES = 0x1000
 
 # A hard link is a file whose Finder type and creator say so; the number of the
 # indirect node it points at is in the BSD info's special field.
@@ -30891,6 +30899,89 @@ def _ntfs_deleted_check(image_gz, listing):
     return matched, len(want), missing, different
 
 
+def _times_fixture_checks(fixtures):
+    """[(label, passed)] for times() of the ext, APFS and HFS+ walkers against
+    known data no qnxprobe code produced: ext-times.json (debugfs's stored
+    fields, decoded by the kernel's rule; tools/make_ext_times_fixture.sh) and
+    mac-times.json (macOS's own getattrlist reading of images it wrote;
+    tools/make_times_fixtures.sh). Every name each file lists is compared,
+    None included, so a time read from the wrong field, a value invented where
+    the volume holds none, or a hard link answered from its own record fails."""
+    import gzip, io, json
+    out = []
+
+    def node_of(w, path):
+        node = w.root
+        for part in path.strip("/").split("/"):
+            node = dict(w.listdir(node)).get(part)
+            if node is None:
+                return None
+        return node
+
+    for listing, stems in (("ext-times.json", ("ext4-times", "ext2-times128")),
+                           ("mac-times.json", ("apfs-times", "hfsplus-times"))):
+        with open(os.path.join(fixtures, listing), encoding="utf-8") as fh:
+            known = json.load(fh)
+        for stem in stems:
+            with gzip.open(os.path.join(fixtures, stem + ".img.gz"), "rb") as gz:
+                img = io.BytesIO(gz.read())
+            size = img.getbuffer().nbytes
+            kind = (identify_fs(img, 0, size) or (None,))[0]
+            w = walker_for(kind, img, 0, size) if kind else None
+            wrong, rows = [], known[stem]
+            for path, row in sorted(rows.items()):
+                if kind == "apfs":
+                    path = "QNXTIMES/" + path
+                node = node_of(w, path) if w is not None else None
+                want = row["expected"]
+                if want is not None:
+                    want = {k: tuple(v) if v is not None else None for k, v in want.items()}
+                got = None
+                if node is not None:
+                    try:
+                        got = w.times(node)
+                    except Exception as exc:         # pylint: disable=broad-except
+                        wrong.append(f"{path}: times() raised {type(exc).__name__}: {exc}")
+                        continue
+                    if got is not None and want is not None:
+                        got = {k: got.get(k) for k in want}
+                if node is None or got != want:
+                    wrong.append(f"{path}: {got} where {want}")
+            out.append((f"{stem}: times() of {len(rows)} files and folders match the known "
+                        f"data in {listing}" + (f"; {'; '.join(wrong)}" if wrong else ""),
+                        not wrong))
+            if kind == "hfs+" and w is not None:
+                try:
+                    out.append(_hfs_expanded_times_check(img, w, node_of(w, "plain.txt")))
+                except Exception as exc:             # pylint: disable=broad-except
+                    out.append(("an HFS+ record flagged for expanded times reads its dates as "
+                                f"Unix seconds ({type(exc).__name__}: {exc})", False))
+    return out
+
+
+def _hfs_expanded_times_check(img, w, cnid):
+    """A record flagged kHFSCatExpandedTimesMask holds Unix seconds (Apple's
+    to_bsd_time returns them unconverted). macOS writes no such record here, so
+    the bit is set in a copy of one the fixture holds: the same five stored
+    words must then read 2082844800 seconds later, and a stored 0 as 1970."""
+    import io
+    rec = w._record(cnid)
+    buf = bytearray(img.getvalue())
+    at = buf.find(rec)
+    ok = at >= 0 and buf.find(rec, at + 1) < 0
+    label = "an HFS+ record flagged for expanded times reads its dates as Unix seconds"
+    if not ok:
+        return (label + " (the record was not found once in the image)", False)
+    struct.pack_into(">H", buf, at + 2, struct.unpack_from(">H", rec, 2)[0]
+                     | HFSP_CAT_EXPANDED_TIMES)
+    struct.pack_into(">I", buf, at + 28, 0)                 # backupDate 0
+    plain = w.times(cnid)
+    got = HfsPlusWalker(io.BytesIO(bytes(buf)), 0).times(cnid)
+    want = {k: (v[0] + HFSP_EPOCH_DELTA, 0) for k, v in plain.items() if k != "backup"}
+    want["backup"] = (0, 0)
+    return (label + ("" if got == want else f"; {got} where {want}"), got == want)
+
+
 def _ext_fixture_check(image_gz, listing):
     """Walk a committed ext fixture and compare every file against the hashes
     sha256sum recorded over the tree the image was built from.
@@ -34876,6 +34967,25 @@ def self_test():
         else:
             print("  [SKIP] the HFS+ fixture is not beside this script, so the "
                   "walk was not compared against it")
+
+        # ---- ext, APFS and HFS+ times() -------------------------------
+        # Known data from debugfs (ext) and from macOS's own reading of the
+        # images it wrote (APFS, HFS+), never from this reader.
+        times_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+        if all(os.path.isfile(os.path.join(times_dir, n)) for n in (
+                "ext-times.json", "mac-times.json", "ext4-times.img.gz",
+                "ext2-times128.img.gz", "apfs-times.img.gz", "hfsplus-times.img.gz")):
+            try:
+                times_checks = _times_fixture_checks(times_dir)
+            except Exception as exc:                 # pylint: disable=broad-except
+                times_checks = [(f"the times() checks ran ({type(exc).__name__}: {exc})", False)]
+            for label, cond in times_checks:
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+        else:
+            print("  [SKIP] the times fixtures are not beside this script, so times() "
+                  "was not compared against them")
 
         # ---- NTFS ----------------------------------------------------
         # A boot sector built by hand, so identification is tested against bytes

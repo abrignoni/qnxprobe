@@ -1,0 +1,698 @@
+{
+ "apfs-times": {
+  "d": {
+   "expected": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944658340
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944658340
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "backup": [
+     1660944388,
+     0
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "hard_a.txt": {
+   "expected": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944701715
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944701715
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "hard_b.txt": {
+   "expected": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944701715
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944701715
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "plain.txt": {
+   "expected": {
+    "accessed": [
+     1593835521,
+     111111111
+    ],
+    "changed": [
+     1792853230,
+     944626006
+    ],
+    "created": [
+     1593835520,
+     444444444
+    ],
+    "modified": [
+     1593835523,
+     333333333
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1593835521,
+     111111111
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944626006
+    ],
+    "created": [
+     1593835520,
+     444444444
+    ],
+    "modified": [
+     1593835523,
+     333333333
+    ]
+   },
+   "set": {
+    "accessed": [
+     1593835521,
+     111111111
+    ],
+    "backup": [
+     1593835524,
+     555555555
+    ],
+    "created": [
+     1593835520,
+     444444444
+    ],
+    "modified": [
+     1593835523,
+     333333333
+    ]
+   },
+   "why": {}
+  },
+  "zero.txt": {
+   "expected": {
+    "accessed": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944739840
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     0,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853230,
+     944739840
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     0,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "why": {}
+  }
+ },
+ "comment": [
+  "Known data for qnxprobe's ApfsWalker.times() and HfsPlusWalker.times(), written by",
+  "tools/make_times_fixtures.sh. set is what setattrlist(2) was given; macos is what",
+  "getattrlist(2) read back from the image attached read only; expected is the macos",
+  "reading as [seconds, nanoseconds] since 1970-01-01 UTC, except where why says it",
+  "is the value written (see the script). The change time is the kernel's own."
+ ],
+ "hfsplus-times": {
+  "d": {
+   "expected": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "backup": [
+     1660944388,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "backup": [
+     1660944388,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "backup": [
+     1660944388,
+     0
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "hard_a.txt": {
+   "expected": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "hard_b.txt": {
+   "expected": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1610612737,
+     0
+    ],
+    "backup": [
+     1610612740,
+     0
+    ],
+    "created": [
+     1610612736,
+     0
+    ],
+    "modified": [
+     1610612739,
+     0
+    ]
+   },
+   "why": {}
+  },
+  "plain.txt": {
+   "expected": {
+    "accessed": [
+     1593835521,
+     0
+    ],
+    "backup": [
+     1593835524,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1593835520,
+     0
+    ],
+    "modified": [
+     1593835523,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1593835521,
+     0
+    ],
+    "backup": [
+     1593835524,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1593835520,
+     0
+    ],
+    "modified": [
+     1593835523,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     1593835521,
+     111111111
+    ],
+    "backup": [
+     1593835524,
+     555555555
+    ],
+    "created": [
+     1593835520,
+     444444444
+    ],
+    "modified": [
+     1593835523,
+     333333333
+    ]
+   },
+   "why": {}
+  },
+  "pre1970.txt": {
+   "expected": {
+    "accessed": [
+     1792853233,
+     0
+    ],
+    "backup": null,
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     -172800,
+     0
+    ],
+    "modified": [
+     -86400,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     1792853233,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     0,
+     0
+    ],
+    "modified": [
+     0,
+     0
+    ]
+   },
+   "set": {
+    "created": [
+     -172800,
+     0
+    ],
+    "modified": [
+     -86400,
+     0
+    ]
+   },
+   "why": {
+    "backup": "never set, stored as 0",
+    "created": "before 1970; macOS reads it back as 0",
+    "modified": "before 1970; macOS reads it back as 0"
+   }
+  },
+  "zero.txt": {
+   "expected": {
+    "accessed": null,
+    "backup": null,
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "macos": {
+    "accessed": [
+     0,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "changed": [
+     1792853233,
+     0
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "set": {
+    "accessed": [
+     0,
+     0
+    ],
+    "backup": [
+     0,
+     0
+    ],
+    "created": [
+     1627389952,
+     0
+    ],
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "why": {
+    "accessed": "stored as 0, uninitialized",
+    "backup": "stored as 0, uninitialized"
+   }
+  }
+ }
+}

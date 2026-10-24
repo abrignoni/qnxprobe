@@ -1,0 +1,421 @@
+{
+ "comment": [
+  "Known data for qnxprobe's ExtWalker.times(), written by tools/make_ext_times_fixture.sh.",
+  "raw is what debugfs stat reports for each field (base, extra or null) and the inode's",
+  "extra size; debugfs is its own date text. expected is raw decoded by the kernel's rule",
+  "(fs/ext4/ext4.h at v7.3, c03c1a14507dfaf8b856c2608f9ac216021fc222), as [seconds,",
+  "nanoseconds] since 1970-01-01 UTC, null where the kernel reads no value, or null for",
+  "the whole inode where __ext4_iget rejects its i_extra_isize."
+ ],
+ "ext2-times128": {
+  "/a.txt": {
+   "debugfs": {
+    "atime": "Thu Mar  2 01:46:41 2023",
+    "ctime": "Thu Mar  2 01:46:42 2023",
+    "mtime": "Thu Mar  2 01:46:43 2023"
+   },
+   "expected": {
+    "accessed": [
+     1677721601,
+     0
+    ],
+    "changed": [
+     1677721602,
+     0
+    ],
+    "created": null,
+    "modified": [
+     1677721603,
+     0
+    ]
+   },
+   "raw": {
+    "atime": [
+     1677721601,
+     null
+    ],
+    "ctime": [
+     1677721602,
+     null
+    ],
+    "extra_isize": 0,
+    "flags": 0,
+    "inode_size": 128,
+    "mtime": [
+     1677721603,
+     null
+    ]
+   }
+  },
+  "/b.txt": {
+   "debugfs": {
+    "atime": "Sat Oct 24 14:45:50 2026",
+    "ctime": "Sat Oct 24 14:45:50 2026",
+    "mtime": "Sat Oct 24 14:45:50 2026"
+   },
+   "expected": {
+    "accessed": [
+     1792853150,
+     0
+    ],
+    "changed": [
+     1792853150,
+     0
+    ],
+    "created": null,
+    "modified": [
+     1792853150,
+     0
+    ]
+   },
+   "raw": {
+    "atime": [
+     1792853150,
+     null
+    ],
+    "ctime": [
+     1792853150,
+     null
+    ],
+    "extra_isize": 0,
+    "flags": 0,
+    "inode_size": 128,
+    "mtime": [
+     1792853150,
+     null
+    ]
+   }
+  }
+ },
+ "ext4-times": {
+  "/badisize.txt": {
+   "debugfs": {
+    "atime": "Sat Oct 24 14:45:50 2026",
+    "ctime": "Sat Oct 24 14:45:50 2026",
+    "mtime": "Sat Oct 24 14:45:50 2026"
+   },
+   "expected": null,
+   "raw": {
+    "atime": [
+     1792853150,
+     null
+    ],
+    "ctime": [
+     1792853150,
+     null
+    ],
+    "extra_isize": 6,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     1792853150,
+     null
+    ]
+   }
+  },
+  "/d": {
+   "debugfs": {
+    "atime": "Fri Aug 19 21:26:25 2022",
+    "crtime": "Fri Aug 19 21:26:24 2022",
+    "ctime": "Fri Aug 19 21:26:26 2022",
+    "mtime": "Fri Aug 19 21:26:27 2022"
+   },
+   "expected": {
+    "accessed": [
+     1660944385,
+     0
+    ],
+    "changed": [
+     1660944386,
+     0
+    ],
+    "created": [
+     1660944384,
+     0
+    ],
+    "modified": [
+     1660944387,
+     0
+    ]
+   },
+   "raw": {
+    "atime": [
+     1660944385,
+     0
+    ],
+    "crtime": [
+     1660944384,
+     0
+    ],
+    "ctime": [
+     1660944386,
+     0
+    ],
+    "extra_isize": 32,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     1660944387,
+     0
+    ]
+   }
+  },
+  "/eainode.txt": {
+   "debugfs": {
+    "atime": "Sat Oct 24 14:45:50 2026",
+    "crtime": "Sun Feb  6 17:06:08 2022",
+    "ctime": "Sat Oct 24 14:45:50 2026",
+    "mtime": "Sat Oct 24 14:45:50 2026"
+   },
+   "expected": {
+    "accessed": null,
+    "changed": null,
+    "created": [
+     1644167168,
+     1
+    ],
+    "modified": null
+   },
+   "raw": {
+    "atime": [
+     1792853150,
+     0
+    ],
+    "crtime": [
+     1644167168,
+     4
+    ],
+    "ctime": [
+     1792853150,
+     0
+    ],
+    "extra_isize": 32,
+    "flags": 2621440,
+    "inode_size": 256,
+    "mtime": [
+     1792853150,
+     0
+    ]
+   }
+  },
+  "/nocrtime.txt": {
+   "debugfs": {
+    "atime": "Thu Jan 14 08:25:37 2021",
+    "ctime": "Thu Jan 14 08:25:38 2021",
+    "mtime": "Thu Jan 14 08:25:39 2021"
+   },
+   "expected": {
+    "accessed": [
+     1610612737,
+     10
+    ],
+    "changed": [
+     1610612738,
+     20
+    ],
+    "created": null,
+    "modified": [
+     1610612739,
+     30
+    ]
+   },
+   "raw": {
+    "atime": [
+     1610612737,
+     40
+    ],
+    "ctime": [
+     1610612738,
+     80
+    ],
+    "extra_isize": 16,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     1610612739,
+     120
+    ]
+   }
+  },
+  "/noextra.txt": {
+   "debugfs": {
+    "atime": "Tue Jul 27 12:45:53 2021",
+    "ctime": "Tue Jul 27 12:45:54 2021",
+    "mtime": "Tue Jul 27 12:45:55 2021"
+   },
+   "expected": {
+    "accessed": [
+     1627389953,
+     0
+    ],
+    "changed": [
+     1627389954,
+     0
+    ],
+    "created": null,
+    "modified": [
+     1627389955,
+     0
+    ]
+   },
+   "raw": {
+    "atime": [
+     1627389953,
+     null
+    ],
+    "ctime": [
+     1627389954,
+     null
+    ],
+    "extra_isize": 0,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     1627389955,
+     null
+    ]
+   }
+  },
+  "/plain.txt": {
+   "debugfs": {
+    "atime": "Sat Jul  4 04:05:21 2020",
+    "crtime": "Sat Jul  4 04:05:20 2020",
+    "ctime": "Sat Jul  4 04:05:22 2020",
+    "mtime": "Sat Jul  4 04:05:23 2020"
+   },
+   "expected": {
+    "accessed": [
+     1593835521,
+     111106759
+    ],
+    "changed": [
+     1593835522,
+     222213518
+    ],
+    "created": [
+     1593835520,
+     444427036
+    ],
+    "modified": [
+     1593835523,
+     333320277
+    ]
+   },
+   "raw": {
+    "atime": [
+     1593835521,
+     444427036
+    ],
+    "crtime": [
+     1593835520,
+     1777708144
+    ],
+    "ctime": [
+     1593835522,
+     888854072
+    ],
+    "extra_isize": 32,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     1593835523,
+     1333281108
+    ]
+   }
+  },
+  "/pre1970.txt": {
+   "debugfs": {
+    "atime": "Tue Jan 19 03:14:08 2038",
+    "crtime": "Wed May 30 01:53:03 2514",
+    "ctime": "Thu Jan  1 00:00:00 1970",
+    "mtime": "Mon Aug  5 09:04:00 2097"
+   },
+   "expected": {
+    "accessed": [
+     -2147483648,
+     0
+    ],
+    "changed": [
+     0,
+     0
+    ],
+    "created": [
+     12884901887,
+     0
+    ],
+    "modified": [
+     -268435456,
+     0
+    ]
+   },
+   "raw": {
+    "atime": [
+     2147483648,
+     0
+    ],
+    "crtime": [
+     4294967295,
+     3
+    ],
+    "ctime": [
+     0,
+     0
+    ],
+    "extra_isize": 32,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     4026531840,
+     0
+    ]
+   }
+  },
+  "/y2040.txt": {
+   "debugfs": {
+    "atime": "Sat Aug 11 03:52:32 2114",
+    "crtime": "Tue Jan 19 03:14:07 2038",
+    "ctime": "Sun Oct  6 13:34:56 2318",
+    "mtime": "Sat Sep 30 22:43:12 2175"
+   },
+   "expected": {
+    "accessed": [
+     4563402752,
+     0
+    ],
+    "changed": [
+     6710886400,
+     0
+    ],
+    "created": [
+     2147483647,
+     0
+    ],
+    "modified": [
+     2197815296,
+     5
+    ]
+   },
+   "raw": {
+    "atime": [
+     268435456,
+     1
+    ],
+    "crtime": [
+     2147483647,
+     0
+    ],
+    "ctime": [
+     2415919104,
+     2
+    ],
+    "extra_isize": 32,
+    "flags": 524288,
+    "inode_size": 256,
+    "mtime": [
+     2197815296,
+     21
+    ]
+   }
+  }
+ }
+}
