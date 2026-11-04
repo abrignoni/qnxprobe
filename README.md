@@ -476,6 +476,14 @@ only.
 Also since 1.59, an empty exFAT file reads as no bytes. Until then `ExfatWalker.read_file()`
 returned one cluster of the volume's own bytes for a file of size zero.
 
+Since 1.77, `read_file(node, size)` on the FAT32, FAT16, FAT12 and exFAT walkers returns
+the first `min(size, file size)` bytes and reads only the clusters that hold them, for a
+FAT chain and an exFAT single run alike. Until then those walkers ignored `size` and read
+the whole file into one buffer, so a caller asking for the head of a large file got all of
+it. A size of zero reads nothing. Asked for the first 3 MiB of a 200 MiB file on a FAT32
+and an exFAT volume macOS wrote, 1.76 read the whole 200 MiB and 1.77 read about 3 MiB of
+the image. A request for the recorded size or more returns what it did before.
+
 ## FAT16, FAT12 and transaction-safe FAT (TFAT)
 
 Since 1.62. A FAT16 volume is read through `Fat16Walker` and a FAT12 volume through
