@@ -116,8 +116,8 @@ python3 qnxprobe_gui.py mmcblk0.img     # open it with an image already added
 ```
 
 It needs `qnxprobe_theme.py` beside it (colours and the header). The logo comes
-from `assets/`; without that folder the window opens with no logo. It starts in the
-system's light or dark mode, and the switch in its header changes it for that session.
+from `assets/`; without that folder the window opens with no logo. It starts in the system's light or dark mode where it can read it (macOS, Windows, and
+GNOME's setting on Linux), otherwise light, and the switch in its header changes it for that session.
 
 Add one or more images, set the same options the command line takes, and press
 **Run report** or **Extract to zip**. Both run `qnxprobe.py` as a subprocess and
