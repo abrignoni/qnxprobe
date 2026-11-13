@@ -76,8 +76,9 @@ servers and storage appliances: version 4 and version 5 (with CRCs), every direc
 format and both forms of extent map. See [XFS](#xfs).
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
-it never writes to the image. A second, optional file, `qnxprobe_gui.py`, puts a
-window over it (see [The window](#the-window)); it is standard library too.
+it never writes to the image. An optional window, `qnxprobe_gui.py` with
+`qnxprobe_theme.py` beside it, goes over it (see [The window](#the-window)); it is
+standard library too.
 
 ## Requirements
 
@@ -113,6 +114,10 @@ on most Linux distributions.
 python3 qnxprobe_gui.py                 # open the window
 python3 qnxprobe_gui.py mmcblk0.img     # open it with an image already added
 ```
+
+It needs `qnxprobe_theme.py` beside it (colours and the header). The logo comes
+from `assets/`; without that folder the window opens with no logo. It starts in the
+system's light or dark mode, and the switch in its header changes it for that session.
 
 Add one or more images, set the same options the command line takes, and press
 **Run report** or **Extract to zip**. Both run `qnxprobe.py` as a subprocess and
