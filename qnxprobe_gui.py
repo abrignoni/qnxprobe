@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """qnxprobe GUI: a tkinter window over qnxprobe.py.
 
-Standard library only, like the tool it drives, so it installs nothing. The
-window has two halves:
+Standard library only, like the tool it drives, so it installs nothing. Its
+colours, header and logo come from qnxprobe_theme.py and assets/ beside it (the
+logo is left out when assets/ is missing). The window has two halves:
 
   Report / Extract   runs qnxprobe.py as a subprocess with the same options the
                      command line takes, streams the report into the window as
@@ -25,6 +26,8 @@ The image is never written to. Both halves open it "rb".
                                                which the Contents pane and the
                                                LEAPP tools read images through,
                                                names the same volumes the report does
+    python3 qnxprobe_gui.py --selfcheck        no visible window: build it, print
+                                               whether the logo and icon loaded, exit
     python3 qnxprobe_gui.py --cli ...          run qnxprobe's own command line;
                                                this is how the window starts
                                                the tool, and it is what makes a
@@ -42,6 +45,7 @@ import runpy
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import qnxprobe as q                                   # noqa: E402
+import qnxprobe_theme                                  # noqa: E402
 
 
 
@@ -108,14 +112,25 @@ def check_discovery(paths):
 # The window
 # ---------------------------------------------------------------------------
 
-def run_window(initial_paths):
+def run_window(initial_paths, selfcheck=False):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, simpledialog
 
     root = tk.Tk()
     root.title(f"qnxprobe {q.QNXPROBE_VERSION}")
-    root.geometry("1100x760")
-    root.minsize(820, 560)
+    root.geometry("1120x800")
+    root.minsize(840, 600)
+    if selfcheck:
+        root.attributes("-alpha", 0.0)
+    theme = qnxprobe_theme.Theme(root)
+    theme.apply(qnxprobe_theme.system_dark())
+    assets = qnxprobe_theme.assets_dir(HERE)
+    icon = qnxprobe_theme.window_icon(root, assets, "qnxprobe")
+    head, _right = theme.header(root, "qnxprobe", f"{q.QNXPROBE_VERSION}   reads the image, never writes it",
+                                logo_folder=assets, on_mode=theme.apply)
+    head.pack(fill="x")
+    page = ttk.Frame(root, padding=(18, 14, 18, 16))
+    page.pack(fill="both", expand=True)
 
     # passwords: an encrypted image's password, by path, once it has opened the
     # image; kept in memory for this window only, never written anywhere
@@ -240,13 +255,14 @@ def run_window(initial_paths):
         return True
 
     # ---- top: images ------------------------------------------------------
-    top = ttk.Frame(root, padding=8)
-    top.pack(fill="x")
-    ttk.Label(top, text="Images").grid(row=0, column=0, sticky="nw")
-    images = tk.Listbox(top, height=4, selectmode="extended", exportselection=False)
-    images.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+    top_card, top = theme.card(page)
+    top_card.pack(fill="x")
+    ttk.Label(top, text="Images", style="Card.TLabel").grid(row=0, column=0, sticky="nw", pady=(2, 0))
+    images = tk.Listbox(top, height=4, selectmode="extended", exportselection=False, borderwidth=0,
+                        highlightthickness=1, activestyle="none")
+    images.grid(row=0, column=1, sticky="ew", padx=(10, 10))
     top.columnconfigure(1, weight=1)
-    btns = ttk.Frame(top)
+    btns = ttk.Frame(top, style="Header.TFrame")
     btns.grid(row=0, column=2, sticky="n")
 
     def add_images():
@@ -277,8 +293,10 @@ def run_window(initial_paths):
     ttk.Button(btns, text="Remove", command=remove_images).pack(fill="x", pady=(4, 0))
 
     # ---- options ----------------------------------------------------------
-    opts = ttk.LabelFrame(root, text="Options (same as the command line)", padding=8)
-    opts.pack(fill="x", padx=8)
+    opts_card, opts_box = theme.card(page, "Options", "the same as the command line")
+    opts_card.pack(fill="x", pady=(12, 0))
+    opts = ttk.Frame(opts_box, style="Header.TFrame")
+    opts.pack(fill="x")
     v_list = tk.BooleanVar(value=False)
     v_triage = tk.BooleanVar(value=False)
     v_unequal = tk.BooleanVar(value=False)
@@ -289,25 +307,25 @@ def run_window(initial_paths):
     v_exclude = tk.StringVar(value="")
     v_zip = tk.StringVar(value="")
 
-    ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
-    ttk.Label(opts, text="--depth").grid(row=0, column=1, sticky="e")
+    ttk.Checkbutton(opts, style="Card.TCheckbutton", text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
+    ttk.Label(opts, style="Card.TLabel", text="--depth").grid(row=0, column=1, sticky="e")
     ttk.Entry(opts, textvariable=v_depth, width=5).grid(row=0, column=2, sticky="w")
-    ttk.Label(opts, text="--list-max").grid(row=0, column=3, sticky="e")
+    ttk.Label(opts, style="Card.TLabel", text="--list-max").grid(row=0, column=3, sticky="e")
     ttk.Entry(opts, textvariable=v_max, width=7).grid(row=0, column=4, sticky="w")
-    ttk.Checkbutton(opts, text="--triage", variable=v_triage).grid(row=0, column=5, sticky="w", padx=(12, 0))
-    ttk.Label(opts, text="--scan-limit MiB").grid(row=0, column=6, sticky="e", padx=(12, 0))
+    ttk.Checkbutton(opts, style="Card.TCheckbutton", text="--triage", variable=v_triage).grid(row=0, column=5, sticky="w", padx=(12, 0))
+    ttk.Label(opts, style="Card.TLabel", text="--scan-limit MiB").grid(row=0, column=6, sticky="e", padx=(12, 0))
     ttk.Entry(opts, textvariable=v_scan, width=6).grid(row=0, column=7, sticky="w")
     # off by default: a split set whose segments are not one size is refused unless
     # the examiner says it is whole as it is (since 1.75)
-    ttk.Checkbutton(opts, text="--allow-unequal-segments",
+    ttk.Checkbutton(opts, style="Card.TCheckbutton", text="--allow-unequal-segments",
                     variable=v_unequal).grid(row=0, column=8, sticky="w", padx=(12, 0))
 
-    ttk.Label(opts, text="--only").grid(row=1, column=0, sticky="e", pady=(6, 0))
+    ttk.Label(opts, style="Card.TLabel", text="--only").grid(row=1, column=0, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_only, width=24).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
-    ttk.Label(opts, text="--exclude (comma separated)").grid(row=1, column=3, columnspan=2, sticky="e", pady=(6, 0))
+    ttk.Label(opts, style="Card.TLabel", text="--exclude (comma separated)").grid(row=1, column=3, columnspan=2, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_exclude, width=36).grid(row=1, column=5, columnspan=3, sticky="ew", pady=(6, 0))
 
-    ttk.Label(opts, text="--extract OUT.zip").grid(row=2, column=0, sticky="e", pady=(6, 0))
+    ttk.Label(opts, style="Card.TLabel", text="--extract OUT.zip").grid(row=2, column=0, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_zip).grid(row=2, column=1, columnspan=6, sticky="ew", pady=(6, 0))
 
     def pick_zip():
@@ -321,27 +339,27 @@ def run_window(initial_paths):
         opts.columnconfigure(c, weight=1)
 
     # ---- actions ----------------------------------------------------------
-    act = ttk.Frame(root, padding=(8, 6))
-    act.pack(fill="x")
-    b_report = ttk.Button(act, text="Run report")
+    act = ttk.Frame(page)
+    act.pack(fill="x", pady=(14, 10))
+    b_report = ttk.Button(act, text="Run report", style="Primary.TButton")
     b_extract = ttk.Button(act, text="Extract to zip")
     b_cancel = ttk.Button(act, text="Cancel", state="disabled")
     b_report.pack(side="left")
-    b_extract.pack(side="left", padx=(6, 0))
-    b_cancel.pack(side="left", padx=(6, 0))
+    b_extract.pack(side="left", padx=(8, 0))
+    b_cancel.pack(side="left", padx=(8, 0))
     progress = ttk.Progressbar(act, mode="determinate", length=260)
     progress.pack(side="right")
-    status = ttk.Label(act, text="ready", anchor="e")
-    status.pack(side="right", padx=(0, 10), fill="x", expand=True)
+    status = ttk.Label(act, text="ready", anchor="e", style="Muted.TLabel")
+    status.pack(side="right", padx=(0, 12), fill="x", expand=True)
 
     # ---- notebook ---------------------------------------------------------
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    nb = ttk.Notebook(page)
+    nb.pack(fill="both", expand=True)
 
     rep = ttk.Frame(nb)
     nb.add(rep, text="Report")
     mono = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10) if sys.platform == "win32" else ("DejaVu Sans Mono", 10)
-    text = tk.Text(rep, wrap="none", font=mono)
+    text = tk.Text(rep, wrap="none", font=mono, padx=10, pady=8)
     ys = ttk.Scrollbar(rep, orient="vertical", command=text.yview)
     xs = ttk.Scrollbar(rep, orient="horizontal", command=text.xview)
     text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set, state="disabled")
@@ -353,12 +371,12 @@ def run_window(initial_paths):
 
     con = ttk.Frame(nb)
     nb.add(con, text="Contents")
-    cbar = ttk.Frame(con, padding=(0, 6))
+    cbar = ttk.Frame(con, padding=(0, 8))
     cbar.pack(fill="x")
     ttk.Label(cbar, text="Image").pack(side="left")
     combo = ttk.Combobox(cbar, state="readonly", width=60)
     combo.pack(side="left", padx=6, fill="x", expand=True)
-    b_load = ttk.Button(cbar, text="Load contents")
+    b_load = ttk.Button(cbar, text="Load contents", style="Primary.TButton")
     b_load.pack(side="left")
     b_save = ttk.Button(cbar, text="Save selected file...", state="disabled")
     b_save.pack(side="left", padx=(6, 0))
@@ -710,6 +728,15 @@ def run_window(initial_paths):
         if os.path.exists(p):
             images.insert("end", os.path.abspath(p))
     refresh_image_combo()
+    theme.apply(theme.dark)   # colours the classic widgets made after the first apply
+    if selfcheck:
+        # for a packaged build: the window was built, with its logo and icon, then closes
+        def report():
+            print(json.dumps({"window": True, "logo": theme.logo is not None, "icon": icon,
+                              "tk": str(tk.TkVersion), "frozen": bool(getattr(sys, "frozen", False))}))
+            sys.stdout.flush()
+            on_close()
+        root.after(500, report)
     root.mainloop()
 
 
@@ -725,4 +752,7 @@ if __name__ == "__main__":
             sys.exit("usage: qnxprobe_gui.py --check-discovery IMAGE [IMAGE ...]"
                      + (f"\nnot found: {', '.join(missing)}" if missing else ""))
         sys.exit(check_discovery(paths))
+    if argv and argv[0] == "--selfcheck":
+        run_window([], selfcheck=True)
+        sys.exit(0)
     run_window(argv)
