@@ -1165,12 +1165,12 @@ def parse_sb(buf, endian):
     # Sync G4 dps_os partition: ctime 308, atime 2024-04-04, everything else
     # consistent and the volume size an exact match for its GPT entry.
     # Requiring BOTH timestamps rejected a real filesystem, so require one.
-    # Some volumes were formatted and mounted with no clock at all, so both
-    # are a few hundred seconds past the epoch (measured on a GM vehicle
-    # image: two volumes, one of them in use, rejected only for this, with
-    # their checksums intact, and reported in VLEAPP issue 448). The checksum
-    # the kernel itself checks is the stronger test, so when it holds and the
-    # clock is the only thing wrong, the copy is accepted and says why.
+    # Some volumes were formatted and mounted with no clock at all, so neither
+    # value falls between T_MIN and T_MAX (measured on a GM vehicle image: two
+    # volumes, one of them in use, refused only for this with their checksums
+    # intact; VLEAPP issue 448 reports the same on a VW/Audi image). The
+    # checksum the kernel itself checks is the stronger test, so when it holds
+    # and the clock is the only thing wrong, the copy is accepted and says why.
     clock = None
     if ts(sb["ctime"]) is None and ts(sb["atime"]) is None:
         clock = (f"neither ctime ({sb['ctime']}) nor atime ({sb['atime']}) "
@@ -1190,13 +1190,30 @@ def parse_sb(buf, endian):
     return sb, bad
 
 
-def _inside_logical(off, regions):
-    """True when byte offset off lies inside a logical volume of an extended
-    partition. regions are (label, base, size); the EBR walk names those
-    "logical @N". A candidate superblock an extended container finds there is
-    that logical volume's own, which the logical volume reports."""
-    return any(label.startswith("logical @") and base <= off < base + size
-               for label, base, size in regions)
+def _logical_slots(fh, regions):
+    """The offsets of superblocks that belong to a logical volume of an
+    extended partition, as a set. regions are (label, base, size); the EBR walk
+    names those "logical @N". A superblock belongs to a logical volume when the
+    logical volume has a first superblock of its own (at +0x2000, or +0 as the
+    kernel retries) that passes check(), and this copy, at one of the offsets
+    the logical volume probes (sb_slots), carries the same volume id. An
+    extended container that meets such a copy has met its logical volume's
+    filesystem, which the logical volume reports, so the container leaves it
+    alone. A logical volume read out of boot code that only looks like an EBR
+    has no first superblock of its own, so a qnx6 that really is in a 0x05
+    entry keeps every copy it has."""
+    out = set()
+    for label, base, _size in regions:
+        if not label.startswith("logical @"):
+            continue
+        own = check(fh, base + BOOTBLOCK_SIZE) or check(fh, base)
+        if not own or own[2]:
+            continue
+        for off, _rel in sb_slots(fh, base, label, regions):
+            r = check(fh, off)
+            if r and r[1]["volumeid"] == own[1]["volumeid"]:
+                out.add(off)
+    return out
 
 
 def check(fh, off):
@@ -29901,10 +29918,11 @@ def volumes(fh, size=None):
     # are read and say so; any other's are named and not walked.
     disk_raid = raid_foreign_disk(fh, size)
 
+    logical_slots = _logical_slots(fh, regions) if containers else set()
     for label, base, rsize in regions:
         best = None
         for off, _rel in sb_slots(fh, base, label, regions):
-            if label in containers and _inside_logical(off, regions):
+            if label in containers and off in logical_slots:
                 continue
             r = check(fh, off)
             if r and not r[2] and (best is None or r[1]["serial"] > best[1]["serial"]):
@@ -30483,9 +30501,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
 
         # the two offsets the kernel itself probes, per region and whole-image
         print()
+        logical_slots = _logical_slots(fh, sized_regions) if containers else set()
         for label, base in [("image start", 0)] + regions:
             for off, rel in sb_slots(fh, base, label, sized_regions):
-                if label in containers and _inside_logical(off, sized_regions):
+                if label in containers and off in logical_slots:
                     continue                    # the logical volume's own superblock
                 r = check(fh, off)
                 if r:
@@ -36133,7 +36152,7 @@ def self_test():
         # land on the logical's superblock, which is the logical's to report.
         q6_ext_problems = []
 
-        def _mbr_disk(vol, with_ebr=True, boot_55aa=False):
+        def _mbr_disk(vol, with_ebr=True, boot_55aa=False, wipe_tail=False):
             vol = vol + bytes(-len(vol) % 512)
             nsec = len(vol) // 512
             cstart, lrel = 2048, 2048
@@ -36152,6 +36171,9 @@ def self_test():
                     vol = bytearray(vol)
                     vol[446:462] = bytes([0, 0, 0, 0, 0x83, 0, 0, 0]) + struct.pack("<II", 8, 16)
                     vol[510:512] = b"\x55\xaa"
+                    if wipe_tail:                       # only the first superblock left
+                        _second = struct.unpack_from("<I", vol, 12)[0] * 512   # b_sblk1
+                        vol[_second:_second + 0x1000] = bytes(0x1000)
                     vol = bytes(vol)
                 img[cstart * 512:cstart * 512 + len(vol)] = vol
             return bytes(img)
@@ -36176,14 +36198,18 @@ def self_test():
             os.remove(_p)
         # a 0x05 entry with no EBR chain that holds a qnx6 itself is still read,
         # and so is one whose qnx6 boot block ends in 0x55AA and parses as an
-        # EBR naming a logical volume that does not cover its superblocks
-        for _boot in (False, True):
-            _img = _mbr_disk(_qnx6_test_volume(4096)[0], with_ebr=False, boot_55aa=_boot)
+        # EBR naming a logical volume 8 sectors in, with and without its second
+        # superblock (without it, only the first copy, at container + 0x2000,
+        # inside that bogus logical, says it is qnx6)
+        for _boot, _wipe in ((False, False), (True, False), (True, True)):
+            _img = _mbr_disk(_qnx6_test_volume(4096)[0], with_ebr=False, boot_55aa=_boot,
+                             wipe_tail=_wipe)
             _q = [v for v in volumes(io.BytesIO(_img), len(_img))
                   if v["kind"] == "qnx6" and v["label"] == "MBR part 1"]
             if len(_q) != 1:
                 q6_ext_problems.append(f"a qnx6 in a 0x05 entry with no EBR chain"
-                                       f"{' and a 0x55AA boot block' if _boot else ''} is lost")
+                                       f"{' and a 0x55AA boot block' if _boot else ''}"
+                                       f"{' and no second superblock' if _wipe else ''} is lost")
 
         # --unallocated, on that volume. The map is written out here as the
         # text it must be: block 7 is 16,384 + 7 * 512 bytes into the image.

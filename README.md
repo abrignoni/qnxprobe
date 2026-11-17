@@ -588,9 +588,9 @@ walker reads little-endian qnx6 only, as before.
 
 ## QNX6 superblocks with no clock, and extended containers
 
-Since 1.80. A qnx6 superblock whose ctime and atime are both a few hundred seconds past
-1970, because the volume was formatted and mounted before any clock was set, is accepted
-when its checksum holds. Until then it was refused, and a volume whose every superblock looks
+Since 1.80. A qnx6 superblock whose ctime and atime both fall outside 1995 to 2050, as on a
+volume formatted and mounted before any clock was set, is accepted when its checksum
+holds. Until then it was refused, and a volume whose every superblock looks
 like that was reported as not recognised. The checksum is the one the Linux driver checks,
 `crc32_be` over bytes 8 to 512 compared with `sb_checksum` (fs/qnx6/inode.c), read in the
 superblock's own byte order. The report says why such a copy was taken, under the generation
@@ -600,8 +600,8 @@ as it did before.
 
 Measured on the two vehicle images at hand that hold qnx6 volumes (a Ford Sync G4 and a GM
 unit), the checksum holds on all 26 superblock copies qnxprobe probes. On the GM image two
-volumes that 1.79 reported as not recognised now list: one freshly formatted, and one in
-use with 64 entries. Seven copies in all are taken on their checksum, three of them older
+volumes that 1.79 reported as not recognised now list: one at serial 1 with 2 inodes used
+and one entry, and one in use with 64 entries. Seven copies in all are taken on their checksum, three of them older
 generations of volumes 1.79 already listed.
 
 Also since 1.80, an MBR extended container is no longer listed as a qnx6 volume of its own.
@@ -610,8 +610,11 @@ superblock slots land on that logical volume's superblock, and the container was
 qnx6 and walked empty (reported in
 [VLEAPP issue 448](https://github.com/abrignoni/VLEAPP/issues/448), and seen on the GM
 image). A superblock a container finds inside one of its logical volumes is now left to
-that logical volume. A container is still probed everywhere else, so a 0x05 entry with no
-EBR chain that holds a qnx6 is still read. The walker still reads little-endian qnx6 only;
+that logical volume, when the logical volume has a first superblock of its own with the
+same volume id. Everything else the container probes is still its own, so a 0x05 entry
+with no EBR chain that holds a qnx6 is still read, and so is one whose boot code parses as
+an EBR naming a logical volume that has no superblock of its own (both shown by the
+self-test only). The walker still reads little-endian qnx6 only;
 a big-endian superblock with no clock is accepted the same way, in the self-test only.
 
 ## QNX6 free space
