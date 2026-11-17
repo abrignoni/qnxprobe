@@ -551,6 +551,39 @@ same bytes for every live file and every recoverable deleted one.
 FAT12 has been read on that one macOS-written fixture only. No FAT12 volume from a device
 has been run through it.
 
+## QNX6 block sizes above 4096
+
+Since 1.79. A qnx6 volume with 8, 16 or 32 KiB blocks lists its files. Until then the
+walker took the start of the data area from the Linux driver's formula, which is right up
+to 4096 and one block short above it, so every pointer named the block before the one meant
+and the volume listed nothing, with no error. 1.79 takes it from QNX's own
+`sys/fs_qnx6.h` (`QNX6FS_DATA_START`): 0x3000 up to 4096, 0x4000 at 8192 and 16384, 0x8000
+at 32768. NFI's qnxmount uses the same value. For block sizes up to 4096 nothing changes.
+
+Also since 1.79, the second superblock location the boot header records (`b_sblk1`) is
+probed too. The header counts in sectors and does not say how big a sector is, so the size
+is the one that puts `b_sblk0` at 0x2000, where the first superblock is. On the seven qnx6
+volumes of two vehicle images at hand, every one carries the header, that size is 512
+bytes on three, 1024 on three and 4096 on one, and `b_sblk1` then names the same second
+superblock the existing candidates find, on all seven. On a volume with blocks above 4096
+the second superblock sits after the data, where no other candidate looks, so 1.78 could
+not see it and could only have walked the older of the two generations. A recorded
+location counts only when a superblock that passes the usual checks is there.
+
+What this rests on: the reporter of
+[VLEAPP issue 448](https://github.com/abrignoni/VLEAPP/issues/448) patched the same value
+into 1.77 and listed 16 data volumes of a VW/Audi MIB2 High eMMC (8, 16 and 32 KiB
+blocks), about 32,000 entries, with no difference from qnxmount 0.1.9. Here, the self-test
+builds volumes at 1024 to 32768 with two generations and checks the tree, the file bytes,
+the free runs and which superblock is walked, and qnxmount reads the same images
+identically. Those synthetic volumes and qnxmount both take the data start from the same
+QNX header, so they show the reader follows it, not that every writer does. No corpus
+volume at hand has blocks above 4096 (seven qnx6 volumes on two vehicle images, at 1024 and
+4096), and on those the listings are the same as 1.78's. `free_extents()` and
+`--unallocated` now return runs on large-block volumes too; the bit order below was
+measured on block sizes up to 4096 only. The walker reads little-endian qnx6 only, as
+before.
+
 ## QNX6 free space
 
 Since 1.58 `Qnx6Walker.free_extents()` reports the space a qnx6 volume says is free, as
