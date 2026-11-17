@@ -586,6 +586,34 @@ on large-block volumes too, checked by the self-test only; `--unallocated` above
 not exercised, and the bit order below was measured on block sizes up to 4096 only. The
 walker reads little-endian qnx6 only, as before.
 
+## QNX6 superblocks with no clock, and extended containers
+
+Since 1.80. A qnx6 superblock whose ctime and atime are both a few hundred seconds past
+1970, because the volume was formatted and mounted before any clock was set, is accepted
+when its checksum holds. Until then it was refused, and a volume whose every superblock looks
+like that was reported as not recognised. The checksum is the one the Linux driver checks,
+`crc32_be` over bytes 8 to 512 compared with `sb_checksum` (fs/qnx6/inode.c), read in the
+superblock's own byte order. The report says why such a copy was taken, under the generation
+it belongs to. Any other inconsistency still refuses the copy, and a checksum that does not
+match is not a new reason to refuse one: a copy with a good clock and a bad checksum reads
+as it did before.
+
+Measured on the two vehicle images at hand that hold qnx6 volumes (a Ford Sync G4 and a GM
+unit), the checksum holds on all 26 superblock copies qnxprobe probes. On the GM image two
+volumes that 1.79 reported as not recognised now list: one freshly formatted, and one in
+use with 64 entries. Seven copies in all are taken on their checksum, three of them older
+generations of volumes 1.79 already listed.
+
+Also since 1.80, an MBR extended container is no longer listed as a qnx6 volume of its own.
+When its last logical volume ends where the container ends, the container's end-of-volume
+superblock slots land on that logical volume's superblock, and the container was listed as
+qnx6 and walked empty (reported in
+[VLEAPP issue 448](https://github.com/abrignoni/VLEAPP/issues/448), and seen on the GM
+image). A superblock a container finds inside one of its logical volumes is now left to
+that logical volume. A container is still probed everywhere else, so a 0x05 entry with no
+EBR chain that holds a qnx6 is still read. The walker still reads little-endian qnx6 only;
+a big-endian superblock with no clock is accepted the same way, in the self-test only.
+
 ## QNX6 free space
 
 Since 1.58 `Qnx6Walker.free_extents()` reports the space a qnx6 volume says is free, as
