@@ -114,7 +114,7 @@ jobs:
           # (its .002 and .003 sit beside it) and the lone cut segment
           fixtures = sorted(glob.glob("fixtures/*.img") + glob.glob("fixtures/*.bin")
                             + glob.glob("fixtures/*.001"))
-          assert len(fixtures) == 25, fixtures     # lvm-fixture.img since 1.64
+          assert len(fixtures) == 26, fixtures     # lvm-fixture.img since 1.64, qnx6_32k.img since 1.79
 
           r = subprocess.run([cli, "--self-test"], capture_output=True, text=True)
           print(r.stdout[-600:]); assert r.returncode == 0 and "SELF-TEST PASSED" in r.stdout
@@ -138,7 +138,7 @@ jobs:
           r = subprocess.run([gui, "--check-discovery"] + fixtures, capture_output=True, text=True)
           print(r.stdout); assert r.returncode == 0, r.stderr[-2000:]
           lines = [l for l in r.stdout.splitlines() if l.strip()]
-          assert len(lines) == 25 and all(l.startswith("OK") for l in lines), lines
+          assert len(lines) == 26 and all(l.startswith("OK") for l in lines), lines
           print("all executables ran on", os.environ.get("RUNNER_OS"), os.environ.get("RUNNER_ARCH"))
 
       - name: Check the command line executable reads zstd
