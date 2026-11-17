@@ -68,7 +68,8 @@ def qnx6_data_start(blocksize):
     Linux fs/qnx6/inode.c (v6.12, lines 374-375) shifts the boot block and the
     superblock area by the block size separately, which gives the same value
     up to 4096 and one block too little above it, so every pointer then names
-    the block before the one meant. The driver cannot meet such a volume:
+    the block before the one meant. On a kernel with 4 KiB pages the driver
+    cannot meet such a volume:
     block/bdev.c (v6.12, lines 158-159) refuses a block size above the page
     size. NFI's qnxmount uses the QNX value (qnx6/parser.ksy data_start)."""
     area = BOOTBLOCK_SIZE + 0x1000
@@ -149,16 +150,22 @@ def sb_slots(fh, base, label, sized_regions):
     # sectors on three, 1024-byte ones on three and 4096-byte ones on one, and
     # b_sblk1 in that unit is the second superblock the kernel's expression
     # above finds, on all seven. qnxmount tries 512 and 4096 only
-    # (qnx6/interface.py determine_sector_size). A place found this way counts
-    # only if a superblock that passes check() is there. On a volume with
-    # blocks above 4096 it is the one candidate that finds the copy after the
-    # data.
+    # (qnx6/interface.py determine_sector_size). The value comes off the disk,
+    # so a place found this way is only offered when the superblock there is a
+    # copy of this volume's own: the same volume id, block size and block count
+    # as the first superblock. It finds the second copy when the region-size
+    # candidates do not, which the self-test shows for blocks above 4096; that
+    # has not been measured on a real volume with blocks above 4096.
     boot = read_at(fh, base, 16)
-    if len(boot) == 16 and boot[:3] == QNX6_BOOT_JMP:
+    if head and len(boot) == 16 and boot[:3] == QNX6_BOOT_JMP:
         sblk0, sblk1 = struct.unpack_from("<II", boot, 8)
         for unit in (512, 1024, 2048, 4096):
             if sblk0 * unit == BOOTBLOCK_SIZE:
-                rels += [sblk1 * unit, sblk1 * unit + 0xE00]
+                for rel in (sblk1 * unit, sblk1 * unit + 0xE00):
+                    other = check(fh, base + rel)
+                    if other and all(other[1][k] == head[1][k]
+                                     for k in ("volumeid", "blocksize", "num_blocks")):
+                        rels.append(rel)
                 break
 
     seen = set()
@@ -32612,7 +32619,7 @@ _Q6_DATA_START_WANT = {1024: 0x3000, 4096: 0x3000, 8192: 0x4000, 16384: 0x4000,
                        32768: 0x8000}
 
 
-def _qnx6_test_volume(bs, cut=None, unit=512):
+def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False):
     """A small little-endian qnx6 volume at block size ``bs``, for the self-test.
 
     Returns (image bytes, the tree the newer generation holds, the tree the older
@@ -32626,7 +32633,8 @@ def _qnx6_test_volume(bs, cut=None, unit=512):
     older root, serial 11 after the data with a root that also holds big.bin, so a
     reader that walks the wrong copy lists a different tree. big.bin has 20 blocks,
     more than the 16 direct pointers, so one level of indirection; deep.bin is two
-    blocks through two levels. ``cut`` truncates the image to that many bytes."""
+    blocks through two levels. ``cut`` truncates the image to that many bytes;
+    ``foreign`` gives the second superblock another volume id."""
     le, none = "<", 0xFFFFFFFF
     blocks, nxt = {}, [0]
 
@@ -32701,7 +32709,7 @@ def _qnx6_test_volume(bs, cut=None, unit=512):
         sb = bytearray(512)
         struct.pack_into(le + "IIQIIIHH", sb, 0, 0x68191122, 0, serial, 1700000000,
                          1700000000 + serial, 0, 4, 3)
-        sb[32:48] = bytes(range(16))
+        sb[32:48] = bytes(range(16)[::-1]) if foreign and gen == "new" else bytes(range(16))
         struct.pack_into(le + "6I", sb, 48, bs, 16, 10, num_blocks, 9, 0)
         sb[72:152] = rnode(*tables[gen])
         sb[152:232] = rnode(bitmap_bytes, [bitmap_b])
@@ -35917,8 +35925,9 @@ def self_test():
                            and _q6_image(cut=Q6_BASE + Q6_DATA + 11 * Q6_BS + 100)
                            .free_extents() == [])
 
-        # qnx6 at every block size QNX allows from 1024 up, the data area where
-        # QNX6FS_DATA_START puts it (_qnx6_test_volume). Above 4096 the Linux
+        # qnx6 at block sizes 1024, 4096, 8192, 16384 and 32768 (32 KiB is the
+        # largest sys/fs_qnx6.h allows), the data area where QNX6FS_DATA_START
+        # puts it (_qnx6_test_volume). Above 4096 the Linux
         # formula lands a block early, so a walker that follows it lists the
         # wrong tree. Each image carries two generations with different roots,
         # and the newer one sits where only the boot header's b_sblk1 points
@@ -35970,6 +35979,13 @@ def self_test():
             if (_linux == _new) != (_bs <= 4096):
                 q6_size_problems.append(f"{_bs}: the Linux formula's tree "
                                         f"{'differs' if _bs <= 4096 else 'matches'}")
+        # a boot header whose b_sblk1 names another volume's superblock, with a
+        # higher serial, is not followed: the copy has to be this volume's own
+        _img, _new, _old, _runs = _qnx6_test_volume(8192, foreign=True)
+        _vols = [v for v in volumes(io.BytesIO(_img), len(_img)) if v["kind"] == "qnx6"]
+        if not (len(_vols) == 1 and "serial 10," in _vols[0]["detail"]):
+            q6_size_problems.append("8192 with a foreign superblock at b_sblk1: "
+                                    + ", ".join(v["detail"] for v in _vols))
         # the boot header's sectors are 1024 or 4096 bytes on some real volumes
         for _unit in (1024, 4096):
             _img, _new, _old, _runs = _qnx6_test_volume(8192, unit=_unit)
@@ -36180,12 +36196,13 @@ def self_test():
                 ("a qnx6 bitmap that disagrees with its superblock, is too short, is "
                  "not mapped, or is cut off reports nothing rather than nothing free",
                  qnx6_refused_ok),
-                ("qnx6 at block sizes 1024 to 32768: the data area is where QNX's "
-                 "header puts it, the newer superblock is found through the boot "
-                 "header, the tree and file bytes read back, free runs are right, "
-                 "the Linux formula gives the wrong tree above 4096, and a volume cut "
-                 "before its second superblock walks the first"
-                 + "".join(f"; {p}" for p in q6_size_problems[:4]),
+                ("qnx6 at block sizes 1024, 4096, 8192, 16384 and 32768: the data "
+                 "area is where QNX's header puts it, the newer superblock is found "
+                 "through the boot header in 512, 1024 or 4096-byte sectors and a "
+                 "foreign one there is not, the tree and file bytes read back, free "
+                 "runs are right, the Linux formula gives the wrong tree above 4096, "
+                 "and a volume cut before its second superblock walks the first"
+                 + "".join(f"; {p}" for p in q6_size_problems),
                  not q6_size_problems),
                 ("--unallocated writes a volume's free runs in order, with a map back "
                  "to the image and the hash of what it wrote", unalloc_written_ok),

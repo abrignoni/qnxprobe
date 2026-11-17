@@ -565,24 +565,26 @@ probed too. The header counts in sectors and does not say how big a sector is, s
 is the one that puts `b_sblk0` at 0x2000, where the first superblock is. On the seven qnx6
 volumes of two vehicle images at hand, every one carries the header, that size is 512
 bytes on three, 1024 on three and 4096 on one, and `b_sblk1` then names the same second
-superblock the existing candidates find, on all seven. On a volume with blocks above 4096
-the second superblock sits after the data, where no other candidate looks, so 1.78 could
-not see it and could only have walked the older of the two generations. A recorded
-location counts only when a superblock that passes the usual checks is there.
+superblock the existing candidates find, on all seven. The value comes off the disk, so
+the copy it names is used only when its volume id, block size and block count match the
+first superblock's. It finds the second copy when the other candidates do not, which the
+self-test shows for blocks above 4096. That has not been measured on a real volume with
+blocks above 4096.
 
 What this rests on: the reporter of
 [VLEAPP issue 448](https://github.com/abrignoni/VLEAPP/issues/448) patched the same value
-into 1.77 and listed 16 data volumes of a VW/Audi MIB2 High eMMC (8, 16 and 32 KiB
-blocks), about 32,000 entries, with no difference from qnxmount 0.1.9. Here, the self-test
-builds volumes at 1024 to 32768 with two generations and checks the tree, the file bytes,
-the free runs and which superblock is walked, and qnxmount reads the same images
+into 1.77 and, on a VW/Audi MIB2 High eMMC with 18 qnx6 volumes, reports that all 16 data
+volumes then list the same entries as qnxmount 0.1.9, about 32,000 entries, with 0
+differences in path, type, size, mtime and SHA-256. Here, the self-test builds volumes at
+1024, 4096, 8192, 16384 and 32768 with two generations and checks the tree, the file
+bytes, the free runs and which superblock is walked, and qnxmount reads the same images
 identically. Those synthetic volumes and qnxmount both take the data start from the same
 QNX header, so they show the reader follows it, not that every writer does. No corpus
 volume at hand has blocks above 4096 (seven qnx6 volumes on two vehicle images, at 1024 and
-4096), and on those the listings are the same as 1.78's. `free_extents()` and
-`--unallocated` now return runs on large-block volumes too; the bit order below was
-measured on block sizes up to 4096 only. The walker reads little-endian qnx6 only, as
-before.
+4096), and on those the listings are the same as 1.78's. `free_extents()` now returns runs
+on large-block volumes too, checked by the self-test only; `--unallocated` above 4096 is
+not exercised, and the bit order below was measured on block sizes up to 4096 only. The
+walker reads little-endian qnx6 only, as before.
 
 ## QNX6 free space
 
