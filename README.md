@@ -1899,7 +1899,7 @@ the damage cap; directory rows naming the root or a directory named elsewhere; a
 the reader, one per rule, fails at least one of these with forefst's volumes absent.
 
 forefst publishes four sample volumes with its own output for each (GPL-3.0; nothing from
-them is in this repository). Where they are mounted, at `/Volumes/Corpus/Data for
+them is in this repository). Where they are mounted, at `/Volumes/Corpus-Main/Data for
 DLEAPP/Public_Test_Images/forefst-ReFS` or the folder `QNXPROBE_REFS_SAMPLES` names, the
 self-test runs ten more checks on them, comparing each with forefst's inventory entry by
 entry, and skips them otherwise:
