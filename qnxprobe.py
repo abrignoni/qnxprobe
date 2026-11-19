@@ -28927,7 +28927,7 @@ def _refs_fixture_checks():
     return out
 
 
-REFS_FOREFST_SAMPLES = os.path.join("/Volumes", "Corpus", "Data for DLEAPP", "Public_Test_Images",
+REFS_FOREFST_SAMPLES = os.path.join("/Volumes", "Corpus-Main", "Data for DLEAPP", "Public_Test_Images",
                                     "forefst-ReFS")
 # name: (corpus key, cluster bytes, the checksum kind its metadata pages carry)
 REFS_FOREFST_IMAGES = {
