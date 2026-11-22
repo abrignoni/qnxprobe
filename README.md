@@ -3546,8 +3546,9 @@ table says `content not collected`.
 
 The zip holds a folder named for the image and, beside it, `<image>.entries.tsv`, one row
 per entry with its stored path, size, status, the MD5 and SHA-1 it stores, and its times
-as stored. A zip member keeps one time: an AD1 file's is its modified time, and an L01
-file's is left at the zip's earliest date, so read the table for an L01's times. Each file
+as stored. A zip member keeps one time, the file's last written time: an AD1's modified
+record, or the `wr` column of an L01 or Lx01. A zip holds that time to two seconds and
+from 1980 on, so read the table for the exact value and for the other times. Each file
 is checked against the hashes it stores, and `volumes.json` counts the matches, the
 mismatches and the files that store none. A file with a mismatch is still written and is
 named in the run's output. Member names can differ from stored paths in three cases, all
