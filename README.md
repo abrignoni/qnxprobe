@@ -3535,9 +3535,14 @@ holds copies of files, not a disk, so it has no partition table or filesystem fo
 tool to identify, and it is never read as raw bytes.
 
 Since 1.81 `--list` and `--extract` read the files of an L01 or an AD1, including an
-AD-encrypted AD1 opened with its password, through the vendored ewfprobe. In the window,
-that is Run report with `--list contents`, or Extract to zip; the Contents tab does not
-browse them. Lx01 is still refused, because ewfprobe does not read it.
+AD-encrypted AD1 opened with its password, through the vendored ewfprobe. Since 1.83 they
+read an Lx01 too. An encrypted Lx01 is refused, because its encryption is not publicly
+documented. In the window, that is Run report with `--list contents`, or Extract to zip;
+the Contents tab does not browse them.
+
+A folder can record a size and an MD5 without its content being collected. EnCase Imager
+7.10 does this by default. Such a folder is not extracted, and its row in the entries
+table says `content not collected`.
 
 The zip holds a folder named for the image and, beside it, `<image>.entries.tsv`, one row
 per entry with its stored path, size, status, the MD5 and SHA-1 it stores, and its times
@@ -4039,8 +4044,8 @@ above are in this README only for now.)
   (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
   encrypted AFF, is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). Since 1.81 the
-  files of an L01 or AD1 are listed and extracted through it too; Lx01 logical evidence
-  is refused. Since 1.74 a folder
+  files of an L01 or AD1 are listed and extracted through it too, and since 1.83 those of
+  an Lx01. Since 1.74 a folder
   that is neither a sparse bundle nor an AFD is refused naming it, as any image that will
   not open is; before, the run ended in a traceback. Other evidence containers
   are not decoded; such a file is read as plain raw bytes, so export the raw image
