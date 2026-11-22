@@ -3,12 +3,12 @@
     {
       "path": "ewfprobe.py",
       "name": "ewfprobe",
-      "version": "0.16.0",
+      "version": "0.17.0",
       "upstream": "https://github.com/abrignoni/ewfprobe",
       "upstream_file": "ewfprobe.py",
-      "commit": "332db1b1744dab6333744128481a33d9b27f1dbf",
-      "commit_date": "2026-11-22T08:28:39-05:00",
-      "sha256": "0c11e8f80df1613bc1203e45754f7daedc37ccbb52b32c2ac6be53fc5973a0a5",
+      "commit": "a597cfb76ab28c3b218b1497313eb1a876e11c29",
+      "commit_date": "2026-11-22T11:07:32-05:00",
+      "sha256": "69abd3f10264a54e48f3aad8905c201a54910eaeb3d7d4d56a7c449e05593d56",
       "licence": "MIT",
       "licence_file": "LICENSE-ewfprobe",
       "note": "Copied verbatim. Fix upstream and re-vendor; edits here are reverted by the next sync."

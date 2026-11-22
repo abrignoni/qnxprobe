@@ -167,7 +167,7 @@ def run_window(initial_paths, selfcheck=False):
             except q.ImagePasswordError:
                 messagebox.showerror("qnxprobe", f"That key does not open {name}.")
                 continue
-            except q.LogicalEvidence:       # it opened, and holds an L01 or an AD1
+            except q.LogicalEvidence:       # it opened, and holds logical evidence
                 pass
             except Exception as exc:        # pylint: disable=broad-exception-caught
                 messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
@@ -192,7 +192,7 @@ def run_window(initial_paths, selfcheck=False):
             except q.ImagePasswordError as exc:
                 wrong = exc.wrong
                 continue
-            except q.LogicalEvidence:       # it opened, and holds an L01 or an AD1
+            except q.LogicalEvidence:       # it opened, and holds logical evidence
                 pass
             except Exception as exc:        # pylint: disable=broad-exception-caught
                 messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")

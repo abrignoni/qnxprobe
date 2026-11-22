@@ -49,7 +49,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.82"
+QNXPROBE_VERSION = "1.83"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -226,7 +226,7 @@ class ImagePasswordError(ImageUnreadable):
 class LogicalEvidence(ImageUnreadable):
     """The image is logical evidence (``kind`` is "L01", "Lx01" or "AD1"): copies of
     files with no disk under them, so open_image() has no bytes to hand a filesystem
-    reader. main() reads the files of an L01 or an AD1 through ewfprobe instead."""
+    reader. main() reads the files of an L01, Lx01 or AD1 through ewfprobe instead."""
 
     def __init__(self, message, kind):
         super().__init__(message)
@@ -681,7 +681,7 @@ def disk_identity(path):
     first = full
     try:
         kind = acquisition_format(full)
-        if kind in ("EWF", "EWF2", "L01") and ewfprobe is not None:
+        if kind in ("EWF", "EWF2", "L01", "Lx01") and ewfprobe is not None:
             first = (ewfprobe.ewf_segments(full) or [full])[0]
         elif kind in ("AD1", "AD_ENCRYPTED"):
             first = _ad1_first(full) or full
@@ -732,7 +732,7 @@ def same_disk_note(img_path, first):
     except OSError:
         kind = None
     what = {"EWF": "the EWF set", "EWF2": "the EWF set", "AFD": "the AFD",
-            "L01": "the L01 set", "AD1": "the AD1 set",
+            "L01": "the L01 set", "Lx01": "the Lx01 set", "AD1": "the AD1 set",
             None: "the split set"}.get(kind, "the image")
     return f"read as a segment of {what} opened from {first}, not on its own"
 
@@ -932,7 +932,8 @@ def open_image(path, segments=None, password=None, private_key=None,
                 str(exc), isinstance(exc, ewfprobe.EwfWrongPasswordError),
                 getattr(exc, "needs", "password")) from None
         # What an AD-encrypted set decrypts to can be logical evidence as well
-        inner = {"EWF-L01": "L01", "AD1": "AD1"}.get(getattr(image, "format", None))
+        inner = {"EWF-L01": "L01", "EWF2-Lx01": "Lx01",
+                 "AD1": "AD1"}.get(getattr(image, "format", None))
         if inner:
             image.close()
             raise LogicalEvidence(_logical_refusal(name, inner, encrypted=True), inner)
@@ -962,9 +963,7 @@ def _folder_refusal(path):
 def _logical_refusal(name, kind, encrypted=False):
     """Why logical evidence is not read as a disk, and what reads its files."""
     maker = "FTK Imager" if kind == "AD1" else "EnCase"
-    if kind == "Lx01":
-        reader = "qnxprobe and its vendored ewfprobe do not read Lx01"
-    elif ewfprobe is None:
+    if ewfprobe is None:
         reader = "qnxprobe needs ewfprobe.py beside this script, and it is missing"
     else:
         reader = ("run qnxprobe with --list or --extract (in the window, Run report "
@@ -30112,15 +30111,15 @@ def open_image_trying(path, segments=None, passwords=(), private_keys=()):
     raise last
 
 
-# --- logical evidence (L01 and AD1) ----------------------------------------------
+# --- logical evidence (L01, Lx01, AD1) --------------------------------------------
 #
-# An L01 or AD1 holds copies of files and no disk, so nothing here identifies a
+# An L01, Lx01 or AD1 holds copies of files and no disk, so nothing here identifies a
 # partition or a filesystem. ewfprobe reads the entries; these functions list them
 # and write them through extract_to_zip(), with the same SHORT and FAILED handling
 # as a file read from a filesystem.
 
 class _LogicalWalker:
-    """What extract_to_zip() needs from a walker, over an L01 or AD1 opened by
+    """What extract_to_zip() needs from a walker, over an L01, Lx01 or AD1 opened by
     ewfprobe. The node is the entry. Each read is hashed against the MD5 and SHA-1
     the entry stores, and ``results`` keeps, by entry, the bytes read and the check."""
 
@@ -30156,6 +30155,13 @@ class _LogicalWalker:
         self.results[id(entry)] = (got, check)
 
 
+def _folder_without_content(entry):
+    """True for a folder with nothing to extract: one with no size, or one whose size
+    and MD5 were recorded and whose content the acquisition did not collect."""
+    return entry.is_folder and (not entry.size
+                                or not getattr(entry, "content_collected", True))
+
+
 def _logical_members(entries):
     """[(member path, entry)] for every entry that holds content, in tree order.
 
@@ -30179,7 +30185,7 @@ def _logical_members(entries):
             taken.add(joined(names))
     out = []
     for number, entry in enumerate(entries, 1):
-        if entry.is_folder and not entry.size:
+        if _folder_without_content(entry):
             continue
         member = joined(entry.names) or "root-entry"
         if entry.is_folder:
@@ -30222,7 +30228,9 @@ def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs):
             member = by_entry.get(id(entry))
             got, check = walker.results.get(id(entry), (None, ""))
             if member is None:
-                status, arc = "folder", ""
+                status = ("folder" if getattr(entry, "content_collected", True)
+                          else "content not collected")
+                arc = ""
             elif member in excluded:
                 status, arc = "excluded", ""
             elif got is None:
@@ -30245,11 +30253,11 @@ def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs):
 def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, extract=None,
                        only=None, zf=None, do_triage=False, exclude=None, reporter=None,
                        manifest=None, unallocated=None, unallocated_log=None):
-    """Report an open L01 or AD1, and list or extract its files."""
-    kind = "AD1" if image.format == "AD1" else "L01"
+    """Report an open L01, Lx01 or AD1, and list or extract its files."""
+    kind = {"AD1": "AD1", "EWF2-Lx01": "Lx01"}.get(image.format, "L01")
     maker = "FTK Imager" if kind == "AD1" else "EnCase"
     entries = list(image.logical_entries)
-    folders = sum(1 for e in entries if e.is_folder and not e.size)
+    folders = sum(1 for e in entries if _folder_without_content(e))
     members = _logical_members(entries)
     parts = list(getattr(image, "paths", []) or [])
     crypt = getattr(image, "encryption", None)
@@ -30350,8 +30358,10 @@ def _logical_self_check():
     import io as _io
 
     class Entry:
-        def __init__(self, names, data=b"", folder=False, md5=None, size=None, fail=False):
+        def __init__(self, names, data=b"", folder=False, md5=None, size=None, fail=False,
+                     collected=True):
             self.names, self.data, self.is_folder, self.fail = names, data, folder, fail
+            self.content_collected = collected
             self.size = len(data) if size is None else size
             self.md5, self.sha1, self.times = md5, None, {}
 
@@ -30383,6 +30393,7 @@ def _logical_self_check():
         Entry(("short",), b"abc", size=9),
         Entry(("broken",), b"x", fail=True),
         Entry(("skip.me",), b"left out"),
+        Entry(("uncollected",), b"x", folder=True, size=48, md5="1" * 32, collected=False),
     ])
     buffer, manifest = _io.BytesIO(), []
     with zipfile.ZipFile(buffer, "w") as zf, contextlib.redirect_stdout(_io.StringIO()):
@@ -30399,8 +30410,9 @@ def _logical_self_check():
                 and zf.read("case/d.folder-data") == b"folder bytes"
                 and zf.read("case/a%2Fb") == b"slash"
                 and "case/short.SHORT-3-of-9-bytes" in names
-                and not any("broken" in n or "skip" in n for n in names)
-                and by_status == {"complete": 5, "SHORT": 1, "FAILED": 1, "excluded": 1}
+                and not any("broken" in n or "skip" in n or "uncollected" in n for n in names)
+                and by_status == {"complete": 5, "SHORT": 1, "FAILED": 1, "excluded": 1,
+                                  "content not collected": 1}
                 and any(r["stored_path"] == "a/b" for r in table)
                 and (rec["files"], rec["short"], rec["failed"], rec["excluded"],
                      rec["stored_hashes_matched"], rec["stored_hashes_mismatched"])
@@ -30408,7 +30420,7 @@ def _logical_self_check():
 
 
 def _open_logical(path, passwords=(), private_keys=()):
-    """ewfprobe's image of an L01 or AD1, plain or AD-encrypted, with the first of
+    """ewfprobe's image of an L01, Lx01 or AD1, plain or AD-encrypted, with the first of
     the passwords and keys that opens it."""
     last = None
     for password in list(passwords) or [None]:
@@ -30616,9 +30628,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         try:
             image = open_image_trying(path, segments, passwords, private_keys)
         except LogicalEvidence as exc:
-            # An L01 or AD1 has files to give and no disk to probe; an Lx01, or
-            # either without the vendored reader, stays refused.
-            if exc.kind not in ("L01", "AD1") or ewfprobe is None:
+            # An L01, Lx01 or AD1 has files to give and no disk to probe; without
+            # the vendored reader it stays refused.
+            if exc.kind not in ("L01", "Lx01", "AD1") or ewfprobe is None:
                 raise
             with _open_logical(path, passwords, private_keys) as logical:
                 read_logical_image(logical, path, do_list=do_list, list_depth=list_depth,
@@ -34908,7 +34920,7 @@ def self_test():
                  "refused as logical evidence",
                  all("logical evidence (" + k + "), encrypted" in (_inner_refusal(f) or "")
                      for f, k in (("EWF-L01", "L01"), ("AD1", "AD1")))),
-                ("an L01 or AD1 extracts with unique members, says what read short, "
+                ("an L01, Lx01 or AD1 extracts with unique members, says what read short, "
                  "failed or was left out, and checks the hashes it stores",
                  _logical_self_check()),
                 ("a sparse bundle is named by its Info.plist, an encrypted one by its "
@@ -39662,7 +39674,7 @@ if __name__ == "__main__":
     ap.add_argument("--list", action="store_true",
                     help="walk each filesystem found and list its contents "
                          "(qnx6, qnx4, ext2/3/4, Btrfs, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, APFS, XFS, ETFS and EFS), "
-                         "or the files of an L01 or AD1")
+                         "or the files of an L01, Lx01 or AD1")
     ap.add_argument("--depth", type=int, default=2, metavar="N",
                     help="how deep to walk with --list (default: 2)")
     ap.add_argument("--list-max", type=int, default=400, metavar="N",
@@ -39675,7 +39687,7 @@ if __name__ == "__main__":
                          "known to be whole as it is")
     ap.add_argument("--extract", metavar="OUT.zip",
                     help="copy the logical files out of every filesystem found, "
-                         "or out of an L01 or AD1, "
+                         "or out of an L01, Lx01 or AD1, "
                          "into a zip, ready for a LEAPP tool. No mounting, no "
                          "administrator rights, same on macOS, Windows and Linux")
     ap.add_argument("--unallocated", metavar="DIR",
