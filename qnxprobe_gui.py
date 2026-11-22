@@ -167,6 +167,8 @@ def run_window(initial_paths, selfcheck=False):
             except q.ImagePasswordError:
                 messagebox.showerror("qnxprobe", f"That key does not open {name}.")
                 continue
+            except q.LogicalEvidence:       # it opened, and holds an L01 or an AD1
+                pass
             except Exception as exc:        # pylint: disable=broad-exception-caught
                 messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
                 return False
@@ -190,6 +192,8 @@ def run_window(initial_paths, selfcheck=False):
             except q.ImagePasswordError as exc:
                 wrong = exc.wrong
                 continue
+            except q.LogicalEvidence:       # it opened, and holds an L01 or an AD1
+                pass
             except Exception as exc:        # pylint: disable=broad-exception-caught
                 messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
                 return False
@@ -249,6 +253,8 @@ def run_window(initial_paths, selfcheck=False):
                         if lk.unlock([answer]):
                             secrets.append(answer)
                         wrong = lk.vek is None
+        except q.LogicalEvidence:           # no volumes to unlock; the run reads its files
+            return True
         except Exception as exc:            # pylint: disable=broad-exception-caught
             messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
             return False

@@ -2947,7 +2947,8 @@ What the search looks at:
   that to 1.x members and to physical volumes as well. How lvm2 itself chooses between
   duplicate physical volumes was not checked.
 - **Every place a member can begin.** Each file is opened as qnxprobe opens any image
-  (raw, a split raw set, E01 and the other containers the vendored ewfprobe reads), and
+  (raw, a split raw set, E01 and the other disk containers the vendored ewfprobe reads;
+  L01, Lx01 and AD1 hold no disk, so none of them can be a member), and
   the whole image and each partition its MBR, EBR chain or GPT gives are read at the
   places the assembly reads, so a member can be a partition. Acquisition containers are
   opened first, then the first segment of each split raw set, then the rest, each in name
@@ -3530,10 +3531,22 @@ missing a segment or a file is refused rather than read short.
 
 Logical evidence, EnCase's (`.L01`, `.Lx01`) and FTK Imager's (`.ad1`, `.ad2`, ...),
 holds copies of files, not a disk, so it has no partition table or filesystem for this
-tool to read. It is refused with a message saying so, and never read as raw bytes,
-including an AD-encrypted set that turns out, once opened with its password, to hold an
-L01 or an AD1. `ewfprobe.py` lists and exports the files of an L01 or an AD1
-(`python3 ewfprobe.py files evidence.ad1`).
+tool to identify, and it is never read as raw bytes.
+
+Since 1.81 `--list` and `--extract` read the files of an L01 or an AD1, including an
+AD-encrypted AD1 opened with its password, through the vendored ewfprobe. In the window,
+that is Run report with `--list contents`, or Extract to zip; the Contents tab does not
+browse them. Lx01 is still refused, because ewfprobe does not read it.
+
+The zip holds a folder named for the image and, beside it, `<image>.entries.tsv`, one row
+per entry with its stored path, size, status, the MD5 and SHA-1 it stores, and its times
+as stored. A zip member keeps one time: an AD1 file's is its modified time, and an L01
+file's is left at the zip's earliest date, so read the table for an L01's times. Each file
+is checked against the hashes it stores, and `volumes.json` counts the matches, the
+mismatches and the files that store none. A file with a mismatch is still written and is
+named in the run's output. Member names can differ from stored paths in three cases, all
+kept in the table: a repeated path gets `.entry-<n>`, data held by a folder entry gets
+`.folder-data`, and a `/` inside a stored name is written `%2F`.
 
 This is `ewfprobe.py`, vendored from
 [abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
@@ -4024,8 +4037,9 @@ above are in this README only for now.)
   `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`,
   (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
   encrypted AFF, is read
-  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
-  (since 1.45) AD1 logical evidence is refused, since it holds no disk. Since 1.74 a folder
+  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). Since 1.81 the
+  files of an L01 or AD1 are listed and extracted through it too; Lx01 logical evidence
+  is refused. Since 1.74 a folder
   that is neither a sparse bundle nor an AFD is refused naming it, as any image that will
   not open is; before, the run ended in a traceback. Other evidence containers
   are not decoded; such a file is read as plain raw bytes, so export the raw image
