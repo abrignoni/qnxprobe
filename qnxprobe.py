@@ -49,7 +49,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.81"
+QNXPROBE_VERSION = "1.82"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -262,6 +262,9 @@ QCOW_MAGIC = b"QFI\xfb"
 # type; an encrypted one keeps the encrcdsa header in its token file.
 UDIF_TRAILER = b"koly"
 SPARSEIMAGE_SIGNATURE = b"sprs"
+# An Apple Sparse Image (.asif, macOS 26 and later) begins "shdw", as an hdiutil
+# shadow file does. The reader tells them apart by header version.
+ASIF_SIGNATURE = b"shdw"
 DMG_ENCRYPTED_SIGNATURE = b"encrcdsa"
 SPARSEBUNDLE_TYPE = "com.apple.diskimage.sparsebundle"
 # FTK Imager's AD encryption wraps every file of an E01, SMART or raw (dd) set; only
@@ -280,6 +283,7 @@ _ACQUISITION_NAMES = {
     "AFF4": "an AFF4 acquisition (.aff4)",
     "UDIF": "an Apple disk image (.dmg)",
     "SPARSEIMAGE": "an Apple sparse image (.sparseimage)",
+    "ASIF": "an Apple Sparse Image Format image (.asif)",
     "SPARSEBUNDLE": "an Apple sparse bundle (a .sparsebundle folder)",
     "DMG_ENCRYPTED": "an encrypted Apple disk image (.dmg, .sparseimage or .sparsebundle)",
     "AD_ENCRYPTED": "an acquisition FTK Imager encrypted with AD encryption (.E01, .s01, "
@@ -469,7 +473,7 @@ def needs_private_key(path):
 
 def acquisition_format(path):
     """What acquisition container path is: "EWF", "EWF2", "AFF", "AFD", "AFF4",
-    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "AD1", "DMG_ENCRYPTED",
+    "UDIF", "SPARSEIMAGE", "ASIF", "SPARSEBUNDLE", "L01", "Lx01", "AD1", "DMG_ENCRYPTED",
     "AD_ENCRYPTED", or a virtual machine disk, "VHD", "VHDX", "VMDK" or "QCOW", or
     None for anything else, which is read as a raw image. An
     AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
@@ -518,6 +522,8 @@ def acquisition_format(path):
         return "AD_ENCRYPTED"
     if head[:4] == SPARSEIMAGE_SIGNATURE:
         return "SPARSEIMAGE"
+    if head[:4] == ASIF_SIGNATURE:
+        return "ASIF"
     if head[:4] == ZIP_SIGNATURE and _is_aff4(path):
         return "AFF4"
     virtual = _virtual_disk_kind(path)
@@ -979,6 +985,7 @@ _ACQUISITION_LABELS = {
     "AFF4": "an AFF4 acquisition",
     "UDIF": "an Apple disk image",
     "SPARSEIMAGE": "an Apple sparse image",
+    "ASIF": "an Apple Sparse Image Format image",
     "SPARSEBUNDLE": "an Apple sparse bundle",
     "UDRW": "an Apple read-write disk image",
     "AFM": "an AFM acquisition",
@@ -1006,7 +1013,7 @@ def describe_acquisition(image):
         return (f"an Apple sparse bundle of {stored:,} stored band "
                 f"file{'' if stored == 1 else 's'}, read by the reader{locked}")
     label = _ACQUISITION_LABELS.get(fmt, "an acquisition")
-    unit = ("files" if fmt in ("AFF", "AFD", "AFM", "AFF4", "UDIF", "SPARSEIMAGE",
+    unit = ("files" if fmt in ("AFF", "AFD", "AFM", "AFF4", "UDIF", "SPARSEIMAGE", "ASIF",
                                "UDRW", "VHD", "VHDX", "VMDK", "QCOW")
             else "segments")
     # a differencing disk, delta or overlay is read through the disks under it
@@ -22423,7 +22430,8 @@ def _sibling_kind(fh, size, name):
     text = head[3:] if head.startswith(b"\xef\xbb\xbf") else head
     if (head[:8] in (EWF_SIGNATURE, EWF2_SIGNATURE, AFF_SIGNATURE, L01_SIGNATURE, LX01_SIGNATURE,
                      AD1_SIGNATURE[:8], DMG_ENCRYPTED_SIGNATURE, ADCRYPT_SIGNATURE, VHDX_SIGNATURE)
-            or head[:4] in (b"AFF\x00", SPARSEIMAGE_SIGNATURE, ZIP_SIGNATURE, VMDK_SPARSE_MAGIC,
+            or head[:4] in (b"AFF\x00", SPARSEIMAGE_SIGNATURE, ASIF_SIGNATURE, ZIP_SIGNATURE,
+                            VMDK_SPARSE_MAGIC,
                             VMDK_COWD_MAGIC, QCOW_MAGIC)
             or text[:len(VMDK_DESCRIPTOR_START)].lower() == VMDK_DESCRIPTOR_START.lower()
             or VHD_COOKIE in (tail[:8], tail[1:9], head[:8])
@@ -34636,6 +34644,7 @@ def self_test():
             "LX01_SIGNATURE": (LX01_SIGNATURE, b"LEF2\r\n\x81\x00"),
             "UDIF_TRAILER": (UDIF_TRAILER, b"koly"),
             "SPARSEIMAGE_SIGNATURE": (SPARSEIMAGE_SIGNATURE, b"sprs"),
+            "ASIF_SIGNATURE": (ASIF_SIGNATURE, b"shdw"),
             "DMG_ENCRYPTED_SIGNATURE": (DMG_ENCRYPTED_SIGNATURE, b"encrcdsa"),
             "ADCRYPT_SIGNATURE": (ADCRYPT_SIGNATURE, b"ADCRYPT\x00"),
             "AD1_SIGNATURE": (AD1_SIGNATURE, b"ADSEGMENTEDFILE\x00"),
@@ -34676,6 +34685,7 @@ def self_test():
         with open(dmg_fake, "wb") as fh:
             fh.write(b"\x00" * 4096 + TRUE_SIGS["UDIF_TRAILER"][1] + b"\x00" * 508)
         sparse_fake = _fake("fake.sparseimage", TRUE_SIGS["SPARSEIMAGE_SIGNATURE"][1])
+        asif_fake = _fake("fake.asif", TRUE_SIGS["ASIF_SIGNATURE"][1])
         enc_fake = _fake("enc.dmg", TRUE_SIGS["DMG_ENCRYPTED_SIGNATURE"][1])
         ad_first = _fake("ad_fake.0001", TRUE_SIGS["ADCRYPT_SIGNATURE"][1])
         ad_second = _fake("ad_fake.0002", b"\x5a" * 8)
@@ -34858,13 +34868,13 @@ def self_test():
                  saved_reader is None or (_ewf_refused_by_reader(ex01_fake)
                                           and _ewf_refused_by_reader(aff_fake))),
                 ("an Apple disk image is named by its trailer or its header",
-                 [acquisition_format(q) for q in (dmg_fake, sparse_fake, enc_fake)]
-                 == ["UDIF", "SPARSEIMAGE", "DMG_ENCRYPTED"]),
-                ("a .dmg or .sparseimage is never opened as raw bytes",
-                 not any(_opened_as_raw(q) for q in (dmg_fake, sparse_fake))),
+                 [acquisition_format(q) for q in (dmg_fake, sparse_fake, asif_fake, enc_fake)]
+                 == ["UDIF", "SPARSEIMAGE", "ASIF", "DMG_ENCRYPTED"]),
+                ("a .dmg, .sparseimage or .asif is never opened as raw bytes",
+                 not any(_opened_as_raw(q) for q in (dmg_fake, sparse_fake, asif_fake))),
                 ("without the vendored reader a .dmg is refused, saying what is missing",
                  all("ewfprobe" in (_refusal(q, None) or "")
-                     for q in (dmg_fake, sparse_fake))),
+                     for q in (dmg_fake, sparse_fake, asif_fake))),
                 ("without the vendored reader an encrypted image is refused, saying "
                  "what is missing",
                  all("ewfprobe" in (_refusal(q, None) or "") for q in (enc_fake, bundle_enc))),

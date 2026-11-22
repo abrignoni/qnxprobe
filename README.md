@@ -3437,6 +3437,7 @@ by its own first bytes rather than its name:
 | Apple disk image (UDIF), since 1.39 | the `.dmg` |
 | Apple disk image split by `hdiutil segment`, since 1.40 | the `.dmg`, with its `.dmgpart` files beside it |
 | Apple sparse image, since 1.39 | the `.sparseimage` |
+| Apple Sparse Image Format (ASIF, macOS 26 and later), since 1.82 | the `.asif` |
 | Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
 | any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
 | any of the Apple images above sealed to a certificate, since 1.48 | the same, with `--private-key` (the certificate's RSA private key), or its password when it also has one |
@@ -4034,7 +4035,7 @@ above are in this README only for now.)
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
   is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
-  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`,
+  `.dmg` (split into `.dmgpart` files or not), `.sparseimage`, `.asif` or `.sparsebundle`,
   (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
   encrypted AFF, is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). Since 1.81 the
