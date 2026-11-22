@@ -49,7 +49,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.86"
+QNXPROBE_VERSION = "1.87"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -12830,7 +12830,7 @@ def _zip_names_in_use(zf, volume, entries):
     return names
 
 
-def extract_to_zip(zf, w, volume, entries, log, progress=None, short_names=None):
+def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -12849,8 +12849,9 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, short_names=None)
     hands back fewer bytes than the inode says and raises nothing. Such a file
     is counted in short, not in files, and logged, and it is stored under a name
     that says how much of it is here: <path>.SHORT-<got>-of-<size>-bytes, with a
-    number after it when another member already has that name. short_names, when
-    given, is filled with {member name: name it was written under} for these.
+    number after it when another member already has that name. written_names, when
+    given, is filled with {member name: name it was written under} for each file
+    whose write finished, so a file that failed has no entry in it.
 
     Each file is read in full into a spool before anything is written, because
     zipfile cannot remove a member once it is written. A file whose read raises
@@ -12897,11 +12898,14 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, short_names=None)
                         retry += 1
                         info.filename = f"{stem}-{retry}"
                     reserved.add(info.filename)
-                    if short_names is not None:
-                        short_names[arc] = info.filename
+                # zipfile decides on ZIP64 from this size when the member opens, and
+                # refuses a member that then grows past the limit
+                info.file_size = spool.tell()
                 spool.seek(0)
                 with zf.open(info, "w") as dst:
                     shutil.copyfileobj(spool, dst)
+                if written_names is not None:
+                    written_names[arc] = info.filename
             # A walker pads a block the image ends inside with zeros, so the bytes
             # it handed back are not the bytes that were there; the shortfall
             # read_at() tallied while this file was read is.
@@ -30203,13 +30207,23 @@ def _logical_members(entries):
     A member path is unique and never also a folder of another member, which a zip
     could hold and an extracting tool could not write: paths can repeat in an AD1,
     and an L01 entry can be a folder and hold data at once. A "/" inside a stored
-    name is escaped so it does not become a folder. The stored path stays in the
-    entries table beside the zip."""
+    name is escaped so it does not become a folder. An entry stored under a file (an
+    AD1 keeps an NTFS file's extra stream this way) is named file:child, so the file
+    keeps its own name. The stored path stays in the entries table beside the zip."""
     def part(name):
         return name.replace("%", "%25").replace("/", "%2F") if "/" in name else name
 
+    file_only = ({tuple(e.names) for e in entries if not e.is_folder}
+                 - {tuple(e.names) for e in entries if e.is_folder})
+
     def joined(names):
-        return "/".join(part(n) for n in names)
+        names, out = tuple(names), []
+        for depth, name in enumerate(names):
+            if depth and names[:depth] in file_only:
+                out[-1] += f":{part(name)}"
+            else:
+                out.append(part(name))
+        return "/".join(out)
 
     def in_zip(path):
         # two stored names can escape to one (a:b and a%3Ab), so uniqueness is
@@ -30220,7 +30234,8 @@ def _logical_members(entries):
     for entry in entries:
         names = tuple(entry.names)
         for depth in range(1, len(names)):
-            taken.add(in_zip(joined(names[:depth])))
+            if names[:depth] not in file_only:
+                taken.add(in_zip(joined(names[:depth])))
         if entry.is_folder and names:
             taken.add(in_zip(joined(names)))
     out = []
@@ -30260,7 +30275,7 @@ def _logical_volume_name(path, manifest):
 
 
 def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
-                         short_names=None):
+                         written_names):
     """<volume>.entries.tsv in the zip: one row per entry, with its path and times
     as the container stores them, since a zip member keeps one time and a name made
     safe. Returns the member name."""
@@ -30284,14 +30299,13 @@ def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
                 arc = ""
             elif member in excluded:
                 status, arc = "excluded", ""
-            elif got is None:
+            elif got is None or arcs[member] not in written_names:
+                # the read or the write into the zip did not finish
                 status, arc = "FAILED", ""
             elif got < entry.size:
-                arc = (short_names or {}).get(
-                    arcs[member], f"{arcs[member]}.SHORT-{got}-of-{entry.size}-bytes")
-                status = "SHORT"
+                status, arc = "SHORT", written_names[arcs[member]]
             else:
-                status, arc = "complete", arcs[member]
+                status, arc = "complete", written_names[arcs[member]]
             out.writerow([arc, entry.path, "folder" if entry.is_folder else "file",
                           entry.size, "" if got is None else got, status, check,
                           entry.md5 or "", entry.sha1 or "",
@@ -30363,14 +30377,14 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
         kept = {r[0] for r in rows}
         excluded = {m for m, _e in members if m not in kept}
         log = []
-        short_names = {}
+        written_names = {}
         files, written, skipped, failed, short = extract_to_zip(
-            zf, walker, volume, rows, log, reporter, short_names)
+            zf, walker, volume, rows, log, reporter, written_names)
         log = [line.replace("are in the image, the rest lies past its end",
                             "are in the container") for line in log]
         arcs = {m: zip_member_name(volume, m) for m, _e in members}
         table = _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
-                                     short_names)
+                                     written_names)
         checks = collections.Counter(c for _g, c in walker.results.values())
         print(f"      {files:,} files, {human(written)}"
               + (f", {failed:,} FAILED" if failed else "")
@@ -30402,6 +30416,18 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
                 "entries_table": table,
             })
     print()
+
+
+def _logical_stream_self_check():
+    """An entry stored under a file: the file keeps its name and the entry sits beside it."""
+    class Entry:
+        size, is_folder = 3, False
+
+        def __init__(self, *names):
+            self.names = names
+
+    members = [m for m, _e in _logical_members([Entry("d", "f"), Entry("d", "f", "s")])]
+    return members == ["d/f", "d/f:s"]
 
 
 def _logical_self_check():
@@ -34991,6 +35017,8 @@ def self_test():
                 ("an L01, Lx01 or AD1 extracts with unique members, says what read short, "
                  "failed or was left out, and checks the hashes it stores",
                  _logical_self_check()),
+                ("an entry stored under a file leaves the file its own name",
+                 _logical_stream_self_check()),
                 ("two images whose names escape alike get separate zip folders",
                  _logical_volume_name("a%3Ab.L01", [{"volume": "a:b"}]) == "a%3Ab_2"
                  and _logical_volume_name("a.entries.tsv.L01", [{"volume": "a"}])
