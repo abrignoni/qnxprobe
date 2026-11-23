@@ -2911,18 +2911,18 @@ class Fat32Walker:
         bytes_held = lost * self.cluster_bytes
         where = (f"and {named:,} live empty or deleted entries still name them" if named else
                  "with no entry in a live folder reaching them")
-        state = (f" The boot sector's state byte is {self._boot_state:#04x}: the volume was not "
-                 f"cleanly unmounted." if self._boot_state & 0x01 else "")
+        # damage_lines() keeps 240 characters of a line, so these stay inside that even at
+        # the largest counts a FAT32 volume can hold
+        state = (f" Boot state byte {self._boot_state:#04x}: not cleanly unmounted."
+                 if self._boot_state & 0x01 else "")
         if folder_clusters:
-            self._record(f"{lost:,} cluster(s) ({bytes_held:,} bytes) are marked in use {where}, "
-                         f"and {folder_clusters:,} of them hold folder entries, so the files "
-                         f"those folders record are not listed.{state}")
+            self._record(f"{lost:,} cluster(s) ({bytes_held:,} bytes) in use {where}, and "
+                         f"{folder_clusters:,} hold folder entries, so their files are not "
+                         f"listed.{state}")
             self._folders_not_read = self._folders_not_read or 1
         else:
-            self._record(f"note: {lost:,} cluster(s) ({bytes_held:,} bytes) are marked in use "
-                         f"{where}. This is what an interrupted write leaves. The count is of "
-                         f"allocated clusters and does not mean that much content was "
-                         f"lost.{state}")
+            self._record(f"note: {lost:,} cluster(s) ({bytes_held:,} bytes) in use {where}, as "
+                         f"an interrupted write leaves. Not a measure of lost content.{state}")
 
     def _record(self, line):
         """Keep one line of damage, once, up to _FAT_DAMAGE_CAP lines."""
@@ -38435,7 +38435,8 @@ def _fat_reader_checks():
         clean.root([keep, late])
         clean_names, ok = listed(clean)
         return (names == {"KEEP.BIN"} and gap.folders_not_read == 0
-                and "after the end marker" in damage(gap) and "marked in use" in damage(gap)
+                and "after the end marker" in damage(gap)
+                and "in use with no entry" in damage(gap)
                 and "KEEP.BIN" in odd_names and "reserved" in damage(ffs)
                 and len(inside) == 14 and "FAT 1 still links" in damage(w)
                 and w.folders_not_read == 1
@@ -38602,10 +38603,11 @@ def _fat_reader_checks():
             return lab.walker()
         dirty, clean = volume(1), volume(0)
         text = damage(dirty)
+        kept = " ".join(damage_lines(dirty, 5)[1])   # what an export keeps of each line
         return (dirty.folders_not_read == 0 and clean.folders_not_read == 0
-                and text.startswith("note: 2 cluster(s) (1,024 bytes) are marked in use")
-                and "interrupted write" in text and "does not mean" in text
-                and "state byte is 0x01" in text and "state byte" not in damage(clean))
+                and text.startswith("note: 2 cluster(s) (1,024 bytes) in use with no entry")
+                and "interrupted write" in text and "Not a measure of lost content" in text
+                and "Boot state byte 0x01" in kept and "state byte" not in damage(clean))
 
     def named_chain_is_not_lost():
         lab = Lab(16, 5000, keep=64)
