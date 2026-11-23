@@ -4416,6 +4416,7 @@ NTFS_MAX_ATTRIBUTE_LIST = 1 << 20   # read no more of a list than this
 NTFS_DAMAGE_CAP = 1000              # lines of damage kept per volume
 NTFS_GAPS_PER_FILE = 8              # missing ranges named per file
 NTFS_STREAMS_NAMED = 16             # streams named per row; the rest are counted
+NTFS_BITS_SET = bytes(bin(i).count("1") for i in range(256))    # set bits of each byte value
 
 NTFS_ATTR_COMPRESSED = 0x0001
 NTFS_ATTR_ENCRYPTED  = 0x4000
@@ -5188,18 +5189,44 @@ class NtfsWalker:
         return self._joined(NTFS_INDEX_ALLOCATION, "$I30", parts, num)
 
     def _cluster_in_use(self, lcn):
-        """True when this cluster is marked allocated in $Bitmap. The bitmap is
-        read once and kept: a deleted-file sweep asks about many clusters."""
+        """True when this cluster is marked allocated in $Bitmap."""
+        bits = self._bitmap_bits()
+        byte = lcn >> 3
+        if byte >= len(bits):
+            return True                              # off the end of the bitmap: treat as used
+        return bool(bits[byte] & (1 << (lcn & 7)))
+
+    def _bitmap_bits(self):
+        """$Bitmap's bytes, read once and kept: a deleted-file sweep asks about many
+        clusters."""
         bits = self._alloc_bitmap
         if bits is None:
             attr = self._data_attr(NTFS_BITMAP)
             size = (len(attr.value) if attr.resident else attr.data_size) if attr else 0
             bits = self._read_bitmap(size) if size else b""
             self._alloc_bitmap = bits
-        byte = lcn >> 3
-        if byte >= len(bits):
-            return True                              # off the end of the bitmap: treat as used
-        return bool(bits[byte] & (1 << (lcn & 7)))
+        return bits
+
+    def _clusters_marked(self, lcn, count):
+        """How many of ``count`` clusters from ``lcn`` $Bitmap marks in use, a cluster past
+        its end counting as marked. Whole bytes are counted at once, so the work is bounded
+        by the bitmap's size whatever length a damaged run states."""
+        bits = self._bitmap_bits()
+        limit = len(bits) * 8
+        end = lcn + count
+        marked = end - max(lcn, limit) if end > limit else 0
+        stop, pos = min(end, limit), lcn
+        while pos < stop and pos & 7:
+            marked += bits[pos >> 3] >> (pos & 7) & 1
+            pos += 1
+        whole = (stop - pos) >> 3 if stop > pos else 0
+        if whole:
+            marked += sum(bits[pos >> 3:(pos >> 3) + whole].translate(NTFS_BITS_SET))
+            pos += whole * 8
+        while pos < stop:
+            marked += bits[pos >> 3] >> (pos & 7) & 1
+            pos += 1
+        return marked
 
     def _read_bitmap(self, size):
         """$Bitmap's bytes, never more than the volume's clusters need, whatever size the
@@ -5261,8 +5288,8 @@ class NtfsWalker:
         """Yield the files whose MFT record is free but still names them.
 
         A deleted file whose record has not yet been handed to another file can
-        be recovered from the record: its name, size, dates, and, when the data
-        has not been overwritten, its content. This is the only route to a file
+        be recovered from the record: its name, size, dates, and, while $Bitmap marks
+        every cluster it used as free, its content. This is the only route to a file
         whose data was **resident**, small enough to live inside the record and
         so never occupying a cluster a carver could find.
 
@@ -5333,22 +5360,27 @@ class NtfsWalker:
             elif size and not data.init_size:
                 reason, ok = "its initialized size is 0, so it records no valid content", False
             else:
-                for lcn, run in data.runs:
-                    if lcn is None:
-                        continue                    # a sparse run holds no data to lose
-                    if lcn < 0 or (self.total_clusters and lcn + run > self.total_clusters):
-                        reason, ok = "a run lies outside the volume", False
-                        break
-                    if any(self._cluster_in_use(lcn + i) for i in range(run)):
-                        reason, ok = "clusters reused by a later file", False
-                        break
+                stored = [(lcn, run) for lcn, run in data.runs if lcn is not None]
+                clusters = sum(run for _lcn, run in stored)  # a sparse run holds no data to lose
+                if any(lcn < 0 or (self.total_clusters and lcn + run > self.total_clusters)
+                       for lcn, run in stored):
+                    reason, ok = "a run lies outside the volume", False
+                elif self.total_clusters and clusters > self.total_clusters:
+                    reason, ok = (f"its runs store {clusters:,} clusters and this volume has "
+                                  f"{self.total_clusters:,}"), False
+                else:
+                    marked = sum(self._clusters_marked(lcn, run) for lcn, run in stored)
+                    if marked:
+                        reason, ok = (f"$Bitmap marks {marked:,} of the {clusters:,} clusters "
+                                      "it reads as in use"), False
             yield NtfsDeletedFile(num, name, parent, is_dir, size, False, ok, reason,
                                   created, modified, accessed, has_list, data)
 
     def read_deleted(self, entry, size=None):
-        """Yield the content of a recoverable deleted file. Refuses one the volume shows
-        was reused or holds no valid content. Reading is otherwise the same as for a
-        live file."""
+        """Yield the content of a recoverable deleted file. Refuses one with a cluster
+        $Bitmap marks in use or with no valid content. Free clusters may still have been
+        reused and freed again, so what this yields is a candidate. Reading is otherwise
+        the same as for a live file."""
         if not entry.recoverable or entry._data is None:
             raise NtfsUnreadable(
                 f"deleted file {entry.name!r} is not recoverable: {entry.reason}")
@@ -37378,6 +37410,37 @@ def _ntfs_reader_fix_checks(image_gz):
         got = deleted_case(change)
         return not got.recoverable and "does not decode" in got.reason
     row("a deleted file whose run list does not decode is not recoverable", deleted_bad_runs)
+
+    def deleted_marked():
+        gone = next(e for e in ref.deleted_files() if not e.resident and e.recoverable and e.size
+                    and sum(c for l, c in e._data.runs if l is not None) >= 2)  # pylint: disable=protected-access
+        stored = [(l, c) for l, c in gone._data.runs if l is not None]  # pylint: disable=protected-access
+        clusters = sum(c for _l, c in stored)
+        table = ref._data_attr(NTFS_BITMAP).runs[0][0] * cluster  # pylint: disable=protected-access
+        img = bytearray(clean)
+        for lcn in (stored[0][0], stored[-1][0] + stored[-1][1] - 1):
+            img[table + (lcn >> 3)] |= 1 << (lcn & 7)
+        got = next(e for e in walker(img).deleted_files() if e.record == gone.record)
+        return (not got.recoverable
+                and got.reason == f"$Bitmap marks 2 of the {clusters:,} clusters it reads as in use")
+    row("a deleted file's reason counts the clusters $Bitmap marks in use", deleted_marked)
+
+    def deleted_overlapping_runs():
+        total = ref.total_sectors * ref.bps // cluster
+        def change(img, num):
+            rec = plain(img, num)
+            attrs = attrs_of(rec)
+            raw = next(a for t, a in attrs if t == NTFS_DATA)
+            alloc, size, init = struct.unpack_from("<QQQ", raw, 40)
+            attrs = [(t, a) for t, a in attrs if t != NTFS_DATA]
+            attrs.append((NTFS_DATA, nonresident(NTFS_DATA, "", 0, 2 * total - 1,
+                                                 [(0, total), (0, total)], alloc, size, init)))
+            put(img, num, with_attrs(rec, attrs))
+        got = deleted_case(change)
+        return (not got.recoverable
+                and got.reason == f"its runs store {2 * total:,} clusters and this volume has "
+                                  f"{total:,}")
+    row("a deleted file whose runs store more than the volume has says so", deleted_overlapping_runs)
 
     def alloc_flip():
         node = names["frag/target.bin"]

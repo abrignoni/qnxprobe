@@ -1430,11 +1430,11 @@ Deleted files are recovered separately, from the MFT rather than the directory i
 file: its name, size, dates, and whether the content can still be read. A file whose
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
-could find. A non-resident file is recoverable only while every cluster it used is still
-free and its initialized size is not 0; once a live file has taken a cluster,
-`read_deleted()` refuses it rather than hand back that file's bytes. A cluster that was
-reused and freed again looks the same as one never reused, so a recovered file's bytes
-are a candidate, not a proven copy. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
+could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
+used as free and its initialized size is not 0. When `$Bitmap` marks any of them in use,
+`read_deleted()` refuses the file and its `reason` gives how many of its clusters are
+marked. A cluster that was reused and freed again looks the same as one never reused, so
+a recovered file's bytes are a candidate, not a proven copy. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
 records that may since have been reused, so a file whose attributes overflowed its record
 is reported as having existed rather than reconstructed from whatever now lives there.
 
