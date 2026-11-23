@@ -343,6 +343,17 @@ and the zip's central directory cannot be written, the run prints `THE ZIP IS NO
 and exits 1. A `volumes.json` that cannot be written is also reported and exits 1, and
 the zip is still closed.
 
+The room for the central directory and the records is held inside the zip's own file and
+flushed to the volume, because a nearly full APFS volume was seen to accept writes it could
+not then store. When a volume has no file of its own to give back for its table, the
+newest files of the volumes before it are taken back out and recorded as failed in their
+own tables.
+
+A recognized volume that cannot be walked gets a record with `extract_error`, and counts
+that were never reached are null. An exFAT folder whose first cluster is outside the volume
+or past the end of the image is named in `damage_first` and counted in `folders_not_read`.
+Either one exits 1.
+
 Inside a volume the first file to hold a name keeps it. A later file whose name clashes,
 ignoring case and Unicode normalization, gets `.dup-<n>`. So does one that would land on
 the same file when Python extracts the zip on Windows, where `:<>|"?*` become `_` and

@@ -3181,6 +3181,25 @@ class ExfatWalker:
         self.heap_start = base + self.heap_off * self.bps
         self.root = (self.root_clus, 0, True, False)
         self._orphan_cache = None                    # recover_deleted() fills it once
+        self.damage = []
+        self.folders_not_read = 0
+        self._not_read = set()
+
+    def _cluster_on_volume(self, clus):
+        """True for a cluster the boot sector's count covers. A count of 0 says nothing,
+        so a volume that stores one is not refused on it."""
+        return clus >= 2 and (not self.cluster_count or clus < self.cluster_count + 2)
+
+    def _folder_not_read(self, what, first, why=None):
+        """Record a folder that could not be read, once. Its files cannot be listed, so
+        nothing else would show they exist."""
+        if (what, first) in self._not_read:
+            return
+        self._not_read.add((what, first))
+        self.folders_not_read += 1
+        why = why or (f"is outside this volume's clusters (2 to {self.cluster_count + 1:,})")
+        self.damage.append(f"{what}: first cluster {first:#x} {why}, so the folder was not "
+                           f"read and the files under it are not listed")
 
     def _fat_next(self, clus):
         raw = read_at(self.fh, self.fat_start + clus * 4, 4)
@@ -3223,7 +3242,13 @@ class ExfatWalker:
         reported as stored rather than applied, so no instant is asserted.
         """
         clus, _, _, contig = node
+        if clus and not self._cluster_on_volume(clus):
+            if node == self.root:
+                self._folder_not_read("the root folder", clus)
+            return []                                # named when its parent was listed
         raw = self._read(clus, 0, contig)
+        if clus and not raw:                         # its cluster lies past the image's end
+            self._folder_not_read("a folder", clus, "lies past the end of the image")
         out = []
         i = 0
         while i < len(raw):
@@ -3248,6 +3273,8 @@ class ExfatWalker:
                     name += ent[2:32].decode("utf-16-le", "replace")
                 name = name[:name_len]
                 if name not in (".", ".."):
+                    if is_dir and first and not self._cluster_on_volume(first):
+                        self._folder_not_read(f"folder {name!r}", first)
                     cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
                     out.append((name, (first, data_len, is_dir, contiguous), {
                         "modified": _exfat_stamp(mod, raw[i + 21]),
@@ -12952,6 +12979,9 @@ class _ZipNames:
         self.numbers = {}               # suffix stem's key -> last number tried
         self.full = None                # why the output took no more, once it has not
         self.manifest = None            # the run's volume records, to keep room for them
+        self.walker = None              # the volume being written, for its damage record
+        self.last_volume = None         # what extract_to_zip kept for _zip_record_exceptions
+        self.finished = []              # recent volumes whose files can still be taken back
         for name in held:
             parts = name.rstrip("/").split("/")
             self.dirs.update(_zip_key("/".join(parts[:d])) for d in range(1, len(parts)))
@@ -13072,18 +13102,149 @@ class _ZipOutput(io.FileIO):
     file keeps the bytes it could not write and fails every later seek on them, so a
     failed member could not be cut back out and the zip could never be finished. A
     plain file may take only part of a write, so this one goes on until all of it is
-    written or the write raises."""
+    written or the write raises.
+
+    ``end`` is how many bytes the file has been seen to take, counted from what each
+    write returned. A failed write can still move the file's position (exFAT and FAT32
+    on a full volume), so the position is put back to where the bytes really stop. The
+    file does not get shorter until the zip is closed: a member taken back out leaves
+    its bytes in place, and the central directory is written over them, into space the
+    file already has. Space freed on a full volume cannot be counted on: APFS refused
+    both a truncate and the write after one."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.end = 0
+        self.refused = False            # the volume refused a write that grew the file
 
     def write(self, data):
         if not isinstance(data, bytes):
             data = bytes(data)
-        done = 0
-        while done < len(data):
-            wrote = super().write(memoryview(data)[done:] if done else data)
-            if not wrote:
-                raise OSError("the output accepted no bytes")
-            done += wrote
+        at, done = self.tell(), 0
+        try:
+            while done < len(data):
+                wrote = super().write(memoryview(data)[done:] if done else data)
+                if not wrote:
+                    raise OSError("the output accepted no bytes")
+                done += wrote
+        except BaseException as exc:
+            grew = at + len(data) > self.end
+            if grew and isinstance(exc, OSError) and (exc.errno in _ZIP_FULL_ERRNOS
+                                                      or exc.errno == errno.EINVAL):
+                self.refused = True
+            self.end = max(self.end, at + done)
+            self._settle(at + done)
+            # exFAT and FAT32 can answer EINVAL at the end of a full volume
+            if isinstance(exc, OSError) and exc.errno == errno.EINVAL and grew:
+                raise OSError(errno.ENOSPC, f"{os.strerror(errno.ENOSPC)} (the output "
+                                            f"answered: {exc.strerror})") from exc
+            raise
+        self.end = max(self.end, at + done)
         return done
+
+    def sync(self):
+        """True once everything written is on the volume. APFS can accept a write and
+        then refuse to store it, so a write's return value does not show this."""
+        try:
+            os.fsync(self.fileno())
+        except OSError as exc:
+            if exc.errno in _ZIP_FULL_ERRNOS or exc.errno in (errno.EIO, errno.EINVAL):
+                return False
+        return True
+
+    def cut_to(self, position):
+        """Drop everything after ``position``, including bytes the volume has not
+        stored. Returns False if the file could not be cut."""
+        try:
+            self.truncate(position)
+        except (OSError, ValueError):
+            return False
+        self.end = min(self.end, position)
+        return True
+
+    def _settle(self, position):
+        """After a failed write: put the position where the bytes stop, and cut off any
+        length the write added without storing it. exFAT and FAT32 were seen to leave
+        the file longer than what it took, and a later write near that end then fails."""
+        try:
+            if os.fstat(self.fileno()).st_size > self.end:
+                self.truncate(self.end)
+        except (OSError, ValueError):
+            pass
+        try:
+            self.seek(position)
+        except (OSError, ValueError):
+            pass
+
+    def hold(self, upto):
+        """Grow the file to ``upto`` bytes with bytes that are not zero and do not
+        compress, as far as the volume takes them. Nothing is raised: ``end`` says how
+        far it got. The position does not move. Once the volume has refused a write that
+        grew the file this adds nothing: a nearly full APFS volume went on accepting
+        writes after that which it could not store, and then refused every flush and
+        cut of the file, while the room in bytes already written stays usable."""
+        if self.end >= upto or self.refused:
+            return
+        at = self.tell()
+        fill = os.urandom(1 << 16)
+        try:
+            self.seek(self.end)
+            while self.end < upto:
+                wrote = super().write(fill[:upto - self.end])
+                if not wrote:
+                    break
+                self.end += wrote
+        except OSError:
+            self.refused = True
+            self._settle(at)
+        finally:
+            self.seek(at)
+
+    def cut(self, directory_at):
+        """End the file at the end of the zip, whose central directory begins at
+        ``directory_at``. A nearly full APFS volume can refuse to cut a file. The directory
+        is then moved to the end of the bytes the file already has, which needs no new
+        space, and what lies between the last member and it belongs to no member."""
+        at = self.tell()
+        try:
+            self.truncate(at)
+        except OSError:
+            self._move_directory_to_end(directory_at, at)
+        else:
+            if os.fstat(self.fileno()).st_size != at:
+                raise OSError(errno.EIO, "the output could not be cut to the end of the zip")
+        if not self.sync():
+            raise OSError(errno.ENOSPC, "the volume did not store the end of the zip")
+
+    def _move_directory_to_end(self, start, stop):
+        """Rewrite the central directory and end records from ``start`` to ``stop`` so
+        that they finish at the file's last byte, with their offsets corrected."""
+        size = os.fstat(self.fileno()).st_size
+        self.seek(start)
+        block = bytearray()
+        while len(block) < stop - start:
+            part = self.read(stop - start - len(block))
+            if not part:
+                raise OSError(errno.EIO, "the central directory could not be read back")
+            block += part
+        moved = size - len(block)
+        end = len(block) - 22
+        if end < 0 or block[end:end + 4] != b"PK\x05\x06":
+            raise OSError(errno.EIO, "the zip's end record was not where it was written")
+        stored = struct.unpack_from("<I", block, end + 16)[0]
+        if stored != 0xFFFFFFFF:
+            if moved >= 0xFFFFFFFF:
+                raise OSError(errno.EFBIG, "the moved central directory needs a ZIP64 record")
+            struct.pack_into("<I", block, end + 16, moved)
+        locator = end - 20
+        if locator >= 0 and block[locator:locator + 4] == b"PK\x06\x07":
+            record = struct.unpack_from("<Q", block, locator + 8)[0] - start
+            if record < 0 or block[record:record + 4] != b"PK\x06\x06":
+                raise OSError(errno.EIO, "the zip's ZIP64 end record was not where it was written")
+            struct.pack_into("<Q", block, locator + 8, moved + record)
+            struct.pack_into("<Q", block, record + 48, moved)
+        self.seek(moved)
+        self.write(bytes(block))
 
 
 def _say(text):
@@ -13111,11 +13272,23 @@ def _zip_close(zf):
     """Close a zip and the file under it, which ZipFile leaves open when it is given
     one. Raises what closing the zip raised."""
     output = zf.fp
+    directory_at = zf.start_dir
     try:
         zf.close()
+        if isinstance(output, _ZipOutput):
+            output.cut(directory_at)
     finally:
         if output is not None:
             output.close()
+
+
+def _zip_opens(path, members):
+    """True if the finished file opens as a zip and lists ``members`` members."""
+    try:
+        with zipfile.ZipFile(path) as written:
+            return len(written.infolist()) == members
+    except (OSError, zipfile.BadZipFile, ValueError, EOFError):
+        return False
 
 
 def _zip_tables_missing(manifest):
@@ -13150,14 +13323,17 @@ def _zip_finish(zf, path, manifest):
         print(f"\nTHE OUTPUT RAN OUT OF ROOM ({full}). Nothing more was added to the zip "
               f"after that, and no further volume was extracted. Every file left out is "
               f"counted as failed. Free some space and run the extraction again.")
+    members = len(zf.filelist)
     try:
         _zip_close(zf)
+        if not _zip_opens(path, members):
+            raise OSError(errno.EIO, "the file written does not open as a zip")
     except Exception as exc:                         # pylint: disable=broad-except
-        print(f"\nTHE ZIP IS NOT USABLE: its central directory could not be written "
-              f"({_zip_reason(exc)}). {path} holds the members written so far but will "
-              f"not open as a zip. Free some space and run the extraction again.")
+        _say(f"\nTHE ZIP IS NOT USABLE: its central directory could not be written "
+             f"({_zip_reason(exc)}). {path} holds the members written so far but will "
+             f"not open as a zip. Free some space and run the extraction again.")
         return False
-    print(f"\nwrote {path}  ({os.path.getsize(path):,} bytes)")
+    _say(f"\nwrote {path}  ({os.path.getsize(path):,} bytes)")
     lost = _zip_tables_missing(manifest)
     if lost:
         whole = False
@@ -13185,28 +13361,21 @@ def _zip_directory_size(zf):
 
 
 def _zip_room(zf, wanted):
-    """How many of ``wanted`` bytes the output takes after the last member, found by
-    writing them and cutting them back. A buffered or unseekable output cannot be
-    tested this way and is taken to have the room."""
+    """How many of ``wanted`` bytes the output really holds after the last member. The
+    file is grown to cover them with real bytes (_ZipOutput.hold) and flushed, and stays
+    that long, so the room counted here is on the volume when the directory is written,
+    and so is every member before it. When the flush is refused, what lies past the last
+    member is dropped and tried once more; 0 then tells the caller to take members back.
+    Any other output is taken to have the room."""
     fp = zf.fp
-    if not getattr(zf, "_seekable", False) or not isinstance(fp, (io.RawIOBase, io.BytesIO)):
+    if not isinstance(fp, _ZipOutput):
         return wanted
-    start, room = zf.start_dir, wanted
-    try:
-        fp.seek(start)
-        block = bytes(min(wanted, 1 << 20))
-        while fp.tell() - start < wanted:
-            fp.write(block[:wanted - (fp.tell() - start)])
-    except OSError as exc:
-        if exc.errno in _ZIP_FULL_ERRNOS:
-            room = max(fp.tell() - start, 0)
-    try:
-        fp.seek(start)
-        fp.truncate()
-    except (OSError, ValueError):
-        fp.seek(0, 2)
-        zf.start_dir = fp.tell()
-    return room
+    for _try in range(2):
+        fp.hold(zf.start_dir + wanted)
+        if fp.sync():
+            return min(wanted, max(fp.end - zf.start_dir, 0))
+        fp.cut_to(zf.start_dir)
+    return 0
 
 
 class _ByteCounter:
@@ -13232,18 +13401,29 @@ def _zip_table_size(write):
     return sink.count
 
 
+_ZIP_DAMAGE_KEPT = 50           # entries of a walker's damage kept in volumes.json
+
+
 def _zip_records_room(names):
-    """Bytes to keep for volumes.json: the records so far as a zip holds them, and
-    2 KiB for its directory entry and for the record of the volume being written."""
+    """Bytes to keep for volumes.json: the records so far as a zip holds them, 2 KiB for
+    its directory entry and the record of the volume being written, and that volume's
+    damage_first in full, which is added to its record after its files are written."""
     import zlib
     text = json.dumps({"volumes": names.manifest or []}, indent=2, default=str)
-    return len(zlib.compress(text.encode("utf-8"))) + 2048
+    room = len(zlib.compress(text.encode("utf-8"))) + 2048
+    if names.walker is not None:
+        lines = damage_lines(names.walker, _ZIP_DAMAGE_KEPT)[1]
+        if lines:
+            room += len(zlib.compress(json.dumps({"damage_first": lines},
+                                                 indent=2).encode("utf-8")))
+    return room
 
 
 def _zip_undo(zf, info, start, dst):
     """Take a member whose write failed back out of the zip: end its writer, drop it
-    from the member list, and cut the file back to where the member began. An output
-    that cannot be cut back keeps the bytes, and no member names them."""
+    from the member list, and go back to where the member began. A _ZipOutput keeps the
+    bytes as room for what follows (see there). Any other output is cut back there, and
+    one that cannot be cut keeps the bytes, and no member names them."""
     if dst is not None:
         try:
             dst.close()                 # always ends the write; may commit the member
@@ -13253,6 +13433,10 @@ def _zip_undo(zf, info, start, dst):
         zf.filelist.pop()
     if zf.NameToInfo.get(info.filename) is info:
         del zf.NameToInfo[info.filename]
+    if isinstance(zf.fp, _ZipOutput):           # its bytes stay, as room for what follows
+        zf.fp.seek(start)
+        zf.start_dir = start
+        return
     if getattr(zf, "_seekable", False):
         try:
             zf.fp.seek(start)
@@ -13341,10 +13525,17 @@ def _zip_time_rows(lost):
 _ZIP_EXCEPTION_COLUMNS = ["stored_path", "zip_member", "issue", "detail"]
 
 
-def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
+def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False):
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip."""
+    names = _zip_names(zf)
+    held, names.last_volume = names.last_volume, None
+    if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
+        held.update(volume=volume, rec=rec, issues=issues, pad=pad, table=None)
+        names.finished = names.finished[-(_ZIP_VOLUMES_HELD - 1):] + [held]
+    else:
+        held = None
     if rec is not None and _zip_component(volume, True) != volume:
         rec["zip_folder"] = _zip_component(volume, True)
     if not issues:
@@ -13365,9 +13556,69 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
     if rec is not None:
         rec["exceptions_table"] = name
         rec["exceptions"] = summary
-    if name:
+    if held is not None and name:
+        held["table"] = zf.NameToInfo.get(name)
+    if name and not quiet:
         _say(f"{pad}every failed, short or renamed file, and each time a zip cannot "
              f"hold: {name}")
+
+
+_ZIP_VOLUMES_HELD = 8           # finished volumes whose last files can still be taken back
+_ZIP_MEMBERS_HELD = 4096        # of each, so a long run does not keep every file in memory
+
+
+def _zip_take_from_earlier(zf, names, table):
+    """Make room for the directory, the records and a table of ``table`` bytes when the
+    volume being written has no member left to give back, as when the output filled
+    just as it began: its files must still be named. The newest files of the volumes
+    before it come back out, newest first, each is recorded as failed in its own
+    volume's table and counts, and those tables are written again."""
+    touched, grown = [], 0
+    while names.finished:
+        wanted = _zip_directory_size(zf) + table + _zip_records_room(names) + grown
+        if _zip_room(zf, wanted) >= wanted:
+            break
+        done = names.finished[-1]
+        if not any(done is t for t in touched):
+            info = done["table"]
+            if info is not None:
+                if not zf.filelist or zf.filelist[-1] is not info:
+                    break
+                grown += info.compress_size + 256
+                _zip_undo(zf, info, info.header_offset, None)
+                done["table"] = None
+            touched.append(done)
+        if not done["kept"]:
+            names.finished.pop()
+            continue
+        info, path, arc, counted, was_short, why, shown = done["kept"][-1]
+        if not zf.filelist or zf.filelist[-1] is not info:
+            break
+        done["kept"].pop()
+        _zip_undo(zf, info, info.header_offset, None)
+        grown += len(path.encode("utf-8", "surrogatepass")) + 128
+        rec = done["rec"]
+        rec["failed"] += 1
+        rec["bytes"] -= counted
+        rec["short" if was_short else "files"] -= 1
+        lost = done["lost_times"]
+        if shown is not None and shown in lost:
+            lost[shown][0] -= 1
+            if (path, info.filename) in lost[shown][1]:
+                lost[shown][1].remove((path, info.filename))
+            if not lost[shown][0]:
+                del lost[shown]
+        done.setdefault("gone", set()).add(info.filename)
+        done.setdefault("added", []).append((path, "", "FAILED", "; ".join(
+            [f"taken back out of the zip to leave room for its directory and records "
+             f"({names.full})"] + why), 1))
+    for done in reversed(touched):
+        gone = done.pop("gone", ())
+        rows = [r for r in done["issues"] if r[2] != "TIME_NOT_HELD" and r[1] not in gone]
+        done["issues"][:] = rows + done.pop("added", []) + _zip_time_rows(done["lost_times"])
+        _zip_record_exceptions(zf, done["volume"], done["rec"], done["issues"], done["pad"],
+                               quiet=True)
+        done["table"] = zf.NameToInfo.get(done["rec"].get("exceptions_table"))
 
 
 def _zip_reason(exc):
@@ -13433,6 +13684,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     total_bytes = sum(size for _, _, size, _ in entries if size is not None)
     files = written = skipped = failed = short = 0
     names = _zip_names(zf)
+    names.walker = w
+    names.last_volume = None
     arcs = [zip_member_name(volume, e[0]) for e in entries]
     finals = names.assign([arc if e[2] is not None else None for arc, e in zip(arcs, entries)])
     folder = _zip_component(volume, True)
@@ -13561,6 +13814,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 table += len(taken[-1][1].encode("utf-8", "surrogatepass")) + 128
             wanted = _zip_directory_size(zf) + table + _zip_records_room(names)
             room = _zip_room(zf, wanted)
+        if room < wanted:
+            _zip_take_from_earlier(zf, names, table)
         if taken and issues is not None:
             gone = {entry[0].filename for entry in taken}
             issues[:] = [row for row in issues if row[1] not in gone]
@@ -13588,6 +13843,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                           f"volume are not in the zip and are counted as failed")
     if issues is not None:
         issues.extend(_zip_time_rows(lost_times))
+        if isinstance(zf.fp, _ZipOutput):
+            names.last_volume = {"kept": kept[-_ZIP_MEMBERS_HELD:], "lost_times": lost_times}
     return files, written, skipped, failed, short
 
 
@@ -30993,7 +31250,7 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
     parts = list(getattr(image, "paths", []) or [])
     crypt = getattr(image, "encryption", None)
     print("=" * 78)
-    print(path)
+    _say(path)
     print(f"  {maker} logical evidence ({kind}), {len(parts) or 1} "
           f"{'segment' if len(parts) <= 1 else 'segments'}"
           + (", encrypted and opened" if crypt else ""))
@@ -31037,7 +31294,7 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
             if below:
                 print(f"      ... {below:,} entries below --depth {list_depth}")
     if zf is not None and wanted:
-        print(f"\n  EXTRACTING to {extract}  as {volume}/")
+        _say(f"\n  EXTRACTING to {extract}  as {volume}/")
         walker = _LogicalEntryReader(image)
         # the file's last written time: an AD1's "modified" record, an L01 or Lx01's wr
         # column (libyal/libewf, "Expert Witness Compression Format (EWF).asciidoc")
@@ -31102,6 +31359,33 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
             if walker.results.get(id(entry), (0, ""))[1] == "MISMATCH":
                 _say(f"      HASH MISMATCH {entry.path!r}")
     print()
+
+
+def _zip_volume_not_read(zf, manifest, vol, image_rec, exc, **where):
+    """Give a recognized volume whose extraction stopped a record that says why. When
+    its record was already written the reason goes on that one. Members already in the
+    zip under its folder are counted; what the walk never reached is not known, so the
+    other counts are null rather than 0."""
+    if manifest is None:
+        return
+    reason = _zip_reason(exc)
+    if manifest and manifest[-1].get("volume") == vol:
+        manifest[-1]["extract_error"] = reason
+        return
+    folder = _zip_component(vol, True) + "/"
+    held = [i for i in zf.filelist if i.filename.startswith(folder)]
+    manifest.append({"volume": vol, **image_rec, **where,
+                     "files": len(held), "bytes": sum(i.file_size for i in held),
+                     "symlinks_or_special_skipped": None,
+                     "failed": None, "short": None, "excluded": None,
+                     "extract_error": reason})
+
+
+def _volumes_not_read(manifest):
+    """How many volumes were found and not read in full, for the exit status: one whose
+    extraction stopped, or one with a folder that could not be listed."""
+    return sum(1 for rec in manifest or []
+               if rec.get("extract_error") or rec.get("folders_not_read"))
 
 
 def _files_not_exported(manifest):
@@ -31545,7 +31829,7 @@ def _zip_export_checks():
                 and json.loads(rows["case/a/b"]["stored_names"]) == ["a", "b"]
                 and rows["case/a%2Fb"]["stored_path"] == rows["case/a/b"]["stored_path"])
 
-    def under_limit(limit, files):
+    def under_limit(limit, files, walker=None):
         """main() over a FAT12 image into a real output, opened as the command line
         opens it, that the operating system refuses to grow past ``limit`` bytes.
         Returns (what _zip_finish returned, what the run printed, the output's path)."""
@@ -31559,7 +31843,7 @@ def _zip_export_checks():
         ignored = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         zf = _zip_create(out)
         try:
-            globals()["walker_for"] = lambda *_a, **_k: Walker(files)
+            globals()["walker_for"] = lambda *_a, **_k: walker or Walker(files)
             resource.setrlimit(resource.RLIMIT_FSIZE, (limit, hard))
             with contextlib.redirect_stdout(said):
                 main(raw, extract=out, zf=zf, manifest=manifest)
@@ -31817,6 +32101,129 @@ def _zip_export_checks():
                 and lzin.read(lrows["a_"]["zip_member"]) == b"2"
                 and lzin.read("case/%6Eul") == b"3" and lrows["nul"]["zip_member"] == "case/%6Eul")
 
+    def full_driver():
+        """A driver that answers EINVAL past the end of a full volume and still moves the
+        file's position, as exFAT and FAT32 were measured to: the zip opens and every file
+        is whole in it or named as failed."""
+        class Driver(_io.FileIO):
+            limit = None
+
+            def write(self, data):
+                if Driver.limit is not None and self.tell() + len(data) > Driver.limit:
+                    self.seek(len(data), 1)
+                    raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+                return super().write(data)
+
+            def truncate(self, size=None):      # APFS refused this on a full volume
+                if Driver.limit is not None:
+                    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+                return super().truncate(size)
+
+        raw, out = os.path.join(work, "driver.dd"), os.path.join(work, "driver.zip")
+        with open(raw, "wb") as fh:
+            fh.write(fat12({"EVID.TXT": b"x"}))
+        stream = random.Random(1987)
+        files = {f"f{n:02d}.bin": stream.randbytes(4096) for n in range(30)}
+        walker = Walker([(n, b, 1_600_000_000, False) for n, b in files.items()])
+        manifest, said, real, bases = [], _io.StringIO(), walker_for, _ZipOutput.__bases__
+        _ZipOutput.__bases__ = (Driver,)
+        try:
+            zf = _zip_create(out)
+            Driver.limit = 60_000
+            globals()["walker_for"] = lambda *_a, **_k: walker
+            with contextlib.redirect_stdout(said):
+                main(raw, extract=out, zf=zf, manifest=manifest)
+                whole = _zip_finish(zf, out, manifest)
+        finally:
+            Driver.limit = None
+            _ZipOutput.__bases__ = bases
+            globals()["walker_for"] = real
+        with zipfile.ZipFile(out) as zin:
+            kept = {n[5:] for n in zin.namelist() if n.startswith("lba0/f")}
+            failed = {r["stored_path"] for r in table(zin, "lba0.exceptions.tsv")
+                      if r["issue"] == "FAILED"}
+            record = json.loads(zin.read("volumes.json"))["volumes"][0]
+            return (whole is False and zin.testzip() is None and kept and failed
+                    and all(zin.read(f"lba0/{n}") == files[n] for n in kept)
+                    and not kept & failed and kept | failed == set(files)
+                    and record["files"] == len(kept) and record["failed"] == len(failed))
+
+    def damage_kept():
+        """The room kept for volumes.json covers a damage list at its limit."""
+        try:
+            import resource as _resource            # pylint: disable=unused-import
+        except ImportError:
+            return None
+        stream = random.Random(1987)
+        files = [(f"f{n}.bin", stream.randbytes(3000), 1_600_000_000, False) for n in range(8)]
+        walker = Walker(files)
+        walker.damage = ["".join(chr(stream.randrange(0x4E00, 0x9FFF)) for _ in range(240))
+                         for _ in range(50)]
+        _whole, _said, out = under_limit(46_000, files, walker)
+        with zipfile.ZipFile(out) as zin:
+            record = json.loads(zin.read("volumes.json"))["volumes"][0]
+            kept = {n[5:] for n in zin.namelist() if n.startswith("lba0/f")}
+            failed = {r["stored_path"] for r in table(zin, "lba0.exceptions.tsv")
+                      if r["issue"] == "FAILED"}
+            return (zin.testzip() is None and len(record["damage_first"]) == 50
+                    and record["damage_recorded"] == 50 and kept
+                    and kept | failed == {f[0] for f in files} and not kept & failed)
+
+    def through_cli(name, image):
+        """The command line over ``image``: (exit status, the zip's volume records)."""
+        import subprocess
+        raw, out = os.path.join(work, f"{name}.dd"), os.path.join(work, f"{name}.zip")
+        with open(raw, "wb") as fh:
+            fh.write(image)
+        done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw,
+                               "--extract", out], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=120, check=False)
+        with zipfile.ZipFile(out) as zin:
+            held = zin.namelist()
+            records = (json.loads(zin.read("volumes.json"))["volumes"]
+                       if "volumes.json" in held else [])
+        return done.returncode, records, held
+
+    def unwalkable_volume():
+        if getattr(sys, "frozen", False):
+            return None
+        image = bytearray(_exfat_orphan_image()[0])
+        image[108] = 0x7F
+        status, records, _held = through_cli("unwalkable", bytes(image))
+        return (status == 1 and len(records) == 1 and records[0]["filesystem"] == "exfat"
+                and bool(records[0]["extract_error"]) and records[0]["files"] == 0
+                and records[0]["failed"] is None)
+
+    def exfat_folder_off_volume():
+        if getattr(sys, "frozen", False):
+            return None
+        image = bytearray(_exfat_orphan_image()[0])
+        root = 9 * 512                               # cluster 3 of a heap at sector 8
+        for at in range(root, root + 512, 32):
+            if image[at] == 0x85 and image[at + 66:at + 80].decode("utf-16-le") == "LIVEDIR":
+                struct.pack_into("<I", image, at + 32 + 20, 0x7FFFFFFF)
+                break
+        else:
+            return False
+        status, records, held = through_cli("offvolume", bytes(image))
+        record = records[0] if records else {}
+        return (status == 1 and record.get("folders_not_read") == 1
+                and record.get("damage_recorded") == 1
+                and "LIVEDIR" in record["damage_first"][0]
+                and any(n.endswith("/LIVE.TXT") for n in held)
+                and not any("INNER" in n for n in held))
+
+    def image_path_console():
+        raw = os.path.join(work, "\u65e5\u672c.dd")
+        with open(raw, "wb") as fh:
+            fh.write(fat12({"EVID.TXT": b"evidence"}))
+        strict = _io.TextIOWrapper(_io.BytesIO(), encoding="cp1252", errors="strict")
+        manifest = []
+        with zipfile.ZipFile(_io.BytesIO(), "w") as zf, contextlib.redirect_stdout(strict):
+            main(raw, extract="x.zip", zf=zf, manifest=manifest)
+        return len(manifest) == 1 and manifest[0]["files"] == 1
+
     def carriage_return():
         zin, _rec = logical([Entry(("Icon\r",), b"icon"), Entry(("plain",), b"p")])
         rows = table(zin, "case.entries.tsv")
@@ -31873,7 +32280,16 @@ def _zip_export_checks():
             ("names Windows would land on one file are kept apart and recorded, and a device "
              "name is escaped", windows_names),
             ("a carriage return in a stored name stays inside its table row", carriage_return),
-            ("a NUL in a logical entry's name does not stop the run", nul_in_entry)):
+            ("a NUL in a logical entry's name does not stop the run", nul_in_entry),
+            ("a full output that answers EINVAL and moves the position leaves a zip that "
+             "opens, with every file whole or named as failed", full_driver),
+            ("the room kept for volumes.json covers a damage list at its limit", damage_kept),
+            ("a recognized volume that cannot be walked gets a record with the error and "
+             "exits 1", unwalkable_volume),
+            ("an exFAT folder whose first cluster is off the volume is recorded as damaged "
+             "and exits 1", exfat_folder_off_volume),
+            ("an image path the console cannot show does not stop the run",
+             image_path_console)):
         try:
             passed = check()
         except Exception:                            # pylint: disable=broad-except
@@ -32130,17 +32546,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
     image = lvm_image(image)
     size = image_size(image)
     print("=" * 78)
-    print(path)
+    _say(path)
     ewf_parts = [] if segments else list(getattr(image, "paths", []) or [])
     if segments:
-        print(f"  one segment of a split image: {len(segments)} segments joined, "
-              f"{os.path.basename(segments[0])} .. {os.path.basename(segments[-1])}")
+        _say(f"  one segment of a split image: {len(segments)} segments joined, "
+             f"{os.path.basename(segments[0])} .. {os.path.basename(segments[-1])}")
         print(f"    {describe_segment_sizes(image.sizes)}")
         warn = split_structure_warning(segments)
         if warn:
             print(f"  {warn}")
     elif ewf_parts:
-        print(f"  {describe_acquisition(image)}")
+        _say(f"  {describe_acquisition(image)}")
     print(f"  {size:,} bytes ({human(size)})")
     print("=" * 78)
     # what volumes.json ties each volume to: the one file, or the first
@@ -32509,7 +32925,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             if zf is not None and base is not None and wanted:
                 vol = _zip_names(zf).volume(name_prefix + (vol_names.get(base) or f"lba{base // ss}"),
                                             (".exceptions.tsv",))
-                print(f"\n      EXTRACTING to {extract}  as {vol}/")
+                _say(f"\n      EXTRACTING to {extract}  as {vol}/")
                 try:
                     w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
                     ents = collect(w, w.root)
@@ -32546,7 +32962,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     if miss:
                         print(f"        INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
                 except Exception as exc:
-                    print(f"        could not extract this filesystem: {exc}")
+                    _say(f"        could not extract this filesystem: {exc}")
+                    _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=base // ss,
+                                         offset_bytes=base, filesystem="qnx6",
+                                         partition_size_bytes=next(
+                                             (r[2] for r in sized_regions if r[1] == base), None))
             print()
 
         # A partitioned disk that ends in DDF or IMSM metadata: said once; a
@@ -32667,7 +33087,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     vol = _zip_names(zf).volume(f"{stem}_{suffix}"
                                                 if suffix and not stem.endswith(f"_{suffix}")
                                                 else stem, (".exceptions.tsv",))
-                    print(f"        EXTRACTING to {extract}  as {vol}/")
+                    _say(f"        EXTRACTING to {extract}  as {vol}/")
                     try:
                         w = ExtWalker(fh, b)
                         ents = collect(w, w.root)
@@ -32704,7 +33124,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         if miss:
                             print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
                     except Exception as exc:
-                        print(f"        could not extract: {exc}")
+                        _say(f"        could not extract: {exc}")
+                        _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
+                                             offset_bytes=b, partition_size_bytes=sz,
+                                             filesystem=kind)
 
                 if kind in ("fat32", "fat16", "fat12", "exfat", "ntfs", "refs", "f2fs", "hfs+", "hfsx", "apfs",
                             "etfs", "efs", "qnx4", "squashfs", "jffs2", "ubi",
@@ -32725,7 +33148,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     if zf is not None:
                         vol = _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
                                                     (".exceptions.tsv",))
-                        print(f"        EXTRACTING to {extract}  as {vol}/")
+                        _say(f"        EXTRACTING to {extract}  as {vol}/")
                         try:
                             w = walker_for(kind, fh, b, sz)
                             ents = collect(w, w.root)
@@ -32746,10 +33169,12 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 })
                             _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
                                                    else None, issues, " " * 12)
-                            n_dmg, dmg = damage_lines(w, 50)
+                            n_dmg, dmg = damage_lines(w, _ZIP_DAMAGE_KEPT)
                             if n_dmg and manifest is not None:
                                 manifest[-1]["damage_recorded"] = n_dmg
                                 manifest[-1]["damage_first"] = dmg
+                                if getattr(w, "folders_not_read", 0):
+                                    manifest[-1]["folders_not_read"] = w.folders_not_read
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
@@ -32765,7 +33190,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             if miss:
                                 print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
                         except Exception as exc:
-                            print(f"        could not extract: {exc}")
+                            _say(f"        could not extract: {exc}")
+                            _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
+                                                 offset_bytes=b, partition_size_bytes=sz,
+                                                 filesystem=kind)
 
                 if (kind == "QNX IFS boot image" and wanted
                         and (do_list or zf is not None)):
@@ -32775,7 +33203,14 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     except IfsUnsupported as exc:
                         print(f"        contents not read: {exc}")
                     except Exception as exc:
-                        print(f"        could not read this image filesystem: {exc}")
+                        _say(f"        could not read this image filesystem: {exc}")
+                        if zf is not None:
+                            vol = _zip_names(zf).volume(
+                                name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                                (".exceptions.tsv",))
+                            _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
+                                                 offset_bytes=b, partition_size_bytes=sz,
+                                                 filesystem="qnx_ifs")
                     if w is not None:
                         ck = ("image checksum balances" if w.cksum_ok
                               else "IMAGE CHECKSUM DOES NOT BALANCE" if w.cksum_ok is False
@@ -32791,7 +33226,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         if zf is not None:
                             vol = _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
                                                         (".exceptions.tsv",))
-                            print(f"        EXTRACTING to {extract}  as {vol}/")
+                            _say(f"        EXTRACTING to {extract}  as {vol}/")
                             try:
                                 ents = collect(w, w.root)
                                 ents, dropped = apply_exclude(ents, exclude)
@@ -32828,7 +33263,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 if miss:
                                     print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
                             except Exception as exc:
-                                print(f"        could not extract: {exc}")
+                                _say(f"        could not extract: {exc}")
+                                _zip_volume_not_read(zf, manifest, vol, image_rec, exc,
+                                                     lba=b // ss, offset_bytes=b,
+                                                     partition_size_bytes=sz,
+                                                     filesystem="qnx_ifs")
                 print()
 
         if rejected:
@@ -41408,5 +41847,9 @@ if __name__ == "__main__":
                  "Not all of them are named: the zip or one of its tables could not be "
                  "written."),
               file=sys.stderr)
-    if refused or not zip_whole or not_exported:
+    not_read = _volumes_not_read(manifest)
+    if not_read:
+        print(f"\n{not_read:,} volume(s) were found and not read in full. Their records in "
+              f"volumes.json say why (extract_error, folders_not_read).", file=sys.stderr)
+    if refused or not zip_whole or not_exported or not_read:
         sys.exit(1)
