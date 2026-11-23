@@ -1011,6 +1011,10 @@ other fields may be wrong. A `com.apple.decmpfs` attribute of type 0x80000001, w
 `bsd/sys/decmpfs.h` names `DATALESS_CMPFS_TYPE`, on a file not flagged compressed is
 counted in `note`, not as damage, and the data stream is read as stored.
 
+These checks cover the structures named above and were run on a limited set of damaged
+images, so they do not show that every damaged sector is detected. File content on an
+ordinary volume has no checksum.
+
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
 Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are
 ciphertext in a given image is a separate question, and the volume's own blocks answer
