@@ -2290,9 +2290,13 @@ Files fsynced after the last checkpoint are read too. A copy of a running or cra
 device can hold them only in the roll-forward log, so the reader replays that log in
 memory by the rules of `fs/f2fs/recovery.c`. The walk starts at the next free block of the
 warm node log, and a node counts only if its footer carries this checkpoint's version, and
-its checksum when the checkpoint's flags say so. Anything the kernel would stop recovery on
-leaves the checkpoint's state in place and is recorded. The image is never written, and each
-file that takes anything from the log has a `ROLL_FORWARD` row in the exceptions table.
+its checksum when the checkpoint's flags say so. A failure costs only its part: an inode the
+kernel would stop on stays as the checkpoint holds it, the other files are still replayed,
+and the volume exits 1 with the inode named in `damage_first`. A replay that would pass its
+memory bound (the main area's size, at most 1 GiB) stops at the last node that fit, as if
+the log ended there, and says so. Only a chain that loops leaves the whole log unused. The
+image is never written, and each file that takes anything from the log has a `ROLL_FORWARD`
+row in the exceptions table.
 Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
 files match the kernel's read-back hashes, where 1.87 listed 1. The log on that volume holds
 inode nodes only, so replay of a direct node has been run on a crafted log and not on one the
@@ -2303,7 +2307,9 @@ it was, so that block can then appear in both files.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
-A compressed cluster in LZO, LZO-RLE or zstd is refused by name.
+A compressed cluster in LZO, LZO-RLE or zstd is refused by name. An LZ4 cluster that cannot
+be decoded costs that cluster: the others keep their offsets, its bytes read as zeros, the
+member is marked `SHORT` and the exceptions table gives the byte ranges.
 
 Encryption: a file with per-file encryption (the norm on a real Android `/data`) is
 exported as stored, with an `ENCRYPTED` row that gives its logical size. The member runs
