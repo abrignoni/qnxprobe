@@ -370,7 +370,9 @@ than 255 bytes of UTF-8 keeps its start and a short last extension around a hash
 A filesystem volume with anything to record gets `<volume>.exceptions.tsv` beside its
 folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 `exceptions`. It has one row per file that failed, read short or was renamed
-(`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
+(`stored_path`, `zip_member`, `issue`, `detail`), a `NO_POINTER_ZEROS` row for a qnx6 file
+with blocks that have no pointer (see "QNX6 superblock choice and damaged volumes"), and
+`TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
@@ -767,10 +769,14 @@ always walk the same one. The rules are the Linux driver's (`fs/qnx6/inode.c`, v
   is read only when no copy passes, and the run says so.
 - Only copies with the first superblock's volume id, block size and block count compete.
   A superblock an earlier, larger format left at the end of a partition is named in the
-  report and not used.
-- If the first superblock is lost, the second is still found through the boot header's
-  `b_sblk1`, and has to pass its checksum. A superblock found only by the brute scan is
-  not walked, because one copy on its own does not say where the volume starts.
+  report and not used, even when the live copies fail their checksums. A newer copy with
+  another identity is not read either, and that is recorded.
+- If the first superblock is lost or damaged, the second is still found through the boot
+  header's `b_sblk1` or the first copy's own block count, and has to pass its checksum.
+  When no usable copy is at those places the first 256 MiB are scanned (`--scan-limit`).
+  A superblock found only by that scan is not walked, because one copy on its own does not
+  say where the volume starts. It is recorded as a volume not read, and so is a first
+  superblock that kept its magic with no valid copy found, on a region nothing else claims.
 - The image has to reach the end of the second superblock's area. If it does not, the
   volume is marked INCOMPLETE and the run says a newer generation may be lost.
 - With no boot block the data area starts at 0x1000 (lines 335-341 and 374-375). Above 4096
@@ -788,24 +794,36 @@ read is a fixture written from that same struct.
 
 **Block pointers.** Only ~0 means unused. A stored 0 is block 0, which real volumes use. On
 the nine vehicle volumes at hand, a stored 0 appears only as a top-level Bitmap pointer (on
-six of them), no pointer block is all zeros, and every slot past a tree's size is ~0. So a
-pointer block of zeros, or one naming block 0 twice inside the file's size, is recorded as
-damage and not read as a run of holes. Pointers past the volume's block count, more than 5
-levels, and a pointer back to its own pointer block are refused the same way.
+six of them), no pointer block is all zeros, and every slot past a tree's size is ~0. Each
+slot is judged on its own, so a bad sector in a pointer block costs only the slots it
+covers. One block cannot be stored twice, so when a pointer block holds 0 in more than one
+slot, those zero slots are refused and the rest are followed. Pointers past the volume's
+block count, more than 5 levels, and a pointer back to its own pointer block are refused
+the same way.
 
-**What a damaged file looks like.** A file whose pointers do not cover its whole size is
-stored as `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is what was really read. A
-missing block before the last block that exists is zeros, so later bytes keep their offsets,
-and nothing is written after the last block that exists. The exceptions table says how many
-blocks were missing and why. A genuinely sparse file would show the same way. None of the
-nine volumes has an unused pointer inside a file's size, so whether QNX writes sparse files
-is not established.
+**Sparse files.** QNX documents that fs-qnx6 [creates sparse files by default since
+7.1](https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.user_guide/topic/fsystems_QNX6_filesystem.html),
+with a [`nosparse` mount option](https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.utilities/topic/f/fs-qnx6.so.html).
+Those pages do not say how a hole is stored. The Linux driver reads a ~0 pointer as no
+block, which returns zeros, and logs an error. So a ~0 pointer inside a file's size is read
+as zeros at full length here too. The file is not SHORT and the exit code does not change.
+One `NO_POINTER_ZEROS` row in the exceptions table says how many blocks that covers,
+because a sparse hole and a damaged pointer look the same. That ~0 is how QNX stores a hole
+has not been confirmed on a real 7.1 volume: none of the nine volumes at hand has an unused
+pointer inside a file's size.
+
+**What a damaged file looks like.** A file with a block whose pointer is damaged is stored
+as `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is what was really read. A lost block
+before the last block that exists is zeros, so later bytes keep their offsets, and nothing
+is written after the last block that exists. The exceptions table says how many blocks were
+lost and why. A size past what the file's pointers can address, or past the volume's own
+size (QNX counts sparse blocks against free space), is SHORT the same way.
 
 Metadata that cannot be read goes into the walker's `damage` list and `volumes.json`
 (`damage_recorded`, `damage_first`, `folders_not_read`), and a folder not read in full makes
 the run exit 1. A long name that cannot be read becomes `long-name-damaged-inode-<n>-block-<b>`,
 an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a name is
-written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`.
+written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`, and a stored NUL as `%00`.
 
 ## QNX6 free space
 
