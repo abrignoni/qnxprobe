@@ -1206,6 +1206,8 @@ stream's name and size (eight are named, then a count), and `--list` names them.
 `com.apple.decmpfs`, a resource fork holding the file's compressed data and the
 `com.apple.system.*` names are how the volume stores the file, so they are left out. A
 file with an empty data fork and a resource fork stays a 0-byte member with that row.
+`com.apple.provenance` gets no row and is not named in another file's row. The volume's
+`note` gives the number of files holding it, each counted once.
 
 A pending journal is recorded and not replayed. When a volume was not cleanly unmounted,
 its `note` says so and gives the bytes of transactions the journal holds: newer data may

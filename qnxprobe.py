@@ -8157,6 +8157,7 @@ HFSP_STREAMS_NAMED = 8                  # streams named per file in its NAMED_ST
 
 HFSP_DECMPFS = "com.apple.decmpfs"
 HFSP_DECMPFS_MAGIC = b"fpmc"
+HFSP_PROVENANCE = "com.apple.provenance"     # counted per volume, not listed per file
 
 
 class HfsUnreadable(Exception):
@@ -8569,6 +8570,7 @@ class HfsPlusWalker:
         self._cut_folders = set()              # folders whose listing stopped at a damaged node
         self._tree_faults = set()              # (tree, node) already recorded
         self._attr_cut = set()                 # ids whose attribute lookup met a damaged node
+        self._provenance = None                # (files holding it, whether the count is whole)
         self._folder_names = {}                # folder id -> (parent id, name), for stream_rows
         self._link_vnodes = {}                 # node past the base -> (id, open folders, repeat, shut)
         self._link_keys = {}
@@ -8671,6 +8673,10 @@ class HfsPlusWalker:
             parts.append(f"{len(self._links_held):,} later name(s) of directory hard links "
                          f"list nothing, past {HFSP_LINK_REPEAT_LIMIT:,} entries of repeated "
                          "contents; each such folder is listed in full under its first name")
+        if self._provenance and self._provenance[0]:
+            count, whole = self._provenance
+            parts.append(f"{'' if whole else 'at least '}{count:,} file(s) hold the "
+                         f"{HFSP_PROVENANCE} attribute")
         return "; ".join(parts) or None
 
     note = volume_note
@@ -9348,14 +9354,41 @@ class HfsPlusWalker:
                 out.append(("rsrc", size))
         return out + self._attr_streams(target)
 
+    def _count_provenance(self):
+        """How many files the walk reached hold com.apple.provenance, each counted once
+        however many names it has: one pass over the attributes tree, against the catalog
+        records the walk read. A damaged node makes the count a lower bound."""
+        wanted = HFSP_PROVENANCE.encode("utf-16-be")
+        found, whole = set(), True
+        tree = self._attrs
+        if tree is None or not tree.first_leaf or not tree.header_ok:
+            self._provenance = (0, tree is None or tree.header_ok)
+            return
+        try:
+            for key, _data in tree.walk_from(tree.first_leaf):
+                if len(key) >= 12 and key[12:] == wanted:
+                    cnid = struct.unpack_from(">I", key, 2)[0]
+                    rec = self._cache.get(cnid)
+                    if rec and struct.unpack_from(">H", rec, 0)[0] == HFSP_FILE:
+                        found.add(cnid)
+        except _HfsNodeDamage as exc:
+            self._tree_fault(exc)
+            whole = False
+        self._provenance = (len(found), whole)
+
     def stream_rows(self, entries, members):
         """One NAMED_STREAM row per file or folder that holds a resource fork or a visible
         extended attribute, for the exceptions table: (path, member, issue, detail, 1). The
         bytes are not exported. ``entries`` is collect()'s list; a folder is named from the
-        walk that listed it."""
+        walk that listed it. com.apple.provenance is left out of every row, and ``note``
+        gives the count of files holding it."""
         rows = []
+        self._count_provenance()
 
         def add(path, member, streams):
+            streams = [s for s in streams if s[0] != HFSP_PROVENANCE]
+            if not streams:
+                return
             shown = ", ".join(f"{n} ({s:,} bytes)" for n, s in streams[:HFSP_STREAMS_NAMED])
             more = len(streams) - HFSP_STREAMS_NAMED
             rows.append((path, member, "NAMED_STREAM",
@@ -36117,6 +36150,42 @@ def _hfs_reader_checks():
                 and rsrc and only)
     row("HFS+: resource forks and visible attributes each get a NAMED_STREAM row, and "
         "compression's own storage does not", streams)
+
+    def provenance_rows():
+        v = _HfsTestVolume()
+        only = v.file(HFSP_ROOT, "only.txt", b"a")
+        both = v.file(HFSP_ROOT, "both.txt", b"b")
+        v.file(HFSP_ROOT, "none.txt", b"c")
+        v.xattr(only, "com.apple.provenance", b"12345678901")
+        v.xattr(both, "com.apple.provenance", b"12345678901")
+        v.xattr(both, "user.kept", b"xyz")
+        marked = v.folder(HFSP_ROOT, "marked")
+        v.xattr(marked, "com.apple.provenance", b"12345678901")
+        tagged = v.folder(HFSP_ROOT, "tagged")
+        v.xattr(tagged, "com.apple.provenance", b"12345678901")
+        v.xattr(tagged, "user.tag", b"t")
+        w, _t, issues, _z = export(v.image())
+        rows = {r[0]: r[3] for r in issues if r[2] == "NAMED_STREAM"}
+        return (set(rows) == {"both.txt", "tagged"} and "user.kept (3 bytes)" in rows["both.txt"]
+                and "1 named stream" in rows["both.txt"] and "user.tag (1 bytes)" in rows["tagged"]
+                and not any("provenance" in d for d in rows.values())
+                and "2 file(s) hold the com.apple.provenance attribute" in note(w))
+    row("HFS+: com.apple.provenance is in no stream row, other streams keep theirs, and the "
+        "note counts the files holding it", provenance_rows)
+
+    def provenance_once():
+        v = _HfsTestVolume()
+        private = v.folder(HFSP_ROOT, HFSP_PRIVATE_DATA)
+        store = v.file(private, "iNode900", b"linked")
+        v.xattr(store, "com.apple.provenance", b"12345678901")
+        for name in ("l1", "l2", "l3"):
+            v.file(HFSP_ROOT, name, info=HFSP_HARD_LINK_TYPE + HFSP_HARD_LINK_CREATOR,
+                   special=900)
+        w, _t, issues, _z = export(v.image())
+        return ("1 file(s) hold the com.apple.provenance attribute" in note(w)
+                and not [r for r in issues if r[2] == "NAMED_STREAM"])
+    row("HFS+: a file with several hard links counts once for com.apple.provenance",
+        provenance_once)
 
     def stream_count():
         v = _HfsTestVolume()
