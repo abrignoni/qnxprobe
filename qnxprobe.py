@@ -190,6 +190,21 @@ def report_generations(copies, sized_regions, how_of):
     return order, gens
 
 
+import codecs                        # pylint: disable=wrong-import-position,wrong-import-order
+
+
+def _escape_name_bytes(error):
+    """Codec error handler for stored names: a stretch that does not decode becomes %XX
+    of its stored bytes. A name is then always text that SQLite, a file path and a
+    report accept, which a surrogate is not."""
+    if not isinstance(error, UnicodeDecodeError):
+        raise error
+    return "".join(f"%{b:02X}" for b in error.object[error.start:error.end]), error.end
+
+
+codecs.register_error("qnxprobe-name", _escape_name_bytes)
+
+
 # read_at() is the only path from a walker to the image, so a short answer from
 # it is the one signal that a read reached past the end of the file. The walkers
 # pad a short block with zeros, which is right for a sector an acquisition could
@@ -2223,7 +2238,7 @@ class ExtWalker:
                                        "were not read")
                 return
             if i and nl:
-                nm = buf[p + 8:p + 8 + nl].decode("utf-8", "surrogateescape")
+                nm = buf[p + 8:p + 8 + nl].decode("utf-8", "qnxprobe-name")
                 if nm not in (".", ".."):
                     out.append((nm, i))
             p += rec
@@ -29011,17 +29026,19 @@ def _ext_reader_checks():
     def raw_names():
         img = bytearray(sparse4)
         at = root_block(img)
+        stored = (b"\xff", b"\xe2\x82")               # a lone byte, a cut UTF-8 sequence
         p, done = 0, 0
         while p < 4096 and done < 2:
             rec, nl = struct.unpack_from("<HB", img, at + p + 4)
             if nl > 2:
-                img[at + p + 6] = 1
-                img[at + p + 8] = 0xFF - done
+                img[at + p + 6] = len(stored[done])
+                img[at + p + 8:at + p + 8 + len(stored[done])] = stored[done]
                 done += 1
             p += rec
-        w = walker(img)
-        names = {n.encode("utf-8", "surrogateescape") for n, _i in w.listdir(2)}
-        return {b"\xff", b"\xfe"} <= names
+        names = [n for n, _i in walker(img).listdir(2)]
+        for name in names:
+            name.encode("utf-8")                        # what SQLite needs of a name
+        return {"%FF", "%E2%82", "dir"} <= set(names) and len(set(names)) == len(names)
 
     def signed_time():
         img = load("ext4-times")
@@ -29050,7 +29067,8 @@ def _ext_reader_checks():
 
     row("ext damage: a record length of 0 inside a folder is recorded with where it is",
         bad_rec_len)
-    row("ext names: two names that are not UTF-8 stay distinct and keep their bytes", raw_names)
+    row("ext names: names that are not UTF-8 stay distinct as %XX of their stored bytes, with "
+        "no surrogate, and a valid name is unchanged", raw_names)
     row("ext times: the zip date comes from the kernel's reading, so a 1961 mtime is not 2097",
         signed_time)
     row("ext encryption: a file flagged encrypted is refused and a flagged folder's names are "

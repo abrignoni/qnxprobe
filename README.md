@@ -318,6 +318,8 @@ requires every one to hash to what `sha256sum` recorded over that tree. A file o
 folder whose data is inline in its inode is read from the inode's 60 bytes and its
 `system.data` attribute. Past what those two hold, a file reads as zeros, as it does in
 the kernel. `meta_bg` volumes are read through the descriptor block of each meta group.
+A stored ext name that is not valid UTF-8 keeps its bytes as `%XX`, so `bad_<0xFF>.bin` is
+`bad_%FF.bin` and two such names stay two names.
 
 Damage on an ext volume is recorded, not read around. A folder that cannot be read in
 full (its inode, a block past the end of the image, a record length that cannot be right)
