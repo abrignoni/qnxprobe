@@ -2300,12 +2300,10 @@ row in the exceptions table.
 Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
 files match the kernel's read-back hashes, where 1.87 listed 1. The log on that volume holds
 inode nodes only, so replay of a direct node has been run on a crafted log and not on one the
-kernel wrote. One step of the kernel's is not done: when the log gives a file a block the
-checkpoint still marks in use, the kernel takes it from the earlier owner through the
-segment summary. This reader records that in `damage_first` and leaves the earlier owner as
-it was, so that block can then appear in both files. That does not apply after an atomic
-write commit: there the earlier owner is an orphan copy-on-write inode, which the kernel
-frees before replay and no folder names.
+kernel wrote. When the log gives a file a block the checkpoint still marks in use, the
+segment summary names the earlier owner. As in the kernel, that index is cleared if it still
+holds the block, so after a move the source reads zeros there. An orphan's blocks need
+nothing, because the kernel frees them before replay.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
@@ -2324,11 +2322,13 @@ path has been run on inodes with the flag patched in, not on a real fscrypt volu
 Damage is recorded and not read through. A node whose footer names another node or inode,
 an address outside the main area, a size past what the format allows or a checkpoint or
 superblock copy that fails its checksum is named in `damage_first`. A bad copy falls back to
-the good one. A file under a damaged node is refused, a folder that cannot be read in full
+the good one, and when the checkpoint read is the older pack the note says newer content may
+be absent. A newest pack that was not written whole is a normal crash state, so that one is
+only a note. A file under a damaged node is refused, a folder that cannot be read in full
 counts in `folders_not_read`, and a name whose inode cannot be read is a `FAILED` row. A real
 hole, a node id of 0 or a block address of 0, stays a hole.
 
-Five checks catch one bad sector that would otherwise read as valid. Each was measured on the
+Six checks catch one bad sector that would otherwise read as valid. Each was measured on the
 known-data volumes before it was used, and none fires on an intact one:
 
 - An inode that fails its checksum (`f2fs_inode_chksum`) is a `FAILED` row. In the log it costs
@@ -2336,15 +2336,21 @@ known-data volumes before it was used, and none fires on an intact one:
   checksum, on a volume with the feature, is counted in `damage_first`, because damage can
   clear the flag that says so.
 - A log whose chain stops while later blocks of its segment still carry this checkpoint's
-  version is recorded as cut, and the run exits 1. A fault in the footer of the log's last
-  node leaves nothing after it, so it cannot be seen this way, and the files in that node are
+  version gets a note in the volume's record: fsynced files may be missing, from a bad sector
+  or from writes still in flight at a crash. The kernel stops at the same place in both
+  cases, so the exit status does not change. A fault in the footer of the log's last node
+  leaves nothing after it, so it cannot be seen this way, and the files in that node are
   missing with no record.
 - Fewer inodes reached than the checkpoint's `valid_inode_count`, after orphans and quota
   inodes, is recorded with both numbers, and the run exits 1.
 - A name that does not match its stored hash is recorded and kept, since it may be the only
   trace of the entry. Casefolded and encrypted folders hash another input and are not checked.
+- An inode with an invalid file type is a `FAILED` row, as the kernel answers `-EIO`. A folder
+  entry whose `file_type` disagrees with its inode's mode is named in `damage_first`.
 - A file whose `i_blocks` is more than its block map accounts for gets a `BLOCKS_UNREACHED`
-  row, and the run exits 1. This covers compressed files. A direct node sector read as 0xFF
+  row, and the run exits 1. Compressed clusters are counted as the kernel counts them, with
+  a released cluster counting only its data blocks. A direct node sector read as 0xFF, or
+  an inode's address sector on a volume with no inode checksums,
   looks like reserved blocks (`NEW_ADDR`), which are valid and read as zeros, so it is not
   caught.
 
