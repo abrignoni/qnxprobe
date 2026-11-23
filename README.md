@@ -373,7 +373,9 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
-time, and for the last five for a value out of their range too.
+time, and for NTFS, ReFS, HFS+ and F2FS for a value out of their range too. APFS keeps
+every stored time, so a time before 1970 gets a row and one from 2100 to 2107 is the
+member's date. Only a stored 0 is no time there.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -492,7 +494,10 @@ record. `entry()` is unchanged.
   (e2fsprogs 1.47.4) reads the base unsigned, so it shows a different date than the
   kernel for a time before 1970 and for one the kernel writes between 2038 and 2106.
 - APFS is `j_inode_val_t` (Apple File System Reference, 2020-06-22, pages 74-75),
-  nanoseconds since 1970 UTC, as stored, 0 included.
+  nanoseconds since 1970 UTC, as stored, 0 included. The reference types the field
+  `uint64_t`; it is read as signed, because macOS `stat` returned negative times for
+  files set before 1970. Such a time is a negative second count with its nanoseconds
+  counted forward from it.
 - HFS+ is the catalog folder and file record (TN1150), seconds since 1904 GMT; the
   volume header's createDate, the one local-time date, is not read. TN1150 says the
   Mac OS X BSD APIs return `attributeModDate` as `st_ctime`. A hard link gives its
@@ -943,8 +948,42 @@ LZFSE or stored, in the attribute or in the resource fork (since 1.74; see
 What it does not do: an encrypted volume whose blocks are ciphertext in the image, and
 which no password given opens (see below), is named, marked `encrypted and locked, not
 read`, and not walked, and a file compressed with LZBITMAP is listed with its size
-and refuses to be read, naming the method. Nothing here reads a snapshot: what is walked is the volume as
-the newest checkpoint leaves it.
+and refuses to be read, naming the method. A locked volume is also named in
+`volumes.json` under `extract_error` and exits 1, so its record does not read as an empty
+volume. Nothing here reads a snapshot: what is walked is the volume as the newest
+checkpoint leaves it. The identification lines give the number of snapshots a volume
+records, and say nothing about what they hold.
+
+Two volumes of a container can carry one name. The first keeps it as its folder and a
+later one gets `_2`, `_3` and so on. Names that differ only in case keep their own
+spelling, so they share a folder if the zip is extracted where case is ignored.
+
+Each B-tree node is checked when it is first read. An ordinary node must pass its
+Fletcher-64 checksum and hold the object id and type its parent's pointer promises (an
+all-zero block passes the checksum alone). A sealed system volume's nodes have no object
+header, so they are held to their structure and to the SHA-2 hash their parent records,
+and the root to the one in the integrity metadata. On a volume whose seal is broken, a
+hash that differs is not treated as damage, because Apple's reference says only that the
+volume was modified after sealing, so a changed node that keeps its structure is not
+detected there.
+
+A node that fails is named in `damage_first`, what it held is not guessed at, and the rest
+of the tree and the other volumes are still read. The container's record says so in
+`extract_error`, which exits 1. A folder that may have lost entries, or whose entries lost
+their inodes, is also named and counted in `folders_not_read`.
+A file with a byte range no extent record covers, or an extent past the end of the
+container, is cut there and stored as `.SHORT-<got>-of-<size>-bytes` with the reason.
+Apple's reference does not say how a hole is stored. Every hole on the macOS volumes
+measured was an extent at block 0 and none left a range with no extent, so a missing record
+is not read as a hole. A volume written by another implementation was not measured. A
+file flagged compressed whose `com.apple.decmpfs` attribute is gone is refused rather than
+written as an empty file.
+
+A block 0 that fails its checksum or is all zero is replaced by a valid superblock copy
+from the checkpoint descriptor area, found through what block 0 still says, in the 64
+blocks after it, or, for a partition the GPT types as APFS, up to 1 GiB in. A bare
+container whose block 0 is gone and whose descriptor area starts further away is not
+recognized. A block 0 that passes its checksum is used exactly as before.
 
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
 Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are
