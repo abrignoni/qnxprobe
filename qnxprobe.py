@@ -190,6 +190,21 @@ def report_generations(copies, sized_regions, how_of):
     return order, gens
 
 
+import codecs                        # pylint: disable=wrong-import-position,wrong-import-order
+
+
+def _escape_name_bytes(error):
+    """Codec error handler for stored names: a stretch that does not decode becomes %XX
+    of its stored bytes. A name is then always text that SQLite, a file path and a
+    report accept, which a surrogate is not."""
+    if not isinstance(error, UnicodeDecodeError):
+        raise error
+    return "".join(f"%{b:02X}" for b in error.object[error.start:error.end]), error.end
+
+
+codecs.register_error("qnxprobe-name", _escape_name_bytes)
+
+
 # read_at() is the only path from a walker to the image, so a short answer from
 # it is the one signal that a read reached past the end of the file. The walkers
 # pad a short block with zeros, which is right for a sector an acquisition could
@@ -4509,8 +4524,8 @@ def _ntfs_file_names(attrs):
         if end > len(v):
             continue                        # the record does not hold the name it declares
         # An NTFS name is 16-bit units with no pairing rule, so an unpaired surrogate is
-        # a real name. "replace" would turn two different names into the same one.
-        name = v[0x42:end].decode("utf-16-le", "surrogatepass")
+        # a real name. It is kept as %XX of its stored bytes, so two names stay two.
+        name = v[0x42:end].decode("utf-16-le", "qnxprobe-name")
         if not name or name in (".", ".."):
             continue
         out.append((ref, name))
@@ -4958,7 +4973,7 @@ class NtfsWalker:
         if name_len:
             end = pos + name_off + name_len * 2
             if end <= pos + length:
-                name = raw[pos + name_off:end].decode("utf-16-le", "replace")
+                name = raw[pos + name_off:end].decode("utf-16-le", "qnxprobe-name")
         attr = _NtfsAttr(type_, name, flags, not nonres)
         if not nonres:
             vlen, voff = struct.unpack_from("<IH", raw, pos + 16)
@@ -5175,7 +5190,7 @@ class NtfsWalker:
                 if a.type == NTFS_FILE_NAME and a.resident and len(a.value) > 0x42:
                     nlen, ns = a.value[0x40], a.value[0x41]
                     parent = struct.unpack_from("<Q", a.value, 0)[0] & 0xFFFFFFFFFFFF
-                    nm = a.value[0x42:0x42 + nlen * 2].decode("utf-16-le", "surrogatepass")
+                    nm = a.value[0x42:0x42 + nlen * 2].decode("utf-16-le", "qnxprobe-name")
                     names.append((ns, nm, parent))
             if not names:
                 continue                            # nothing names it
@@ -5233,7 +5248,7 @@ class NtfsWalker:
         when the record cannot be read. An empty string means the volume has none."""
         for a in self._record(3):
             if a.type == 0x60 and a.resident:
-                return a.value.decode("utf-16-le", "replace")
+                return a.value.decode("utf-16-le", "qnxprobe-name")
         return "" if self._record(3) else None
 
     def _flags(self, num):
@@ -5281,7 +5296,7 @@ class NtfsWalker:
         if not size:
             target = self._link_target(num)
             if target is not None:
-                return (S_IFLNK | 0o777, len(target.encode("utf-8", "surrogatepass")), mtime)
+                return (S_IFLNK | 0o777, len(target.encode("utf-8")), mtime)
         if is_dir:
             return (S_IFDIR | 0o755, 0, mtime)
         return (0o100644, size, mtime)
@@ -5307,7 +5322,7 @@ class NtfsWalker:
         text = data[names:]
         for off, length in ((show_off, show_len), (sub_off, sub_len)):
             if length and not length & 1 and off + length <= len(text):
-                return text[off:off + length].decode("utf-16-le", "surrogatepass")
+                return text[off:off + length].decode("utf-16-le", "qnxprobe-name")
         return ""
 
     def readlink(self, num):
@@ -5963,7 +5978,7 @@ class NtfsWalker:
                 nstart = pos + 0x52
                 nend = nstart + name_len * 2
                 if nend <= pos + elen:
-                    name = buf[nstart:nend].decode("utf-16-le", "surrogatepass")
+                    name = buf[nstart:nend].decode("utf-16-le", "qnxprobe-name")
                     # Namespace 2 is the 8.3 name of a file that also has a long
                     # one, indexed beside it. Reporting both would list every such
                     # file twice under two names. The root's index also carries an
@@ -36903,14 +36918,57 @@ def _ntfs_reader_fix_checks(image_gz):
         return read == cluster
     row("a 4 TiB size on a one-cluster file does not run on", size_huge)
 
-    # NTFS-20: unpaired surrogates stay distinct.
-    def surrogate():
+    # NTFS-20: an unpaired surrogate becomes %XX of its stored bytes on every name path.
+    def unpaired_names():
         img = bytearray(clean)
+        label = struct.pack("<2H", 0x73, 0xDC00)
+        stream = bytearray((0x18 + len(label) + 8 + 7) & ~7)
+        struct.pack_into("<II", stream, 0, NTFS_DATA, len(stream))
+        stream[9] = 2
+        struct.pack_into("<H", stream, 10, 0x18)
+        struct.pack_into("<IH", stream, 16, 8, 0x18 + len(label))
+        stream[0x18:0x18 + len(label)] = label
+        goal = struct.pack("<2H", 0x43, 0xD800)
+        body = struct.pack("<HHHHI", 0, len(goal), 0, len(goal), 0) + goal
+        point = resident(0xC0, struct.pack("<IHH", 0xA000000C, len(body), 0) + body)
         put(img, spare[0], fresh([0x61, 0xD800], NTFS_ROOT))
-        put(img, spare[1], fresh([0x61, 0xD801], NTFS_ROOT))
-        got = {p for p, node, *_r in walker(img).listing() if node in spare[:2]}
-        return got == {"a\ud800", "a\ud801"}
-    row("two names differing only in an unpaired surrogate stay two names", surrogate)
+        put(img, spare[1], fresh([0x61, 0xD801], NTFS_ROOT, [(NTFS_DATA, bytes(stream))]))
+        put(img, spare[2], fresh([0x6C], NTFS_ROOT, [(0xC0, point)]))
+        w = walker(img)
+        listed = {p for p, node, *_r in w.listing() if node in spare[:2]}
+        unit = struct.pack("<2H", 0x61, 0xD800)
+        entry = bytearray((0x52 + len(unit) + 7) & ~7)
+        struct.pack_into("<Q", entry, 0, 70)
+        struct.pack_into("<HHH", entry, 8, len(entry), 0x42 + len(unit), 0)
+        entry[0x50], entry[0x51] = 2, 1
+        entry[0x52:0x52 + len(unit)] = unit
+        end = bytearray(0x18)
+        struct.pack_into("<HHH", end, 8, 0x18, 0, 2)
+        index = bytearray(16) + entry + end
+        struct.pack_into("<II", index, 0, 16, len(index))
+
+        class _NoSeq:
+            """Only what _index_entries asks of a walker."""
+            _index_entries = NtfsWalker._index_entries   # pylint: disable=protected-access
+
+            def _seq(self, _num):
+                return None
+
+        indexed = []
+        _NoSeq()._index_entries(bytes(index), 0, indexed, set())  # pylint: disable=protected-access
+        names_seen = sorted(listed) + [n for n, _r in indexed] + [
+            n for n, _s in w.named_streams(spare[1])] + [getattr(w, "readlink", str)(spare[2])]
+        if names_seen != ["a%00%D8", "a%01%D8", "a%00%D8", "s%00%DC", "C%00%D8"]:
+            return False
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        db.execute("create table t (name text primary key)")
+        db.executemany("insert into t values (?)", [(n,) for n in sorted(listed)])
+        held = sorted(r[0] for r in db.execute("select name from t"))
+        db.close()
+        return held == ["a%00%D8", "a%01%D8"]
+    row("an unpaired surrogate in a name, stream or link target is kept as %XX of its stored "
+        "bytes, stays distinct and fits SQLite", unpaired_names)
 
     # NTFS-21: an unreadable $Bitmap is not free space.
     def bitmap_lost():
