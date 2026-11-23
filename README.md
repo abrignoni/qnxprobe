@@ -151,7 +151,8 @@ set. It was run on the 12 synthetic self-test images, qnxmount's four reference
 images, a Ford Sync G4 eMMC image (9 volumes) and a BMW MGU image (11 volumes)
 before this was published, and all agreed. A qnx6 found only by the brute scan
 is reported but has no partition to walk, so it appears in the report and not in
-the Contents pane, in the window exactly as on the command line.
+the Contents pane, in the window exactly as on the command line. An export records one
+whose checksum holds as a volume that was not read.
 
 ## Executables
 
@@ -733,9 +734,9 @@ holds. Until then it was refused, and a volume whose every superblock looks
 like that was reported as not recognised. The checksum is the one the Linux driver checks,
 `crc32_be` over bytes 8 to 512 compared with `sb_checksum` (fs/qnx6/inode.c), read in the
 superblock's own byte order. The report says why such a copy was taken, under the generation
-it belongs to. Any other inconsistency still refuses the copy, and a checksum that does not
-match is not a new reason to refuse one: a copy with a good clock and a bad checksum reads
-as it did before.
+it belongs to. Any other inconsistency still refuses the copy. A copy with a good clock and
+a bad checksum is not refused outright, but it is read only when no copy of the volume
+passes (see "QNX6 superblock choice and damaged volumes" below).
 
 Measured on the two vehicle images at hand that hold qnx6 volumes (a Ford Sync G4 and a GM
 unit), the checksum holds on all 26 superblock copies qnxprobe probes. On the GM image two
@@ -754,7 +755,57 @@ same volume id. Everything else the container probes is still its own, so a 0x05
 with no EBR chain that holds a qnx6 is still read, and so is one whose boot code parses as
 an EBR naming a logical volume that has no superblock of its own (both shown by the
 self-test only). The walker still reads little-endian qnx6 only;
-a big-endian superblock with no clock is accepted the same way, in the self-test only.
+a big-endian superblock with no clock is accepted the same way, in the self-test only,
+and that volume is then recorded as not read.
+
+## QNX6 superblock choice and damaged volumes
+
+The report and `volumes()` pick the superblock with one function, `qnx6_select()`, so they
+always walk the same one. The rules are the Linux driver's (`fs/qnx6/inode.c`, v6.12):
+
+- A copy whose checksum holds beats one that fails, whatever their serials. A failed copy
+  is read only when no copy passes, and the run says so.
+- Only copies with the first superblock's volume id, block size and block count compete.
+  A superblock an earlier, larger format left at the end of a partition is named in the
+  report and not used.
+- If the first superblock is lost, the second is still found through the boot header's
+  `b_sblk1`, and has to pass its checksum. A superblock found only by the brute scan is
+  not walked, because one copy on its own does not say where the volume starts.
+- The image has to reach the end of the second superblock's area. If it does not, the
+  volume is marked INCOMPLETE and the run says a newer generation may be lost.
+- With no boot block the data area starts at 0x1000 (lines 335-341 and 374-375). Above 4096
+  bytes per block no source says where it starts, so such a volume is not read. This layout
+  is checked on fixtures only: no real volume without a boot block is at hand.
+- A big-endian volume is recorded as not read, with the reason, so it cannot pass for an
+  empty volume.
+
+**Audi MMI 3G.** The superblock layout the kernel calls `qnx6_mmi_super_block`
+(`include/linux/qnx6_fs.h`, `fs/qnx6/super_mmi.c`) is read: first superblock at byte 0,
+data at 0x1000, no timestamps. The kernel picks this layout with a mount option, so here
+it is tried only on a copy whose checksum holds and whose standard fields do not. It is
+built from the kernel source and has not been tested on a real unit: the only image it has
+read is a fixture written from that same struct.
+
+**Block pointers.** Only ~0 means unused. A stored 0 is block 0, which real volumes use. On
+the nine vehicle volumes at hand, a stored 0 appears only as a top-level Bitmap pointer (on
+six of them), no pointer block is all zeros, and every slot past a tree's size is ~0. So a
+pointer block of zeros, or one naming block 0 twice inside the file's size, is recorded as
+damage and not read as a run of holes. Pointers past the volume's block count, more than 5
+levels, and a pointer back to its own pointer block are refused the same way.
+
+**What a damaged file looks like.** A file whose pointers do not cover its whole size is
+stored as `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is what was really read. A
+missing block before the last block that exists is zeros, so later bytes keep their offsets,
+and nothing is written after the last block that exists. The exceptions table says how many
+blocks were missing and why. A genuinely sparse file would show the same way. None of the
+nine volumes has an unused pointer inside a file's size, so whether QNX writes sparse files
+is not established.
+
+Metadata that cannot be read goes into the walker's `damage` list and `volumes.json`
+(`damage_recorded`, `damage_first`, `folders_not_read`), and a folder not read in full makes
+the run exit 1. A long name that cannot be read becomes `long-name-damaged-inode-<n>-block-<b>`,
+an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a name is
+written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`.
 
 ## QNX6 free space
 
