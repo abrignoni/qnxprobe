@@ -373,7 +373,8 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
-time, and for the last five for a value out of their range too.
+time, and for ReFS, HFS+, APFS and F2FS for a value out of their range too. An NTFS
+FILETIME that no date can show gets a `TIME_NOT_HELD` row with the raw value as stored.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -1378,6 +1379,34 @@ Only the unnamed stream is the file's content; the named ones are read separatel
 [Alternate data streams](#alternate-data-streams) describes. `NtfsWalker.stamps(record)` returns
 the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
 `entry()` carries only the modified one, which is what a listing needs.
+
+Symbolic links and junctions are listed as links, with `readlink()` giving the target as
+stored, and are not followed. An extraction writes no member for them and counts them in
+`symlinks_or_special_skipped`, as it does on every other filesystem. A link used to come
+out as an empty file, or not at all when it pointed at a folder.
+
+The update sequence protects every 512 bytes of a record on any sector size, so a volume
+on a 4096-byte-sector disk reads like any other, and a record whose sequence count does
+not fit its length is refused. Clusters over 64 KiB, up to the 2 MiB Windows formats, are
+read. An `$MFT` too fragmented for its own record is followed through its
+`$ATTRIBUTE_LIST`, and so is a directory index split over several records.
+
+When a volume is damaged or cut short, the export says what is missing:
+
+- A run past the end of the image stays at its own offset as zeros, so nothing after it
+  moves. The member is named `.SHORT-<here>-of-<size>-bytes`, and the missing ranges are
+  in `damage_first`. A compressed unit that is not all there is not inflated, and the
+  count is in file bytes.
+- A file is refused, and recorded as failed, when its run list does not decode, a run
+  leaves the volume, or an extension record holding some of its extents cannot be read.
+- A recorded size past the run list is read up to where the runs end and named `.SHORT`,
+  with the reason in the exceptions table.
+- A directory whose record or index block cannot be read is listed from the records that
+  name it as their parent, and is counted in `folders_not_read`, which makes the exit
+  status 1.
+- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut through `$MFT` says how
+  many records lie past its end. Clusters whose `$Bitmap` could not be read count as in
+  use, so `free_extents()` does not report them free.
 
 Deleted files are recovered separately, from the MFT rather than the directory index.
 `NtfsWalker.deleted_files()` yields every record that is marked free but still names a
