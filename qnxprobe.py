@@ -31,6 +31,7 @@ Read-only throughout. Never writes to the image.
 """
 import os, re, struct, sys, datetime, json, time, uuid, zipfile, bisect, collections, itertools
 import binascii
+import errno
 import getpass
 import io
 import plistlib
@@ -12831,25 +12832,43 @@ def _zip_is_device_name(part):
     return part[:1] in _ZIP_DEVICE_FIRST and _ZIP_DEVICE_NAME.match(part) is not None
 
 
-def _zip_safe_component(part):
+def _zip_folder_end(part):
+    """Where the end of a folder name that cannot be extracted on Windows begins, or
+    len(part) when it can. Measured on Windows 11 with Python 3.11.9 and Expand-Archive:
+    a folder whose name ends in a run of spaces and dots holding a space, or in two or
+    more dots, stops the extraction or loses the files under it. One trailing dot
+    extracts, and so does a file's own name ending in spaces or dots."""
+    if part[-1:] not in (" ", "."):
+        return len(part)
+    kept = len(part.rstrip(" ."))
+    run = part[kept:]
+    return kept if " " in run or len(run) > 1 else len(part)
+
+
+def _zip_safe_component(part, folder=False):
     """One path component as a zip member may hold it: '.', '..' and an empty
     component (a '/' that was part of a stored name, or a leading one) are
     written escaped, and so is any character in _ZIP_UNSAFE or a lone surrogate,
     as %XX of its UTF-8 bytes. A '%' is escaped too, but only in a component that needs other
     escaping, so ordinary names stay exactly as stored. A Windows device name has its
-    first letter escaped the same way."""
+    first letter escaped the same way. With ``folder``, the end _zip_folder_end finds is
+    escaped too."""
     if part in ("", ".", ".."):
         return {"": "%2F", ".": "%2E", "..": "%2E%2E"}[part]
+    tail = ""
+    if folder:
+        end = _zip_folder_end(part)
+        part, tail = part[:end], "".join(f"%{ord(c):02X}" for c in part[end:])
     if _zip_is_device_name(part):
-        return f"%{ord(part[0]):02X}{part[1:]}"
+        return f"%{ord(part[0]):02X}{part[1:]}{tail}"
     def unsafe(c):
         # a lone surrogate can come from a stored name and has no UTF-8 form
         return ord(c) in _ZIP_UNSAFE or 0xD800 <= ord(c) <= 0xDFFF
 
-    if not any(unsafe(c) for c in part):
+    if not tail and not any(unsafe(c) for c in part):
         return part
     return "".join("".join(f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
-                   if unsafe(c) or c == "%" else c for c in part)
+                   if unsafe(c) or c == "%" else c for c in part) + tail
 
 
 _ZIP_NAME_BYTES = 255                   # the longest file name APFS and ext4 take
@@ -12873,9 +12892,10 @@ def _zip_shorten(part):
     return stem.decode("utf-8", "ignore") + mark + tail
 
 
-def _zip_component(part):
-    """One path component as the zip holds it: made safe, then cut to length."""
-    return _zip_shorten(_zip_safe_component(part))
+def _zip_component(part, folder=False):
+    """One path component as the zip holds it: made safe, then cut to length. ``folder``
+    is true for a component with members under it."""
+    return _zip_shorten(_zip_safe_component(part, folder))
 
 
 def zip_member_name(volume, path):
@@ -12884,8 +12904,10 @@ def zip_member_name(volume, path):
     _ZIP_NAME_BYTES, so no member can climb out of the folder it is extracted into,
     start at a root, be cut short, or be refused for its length, whatever names the
     filesystem stored."""
-    return "/".join([_zip_component(volume)]
-                    + [_zip_component(c) for c in path.split("/")])
+    parts = path.split("/")
+    return "/".join([_zip_component(volume, True)]
+                    + [_zip_component(c, True) for c in parts[:-1]]
+                    + [_zip_component(parts[-1])])
 
 
 _ZIP_WINDOWS_CHARS = str.maketrans(':<>|"?*', "_" * 7)
@@ -12900,7 +12922,8 @@ def _zip_key(name):
 
     Each component is first read the way Python's zipfile extracts it on Windows
     (ZipFile._sanitize_windows_name): :<>|"?* become _, trailing dots and spaces go
-    (3.10 removes only the dots, and Windows itself removes the spaces), and a
+    (before 3.12 zipfile removes only the dots, and Windows removes the spaces from a
+    file's name; a folder with such an end is escaped, _zip_folder_end), and a
     component left empty goes too. The stored name is not changed, so a name with no
     clash keeps its spelling in the zip."""
     # most names have nothing to change, and this runs many times per file
@@ -12927,6 +12950,8 @@ class _ZipNames:
         self.dirs = set()
         self.folders = {}               # folder as asked for -> folder as held
         self.numbers = {}               # suffix stem's key -> last number tried
+        self.full = None                # why the output took no more, once it has not
+        self.manifest = None            # the run's volume records, to keep room for them
         for name in held:
             parts = name.rstrip("/").split("/")
             self.dirs.update(_zip_key("/".join(parts[:d])) for d in range(1, len(parts)))
@@ -12940,7 +12965,7 @@ class _ZipNames:
         tables are all free, reserved unless ``claim`` is false."""
         name, n = wanted, 1
         while True:
-            folder = _zip_key(_zip_component(name))
+            folder = _zip_key(_zip_component(name, True))
             beside = [_zip_key(_zip_component(name + s)) for s in sidecars]
             if not any(self._taken(k) for k in [folder, *beside]):
                 break
@@ -13061,6 +13086,17 @@ class _ZipOutput(io.FileIO):
         return done
 
 
+def _say(text):
+    """Print a line holding a stored name. A stream that cannot encode a character gets
+    it escaped, so a name cannot stop the run or cost a record. __main__ sets this for
+    the command line; this covers a program that imports the module."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, "backslashreplace").decode(encoding))
+
+
 def _zip_create(path):
     """The zip the command line writes, over a _ZipOutput. Finish it with _zip_finish."""
     output = _ZipOutput(path, "w+")
@@ -13082,6 +13118,14 @@ def _zip_close(zf):
             output.close()
 
 
+def _zip_tables_missing(manifest):
+    """How many volumes have a table that could not be written. A volume with nothing
+    to record has no exceptions_table at all; one whose write failed holds None."""
+    return sum(1 for rec in manifest or []
+               if ("exceptions_table" in rec and rec["exceptions_table"] is None)
+               or ("entries_table" in rec and rec["entries_table"] is None))
+
+
 def _zip_finish(zf, path, manifest):
     """Write volumes.json and the zip's central directory and close the file. A failed
     volumes.json is taken back out so the zip can still be closed. Says plainly what
@@ -13095,11 +13139,17 @@ def _zip_finish(zf, path, manifest):
             info.compress_type = zf.compression
             info.external_attr = 0o600 << 16
             info.file_size = len(data)
-            _zip_store(zf, info, io.BytesIO(data))
+            _zip_store(zf, info, io.BytesIO(data), last=True)
         except Exception as exc:                     # pylint: disable=broad-except
             whole = False
             print(f"\nCOULD NOT WRITE volumes.json: {_zip_reason(exc)}. The zip does not "
                   f"record which volume or image its folders came from.")
+    full = _zip_names(zf).full
+    if full is not None:
+        whole = False
+        print(f"\nTHE OUTPUT RAN OUT OF ROOM ({full}). Nothing more was added to the zip "
+              f"after that, and no further volume was extracted. Every file left out is "
+              f"counted as failed. Free some space and run the extraction again.")
     try:
         _zip_close(zf)
     except Exception as exc:                         # pylint: disable=broad-except
@@ -13108,7 +13158,86 @@ def _zip_finish(zf, path, manifest):
               f"not open as a zip. Free some space and run the extraction again.")
         return False
     print(f"\nwrote {path}  ({os.path.getsize(path):,} bytes)")
+    lost = _zip_tables_missing(manifest)
+    if lost:
+        whole = False
+        print(f"\nCOULD NOT WRITE the file table of {lost:,} volume(s). Those volumes' "
+              f"records in volumes.json say so, and the zip does not name their files.")
     return whole
+
+
+# What an output says when it has no more room. After the first of these nothing more
+# is added to the zip: a smaller file might still fit, but it would take the room the
+# central directory needs, and without that directory no member can be opened.
+_ZIP_FULL_ERRNOS = frozenset(getattr(errno, n) for n in ("ENOSPC", "EFBIG", "EDQUOT")
+                             if hasattr(errno, n))
+
+
+def _zip_directory_size(zf):
+    """An upper bound, in bytes, on the zip's central directory and end records."""
+    total, big = 22, len(zf.filelist) >= 0xFFFF or zf.start_dir >= 0xFFFFFFFF
+    for info in zf.filelist:
+        total += (46 + len(info.filename.encode("utf-8", "surrogatepass"))
+                  + len(info.extra) + len(info.comment))
+        if max(info.file_size, info.compress_size, info.header_offset) >= 0xFFFFFFFF:
+            total, big = total + 28, True
+    return total + (76 if big else 0)
+
+
+def _zip_room(zf, wanted):
+    """How many of ``wanted`` bytes the output takes after the last member, found by
+    writing them and cutting them back. A buffered or unseekable output cannot be
+    tested this way and is taken to have the room."""
+    fp = zf.fp
+    if not getattr(zf, "_seekable", False) or not isinstance(fp, (io.RawIOBase, io.BytesIO)):
+        return wanted
+    start, room = zf.start_dir, wanted
+    try:
+        fp.seek(start)
+        block = bytes(min(wanted, 1 << 20))
+        while fp.tell() - start < wanted:
+            fp.write(block[:wanted - (fp.tell() - start)])
+    except OSError as exc:
+        if exc.errno in _ZIP_FULL_ERRNOS:
+            room = max(fp.tell() - start, 0)
+    try:
+        fp.seek(start)
+        fp.truncate()
+    except (OSError, ValueError):
+        fp.seek(0, 2)
+        zf.start_dir = fp.tell()
+    return room
+
+
+class _ByteCounter:
+    """A write-only stream that keeps only how many bytes it was given."""
+
+    def __init__(self):
+        self.count = 0
+
+    def write(self, data):
+        self.count += len(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+def _zip_table_size(write):
+    """The bytes a table takes in a zip, member and directory entry, from ``write``
+    storing it in a throwaway zip."""
+    sink = _ByteCounter()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as out:
+        write(out)
+    return sink.count
+
+
+def _zip_records_room(names):
+    """Bytes to keep for volumes.json: the records so far as a zip holds them, and
+    2 KiB for its directory entry and for the record of the volume being written."""
+    import zlib
+    text = json.dumps({"volumes": names.manifest or []}, indent=2, default=str)
+    return len(zlib.compress(text.encode("utf-8"))) + 2048
 
 
 def _zip_undo(zf, info, start, dst):
@@ -13135,17 +13264,28 @@ def _zip_undo(zf, info, start, dst):
     zf.start_dir = zf.fp.tell()
 
 
-def _zip_store(zf, info, source):
+def _zip_store(zf, info, source, last=False):
     """Copy the stream ``source`` into a new member. If that fails nothing of it
-    stays in the zip (_zip_undo) and the error is raised to the caller."""
+    stays in the zip (_zip_undo) and the error is raised to the caller.
+
+    An error that says the output is full is remembered for the whole zip (_ZipNames.full).
+    From then on a member stays only if the central directory and volumes.json still
+    fit after it. ``last`` marks volumes.json itself, which is always held to that."""
     import shutil
+    names = _zip_names(zf)
     start, dst = zf.start_dir, None
     try:
         dst = zf.open(info, "w")
         shutil.copyfileobj(source, dst)
         dst.close()
-    except BaseException:
+        if names.full is not None or (last and isinstance(zf.fp, _ZipOutput)):
+            wanted = _zip_directory_size(zf) + (0 if last else _zip_records_room(names))
+            if _zip_room(zf, wanted) < wanted:
+                raise OSError(errno.ENOSPC, "No space left on device")
+    except BaseException as exc:
         _zip_undo(zf, info, start, dst)
+        if isinstance(exc, OSError) and exc.errno in _ZIP_FULL_ERRNOS and names.full is None:
+            names.full = _zip_reason(exc)
         raise
 
 
@@ -13198,12 +13338,15 @@ def _zip_time_rows(lost):
     return rows
 
 
+_ZIP_EXCEPTION_COLUMNS = ["stored_path", "zip_member", "issue", "detail"]
+
+
 def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip."""
-    if rec is not None and _zip_component(volume) != volume:
-        rec["zip_folder"] = _zip_component(volume)
+    if rec is not None and _zip_component(volume, True) != volume:
+        rec["zip_folder"] = _zip_component(volume, True)
     if not issues:
         return
     counts = collections.Counter()
@@ -13214,7 +13357,7 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
                "time_not_held": counts["TIME_NOT_HELD"]}
     name = _zip_component(f"{volume}.exceptions.tsv")
     try:
-        _zip_store_table(zf, name, ["stored_path", "zip_member", "issue", "detail"],
+        _zip_store_table(zf, name, _ZIP_EXCEPTION_COLUMNS,
                          ([p, m, i, d] for p, m, i, d, _n in issues))
     except Exception as exc:                         # pylint: disable=broad-except
         name = None
@@ -13223,8 +13366,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
         rec["exceptions_table"] = name
         rec["exceptions"] = summary
     if name:
-        print(f"{pad}every failed, short or renamed file, and each time a zip cannot "
-              f"hold: {name}")
+        _say(f"{pad}every failed, short or renamed file, and each time a zip cannot "
+             f"hold: {name}")
 
 
 def _zip_reason(exc):
@@ -13236,7 +13379,7 @@ def _zip_reason(exc):
 
 
 def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=None,
-                   issues=None):
+                   issues=None, table_room=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -13276,6 +13419,14 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
 
     issues, when given, is filled with one (stored path, zip member, issue, detail,
     files counted) per file that failed, read short or was renamed, and for each stored time a zip cannot hold (_zip_time_rows).
+
+    Once the output reports it is full (_zip_store), no further file is read or added,
+    here or in any later volume of this zip: each is counted in failed and recorded.
+    The last members of this call are then taken back out, newest first, until the
+    central directory, this volume's table and volumes.json fit, and are recorded as
+    failed too. Members of earlier calls stay, since their tables already name them.
+    table_room, when given, returns the bytes this volume's table will take; without it
+    that is measured from ``issues``.
     """
     import tempfile
     total_files = sum(1 for _, _, size, _ in entries if size is not None)
@@ -13284,8 +13435,9 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     names = _zip_names(zf)
     arcs = [zip_member_name(volume, e[0]) for e in entries]
     finals = names.assign([arc if e[2] is not None else None for arc, e in zip(arcs, entries)])
-    folder = _zip_component(volume)
+    folder = _zip_component(volume, True)
     lost_times = {}
+    kept = []                   # what is needed to take a written member back out
 
     def note(path, member, issue, detail):
         if issues is not None:
@@ -13298,8 +13450,11 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
             reasons.append("the stored name is a Windows device name, which extracts to no file")
         if any(_zip_safe_component(c) != c and not _zip_is_device_name(c) for c in parts):
             reasons.append("the stored name carries characters a zip member cannot hold safely")
-        if any(len(_zip_safe_component(c).encode("utf-8", "surrogatepass")) > _ZIP_NAME_BYTES
-               for c in parts):
+        if any(c not in (".", "..") and _zip_folder_end(c) != len(c) for c in parts[:-1]):
+            reasons.append("a folder name ends in spaces or dots, which stops extraction "
+                           "on Windows")
+        if any(len(_zip_safe_component(c, d < len(parts) - 1).encode("utf-8", "surrogatepass"))
+               > _ZIP_NAME_BYTES for d, c in enumerate(parts)):
             reasons.append(f"a name was longer than {_ZIP_NAME_BYTES} bytes")
         return reasons
 
@@ -13318,6 +13473,13 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
             why.extend(name_reasons(path))
             if final != arc:
                 why.append("another file in the zip holds that name")
+        if names.full is not None:
+            failed += 1
+            note(path, "", "FAILED", "; ".join(
+                [f"not written: the output ran out of room ({names.full})"] + why))
+            if progress is not None:
+                progress(volume, files, written, total_files, total_bytes)
+            continue
         info = None
         try:
             info = zipfile.ZipInfo(final, date_time=_zip_time(mtime))
@@ -13367,12 +13529,63 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 held[0] += 1
                 if len(held[1]) < _TIME_ROWS_PER_VALUE:
                     held[1].append((path, info.filename))
+            kept.append((info, path, arc, min(got, size), got < size, why, shown))
         except Exception as exc:
             failed += 1
             log.append(f"        could not extract {arc}: {exc}")
             note(path, "", "FAILED", "; ".join([_zip_reason(exc)] + why))
         if progress is not None:
             progress(volume, files, written, total_files, total_bytes)
+    if names.full is not None or isinstance(zf.fp, _ZipOutput):
+        taken = []
+        table = 0
+        try:                    # an estimate: failing to make one must not stop the run
+            if table_room is not None:
+                table = table_room()
+            elif issues or lost_times:
+                table = _zip_table_size(lambda out: _zip_store_table(
+                    out, "t", _ZIP_EXCEPTION_COLUMNS,
+                    ([p, m, i, d] for p, m, i, d, _n
+                     in itertools.chain(issues or (), _zip_time_rows(lost_times)))))
+        except Exception:       # pylint: disable=broad-except
+            pass
+        wanted = _zip_directory_size(zf) + table + _zip_records_room(names)
+        room = _zip_room(zf, wanted)
+        if room < wanted and names.full is None:
+            names.full = "no room left for the zip's directory and records"
+        while room < wanted and kept:
+            goal = zf.start_dir - (wanted - room)
+            while kept and zf.start_dir > goal:
+                taken.append(kept.pop())
+                _zip_undo(zf, taken[-1][0], taken[-1][0].header_offset, None)
+                table += len(taken[-1][1].encode("utf-8", "surrogatepass")) + 128
+            wanted = _zip_directory_size(zf) + table + _zip_records_room(names)
+            room = _zip_room(zf, wanted)
+        if taken and issues is not None:
+            gone = {entry[0].filename for entry in taken}
+            issues[:] = [row for row in issues if row[1] not in gone]
+        for info, path, arc, counted, was_short, why, shown in reversed(taken):
+            failed += 1
+            written -= counted
+            if was_short:
+                short -= 1
+            else:
+                files -= 1
+            if written_names is not None:
+                written_names.pop(arc, None)
+            if shown is not None:
+                held = lost_times[shown]
+                held[0] -= 1
+                if (path, info.filename) in held[1]:
+                    held[1].remove((path, info.filename))
+                if not held[0]:
+                    del lost_times[shown]
+            note(path, "", "FAILED", "; ".join(
+                [f"taken back out of the zip to leave room for its directory and records "
+                 f"({names.full})"] + why))
+        if names.full is not None:
+            log.insert(0, f"        OUTPUT FULL ({names.full}): {failed:,} file(s) of this "
+                          f"volume are not in the zip and are counted as failed")
     if issues is not None:
         issues.extend(_zip_time_rows(lost_times))
     return files, written, skipped, failed, short
@@ -30672,11 +30885,13 @@ def _logical_members(entries):
                 out.append(part(name))
         return "/".join(out)
 
-    def in_zip(path):
+    def in_zip(path, folder=False):
         # two stored names can escape to one (a:b and a%3Ab) or differ only in case
         # (README and readme), so uniqueness is decided on the name the zip will hold,
         # compared the way the folder it is extracted into may compare it
-        return _zip_key("/".join(_zip_component(c) for c in path.split("/")))
+        parts = path.split("/")
+        return _zip_key("/".join(_zip_component(c, folder or d < len(parts) - 1)
+                                 for d, c in enumerate(parts)))
 
     def plain(entry):
         base = joined(entry.names) or "root-entry"
@@ -30687,9 +30902,9 @@ def _logical_members(entries):
         names = tuple(entry.names)
         for depth in range(1, len(names)):
             if names[:depth] not in file_only:
-                taken.add(in_zip(joined(names[:depth])))
+                taken.add(in_zip(joined(names[:depth]), True))
         if entry.is_folder and names:
-            taken.add(in_zip(joined(names)))
+            taken.add(in_zip(joined(names), True))
     # every first holder takes its name before any suffix is chosen, so a suffix
     # cannot land on a name stored later in the image
     first = {}
@@ -30788,6 +31003,8 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
     print("  It holds copies of files and no disk, so no partition table or filesystem "
           "is read.")
     zip_names = _zip_names(zf) if zf is not None else None
+    if zip_names is not None:
+        zip_names.manifest = manifest
     volume = _logical_volume_name(path, manifest, zip_names)
     wanted = only is None or only.lower() in volume.lower()
     if not wanted:
@@ -30835,11 +31052,13 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
         excluded = {m for m, _e in members if m not in kept}
         log = []
         written_names = {}
+        arcs = {m: zip_member_name(volume, m) for m, _e in members}
         files, written, skipped, failed, short = extract_to_zip(
-            zf, walker, volume, rows, log, reporter, written_names)
+            zf, walker, volume, rows, log, reporter, written_names,
+            table_room=lambda: _zip_table_size(lambda out: _write_logical_table(
+                out, volume, entries, members, excluded, walker, arcs, written_names)))
         log = [line.replace("are in the image, the rest lies past its end",
                             "are in the container") for line in log]
-        arcs = {m: zip_member_name(volume, m) for m, _e in members}
         table_error = None
         try:
             table = _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
@@ -30847,22 +31066,6 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
         except Exception as exc:                     # pylint: disable=broad-except
             table, table_error = None, _zip_reason(exc)
         checks = collections.Counter(c for _g, c in walker.results.values())
-        print(f"      {files:,} files, {human(written)}"
-              + (f", {failed:,} FAILED" if failed else "")
-              + (f", {short:,} SHORT" if short else "")
-              + (f", {dropped:,} excluded" if dropped else ""))
-        print(f"      stored hashes: {checks['match']:,} match, {checks['MISMATCH']:,} do "
-              f"not, {checks['no stored hash']:,} files store none")
-        if table_error is None:
-            print(f"      every entry, with its path and times as stored: {table}")
-        else:
-            print(f"      COULD NOT WRITE the entries table: {table_error}. The zip does not "
-                  f"record the stored paths, times or status of this image's entries.")
-        for line in log[:5]:
-            print(line)
-        for entry in entries:
-            if walker.results.get(id(entry), (0, ""))[1] == "MISMATCH":
-                print(f"      HASH MISMATCH {entry.path!r}")
         if manifest is not None:
             manifest.append({
                 "volume": volume,
@@ -30880,8 +31083,24 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
                 "files_without_stored_hash": checks["no stored hash"],
                 "entries_table": table,
             })
-            if _zip_component(volume) != volume:
-                manifest[-1]["zip_folder"] = _zip_component(volume)
+            if _zip_component(volume, True) != volume:
+                manifest[-1]["zip_folder"] = _zip_component(volume, True)
+        print(f"      {files:,} files, {human(written)}"
+              + (f", {failed:,} FAILED" if failed else "")
+              + (f", {short:,} SHORT" if short else "")
+              + (f", {dropped:,} excluded" if dropped else ""))
+        print(f"      stored hashes: {checks['match']:,} match, {checks['MISMATCH']:,} do "
+              f"not, {checks['no stored hash']:,} files store none")
+        if table_error is None:
+            _say(f"      every entry, with its path and times as stored: {table}")
+        else:
+            print(f"      COULD NOT WRITE the entries table: {table_error}. The zip does not "
+                  f"record the stored paths, times or status of this image's entries.")
+        for line in log[:5]:
+            _say(line)
+        for entry in entries:
+            if walker.results.get(id(entry), (0, ""))[1] == "MISMATCH":
+                _say(f"      HASH MISMATCH {entry.path!r}")
     print()
 
 
@@ -31040,13 +31259,13 @@ def _zip_export_checks():
             return _io.BytesIO(entry.data)
 
     class FullDisk(_io.FileIO):
-        """A real file whose write fails once, past a byte offset, like a full disk."""
-        fail_past = None
+        """A real file whose write fails once, past a byte offset."""
+        fail_past, fail_with = None, errno.EIO
 
         def write(self, data):
             if self.fail_past is not None and self.tell() + len(data) > self.fail_past:
                 self.fail_past = None
-                raise OSError(errno.ENOSPC, "No space left on device")
+                raise OSError(self.fail_with, os.strerror(self.fail_with))
             return super().write(data)
 
     def fat12(files):
@@ -31204,7 +31423,7 @@ def _zip_export_checks():
             return (clean and whole and after == b"after" and tally[3] == 1 and tally[0] == 2
                     and names == ["vol/case/first.txt", "vol/case/after.txt"])
 
-        # the disk fills during the write
+        # the output fails during the write, for a reason that does not mean it is full
         path = os.path.join(work, "full.zip")
         with FullDisk(path, "w+") as raw:
             with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -31359,26 +31578,195 @@ def _zip_export_checks():
             return None
         # under the 8 KiB of a buffered file, so a buffer would be left holding the bytes
         body, when = random.Random(1987).randbytes(6000), 1_600_000_000
-        whole, _said, out = under_limit(3000, [("first.txt", b"first", when, False),
-                                               ("victim.db", body, when, False),
-                                               ("after.txt", b"after", when, False)])
+        whole, said, out = under_limit(3000, [("first.txt", b"first", when, False),
+                                              ("victim.db", body, when, False),
+                                              ("after.txt", b"after", when, False)])
         with zipfile.ZipFile(out) as zin:
             names = zin.namelist()
             rows = table(zin, "lba0.exceptions.tsv")
-            return (whole and zin.testzip() is None and "volumes.json" in names
+            record = json.loads(zin.read("volumes.json"))["volumes"][0]
+            return (whole is False and zin.testzip() is None
                     and zin.read("lba0/first.txt") == b"first"
-                    and zin.read("lba0/after.txt") == b"after"
-                    and not any("victim" in n for n in names)
+                    and not any("victim" in n or "after" in n for n in names)
                     and [(r["stored_path"], r["issue"]) for r in rows]
-                    == [("victim.db", "FAILED")])
+                    == [("victim.db", "FAILED"), ("after.txt", "FAILED")]
+                    and record["files"] == 1 and record["failed"] == 2
+                    and "THE OUTPUT RAN OUT OF ROOM" in said)
 
     def index_refused():
         try:
             import resource as _resource            # pylint: disable=unused-import
         except ImportError:
             return None
-        whole, said, _out = under_limit(60, [("first.txt", b"first", 1_600_000_000, False)])
+        # not even the end record fits
+        whole, said, _out = under_limit(10, [("first.txt", b"first", 1_600_000_000, False)])
         return whole is False and "THE ZIP IS NOT USABLE" in said
+
+    def many_small_files():
+        """The output fills among many small files: the zip opens, each file is either
+        whole in it or named as failed, and the counts agree."""
+        try:
+            import resource as _resource            # pylint: disable=unused-import
+        except ImportError:
+            return None
+        stream = random.Random(1987)
+        files = {f"f{n:04d}.bin": stream.randbytes(4096) for n in range(300)}
+        whole, said, out = under_limit(600_000, [(n, b, 1_600_000_000, False)
+                                                 for n, b in files.items()])
+        with zipfile.ZipFile(out) as zin:
+            names = set(zin.namelist())
+            kept = {n[5:] for n in names if n.startswith("lba0/f")}
+            rows = table(zin, "lba0.exceptions.tsv")
+            record = json.loads(zin.read("volumes.json"))["volumes"][0]
+            failed = {r["stored_path"] for r in rows if r["issue"] == "FAILED"}
+            return (whole is False and zin.testzip() is None
+                    and all(zin.read(f"lba0/{n}") == files[n] for n in kept)
+                    and kept and failed and not kept & failed
+                    and kept | failed == set(files)
+                    and record["files"] == len(kept) and record["failed"] == len(failed)
+                    and "THE OUTPUT RAN OUT OF ROOM" in said)
+
+    def later_image_not_read():
+        """After the output fills, a further image is not extracted, and its files are
+        counted."""
+        try:
+            import resource
+        except ImportError:
+            return None
+        import signal
+        one, two = os.path.join(work, "one.dd"), os.path.join(work, "two.dd")
+        out = os.path.join(work, "later.zip")
+        body = random.Random(1987).randbytes(6000)
+        with open(one, "wb") as fh:
+            fh.write(fat12({"BIG.BIN": b"x"}))
+        with open(two, "wb") as fh:
+            fh.write(fat12({"NEXT.TXT": b"second image"}))
+        manifest, said, real = [], _io.StringIO(), walker_for
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        ignored = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        zf = _zip_create(out)
+        try:
+            stand_in = [Walker([("big.bin", body, 1_600_000_000, False)])]
+            globals()["walker_for"] = lambda *a, **k: (stand_in.pop() if stand_in
+                                                       else real(*a, **k))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (3000, hard))
+            with contextlib.redirect_stdout(said):
+                main(one, extract=out, zf=zf, manifest=manifest)
+                main(two, extract=out, zf=zf, manifest=manifest)
+                whole = _zip_finish(zf, out, manifest)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, ignored)
+            globals()["walker_for"] = real
+        with zipfile.ZipFile(out) as zin:
+            names = zin.namelist()
+        return (whole is False and not any("NEXT" in n or "big" in n for n in names)
+                and [r["failed"] for r in manifest] == [1, 1]
+                and _files_not_exported(manifest) == 2 and "OUTPUT FULL" in said.getvalue())
+
+    def missing_table_fails_run():
+        real, out, manifest = _zip_store_table, os.path.join(work, "t.zip"), []
+
+        def refuse(zf, name, header, rows):
+            if name.endswith(".entries.tsv"):
+                raise OSError(errno.EIO, "Input/output error")
+            return real(zf, name, header, rows)
+
+        zf = _zip_create(out)
+        said = _io.StringIO()
+        globals()["_zip_store_table"] = refuse
+        try:
+            with contextlib.redirect_stdout(said):
+                read_logical_image(Image([Entry(("a",), b"data")]), "case.L01",
+                                   extract=out, zf=zf, manifest=manifest)
+                whole = _zip_finish(zf, out, manifest)
+        finally:
+            globals()["_zip_store_table"] = real
+        with zipfile.ZipFile(out) as zin:
+            opens = zin.read("case/a") == b"data"
+        return whole is False and opens and "COULD NOT WRITE the file table" in said.getvalue()
+
+    def cut_disk(path, stored):
+        """An MBR disk with one FAT12 partition, a file in it under the long name
+        ``stored``, cut 4 KiB short."""
+        volume = bytearray(fat12({"EVID.TXT": b"evidence"}))
+        short, check = bytes(volume[2560:2571]), 0
+        for byte in short:
+            check = (((check & 1) << 7) + (check >> 1) + byte) & 0xFF
+        units = (stored.encode("utf-16-le") + b"\0\0").ljust(26, b"\xff")
+        slot = bytearray(32)
+        slot[0], slot[11], slot[13] = 0x41, 0x0F, check
+        slot[1:11], slot[14:26], slot[28:32] = units[:10], units[10:22], units[22:26]
+        volume[2560:2624] = bytes(slot) + bytes(volume[2560:2592])
+        mbr = bytearray(512)
+        struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\0\0\0", 1, b"\0\0\0", 1, 256)
+        mbr[510:512] = b"\x55\xaa"
+        with open(path, "wb") as fh:
+            fh.write(bytes(mbr) + bytes(volume[:-4096]))
+
+    def narrow_stdout():
+        """A stored name the console cannot show changes nothing in the zip or its record,
+        from the command line and for a program that imports this module."""
+        import subprocess
+        if getattr(sys, "frozen", False):
+            return None
+        raw = os.path.join(work, "cut.dd")
+        cut_disk(raw, "\u65e5\u672c:\u8a9e.txt")
+
+        def run(encoding):
+            out = os.path.join(work, f"{encoding}.zip")
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONUTF8"}
+            env["PYTHONIOENCODING"] = encoding
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw,
+                                   "--extract", out], env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=120, check=False)
+            with zipfile.ZipFile(out) as zin:
+                members = [(i.filename, i.CRC, i.file_size, i.date_time)
+                           for i in zin.infolist() if i.filename != "volumes.json"]
+                record = json.loads(zin.read("volumes.json"))
+            return done.returncode, members, record, b"INCOMPLETE" in done.stdout
+
+        wide, narrow = run("utf-8"), run("cp1252")
+        if not (wide == narrow and wide[0] == 0 and wide[3]
+                and wide[2]["volumes"][0].get("extends_past_image_by_bytes") == 4096):
+            return False
+        strict = _io.TextIOWrapper(_io.BytesIO(), encoding="cp1252", errors="strict")
+        manifest = []
+        with zipfile.ZipFile(_io.BytesIO(), "w") as zf, contextlib.redirect_stdout(strict):
+            main(raw, extract="x.zip", zf=zf, manifest=manifest)
+        logical_records = []
+        with zipfile.ZipFile(_io.BytesIO(), "w") as zf, contextlib.redirect_stdout(strict):
+            read_logical_image(Image([Entry(("\u65e5\u672c:\u8a9e",), b"data")]), "case.L01",
+                               extract="x.zip", zf=zf, manifest=logical_records)
+        return (manifest[0].get("extends_past_image_by_bytes") == 4096
+                and len(logical_records) == 1 and logical_records[0]["files"] == 1)
+
+    def folder_ends():
+        stored = ["aaa.txt", "dir /evidence.txt", "dir%20/evidence.txt", "dots../two",
+                  "dot./one", "mix .  /deep/three", "file ", "file2.", "zzz.txt"]
+        zin, manifest = through_main({"EVID.TXT": b"x"},
+                                     Walker([(n, n.encode(), 1_600_000_000, False)
+                                             for n in stored]))
+        names = [n for n in zin.namelist() if n.startswith("lba0/")]
+        rows = {r["stored_path"]: r for r in table(zin, manifest[0]["exceptions_table"])}
+        spaced = rows["dir /evidence.txt"]
+        lzin, _rec = logical([Entry(("d ",), b"", folder=True), Entry(("d ", "x"), b"under"),
+                              Entry(("d",), b"file")])
+        return (sorted(zin.read(n) for n in names) == sorted(n.encode() for n in stored)
+                and not any(part.endswith((" ", "..")) for n in names
+                            for part in n.split("/")[:-1])
+                and spaced["issue"] == "RENAMED" and "folder name" in spaced["detail"]
+                and zin.read(spaced["zip_member"]) == b"dir /evidence.txt"
+                and spaced["zip_member"].startswith("lba0/dir%20/")
+                and "lba0/dots%2E%2E/two" in names and "lba0/dot./one" in names
+                and "lba0/mix%20%2E%20%20/deep/three" in names
+                and "lba0/file " in names and "lba0/file2." in names
+                and "file " not in rows and "dot./one" not in rows
+                and lzin.read("case/d%20/x") == b"under" and lzin.read("case/d") == b"file"
+                and _zip_safe_component("100% ", True) == "100%25%20"
+                and _zip_safe_component("con ", True) == "%63on%20"
+                and _zip_safe_component("dir ") == "dir ")
 
     def table_refused():
         real, said, buf, manifest = _zip_store_table, _io.StringIO(), _io.BytesIO(), []
@@ -31416,11 +31804,12 @@ def _zip_export_checks():
         lrows = {r["stored_path"]: r for r in table(lzin, "case.entries.tsv")}
         return (no_clash([on_windows(n) for n in names]) and len(names) == len(stored)
                 and sorted(zin.read(n) for n in names) == sorted(n.encode() for n in stored)
-                and all(f"lba0/{n}" in names for n in ("a?", "b.", "c ", "d<", "dir.../x",
+                and all(f"lba0/{n}" in names for n in ("a?", "b.", "c ", "d<", "dir/x",
                                                        "aux.c", "con.txt", "alone?"))
+                and zin.read("lba0/dir%2E%2E%2E/x") == b"dir.../x"
                 and zin.read("lba0/%6Eul") == b"nul" and zin.read("lba0/%4EUL.") == b"NUL."
                 and all(rows[n]["issue"] == "RENAMED" and rows[n]["zip_member"] in names
-                        for n in ("a_", "b", "c", "d>", "d_", "dir/x", "nul", "NUL."))
+                        for n in ("a_", "b", "c", "d>", "d_", "dir.../x", "nul", "NUL."))
                 and "device name" in rows["nul"]["detail"]
                 and "characters" not in rows["nul"]["detail"]
                 and not {"a?", "aux.c", "con.txt", "alone?"} & set(rows)
@@ -31465,10 +31854,20 @@ def _zip_export_checks():
             ("--exclude on logical evidence reads the stored path, not the generated name",
              exclude_stored),
             ("the entries table keeps the boundaries between stored names", name_boundaries),
-            ("an output the system refuses to grow loses only the file that did not fit, "
-             "and the zip opens", output_refused),
+            ("an output the system refuses to grow takes nothing more, names every file "
+             "left out, and the zip opens", output_refused),
             ("a zip whose central directory cannot be written is reported, not called written",
              index_refused),
+            ("an output that fills among many small files leaves a zip that opens, with "
+             "every file whole or named as failed", many_small_files),
+            ("after the output fills, a further image is not extracted and its files are "
+             "counted", later_image_not_read),
+            ("a table that could not be written makes the run report failure",
+             missing_table_fails_run),
+            ("a stored name the console cannot show changes neither the zip nor its record",
+             narrow_stdout),
+            ("a folder name ending in spaces or dots is escaped for every member under it, "
+             "and a file's own name is kept", folder_ends),
             ("a logical image whose entries table cannot be written still reports its files",
              table_refused),
             ("names Windows would land on one file are kept apart and recorded, and a device "
@@ -31480,7 +31879,7 @@ def _zip_export_checks():
         except Exception:                            # pylint: disable=broad-except
             passed = False
         if passed is None:
-            print(f"  [SKIP] {label}: this platform cannot limit a file's size")
+            print(f"  [SKIP] {label}: this platform or build cannot run it")
         else:
             out.append((label, bool(passed)))
         clear()
@@ -31691,6 +32090,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
          reporter=None, manifest=None, passwords=(), key_files=(), private_keys=(),
          unallocated=None, unallocated_log=None, image=None, name_prefix="", image_info=None,
          allow_unequal_segments=False):
+    if zf is not None:
+        _zip_names(zf).manifest = manifest
     # a set that is not whole raises SplitImageError; an acquisition's reader joins
     # its own files (an AD-encrypted raw set is numbered like a split image, and its
     # files are ciphertext until the reader decrypts them). An image already open
@@ -32133,17 +32534,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         })
                     _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None else None,
                                            issues)
+                    if miss and manifest is not None:
+                        manifest[-1]["extends_past_image_by_bytes"] = miss
                     print(f"        {f_:,} files, {human(wr)}"
                           + (f", {sk:,} symlinks or special files skipped" if sk else "")
                           + (f", {fa:,} FAILED" if fa else "")
                           + (f", {sh:,} SHORT" if sh else "")
                           + (f", {dropped:,} excluded" if dropped else ""))
                     for line in log[:5]:
-                        print(line)
+                        _say(line)
                     if miss:
                         print(f"        INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
-                        if manifest is not None:
-                            manifest[-1]["extends_past_image_by_bytes"] = miss
                 except Exception as exc:
                     print(f"        could not extract this filesystem: {exc}")
             print()
@@ -32291,17 +32692,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             })
                         _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
                                                else None, issues, " " * 12)
+                        if miss and manifest is not None:
+                            manifest[-1]["extends_past_image_by_bytes"] = miss
                         print(f"            {f_:,} files, {human(wr)}"
                               + (f", {sk:,} symlinks or special files skipped" if sk else "")
                               + (f", {fa:,} FAILED" if fa else "")
                               + (f", {sh:,} SHORT" if sh else "")
                               + (f", {dropped:,} excluded" if dropped else ""))
                         for line in log[:5]:
-                            print(line)
+                            _say(line)
                         if miss:
                             print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
-                            if manifest is not None:
-                                manifest[-1]["extends_past_image_by_bytes"] = miss
                     except Exception as exc:
                         print(f"        could not extract: {exc}")
 
@@ -32349,6 +32750,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             if n_dmg and manifest is not None:
                                 manifest[-1]["damage_recorded"] = n_dmg
                                 manifest[-1]["damage_first"] = dmg
+                            if miss and manifest is not None:
+                                manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
                                   + (f", {sk:,} symlinks or special files skipped" if sk else "")
                                   + (f", {fa:,} FAILED" if fa else "")
@@ -32356,13 +32759,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                   + (f", {dropped:,} excluded" if dropped else "")
                                   + (f", {n_dmg:,} DAMAGED structure(s) recorded" if n_dmg else ""))
                             for line in log[:5]:
-                                print(line)
+                                _say(line)
                             for line in dmg[:5]:
-                                print(f"            DAMAGE {line}")
+                                _say(f"            DAMAGE {line}")
                             if miss:
                                 print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
-                                if manifest is not None:
-                                    manifest[-1]["extends_past_image_by_bytes"] = miss
                         except Exception as exc:
                             print(f"        could not extract: {exc}")
 
@@ -32414,6 +32815,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                     })
                                 _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
                                                        else None, issues, " " * 12)
+                                if miss and manifest is not None:
+                                    manifest[-1]["extends_past_image_by_bytes"] = miss
                                 print(f"            {f_:,} files, {human(wr)}"
                                       + (f", {sk:,} symlinks or special files skipped"
                                          if sk else "")
@@ -32421,11 +32824,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                       + (f", {sh:,} SHORT" if sh else "")
                                       + (f", {dropped:,} excluded" if dropped else ""))
                                 for line in log[:5]:
-                                    print(line)
+                                    _say(line)
                                 if miss:
                                     print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
-                                    if manifest is not None:
-                                        manifest[-1]["extends_past_image_by_bytes"] = miss
                             except Exception as exc:
                                 print(f"        could not extract: {exc}")
                 print()
@@ -40764,6 +41165,13 @@ note:
 
 if __name__ == "__main__":
     import argparse
+    # A stored name can hold characters the console's code page has no form for. Only
+    # the command line does this: a program that imports this module keeps its streams.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser(
         prog="qnxprobe.py",
         description="Read QNX6, QNX4, ETFS, EFS, ext2/3/4, Btrfs, F2FS, FAT32, FAT16, FAT12, exFAT, NTFS, ReFS, HFS+, "
@@ -40993,7 +41401,12 @@ if __name__ == "__main__":
                   f"{args.unallocated}  ({sum(r['bytes'] for r in ua_written):,} bytes)")
     not_exported = _files_not_exported(manifest)
     if not_exported:
-        print(f"\n{not_exported:,} file(s) could not be exported. Each is named in the "
-              f"zip's tables.", file=sys.stderr)
+        named = (args.extract and zipfile.is_zipfile(args.extract)
+                 and not _zip_tables_missing(manifest))
+        print(f"\n{not_exported:,} file(s) could not be exported. "
+              + ("Each is named in the zip's tables." if named else
+                 "Not all of them are named: the zip or one of its tables could not be "
+                 "written."),
+              file=sys.stderr)
     if refused or not zip_whole or not_exported:
         sys.exit(1)
