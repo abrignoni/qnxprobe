@@ -350,15 +350,19 @@ newest files of the volumes before it are taken back out and recorded as failed 
 own tables.
 
 A recognized volume that cannot be walked gets a record with `extract_error`, and counts
-that were never reached are null. An exFAT folder whose first cluster is outside the volume
-or past the end of the image is named in `damage_first` and counted in `folders_not_read`.
-Either one exits 1.
+that were never reached are null. So does an IFS whose contents are declined (LZO
+compression, a big-endian image, no imagefs header), with the reason. An exFAT folder whose
+first cluster is outside the volume or past the end of the image is named in `damage_first`
+and counted in `folders_not_read`. So is a NoFatChain folder whose recorded size runs off
+the volume or the image or is over the 256MB the format allows (what is there is read), and
+a folder whose last entry set is cut at its end. That file is listed under the part of its
+name that is there, or not listed when none of it is. Any of these exits 1.
 
 Inside a volume the first file to hold a name keeps it. A later file whose name clashes,
 ignoring case and Unicode normalization, gets `.dup-<n>`. So does one that would land on
-the same file when Python extracts the zip on Windows, where `:<>|"?*` become `_` and
-trailing dots and spaces are removed (`a?` and `a_`, `b.` and `b`). The first holder keeps
-its stored spelling, so `a?` stays `a?` when nothing clashes with it. A file that clashes
+the same file when Python extracts the zip on Windows, where `<>|"` become `_` and
+trailing dots and spaces are removed (`a<` and `a_`, `b.` and `b`). The first holder keeps
+its stored spelling, so `a<` stays `a<` when nothing clashes with it. A file that clashes
 with a folder is the one renamed, so the folder's files keep their paths. A name longer
 than 255 bytes of UTF-8 keeps its start and a short last extension around a hash.
 
@@ -375,7 +379,9 @@ Since 1.68 a member's name is made safe before it is written: a stored name of `
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
 backslash, colon or control character are written escaped as `%XX`, so no member can
 land outside the folder it is extracted into, start at a root, or be cut short by a
-NUL. A name that is only a Windows device name (`NUL`, `CON`, `PRN`, `AUX`, `COM1` to
+NUL. Since 1.87 a `?` or `*` is escaped the same way: one such name, as a file or a folder,
+made `Expand-Archive` in Windows PowerShell 5.1.26100 stop with an error and leave none of
+the zip's files. A name that is only a Windows device name (`NUL`, `CON`, `PRN`, `AUX`, `COM1` to
 `COM9`, `LPT1` to `LPT9`, in any case, with or without trailing dots or spaces) has its
 first letter escaped, so `nul` is held as `%6Eul`. A name with an extension, such as
 `aux.c`, is not changed. Ordinary names are kept exactly as stored. Each renamed member is logged as

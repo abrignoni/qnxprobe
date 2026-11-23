@@ -3162,6 +3162,9 @@ def _vfat_name(lfn):
     return name.split("\x00")[0]
 
 
+_EXFAT_DIR_MAX = 256 << 20       # exFAT specification 7.6.5: a directory's largest DataLength
+
+
 class ExfatWalker:
     """List and read files from an exFAT volume, same interface as Fat32Walker.
     A node is (cluster, size, is_dir, fat_chain_flag)."""
@@ -3184,11 +3187,59 @@ class ExfatWalker:
         self.damage = []
         self.folders_not_read = 0
         self._not_read = set()
+        self._folder_names = {}                      # a folder's first cluster -> its name
 
     def _cluster_on_volume(self, clus):
         """True for a cluster the boot sector's count covers. A count of 0 says nothing,
         so a volume that stores one is not refused on it."""
         return clus >= 2 and (not self.cluster_count or clus < self.cluster_count + 2)
+
+    def _folder_part_read(self, first, detail, count=True):
+        """Record a folder read only in part, once per detail. With ``count`` it is counted
+        in folders_not_read, once per folder, because files it records may not be listed."""
+        name = self._folder_names.get(first)
+        what = ("the root folder" if first == self.root_clus else
+                f"folder {name!r}" if name is not None else "a folder")
+        line = f"{what} at cluster {first:#x}: {detail}"
+        if line in self._not_read:
+            return
+        self._not_read.add(line)
+        if count and ("part", first) not in self._not_read:
+            self._not_read.add(("part", first))
+            self.folders_not_read += 1
+        self.damage.append(line)
+
+    def _folder_bytes(self, node, live=True):
+        """The bytes of a folder. A NoFatChain folder is one run of clusters for its
+        recorded size (exFAT specification 6.3.4.2), held to the volume, to the 256MB the
+        specification allows a directory (7.6.5) and to the image. A size the run cannot
+        cover is recorded as damage when ``live``. A deleted folder (``live`` false) stops
+        at its first cluster that is allocated again, since that cluster now holds
+        something else. The root, a FAT-chained folder and a folder recording no size are
+        read as _read() reads them."""
+        clus, size, _, contig = node
+        if not contig or not size or clus < 2:
+            return self._read(clus, 0, contig)
+        cb = self.cluster_bytes
+        want = min(size, _EXFAT_DIR_MAX)
+        if self.cluster_count:
+            want = min(want, max(self.cluster_count + 2 - clus, 0) * cb)
+        out = bytearray()
+        for n in range((want + cb - 1) // cb):
+            if not live and n and self._cluster_in_use(clus + n):
+                break
+            part = read_at(self.fh, self._cluster_off(clus + n), cb)
+            out += part
+            if len(part) < cb:
+                break
+        if live and 0 < len(out) < size:
+            why = ("is over the 256MB exFAT allows a folder" if size > _EXFAT_DIR_MAX
+                   else "runs off the end of this volume" if want < size
+                   else "runs past the end of the image")
+            self._folder_part_read(clus, f"its recorded size of {size:,} bytes {why}, so only "
+                                         f"its first {len(out):,} bytes were read and any "
+                                         f"files recorded after them are not listed")
+        return bytes(out[:size])
 
     def _folder_not_read(self, what, first, why=None):
         """Record a folder that could not be read, once. Its files cannot be listed, so
@@ -3235,29 +3286,39 @@ class ExfatWalker:
         _, size, is_dir, _ = node
         return (0o040000 if is_dir else 0o100000, size, 0)
 
-    def listdir_records(self, node):
+    def listdir_records(self, node, live=True):
         """(name, node, recorded times as stored) for every entry.
 
         exFAT carries a UTC offset beside each timestamp, unlike FAT. It is
         reported as stored rather than applied, so no instant is asserted.
+
+        An entry set the folder's end cuts short is recorded as damage. It is listed
+        under the part of its name that is there, and not at all when none of it is.
+        ``live`` is false for a deleted folder, whose damage is not the volume's.
         """
         clus, _, _, contig = node
         if clus and not self._cluster_on_volume(clus):
             if node == self.root:
                 self._folder_not_read("the root folder", clus)
             return []                                # named when its parent was listed
-        raw = self._read(clus, 0, contig)
+        raw = self._folder_bytes(node, live)
         if clus and not raw:                         # its cluster lies past the image's end
             self._folder_not_read("a folder", clus, "lies past the end of the image")
         out = []
         i = 0
-        while i < len(raw):
+        while i + 32 <= len(raw):
             etype = raw[i]
             if etype == 0x00:
                 break
             if etype == 0x85:                       # File directory entry
                 secs = raw[i + 1]
                 s2 = raw[i + 32:i + 64]             # Stream extension (next entry)
+                if len(s2) < 32:
+                    if live:
+                        self._folder_part_read(clus, f"the entry set at byte {i:,} is cut at "
+                                                     f"the end of the folder before its "
+                                                     f"stream entry, so its file is not listed")
+                    break
                 flags = s2[1]
                 name_len = s2[3]
                 first = struct.unpack_from("<I", s2, 20)[0]
@@ -3268,11 +3329,23 @@ class ExfatWalker:
                 name = ""
                 for k in range(2, secs + 1):
                     ent = raw[i + 32 * k:i + 32 * k + 32]
-                    if not ent or ent[0] != 0xC1:
+                    if len(ent) < 32 or ent[0] != 0xC1:
                         break
                     name += ent[2:32].decode("utf-16-le", "replace")
                 name = name[:name_len]
+                if i + 32 * (secs + 1) > len(raw):
+                    if live:
+                        told = (f"so its file (first cluster {first:#x}, {data_len:,} bytes) "
+                                f"is not listed" if not name else
+                                f"so its file is listed as {name!r}, {len(name)} of the "
+                                f"{name_len} characters of its name")
+                        self._folder_part_read(clus, f"the entry set at byte {i:,} is cut at "
+                                                     f"the end of the folder, {told}")
+                    if not name:
+                        break
                 if name not in (".", ".."):
+                    if is_dir:
+                        self._folder_names.setdefault(first, name)
                     if is_dir and first and not self._cluster_on_volume(first):
                         self._folder_not_read(f"folder {name!r}", first)
                     cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
@@ -3310,17 +3383,24 @@ class ExfatWalker:
 
     def _deleted_in(self, node, in_deleted_dir):
         clus, _, _, contig = node
-        raw = self._read(clus, 0, contig)
+        raw = self._folder_bytes(node, not in_deleted_dir)
         out = []
         i = 0
-        while i < len(raw):
+        while i + 32 <= len(raw):
             etype = raw[i]
             if etype == 0x00:
                 break
             if etype == 0x05:                        # File entry with the in-use bit cleared
                 secs = raw[i + 1]
                 s2 = raw[i + 32:i + 64]
-                if len(s2) < 32 or s2[0] not in (0x40, 0xC0):
+                if len(s2) < 32:
+                    if not in_deleted_dir:
+                        self._folder_part_read(clus, f"the deleted entry set at byte {i:,} is "
+                                                     f"cut at the end of the folder before its "
+                                                     f"stream entry, so it is not listed",
+                                               count=False)
+                    break
+                if s2[0] not in (0x40, 0xC0):
                     i += 32
                     continue
                 flags = s2[1]
@@ -3332,10 +3412,21 @@ class ExfatWalker:
                 name = ""
                 for k in range(2, secs + 1):
                     ent = raw[i + 32 * k:i + 32 * k + 32]
-                    if not ent or ent[0] not in (0x41, 0xC1):
+                    if len(ent) < 32 or ent[0] not in (0x41, 0xC1):
                         break
                     name += ent[2:32].decode("utf-16-le", "replace")
                 name = name[:name_len]
+                if i + 32 * (secs + 1) > len(raw):
+                    if not in_deleted_dir:
+                        told = (f"its name is not there (first cluster {first:#x}, "
+                                f"{data_len:,} bytes), so it is not listed" if not name else
+                                f"it is listed as {name!r}, {len(name)} of the {name_len} "
+                                f"characters of its name")
+                        self._folder_part_read(clus, f"the deleted entry set at byte {i:,} is "
+                                                     f"cut at the end of the folder: {told}",
+                                               count=False)
+                    if not name:
+                        break
                 cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
                 times = {
                     "modified": _exfat_stamp(mod, raw[i + 21]),
@@ -3382,7 +3473,7 @@ class ExfatWalker:
                     yield FatDeletedFile(name, node[0], True, 0, first, False,
                                          "directory", False, times, in_deleted, None)
                     if ok_dir:
-                        yield from walk((first, 0, True, contiguous), depth + 1, True)
+                        yield from walk((first, size, True, contiguous), depth + 1, True)
                     continue
                 if size < min_size:
                     continue
@@ -3406,7 +3497,7 @@ class ExfatWalker:
                 yield FatDeletedFile(name, node[0], False, size, first, ok, reason,
                                      False, times, in_deleted,
                                      (chain, size) if ok else None)
-            for _nm, child, _t in self.listdir_records(node):
+            for _nm, child, _t in self.listdir_records(node, live=not in_deleted):
                 if child[2]:
                     yield from walk(child, depth + 1, in_deleted)
 
@@ -12842,9 +12933,10 @@ class ProgressEmitter:
 
 
 # Characters a zip member name must not carry as they are: a backslash or a colon
-# that an extracting tool on Windows reads as a separator or a stream, and
-# control characters (NUL ends the name early in some tools).
-_ZIP_UNSAFE = set(range(0x20)) | {0x7F, ord("\\"), ord(":")}
+# that an extracting tool on Windows reads as a separator or a stream, control
+# characters (NUL ends the name early in some tools), and ? and *, which stop Windows
+# PowerShell 5.1's Expand-Archive and leave none of the zip's files.
+_ZIP_UNSAFE = set(range(0x20)) | {0x7F, ord("\\"), ord(":"), ord("?"), ord("*")}
 
 # Names Windows keeps for devices. Extracting a file under one can write to the device
 # and leave no file and no error, with or without trailing dots and spaces, which
@@ -13227,24 +13319,40 @@ class _ZipOutput(io.FileIO):
             if not part:
                 raise OSError(errno.EIO, "the central directory could not be read back")
             block += part
-        moved = size - len(block)
-        end = len(block) - 22
-        if end < 0 or block[end:end + 4] != b"PK\x05\x06":
-            raise OSError(errno.EIO, "the zip's end record was not where it was written")
-        stored = struct.unpack_from("<I", block, end + 16)[0]
-        if stored != 0xFFFFFFFF:
-            if moved >= 0xFFFFFFFF:
-                raise OSError(errno.EFBIG, "the moved central directory needs a ZIP64 record")
-            struct.pack_into("<I", block, end + 16, moved)
-        locator = end - 20
-        if locator >= 0 and block[locator:locator + 4] == b"PK\x06\x07":
-            record = struct.unpack_from("<Q", block, locator + 8)[0] - start
-            if record < 0 or block[record:record + 4] != b"PK\x06\x06":
-                raise OSError(errno.EIO, "the zip's ZIP64 end record was not where it was written")
-            struct.pack_into("<Q", block, locator + 8, moved + record)
-            struct.pack_into("<Q", block, record + 48, moved)
+        moved, block = _zip_moved_end(block, start, size)
         self.seek(moved)
         self.write(bytes(block))
+
+
+def _zip_moved_end(block, start, size):
+    """(new offset, new bytes) of a central directory and end records that were written
+    at ``start`` and now finish at byte ``size`` of the file. An offset the end record
+    cannot hold is written there as 0xFFFFFFFF with the real one in a ZIP64 record, as
+    the zip format requires. When the zip has no ZIP64 record one is added before the
+    end record, in the space the move leaves."""
+    block = bytearray(block)
+    end = len(block) - 22
+    if end < 0 or block[end:end + 4] != b"PK\x05\x06" or block[end + 20:end + 22] != b"\0\0":
+        raise OSError(errno.EIO, "the zip's end record was not where it was written")
+    moved = size - len(block)
+    locator = end - 20
+    if locator >= 0 and block[locator:locator + 4] == b"PK\x06\x07":
+        record = struct.unpack_from("<Q", block, locator + 8)[0] - start
+        if record < 0 or block[record:record + 4] != b"PK\x06\x06":
+            raise OSError(errno.EIO, "the zip's ZIP64 end record was not where it was written")
+        struct.pack_into("<Q", block, locator + 8, moved + record)
+        struct.pack_into("<Q", block, record + 48, moved)
+    elif moved >= 0xFFFFFFFF:
+        moved -= 76
+        if moved < start:
+            raise OSError(errno.EFBIG, "no room for the ZIP64 record the moved directory needs")
+        count = struct.unpack_from("<H", block, end + 10)[0]
+        block[end:end] = (struct.pack("<4sQHHIIQQQQ", b"PK\x06\x06", 44, 45, 45, 0, 0,
+                                      count, count, end, moved)
+                          + struct.pack("<4sIQI", b"PK\x06\x07", 0, moved + end, 1))
+        end += 76
+    struct.pack_into("<I", block, end + 16, min(moved, 0xFFFFFFFF))
+    return moved, block
 
 
 def _say(text):
@@ -13349,15 +13457,33 @@ _ZIP_FULL_ERRNOS = frozenset(getattr(errno, n) for n in ("ENOSPC", "EFBIG", "EDQ
                              if hasattr(errno, n))
 
 
-def _zip_directory_size(zf):
-    """An upper bound, in bytes, on the zip's central directory and end records."""
-    total, big = 22, len(zf.filelist) >= 0xFFFF or zf.start_dir >= 0xFFFFFFFF
+def _zip_directory_size(zf, coming=0):
+    """An upper bound, in bytes, on the zip's central directory and end records, by the
+    tests ZipFile._write_end_record makes (the same in Python 3.10, 3.11, 3.12 and 3.14): a
+    member past zipfile.ZIP64_LIMIT, which is 2 GiB and not 4, takes a ZIP64 field of up
+    to 28 bytes, and the zip takes 76 bytes of ZIP64 end records when its member count,
+    directory offset or directory size is past its limit. ``coming`` is the bytes still
+    to be written before the directory: the tables and volumes.json, whose two entries
+    can then need the ZIP64 field too."""
+    limit = zipfile.ZIP64_LIMIT
+    total = 22 + len(zf.comment)
     for info in zf.filelist:
         total += (46 + len(info.filename.encode("utf-8", "surrogatepass"))
                   + len(info.extra) + len(info.comment))
-        if max(info.file_size, info.compress_size, info.header_offset) >= 0xFFFFFFFF:
-            total, big = total + 28, True
-    return total + (76 if big else 0)
+        if max(info.file_size, info.compress_size, info.header_offset) > limit:
+            total += 28
+    if coming and zf.start_dir + coming > limit:
+        total += 56
+    if (len(zf.filelist) > zipfile.ZIP_FILECOUNT_LIMIT or zf.start_dir + coming > limit
+            or total > limit):
+        total += 76
+    return total
+
+
+def _zip_end_room(zf, coming=0):
+    """The bytes the zip needs past its last member: ``coming`` bytes of tables and
+    records, then the central directory and end records."""
+    return _zip_directory_size(zf, coming) + coming
 
 
 def _zip_room(zf, wanted):
@@ -13463,7 +13589,7 @@ def _zip_store(zf, info, source, last=False):
         shutil.copyfileobj(source, dst)
         dst.close()
         if names.full is not None or (last and isinstance(zf.fp, _ZipOutput)):
-            wanted = _zip_directory_size(zf) + (0 if last else _zip_records_room(names))
+            wanted = _zip_end_room(zf, 0 if last else _zip_records_room(names))
             if _zip_room(zf, wanted) < wanted:
                 raise OSError(errno.ENOSPC, "No space left on device")
     except BaseException as exc:
@@ -13575,7 +13701,7 @@ def _zip_take_from_earlier(zf, names, table):
     volume's table and counts, and those tables are written again."""
     touched, grown = [], 0
     while names.finished:
-        wanted = _zip_directory_size(zf) + table + _zip_records_room(names) + grown
+        wanted = _zip_end_room(zf, table + _zip_records_room(names) + grown)
         if _zip_room(zf, wanted) >= wanted:
             break
         done = names.finished[-1]
@@ -13640,9 +13766,9 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     the first file is written.
 
     Member names come from zip_member_name(): a stored name that would climb out
-    of the extraction folder ('..'), start at a root, carry a backslash, a colon
-    or a control character is written escaped, and logged as RENAMED with the
-    name as stored.
+    of the extraction folder ('..'), start at a root, carry a backslash, a colon,
+    a ? or * or a control character is written escaped, and logged as RENAMED with
+    the name as stored.
 
     A file whose blocks lie past the end of the image is a SHORT read: read_at()
     answers a seek past the end of the file with empty bytes, so the walker
@@ -13802,7 +13928,7 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                      in itertools.chain(issues or (), _zip_time_rows(lost_times)))))
         except Exception:       # pylint: disable=broad-except
             pass
-        wanted = _zip_directory_size(zf) + table + _zip_records_room(names)
+        wanted = _zip_end_room(zf, table + _zip_records_room(names))
         room = _zip_room(zf, wanted)
         if room < wanted and names.full is None:
             names.full = "no room left for the zip's directory and records"
@@ -13812,7 +13938,7 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 taken.append(kept.pop())
                 _zip_undo(zf, taken[-1][0], taken[-1][0].header_offset, None)
                 table += len(taken[-1][1].encode("utf-8", "surrogatepass")) + 128
-            wanted = _zip_directory_size(zf) + table + _zip_records_room(names)
+            wanted = _zip_end_room(zf, table + _zip_records_room(names))
             room = _zip_room(zf, wanted)
         if room < wanted:
             _zip_take_from_earlier(zf, names, table)
@@ -31488,6 +31614,420 @@ def _logical_self_check():
                 == (10, 1, 1, 1, 1, 1))
 
 
+def _exfat_entry_set(name, first, size, *, is_dir=False, in_use=True):
+    """One exFAT file entry set with NoFatChain set, its checksum from the
+    specification's formula and not from the reader."""
+    chars = name.encode("utf-16-le")
+    slots = max(1, (len(name) + 14) // 15)
+    ent = bytearray(32 * (2 + slots))
+    ent[0], ent[1] = 0x85, 1 + slots
+    ent[4] = 0x10 if is_dir else 0x20
+    struct.pack_into("<I", ent, 12, (22209 << 16) | 24576)
+    ent[32], ent[33], ent[35] = 0xC0, 0x03, len(name)
+    struct.pack_into("<Q", ent, 40, size)
+    struct.pack_into("<I", ent, 52, first)
+    struct.pack_into("<Q", ent, 56, size)
+    for k in range(slots):
+        ent[64 + 32 * k] = 0xC1
+        ent[66 + 32 * k:96 + 32 * k] = chars[30 * k:30 * (k + 1)].ljust(30, b"\0")
+    total = 0
+    for i, byte in enumerate(ent):
+        if i not in (2, 3):
+            total = ((0x8000 if total & 1 else 0) + (total >> 1) + byte) & 0xFFFF
+    struct.pack_into("<H", ent, 2, total)
+    if not in_use:
+        ent[0], ent[32] = 0x05, 0x40
+        for k in range(slots):
+            ent[64 + 32 * k] = 0x41
+    return bytes(ent)
+
+
+def _exfat_run_image(content, *, first=5, clusters=3, size=None, count=32, past=b"",
+                     root_extra=b"", plant=None, used=()):
+    """An exFAT volume of ``count`` 4 KiB clusters whose root holds the NoFatChain folder
+    "big" at ``first``, recording ``size`` bytes (``clusters`` of them by default) and
+    holding ``content``. ``past`` is written just after the volume, ``plant`` is
+    {cluster: bytes} and ``used`` lists more clusters to mark allocated."""
+    cb, heap = 4096, 8
+    buf = bytearray(heap * 512 + (count + 1) * cb)
+    buf[3:11] = b"EXFAT   "
+    struct.pack_into("<IIIII", buf, 80, 4, 1, heap, count, 3)
+    buf[108], buf[109], buf[110] = 9, 3, 1
+    buf[510:512] = b"\x55\xaa"
+
+    def at(clus):
+        return heap * 512 + (clus - 2) * cb
+
+    for clus in (2, 3, 4):
+        struct.pack_into("<I", buf, 4 * 512 + clus * 4, 0xFFFFFFFF)
+    for clus in (2, 3, 4, *range(first, min(first + clusters, count + 2)), *used):
+        buf[at(2) + ((clus - 2) >> 3)] |= 1 << ((clus - 2) & 7)
+    root = bytearray(cb)
+    root[0] = 0x81
+    struct.pack_into("<I", root, 20, 2)
+    struct.pack_into("<Q", root, 24, (count + 7) // 8)
+    root[32] = 0x82
+    struct.pack_into("<I", root, 52, 4)
+    struct.pack_into("<Q", root, 56, 512)
+    entries = _exfat_entry_set("big", first, cb * clusters if size is None else size,
+                               is_dir=True) + root_extra
+    root[64:64 + len(entries)] = entries
+    buf[at(3):at(3) + cb] = root
+    room = min(len(content), (count + 2 - first) * cb)
+    buf[at(first):at(first) + room] = content[:room]
+    for clus, data in (plant or {}).items():
+        buf[at(clus):at(clus) + len(data)] = data
+    buf[at(count + 2):at(count + 2) + len(past)] = past
+    return bytes(buf)
+
+
+def _exfat_nofatchain_checks():
+    """[(label, passed)] for an exFAT folder flagged NoFatChain, the way Linux creates
+    them: it is one run of clusters as long as its recorded size."""
+    import io as _io
+    sets = [_exfat_entry_set(f"f{n:03}.txt", 0, 0) for n in range(120)]
+    filler = b"\xA1" + bytes(31)                     # a benign entry that shifts the rest
+
+    def listed(raw):
+        w = ExfatWalker(_io.BytesIO(raw), 0)
+        return w, [e[0] for e in collect(w, w.root) if e[0] != "big"]
+
+    def whole():
+        w, names = listed(_exfat_run_image(b"".join(sets)))
+        buf, log = _io.BytesIO(), []
+        with zipfile.ZipFile(buf, "w") as zf:
+            tally = extract_to_zip(zf, w, "v", collect(w, w.root), log)
+        with zipfile.ZipFile(_io.BytesIO(buf.getvalue())) as zin:
+            held = zin.namelist()
+        return (names == [f"big/f{n:03}.txt" for n in range(120)] and tally[0] == 120
+                and len(held) == 120 and not any("%2F" in n for n in held)
+                and not w.damage and w.folders_not_read == 0)
+
+    def last_slot():
+        w, names = listed(_exfat_run_image(b"".join(sets[:42]) + filler + b"".join(sets[42:])))
+        return len(names) == 120 and not w.damage
+
+    def cut_before_stream():
+        w, names = listed(_exfat_run_image(b"".join(sets[:42]) + filler + b"".join(sets[42:]),
+                                           size=4096))
+        return (names == [f"big/f{n:03}.txt" for n in range(42)] and w.folders_not_read == 1
+                and "cut at the end" in w.damage[0])
+
+    def cut_no_name():
+        w, names = listed(_exfat_run_image(b"".join(sets), size=4096))
+        return (names == [f"big/f{n:03}.txt" for n in range(42)] and w.folders_not_read == 1
+                and "not listed" in w.damage[0] and not any(n.endswith("/") for n in names))
+
+    def cut_part_name():
+        long_name = "abcdefghijklmnopqrst"
+        raw = (b"".join(sets[:41]) + filler * 2 + _exfat_entry_set(long_name, 0, 0))
+        w, names = listed(_exfat_run_image(raw, size=4096))
+        return (names[-1] == "big/" + long_name[:15] and len(names) == 42
+                and w.folders_not_read == 1 and "15 of the 20" in w.damage[0])
+
+    def off_volume():
+        past = _exfat_entry_set("PAST.TXT", 0, 0)
+        raw = _exfat_run_image(b"".join(sets), first=32, size=3 * 4096, past=past)
+        w, names = listed(raw)
+        return (len(names) == 85 and "big/PAST.TXT" not in names and w.folders_not_read == 1
+                and any("runs off the end of this volume" in d for d in w.damage))
+
+    def over_limit():
+        w, names = listed(_exfat_run_image(b"".join(sets), size=(256 << 20) + 4096))
+        return (len(names) == 120 and w.folders_not_read == 1
+                and any("over the 256MB" in d for d in w.damage))
+
+    def past_image():
+        raw = _exfat_run_image(b"".join(sets))
+        w, names = listed(raw[:8 * 512 + (5 - 2 + 2) * 4096])
+        return len(names) == 85 and w.folders_not_read == 1 and any(
+            "past the end of the image" in d for d in w.damage)
+
+    def deleted_later_cluster():
+        gone = _exfat_entry_set("GONE.TXT", 0, 0, in_use=False)
+        w, _names = listed(_exfat_run_image(b"".join(sets[:42]) + filler * 2 + gone))
+        return [e.name for e in w.deleted_files()] == ["GONE.TXT"]
+
+    def deleted_folder_reused():
+        first = _exfat_entry_set("ONE.TXT", 0, 0, in_use=False)
+        second = _exfat_entry_set("TWO.TXT", 0, 0, in_use=False)
+        doomed = _exfat_entry_set("OLD", 10, 2 * 4096, is_dir=True, in_use=False)
+        plant = {10: first + filler * ((4096 - len(first)) // 32), 11: second}
+        free = _exfat_run_image(b"", root_extra=doomed, plant=plant)
+        taken = _exfat_run_image(b"", root_extra=doomed, plant=plant, used=(11,))
+        return ({e.name for e in listed(free)[0].deleted_files()} == {"OLD", "ONE.TXT", "TWO.TXT"}
+                and {e.name for e in listed(taken)[0].deleted_files()} == {"OLD", "ONE.TXT"})
+
+    def ran(check):
+        try:
+            return check()
+        except Exception:                            # pylint: disable=broad-except
+            return False
+
+    return [("an exFAT NoFatChain folder of 3 clusters lists and exports all 120 files, with "
+             "no nameless member and no damage", ran(whole)),
+            ("an exFAT File entry in the last slot of a NoFatChain folder's cluster reads on "
+             "into the next cluster", ran(last_slot)),
+            ("an exFAT entry set cut before its stream entry at a folder's end is recorded "
+             "and stops nothing", ran(cut_before_stream)),
+            ("an exFAT entry set cut before its name at a folder's end gives no nameless "
+             "member and is recorded", ran(cut_no_name)),
+            ("an exFAT entry set cut inside its name is listed under the part that is there "
+             "and recorded", ran(cut_part_name)),
+            ("an exFAT folder size that runs off the volume is recorded and nothing past the "
+             "volume is read", ran(off_volume)),
+            ("an exFAT folder size over the format's 256MB is recorded as damage",
+             ran(over_limit)),
+            ("an exFAT folder size that runs past the image's end is recorded as damage",
+             ran(past_image)),
+            ("a deleted entry in a later cluster of a NoFatChain folder is found",
+             ran(deleted_later_cluster)),
+            ("a deleted NoFatChain folder is read through its free clusters and stops at one "
+             "allocated again", ran(deleted_folder_reused))]
+
+
+def _zip_directory_bound_checks():
+    """[(label, passed)]: _zip_directory_size against what zipfile really writes, with
+    sizes and offsets either side of its limits and no large file."""
+    import io as _io
+    limit = zipfile.ZIP64_LIMIT
+
+    class Sink:
+        """Takes the directory and answers tell() as if it began at ``base``."""
+
+        def __init__(self, base):
+            self.base, self.count = base, 0
+
+        def write(self, data):
+            self.count += len(data)
+            return len(data)
+
+        def tell(self):
+            return self.base + self.count
+
+        def flush(self):
+            pass
+
+    def info(file_size=10, compress_size=10, offset=0):
+        one = zipfile.ZipInfo("folder/name.bin", date_time=(2020, 1, 2, 3, 4, 6))
+        one.file_size, one.compress_size, one.header_offset = file_size, compress_size, offset
+        one.CRC = 0
+        return one
+
+    def measure(members, start):
+        """(bytes zipfile writes, the bound) for these members and directory offset."""
+        zf = zipfile.ZipFile(_io.BytesIO(), "w", allowZip64=True)
+        held, zf.fp = zf.fp, Sink(start)
+        try:
+            zf.filelist, zf.start_dir = members, start
+            zf._write_end_record()              # pylint: disable=protected-access
+            return zf.fp.count, _zip_directory_size(zf)
+        finally:
+            zf.filelist, zf.fp, zf.start_dir = [], held, 0
+            zf.close()
+
+    sizes = (limit - 1, limit, limit + 1, 0xFFFFFFFF, 0xFFFFFFFF + 1)
+    cases = ([([info(file_size=v)], 100) for v in sizes]
+             + [([info(compress_size=v)], 100) for v in sizes]
+             + [([info(offset=v)], v + 100) for v in sizes]
+             + [([info()], v) for v in sizes]
+             + [([info(file_size=limit + 1, compress_size=limit + 1, offset=limit + 1)],
+                 2 * limit + 4)]
+             + [([info(offset=limit + 1 + n) for n in range(2870)], limit + 4000)]
+             + [([info()] * n, 100) for n in (0xFFFF, 0x10000)])
+    results = []
+    for members, start in cases:
+        results.append(measure(members, start))
+    zf = zipfile.ZipFile(_io.BytesIO(), "w")
+    zf.start_dir = limit - 10
+    try:
+        crossing = _zip_directory_size(zf, 100) - _zip_directory_size(zf)
+    except TypeError:
+        crossing = None
+    zf.start_dir = 0
+    zf.close()
+    return [(f"the room kept for a zip's directory covers what zipfile writes, in all "
+             f"{len(results)} cases either side of its ZIP64 limits",
+             all(real <= bound for real, bound in results)),
+            ("the room kept counts the ZIP64 records that tables still to come will need",
+             crossing == 56 + 76)]
+
+
+def _zip_moved_end_checks():
+    """[(label, passed)]: a directory moved to the end of an output whose truncate was
+    refused, past 4 GiB, with and without a ZIP64 record. The output is a stand-in that
+    holds only the bytes written, so no large file is made."""
+    import io as _io
+    import types
+
+    class Output:
+        """A file of ``size`` bytes holding ``head`` and whatever is written after it."""
+
+        def __init__(self, head, size):
+            self.pieces, self.pos, self.size = [(0, bytes(head))], 0, size
+
+        def fileno(self):
+            return -1
+
+        def seekable(self):
+            return True
+
+        def tell(self):
+            return self.pos
+
+        def seek(self, pos, how=0):
+            self.pos = pos if how == 0 else self.pos + pos if how == 1 else self.size + pos
+            return self.pos
+
+        def read(self, n=-1):
+            n = (self.size - self.pos if n is None or n < 0
+                 else min(n, self.size - self.pos))
+            out = bytearray(n)
+            for at, data in self.pieces:
+                lo, hi = max(at, self.pos), min(at + len(data), self.pos + n)
+                if lo < hi:
+                    out[lo - self.pos:hi - self.pos] = data[lo - at:hi - at]
+            self.pos += n
+            return bytes(out)
+
+        def write(self, data):
+            self.pieces.append((self.pos, bytes(data)))
+            self.pos += len(data)
+            return len(data)
+
+    def build(zip64):
+        buf, limit = _io.BytesIO(), zipfile.ZIP64_LIMIT
+        if zip64:
+            zipfile.ZIP64_LIMIT = 16                 # zipfile then writes its ZIP64 records
+        try:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("one.txt", b"first member " * 20)
+                zf.writestr("two/three.txt", b"second member")
+                start = zf.fp.tell()
+        finally:
+            zipfile.ZIP64_LIMIT = limit
+        return buf.getvalue(), start
+
+    def moved_opens(zip64, size=(5 << 30) + 123):
+        """The zip opens with its members whole after the move. Returns the offset its
+        end record holds, or None."""
+        data, start = build(zip64)
+        out = Output(data, size)
+        fstat = os.fstat
+        os.fstat = lambda fd: (types.SimpleNamespace(st_size=size) if fd == -1 else fstat(fd))
+        try:
+            _ZipOutput._move_directory_to_end(out, start, len(data))  # pylint: disable=protected-access
+        finally:
+            os.fstat = fstat
+        out.seek(-22, 2)
+        end = out.read(22)
+        with zipfile.ZipFile(out) as zin:
+            whole = (zin.testzip() is None and zin.read("one.txt") == b"first member " * 20
+                     and zin.read("two/three.txt") == b"second member")
+        return struct.unpack_from("<I", end, 16)[0] if whole and end[:4] == b"PK\x05\x06" else None
+
+    def ran(zip64, size=(5 << 30) + 123):
+        try:
+            return moved_opens(zip64, size)
+        except Exception:                            # pylint: disable=broad-except
+            return None
+
+    return [("a directory moved past 4 GiB in a zip with no ZIP64 record gets one and opens",
+             ran(False) == 0xFFFFFFFF),
+            ("a directory moved past 4 GiB in a zip with a ZIP64 record holds 0xFFFFFFFF in "
+             "the end record and opens", ran(True) == 0xFFFFFFFF),
+            ("a directory moved under 4 GiB keeps a plain offset in its end record",
+             ran(False, len(build(False)[0]) + 100_000) not in (None, 0xFFFFFFFF))]
+
+
+def _ifs_decline_checks():
+    """[(label, passed)]: an IFS this reader declines has a record that says why."""
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+
+    def image(flags, body):
+        hdr = bytearray(256)
+        struct.pack_into("<I", hdr, IFS_F["signature"], QNX_IFS_SIG)
+        struct.pack_into("<H", hdr, IFS_F["version"], 1)
+        hdr[IFS_F["flags1"]] = flags
+        struct.pack_into("<H", hdr, IFS_F["header_size"], 256)
+        struct.pack_into("<H", hdr, IFS_F["machine"], 183)
+        struct.pack_into("<I", hdr, IFS_F["startup_size"], 512)
+        struct.pack_into("<I", hdr, IFS_F["stored_size"], 512 + len(body))
+        struct.pack_into("<I", hdr, IFS_F["imagefs_size"], len(body))
+        return bytes(hdr) + bytes(256) + body + bytes(4096)
+
+    # A folder of its own: the CI build's mkdtemp returns its fixtures folder.
+    parent = tempfile.mkdtemp(prefix="qnxprobe-ifs-")
+    work = os.path.join(parent, "ifs-declined")
+    os.makedirs(work, exist_ok=True)
+    out = []
+    try:
+        for label, flags, why in (("LZO", 0x01 | 0x08, "lzo compression not read here"),
+                                  ("big-endian", 0x01 | 0x02, "big-endian image"),
+                                  ("no imagefs header", 0x01, "no imagefs header")):
+            raw = os.path.join(work, "ifs.img")
+            with open(raw, "wb") as fh:
+                fh.write(image(flags, b"not an image filesystem" + bytes(233)))
+            manifest, said = [], _io.StringIO()
+            try:
+                with zipfile.ZipFile(_io.BytesIO(), "w") as zf, contextlib.redirect_stdout(said):
+                    main(raw, extract="x.zip", zf=zf, manifest=manifest)
+                good = (len(manifest) == 1 and manifest[0]["filesystem"] == "qnx_ifs"
+                        and why in (manifest[0].get("extract_error") or "")
+                        and _volumes_not_read(manifest) == 1
+                        and "contents not read" in said.getvalue())
+            except Exception:                        # pylint: disable=broad-except
+                good = False
+            out.append((f"an IFS declined for {label} has a volumes.json record with the reason "
+                        f"and counts for exit 1", good))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            os.rmdir(parent)                         # only when nothing else is in it
+        except OSError:
+            pass
+    return out
+
+
+def _zip_wildcard_checks():
+    """[(label, passed)]: a stored name holding ? or * is escaped and logged RENAMED."""
+    import io as _io
+
+    class Walker:
+        root = 0
+        names = {1: "keep.txt", 2: "wh?t.txt", 3: "st*r/in.txt", 4: "last.txt", 5: "100%?"}
+
+        def listdir(self, node):
+            if node == 0:
+                return [("keep.txt", 1), ("wh?t.txt", 2), ("st*r", 6), ("last.txt", 4),
+                        ("100%?", 5)]
+            return [("in.txt", 3)] if node == 6 else []
+
+        def entry(self, node):
+            return (0o040755, 0, 0) if node in (0, 6) else (0o100644, 3, 0)
+
+        def read_file(self, _node, _size):
+            yield b"abc"
+
+    w, buf, log, issues = Walker(), _io.BytesIO(), [], []
+    with zipfile.ZipFile(buf, "w") as zf:
+        tally = extract_to_zip(zf, w, "vol", collect(w, w.root), log, issues=issues)
+    with zipfile.ZipFile(_io.BytesIO(buf.getvalue())) as zin:
+        names = sorted(zin.namelist())
+    want = sorted(["vol/keep.txt", "vol/wh%3Ft.txt", "vol/st%2Ar/in.txt", "vol/last.txt",
+                   "vol/100%25%3F"])
+    renamed = {row[0] for row in issues if row[2] == "RENAMED"}
+    return [("a stored name holding ? or *, as a file or a folder, is escaped, logged RENAMED "
+             "and leaves the other names as stored",
+             names == want and tally[0] == 5
+             and renamed == {"wh?t.txt", "st*r/in.txt", "100%?"}
+             and sum("RENAMED" in line for line in log) == 3
+             and zip_member_name("vol", "a?b/c*d") == "vol/a%3Fb/c%2Ad")]
+
+
 def _zip_export_checks():
     """[(label, passed)] for what an export must not do to a file: lose it, hide it,
     misname it or misdate it. Each case drives extract_to_zip, read_logical_image or
@@ -32088,15 +32628,17 @@ def _zip_export_checks():
         lrows = {r["stored_path"]: r for r in table(lzin, "case.entries.tsv")}
         return (no_clash([on_windows(n) for n in names]) and len(names) == len(stored)
                 and sorted(zin.read(n) for n in names) == sorted(n.encode() for n in stored)
-                and all(f"lba0/{n}" in names for n in ("a?", "b.", "c ", "d<", "dir/x",
-                                                       "aux.c", "con.txt", "alone?"))
+                and all(f"lba0/{n}" in names for n in ("a_", "b.", "c ", "d<", "dir/x",
+                                                       "aux.c", "con.txt"))
+                and zin.read("lba0/a%3F") == b"a?" and zin.read("lba0/alone%3F") == b"alone?"
                 and zin.read("lba0/dir%2E%2E%2E/x") == b"dir.../x"
                 and zin.read("lba0/%6Eul") == b"nul" and zin.read("lba0/%4EUL.") == b"NUL."
                 and all(rows[n]["issue"] == "RENAMED" and rows[n]["zip_member"] in names
-                        for n in ("a_", "b", "c", "d>", "d_", "dir.../x", "nul", "NUL."))
+                        for n in ("a?", "alone?", "b", "c", "d>", "d_", "dir.../x", "nul",
+                                  "NUL."))
                 and "device name" in rows["nul"]["detail"]
                 and "characters" not in rows["nul"]["detail"]
-                and not {"a?", "aux.c", "con.txt", "alone?"} & set(rows)
+                and not {"a_", "aux.c", "con.txt"} & set(rows)
                 and no_clash([on_windows(n) for n in lzin.namelist()])
                 and lzin.read(lrows["a_"]["zip_member"]) == b"2"
                 and lzin.read("case/%6Eul") == b"3" and lrows["nul"]["zip_member"] == "case/%6Eul")
@@ -33202,6 +33744,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         w = IfsWalker(fh, b)
                     except IfsUnsupported as exc:
                         print(f"        contents not read: {exc}")
+                        if zf is not None:
+                            vol = _zip_names(zf).volume(
+                                name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                                (".exceptions.tsv",))
+                            _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
+                                                 offset_bytes=b, partition_size_bytes=sz,
+                                                 filesystem="qnx_ifs")
                     except Exception as exc:
                         _say(f"        could not read this image filesystem: {exc}")
                         if zf is not None:
@@ -36864,6 +37413,11 @@ def self_test():
                 ("an entry stored under a file leaves the file its own name",
                  _logical_stream_self_check()),
                 *_zip_export_checks(),
+                *_exfat_nofatchain_checks(),
+                *_zip_directory_bound_checks(),
+                *_zip_moved_end_checks(),
+                *_ifs_decline_checks(),
+                *_zip_wildcard_checks(),
                 ("two images whose names escape alike get separate zip folders",
                  _logical_volume_name("a%3Ab.L01", [{"volume": "a:b"}]) == "a%3Ab_2"
                  and _logical_volume_name("a.entries.tsv.L01", [{"volume": "a"}])
