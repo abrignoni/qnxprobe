@@ -947,7 +947,12 @@ LZFSE or stored, in the attribute or in the resource fork (since 1.74; see
 
 What it does not do: an encrypted volume whose blocks are ciphertext in the image, and
 which no password given opens (see below), is named, marked `encrypted and locked, not
-read`, and not walked, and a file compressed with LZBITMAP is listed with its size
+read`, and not walked. A root node that fails its check does not alone make a volume
+locked. If the root still names itself, or another node the volume maps passes its check,
+the blocks are in the clear and the root is recorded as damage. If the other nodes all
+fail, the volume is called ciphertext. If it has no other node to test, as a nearly empty
+encrypted volume does, it is marked `flagged encrypted, locked or damaged, not read`,
+because its blocks cannot show which. A file compressed with LZBITMAP is listed with its size
 and refuses to be read, naming the method. A locked volume is also named in
 `volumes.json` under `extract_error` and exits 1, so its record does not read as an empty
 volume. Nothing here reads a snapshot: what is walked is the volume as the newest
@@ -981,9 +986,13 @@ written as an empty file.
 
 A block 0 that fails its checksum or is all zero is replaced by a valid superblock copy
 from the checkpoint descriptor area, found through what block 0 still says, in the 64
-blocks after it, or, for a partition the GPT types as APFS, up to 1 GiB in. A bare
-container whose block 0 is gone and whose descriptor area starts further away is not
-recognized. A block 0 that passes its checksum is used exactly as before.
+blocks after it, or, for a partition the GPT types as APFS, up to 1 GiB in. A block 0 that
+lost its magic and holds other bytes is read the same way in a partition the GPT types as
+APFS, once no other filesystem has claimed the partition. If no valid copy is found there,
+the partition still gets a record with `extract_error` and exits 1. Without that GPT type,
+a block 0 with other bytes and no magic is not recognized as APFS, and neither is a bare
+container whose block 0 is zero and whose descriptor area starts further away. A block 0
+that passes its checksum is used exactly as before.
 
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
 Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are

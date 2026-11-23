@@ -190,6 +190,21 @@ def report_generations(copies, sized_regions, how_of):
     return order, gens
 
 
+import codecs                        # pylint: disable=wrong-import-position,wrong-import-order
+
+
+def _escape_name_bytes(error):
+    """Codec error handler for stored names: a stretch that does not decode becomes %XX
+    of its stored bytes. A name is then always text that SQLite, a file path and a
+    report accept, which a surrogate is not."""
+    if not isinstance(error, UnicodeDecodeError):
+        raise error
+    return "".join(f"%{b:02X}" for b in error.object[error.start:error.end]), error.end
+
+
+codecs.register_error("qnxprobe-name", _escape_name_bytes)
+
+
 # read_at() is the only path from a walker to the image, so a short answer from
 # it is the one signal that a read reached past the end of the file. The walkers
 # pad a short block with zeros, which is right for a sector an acquisition could
@@ -6058,6 +6073,11 @@ APFS_SEAL_BROKEN = 1              # im_flags: the volume was modified after seal
 APFS_SEAL_HASHES = {1: ("sha256", 32), 2: ("sha512_256", 32),
                     3: ("sha384", 48), 4: ("sha512", 64)}    # apfs_hash_type_t
 APFS_NUM_SNAPSHOTS_OFF = 216      # apfs_num_snapshots in the volume superblock
+APFS_VOLNAME_OFF = 704            # apfs_volname in the volume superblock
+APFS_VOLNAME_LEN = 256
+# How many of a volume's other mapped nodes are tried to tell a damaged root from
+# ciphertext (ApfsWalker._blocks_state).
+APFS_PLAIN_PROBE = 64
 APFS_DREC_TYPE_MASK = 0x000F      # j_drec_val_t.flags holds the inode's file type
 APFS_DT_DIR = 4
 # How far past a damaged block 0 a checkpoint's superblock is looked for. Most
@@ -6982,8 +7002,9 @@ def _apfs_head(fh, base):
     writes for an unreadable sector), is replaced by a valid copy from the checkpoint
     descriptor area, and _newest_checkpoint() then takes the newest from that copy's
     area. The area is looked for where a damaged block 0 still says it is, then in the
-    blocks after block 0, then, for a partition the GPT types as APFS, further on. Any
-    other block without the magic is not APFS and costs no further read."""
+    blocks after block 0, then, for a partition the GPT types as APFS, further on. A
+    block with other bytes and no magic is treated this way only in a partition the GPT
+    types as APFS; anywhere else it is not APFS and costs no further read of the area."""
     head = read_at(fh, base, 4096)
     if len(head) < 4096:
         return None, None
@@ -6998,10 +7019,13 @@ def _apfs_head(fh, base):
         blocks = struct.unpack_from("<I", head, 104)[0]
         if 0 < blocks <= 1 << 16:
             found = _apfs_copy_in(fh, base, struct.unpack_from("<Q", head, 112)[0], blocks)
-    elif any(head):
-        return None, None
+    typed = None
+    if not magic and any(head):
+        typed = _apfs_typed_partition(fh, base)
+        if not typed:
+            return None, None
     found = found or _apfs_copy_in(fh, base, 1, APFS_NX_PROBE_BLOCKS)
-    if found is None and _apfs_typed_partition(fh, base):
+    if found is None and (_apfs_typed_partition(fh, base) if typed is None else typed):
         found = _apfs_copy_in(fh, base, 1, APFS_NX_PROBE_TYPED_BLOCKS)
     if found is not None:
         return found[1], (f"the container superblock at block 0 is not valid, so the "
@@ -7225,10 +7249,14 @@ class ApfsWalker:
         self._bad_volumes = {}                      # volume index -> why it cannot be read
         self._stream_lines = set()                  # streams already recorded as cut
         self._nodes_lost = 0                        # tree subtrees that could not be read
+        self._crypt_unknown = set()                 # locked, but ciphertext is not shown
         self._vol_folders = None
         head, head_fault = _apfs_head(fh, base)
         if head is None:
-            raise ValueError("not an APFS container superblock")
+            raise ValueError("the GPT types this partition as APFS, and neither block 0 nor "
+                             "a checkpoint copy holds a valid container superblock"
+                             if _apfs_typed_partition(fh, base)
+                             else "not an APFS container superblock")
         if head_fault:
             self.damage.append(head_fault)
         self.block_size = struct.unpack_from("<I", head, 36)[0]
@@ -7418,7 +7446,9 @@ class ApfsWalker:
         if self.encryption(index) == "locked":
             # every route to a volume's tree comes through here, so a locked one is
             # never parsed: ciphertext read as a tree returns nothing, silently
-            raise ApfsUnreadable(f"volume {index} is encrypted and its blocks are "
+            raise ApfsUnreadable(f"volume {index} is flagged encrypted and could not be read"
+                                 if index in self._crypt_unknown else
+                                 f"volume {index} is encrypted and its blocks are "
                                  f"ciphertext in this image")
         got = self._state.get(index)
         if got is None:
@@ -7498,13 +7528,14 @@ class ApfsWalker:
 
     def encryption(self, index):
         """None for a volume its flags say is not encrypted. For an encrypted one,
-        "clear" when its file-system tree's root node passes its checksum here, so
-        the image holds its blocks decrypted (an acquisition read through the Mac's
-        own decryption, as BlackBag's Digital Collector reads one, stores them so);
-        "unlocked" when its blocks are ciphertext and the key unlock_apfs() derived
-        for it decrypts that root node to one that passes; and "locked" otherwise.
-        A locked volume is not walked: parsing ciphertext as a tree returns
-        nothing, and returning nothing reads as an empty volume."""
+        "clear" when _blocks_state() finds its blocks readable here, so the image holds
+        them decrypted (an acquisition read through the Mac's own decryption, as
+        BlackBag's Digital Collector reads one, stores them so); "unlocked" when its
+        blocks are not and the key unlock_apfs() derived for it decrypts the root node
+        to one that passes; and "locked" otherwise. A locked volume is not walked:
+        parsing ciphertext as a tree returns nothing, and returning nothing reads as an
+        empty volume. A locked volume in _crypt_unknown is one whose blocks could be
+        ciphertext or damage, and what is reported about it says so."""
         if index in self._crypt:
             return self._crypt[index]
         _oid, block, _name, _incompat = self.volumes[index]
@@ -7513,24 +7544,50 @@ class ApfsWalker:
         if not struct.unpack_from("<Q", sb, APFS_FS_FLAGS_OFF)[0] & APFS_FS_UNENCRYPTED:
             vol_omap_oid, root_oid = struct.unpack_from("<QQ", sb, 128)
             saved = self._current, self._volume_omap
-            ok = False
+            found = "unknown"
             try:
                 # as in _open_volume: the volume's own map is read with nothing current
                 self._current, self._volume_omap = None, {}
-                root_block = self._read_omap(vol_omap_oid,
-                                             f"{self._volume_label(index)}'s object map"
-                                             ).get(root_oid)
-                ok = root_block is not None and _apfs_fletcher_ok(self.block(root_block))
+                found = self._blocks_state(self._read_omap(
+                    vol_omap_oid, f"{self._volume_label(index)}'s object map"), root_oid)
             except (ValueError, OSError, struct.error):
-                ok = False
+                found = "unknown"
             finally:
                 self._current, self._volume_omap = saved
-            state = "clear" if ok else "locked"
+            state = "clear" if found == "clear" else "locked"
             key = self._keys.get((self.uuid, self.volume_uuids[index]))
             if state == "locked" and key is not None and self._apply_key(index, sb, key):
                 state = "unlocked"
+            elif state == "locked" and found == "unknown":
+                self._crypt_unknown.add(index)
         self._crypt[index] = state
         return state
+
+    def _blocks_state(self, omap, root_oid):
+        """"clear", "ciphertext" or "unknown", for the blocks of a volume flagged encrypted.
+
+        A whole node of ciphertext passes no check, so one node that does shows the image
+        holds this volume's blocks in the clear. So does a root that fails its checksum
+        and still names its own object id and a tree type: those twelve bytes would not
+        survive encryption. The object map's encrypted flag cannot decide it, because it
+        is set on a clear volume's root too. With a bad root, a volume's other mapped
+        nodes decide, and one with none left to test, or only empty ones, is "unknown"."""
+        types = (APFS_OBJECT_TYPE_BTREE, APFS_OBJECT_TYPE_BTREE_NODE)
+        root_block = omap.get(root_oid)
+        root = self.block(root_block) if root_block is not None else b""
+        if root_block is not None and self._object_fault(root, root_oid, types) is None:
+            return "clear"
+        if (len(root) >= APFS_OBJ_HDR and struct.unpack_from("<Q", root, 8)[0] == root_oid
+                and struct.unpack_from("<I", root, 24)[0] & APFS_OBJ_TYPE_MASK in types):
+            return "clear"
+        others = sorted((o, b) for o, b in omap.items() if o != root_oid)
+        opaque = False
+        for oid, block in others[::max(1, len(others) // APFS_PLAIN_PROBE)][:APFS_PLAIN_PROBE]:
+            raw = self.block(block)
+            if self._object_fault(raw, oid, types) is None:
+                return "clear"
+            opaque = opaque or (len(raw) == self.block_size and any(raw))
+        return "ciphertext" if opaque else "unknown"
 
     def crypto_blocker(self, sb):
         """Why a volume's key, even known, would not be used to read it, or "".
@@ -7608,7 +7665,8 @@ class ApfsWalker:
                 ("clear", "{} flagged encrypted, but {} blocks read in the clear in "
                           "this image, as an acquisition made through the Mac's own "
                           "decryption stores them, so {} files are read as they are")):
-            which = [i for i in range(len(self.volumes)) if self.encryption(i) == state]
+            which = [i for i in range(len(self.volumes))
+                     if self.encryption(i) == state and i not in self._crypt_unknown]
             names = [self.volumes[i][2] or f"volume {i}" for i in which]
             if names:
                 one = len(names) == 1
@@ -7621,12 +7679,28 @@ class ApfsWalker:
                     if lk is not None:
                         parts.append(f"{self.volumes[i][2] or f'volume {i}'}: "
                                      f"{lk.locked_note()}")
+        unknown = sorted(self._crypt_unknown)
+        if unknown:
+            parts.append(self._unknown_text(unknown))
+            for i in unknown:
+                lk = self.lock(i)
+                if lk is not None:
+                    parts.append(f"{self._volume_label(i)}: {lk.locked_note()}")
         for i in range(len(self.volumes)):
             if self.encryption(i) == "unlocked":
                 parts.append(f"{self.volumes[i][2] or f'volume {i}'} is encrypted and was "
                              f"opened with {_apfs_opened_with(self._vol_by.get(i))}, so its "
                              f"files are read decrypted")
         return "; ".join(parts) or None
+
+    def _unknown_text(self, indexes):
+        """What can be said of flagged-encrypted volumes whose blocks show neither."""
+        one = len(indexes) == 1
+        return (f"{', '.join(self._volume_label(i) for i in indexes)} "
+                f"{'is' if one else 'are'} flagged encrypted and could not be read: the "
+                f"root node fails its check and no other node shows whether the blocks are "
+                f"ciphertext or damaged, so {'its' if one else 'their'} files are not listed "
+                f"or extracted")
 
     @property
     def not_read_note(self):
@@ -7635,11 +7709,13 @@ class ApfsWalker:
         node that could not be read can have held any record of its key range."""
         parts = []
         names = [self._volume_label(i) for i in range(len(self.volumes))
-                 if self.encryption(i) == "locked"]
+                 if self.encryption(i) == "locked" and i not in self._crypt_unknown]
         if names:
             one = len(names) == 1
             parts.append(f"{', '.join(names)} {'is' if one else 'are'} encrypted and locked, "
                          f"so {'its' if one else 'their'} files are not listed or extracted")
+        if self._crypt_unknown:
+            parts.append(self._unknown_text(sorted(self._crypt_unknown)))
         if self._nodes_lost:
             parts.append(f"{self._nodes_lost:,} B-tree node(s) or subtree(s) could not be read, "
                          f"so what they held is missing (see damage_first)")
@@ -8035,7 +8111,7 @@ class ApfsWalker:
             if len(key) < 12 or len(val) < 4:
                 continue
             nlen = struct.unpack_from("<H", key, 8)[0]
-            got = key[10:10 + nlen].split(b"\x00")[0].decode("utf-8", "replace")
+            got = _apfs_name(key[10:10 + nlen])
             if got != name:
                 continue
             flags, xlen = struct.unpack_from("<HH", val, 0)
@@ -8070,13 +8146,18 @@ class ApfsWalker:
         if cipher is not None and self._fext is not None:
             raise ApfsUnreadable("a sealed volume's extents carry no tweak to decrypt "
                                  "them with")
-        pos = cut_to = 0       # cut_to: the end of a run whose blocks the image lacks
+        # cut_to is the end of a run whose blocks the image lacks, and held counts the
+        # bytes that really came from the volume. read_at() tallies one piece of a run it
+        # cannot finish, so that tally is taken back and the whole shortfall is added
+        # once, below: extract_to_zip() subtracts it from the size to say what is held.
+        pos = cut_to = held = 0
+        cut = False
         for logical, phys, length, crypto in self._runs(private_id):
             if pos >= want:
                 break
             if logical > pos and pos < cut_to:
-                # the rest of a run past the end of the image: zeros hold its place, so
-                # what follows stays at its own offset, and read_at() tallied the bytes
+                # the rest of a run past the end of the image: zeros hold its place so
+                # what follows stays at its own offset, and they are not counted as held
                 gap = min(cut_to, logical, want) - pos
                 while gap:
                     n = min(gap, piece)
@@ -8087,17 +8168,18 @@ class ApfsWalker:
                 # a range with no run, so zeros here would read as content.
                 self._stream_cut(private_id, f"no extent record covers bytes {pos:,} to "
                                              f"{min(logical, want) - 1:,}")
-                return
+                break
             if phys and phys + (length + bs - 1) // bs > self.block_count:
                 self._stream_cut(private_id, f"the extent at byte {logical:,} points past "
                                              f"the end of the container")
-                return
+                break
             take = min(length, want - pos)
             if take <= 0:
                 continue
             done = 0
             while done < take:
                 n = min(piece, take - done)
+                tallied = EOF_SHORTFALL["bytes"]
                 if phys == 0:
                     data = b"\x00" * n
                 elif cipher is None:
@@ -8105,12 +8187,16 @@ class ApfsWalker:
                 else:
                     raw = read_at(self.fh, self.base + phys * bs + done, -(-n // 512) * 512)
                     data = _xts_crypt(cipher, raw, crypto * (bs // 512) + done // 512)[:n]
+                if len(data) < n:
+                    EOF_SHORTFALL["bytes"] = tallied
+                    cut, cut_to = True, logical + length
                 if data:
                     yield data
-                done, pos = done + len(data), pos + len(data)
+                done, pos, held = done + len(data), pos + len(data), held + len(data)
                 if len(data) < n:
-                    cut_to = logical + length
                     break
+        if cut:
+            EOF_SHORTFALL["bytes"] += want - held
 
     def _stream_cut(self, private_id, detail):
         """Record, once per stream, why it stops before its size."""
@@ -8273,7 +8359,7 @@ class ApfsWalker:
                     continue
                 nlen = struct.unpack_from("<H", key, 8)[0]
                 name = key[10:10 + nlen]
-            name = name.split(b"\x00")[0].decode("utf-8", "replace")
+            name = _apfs_name(name)
             child = struct.unpack_from("<Q", val, 0)[0]
             if child > APFS_OID_MASK:
                 continue                        # an id too large to carry a volume
@@ -8322,7 +8408,7 @@ class ApfsWalker:
             if len(key) < 12 or len(val) < 4:
                 continue
             nlen = struct.unpack_from("<H", key, 8)[0]
-            name = key[10:10 + nlen].split(b"\x00")[0].decode("utf-8", "replace")
+            name = _apfs_name(key[10:10 + nlen])
             flags, xlen = struct.unpack_from("<HH", val, 0)
             if flags & APFS_XATTR_DATA_STREAM and xlen >= 16:
                 size = struct.unpack_from("<Q", val, 12)[0]
@@ -8441,8 +8527,18 @@ def _apfs_fs_key(key):
     return (raw & ((1 << 60) - 1), raw >> 60)
 
 
+def _apfs_name(raw):
+    """A directory record's or attribute's stored name as text. The stored length counts
+    a final NUL, which is trimmed. A NUL inside the name is kept as %00, and bytes that
+    do not decode as %XX, so two different stored names stay different."""
+    return raw.rstrip(b"\x00").decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+
+
 def _apfs_volume_name(sb):
-    return sb[704:768].split(b"\x00")[0].decode("utf-8", "replace")
+    """apfs_volname, a NUL-terminated string in a field of APFS_VOLNAME_LEN bytes (Apple
+    File System Reference, 2020-06-22). What follows the first NUL is not the name."""
+    field = sb[APFS_VOLNAME_OFF:APFS_VOLNAME_OFF + APFS_VOLNAME_LEN]
+    return field.split(b"\x00")[0].decode("utf-8", "qnxprobe-name")
 
 
 def _apfs_xfields(blob, off):
@@ -19139,7 +19235,7 @@ def identify_efs(fh, base, size):
     ]
 
 
-def identify_apfs(fh, base):
+def identify_apfs(fh, base, damaged=False):
     """Return ("apfs", lines) for an APFS container at base, else None.
 
     A container is claimed by the NXSB magic in the first block's object header
@@ -19147,9 +19243,22 @@ def identify_apfs(fh, base):
     once its newest checkpoint and object map have been read far enough to name
     the volumes inside it. A container that cannot get that far is not one this
     tool can offer to walk.
+
+    ``damaged`` is the last test identify_fs() makes, once no filesystem has claimed
+    the region: a block 0 with no magic, read through a checkpoint copy (_apfs_head).
+    It comes last because a reformatted partition can keep old APFS checkpoints behind
+    a live filesystem. A partition the GPT types as APFS with no usable superblock is
+    still claimed then, so that it gets a record instead of no trace.
     """
+    first = read_at(fh, base, 4096)
+    if len(first) < 4096 or (first[32:36] == APFS_NX_MAGIC) == damaged:
+        return None
     head, _fault = _apfs_head(fh, base)
     if head is None:
+        if damaged and _apfs_typed_partition(fh, base):
+            return "apfs", ["walk         not possible: the GPT types this partition as "
+                            "APFS, and neither block 0 nor a checkpoint copy holds a valid "
+                            "container superblock"]
         return None
     block = struct.unpack_from("<I", head, 36)[0]
     if not block or block & (block - 1) or block > (1 << 24):
@@ -19178,6 +19287,8 @@ def identify_apfs(fh, base):
                      + ("   encrypted, read in the clear" if state == "clear" else
                         f"   encrypted, opened with {_apfs_opened_with(w._vol_by.get(i))}"   # pylint: disable=protected-access
                         if state == "unlocked" else
+                        "   flagged encrypted, locked or damaged, not read"
+                        if state == "locked" and i in w._crypt_unknown else   # pylint: disable=protected-access
                         "   encrypted and locked, not read" if state == "locked" else ""))
     if w.note:
         lines.append(f"note         {w.note}")
@@ -28512,6 +28623,7 @@ def _apfs_reader_checks():
     bytes as content, or lose a time. Each case patches a volume macOS wrote, in memory,
     and fixes the checksum of what it patched where the case needs the node to be read."""
     import contextlib
+    import gc
     import gzip
     import hashlib
     import io as _io
@@ -28642,7 +28754,7 @@ def _apfs_reader_checks():
         zeroed[:bs] = bytes(bs)
         flipped = bytearray(clean)
         flipped[160] ^= 0x40
-        out = identify_apfs(_io.BytesIO(bytes(zeroed)), 0) is not None
+        out = identify_fs(_io.BytesIO(bytes(zeroed)), 0, len(zeroed))[0] == "apfs"
         for raw in (zeroed, flipped):
             w = walker(raw)
             out = (out and w.xid == base.xid and set(listed(w)) == set(full)
@@ -28762,53 +28874,205 @@ def _apfs_reader_checks():
             main(path, extract=out, zf=zf, manifest=manifest)
             _zip_finish(zf, out, manifest)
         rec = next(r for r in manifest if r.get("filesystem") == "apfs")
-        return ("locked" in (rec.get("extract_error") or "") and rec["files"] > 0
+        return ("encrypted" in (rec.get("extract_error") or "") and rec["files"] > 0
                 and _volumes_not_read(manifest) == 1)
+
+    class Patched:
+        """A read-only view of an image with some byte ranges replaced."""
+
+        def __init__(self, inner, patches):
+            self.inner, self.patches, self.pos = inner, patches, 0
+            self.size = image_size(inner)
+
+        def seek(self, off, whence=0):
+            self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
+            return self.pos
+
+        def tell(self):
+            return self.pos
+
+        def read(self, n=-1):
+            self.inner.seek(self.pos)
+            data = self.inner.read(n)
+            for at, new in self.patches:
+                lo, hi = max(at, self.pos), min(at + len(new), self.pos + len(data))
+                if lo < hi:
+                    data = data[:lo - self.pos] + new[lo - at:hi - at] + data[hi - self.pos:]
+            self.pos += len(data)
+            return data
+
+    def sealed_block(raw):
+        block = bytearray(raw)
+        struct.pack_into("<Q", block, 0, _apfs_fletcher(bytes(block)))
+        return bytes(block)
 
     def one_volume_lost():
         """A volume whose object map is gone: the container's other volume still reads."""
         if _BDE_AES is None or ewfprobe is None:
             return None
-        fh = open_image(encrypted_image())
-        try:
-            raw = bytearray(read_at(fh, 0, image_size(fh)))
-        finally:
-            close = getattr(fh, "close", None)
-            if close:
-                close()
         base = 20480
-        w = ApfsWalker(_io.BytesIO(bytes(raw)), base)
-        sb = w.block(w.volumes[0][1])
-        vomap = struct.unpack_from("<Q", sb, 128)[0]
-        raw[base + vomap * bs:base + (vomap + 1) * bs] = bytes(bs)
-        opened, _found = unlock_apfs(_io.BytesIO(bytes(raw)), passwords=["qnxprobe-apfs-test"])
-        w = ApfsWalker(opened, base)
-        got = listed(w)
-        return (w.encryption(1) == "unlocked" and len(got) > 0
-                and all(p.split("/", 1)[0] == w.volumes[1][2] for p in got)
-                and w.folders_not_read >= 1 and any(w.volumes[0][2] in str(d) for d in w.damage))
+        with open_image(encrypted_image()) as fh:
+            w = ApfsWalker(fh, base)
+            vomap = struct.unpack_from("<Q", w.block(w.volumes[0][1]), 128)[0]
+            view = Patched(fh, [(base + vomap * bs, bytes(bs))])
+            opened, _found = unlock_apfs(view, passwords=["qnxprobe-apfs-test"])
+            w = ApfsWalker(opened, base)
+            got = listed(w)
+            return (w.encryption(1) == "unlocked" and len(got) > 0
+                    and all(p.split("/", 1)[0] == w.volumes[1][2] for p in got)
+                    and w.folders_not_read >= 1
+                    and any(w.volumes[0][2] in str(d) for d in w.damage))
 
     def same_names():
         if ewfprobe is None:
             return None
-        fh = open_image(encrypted_image())
-        try:
-            raw = bytearray(read_at(fh, 0, image_size(fh)))
-        finally:
-            close = getattr(fh, "close", None)
-            if close:
-                close()
         base = 20480
-        w = ApfsWalker(_io.BytesIO(bytes(raw)), base)
-        first = w.volumes[0][2]
-        block = w.volumes[1][1]
-        field = base + block * bs + 704
-        raw[field:field + 64] = first.encode("utf-8").ljust(64, b"\x00")
-        reseal(raw, block, base)
-        again = ApfsWalker(_io.BytesIO(bytes(raw)), base)
-        tops = [name for name, _node in again.listdir(again.root)]
+        with open_image(encrypted_image()) as fh:
+            w = ApfsWalker(fh, base)
+            first, block = w.volumes[0][2], w.volumes[1][1]
+            sb = bytearray(w.block(block))
+            sb[704:768] = first.encode("utf-8").ljust(64, b"\x00")
+            again = ApfsWalker(Patched(fh, [(base + block * bs, sealed_block(sb))]), base)
+            tops = [name for name, _node in again.listdir(again.root)]
         return (tops == [first, f"{first}_2"]
                 and [name for name, _node in walker(clean).listdir(APFS_CONTAINER)] == ["QNXPROBE"])
+
+    def cut_count():
+        """A 2 MiB run past the end of the image, then 1 MiB that is there."""
+        w = walker(clean)
+        mib = 1 << 20
+        path, entry = next((p, e) for p, e in sorted(listed(w).items())
+                           if e[2] and e[2] >= 3 * mib
+                           and w._decmpfs_of(w._select(e[1]), w._inode(w._select(e[1]))) is None)  # pylint: disable=protected-access
+        past = len(clean) // bs + 16
+        w.block_count = past + 2048
+        w._runs = lambda _p: [(0, past, 2 * mib, 0), (2 * mib, 16, mib, 0)]  # pylint: disable=protected-access
+        name, body, rows = export(w, path, entry[1], 3 * mib)
+        return (f".SHORT-{mib}-of-{3 * mib}-bytes" in name and len(body) == 3 * mib
+                and not any(body[:2 * mib]) and body[2 * mib:] == clean[16 * bs:16 * bs + mib]
+                and any(r[2] == "SHORT" and r[3].startswith(f"{mib:,} of {3 * mib:,} ")
+                        for r in rows))
+
+    def flagged(raw):
+        """Flag the fixture's volume encrypted, its blocks staying in the clear."""
+        w = walker(raw)
+        block = w.volumes[0][1]
+        at = block * bs + APFS_FS_FLAGS_OFF
+        struct.pack_into("<Q", raw, at, struct.unpack_from("<Q", raw, at)[0] & ~APFS_FS_UNENCRYPTED)
+        reseal(raw, block)
+        return walker(raw)
+
+    def damaged_clear():
+        out = True
+        for at in (200, 9):                          # in the body, then in its own id
+            raw = bytearray(clean)
+            root = flagged(raw).fs_root_block
+            raw[root * bs + at] ^= 0x01
+            w = walker(raw)
+            listed(w)
+            record = w.not_read_note or ""
+            out = (out and w.encryption(0) == "clear" and "ciphertext" not in (w.note or "")
+                   and "locked" not in record and "could not be read" in record)
+        # with every node the volume maps unreadable, it is called ciphertext
+        raw = bytearray(clean)
+        w = flagged(raw)
+        vomap = struct.unpack_from("<Q", w.block(w.volumes[0][1]), 128)[0]
+        for n, block in enumerate(sorted(set(w._read_omap(vomap).values()))):  # pylint: disable=protected-access
+            raw[block * bs:(block + 1) * bs] = hashlib.sha256(b"%d" % n).digest() * (bs // 32)
+        w = walker(raw)
+        return out and w.encryption(0) == "locked" and "blocks are ciphertext" in (w.note or "")
+
+    def zero_root_cipher():
+        if ewfprobe is None:
+            return None
+        base = 20480
+        with open_image(encrypted_image()) as fh:
+            w = ApfsWalker(fh, base)
+            sb = w.block(w.volumes[1][1])
+            vomap, root_oid = struct.unpack_from("<QQ", sb, 128)
+            root = w._read_omap(vomap)[root_oid]     # pylint: disable=protected-access
+            hit = ApfsWalker(Patched(fh, [(base + root * bs, bytes(bs))]), base)
+            note = hit.note or ""
+            return (hit.encryption(1) == "locked" and "read in the clear" not in note
+                    and "could not be read" in note and "could not be read" in hit.not_read_note)
+
+    def typed_magic():
+        if ewfprobe is None:
+            return None
+        base = 20480
+        with open_image(encrypted_image()) as fh:
+            size = image_size(fh) - base
+            good = ApfsWalker(fh, base)
+            want = set(listed(good))
+            head = read_at(fh, base, bs)
+            for patch in ((base + 32, bytes([head[32] ^ 1])), (base, b"\xff" * bs),
+                          (base, (b"BAD SECTOR " * (bs // 11 + 1))[:bs])):
+                view = Patched(fh, [patch])
+                if identify_fs(view, base, size)[0] != "apfs":
+                    return False
+                w = ApfsWalker(view, base)
+                if w.xid != good.xid or set(listed(w)) != want or not w.damage:
+                    return False
+            first, count = struct.unpack_from("<Q", head, 112)[0], struct.unpack_from("<I", head, 104)[0]
+            view = Patched(fh, [(base, b"\xff" * bs), (base + first * bs, bytes(count * bs))])
+            kind, lines = identify_fs(view, base, size)
+            if kind != "apfs" or not any("not possible" in line for line in lines):
+                return False
+            try:
+                ApfsWalker(view, base)
+                return False
+            except ValueError as exc:
+                if "GPT types" not in str(exc):
+                    return False
+        bare = bytearray(clean)
+        bare[32] ^= 1
+        return identify_fs(_io.BytesIO(bytes(bare)), 0, len(bare))[0] != "apfs"
+
+    def stored_names():
+        import sqlite3
+        raw = bytearray(clean)
+        w = walker(raw)
+        tree = w._tree                               # pylint: disable=protected-access
+        name_at = 12 if w._hashed_names else 10      # pylint: disable=protected-access
+        picks = []
+        for _first, block in tree.leaves(_apfs_fs_key):
+            node = w.block(block)
+            flags, nkeys, toc_at, keys_at, _ends = tree._layout(node, len(node))
+            if flags & APFS_BTNODE_FIXED_KV:
+                continue
+            for i in range(nkeys):
+                k, klen, _v, _vl = struct.unpack_from("<HHHH", node, toc_at + i * 8)
+                key = node[keys_at + k:keys_at + k + klen]
+                if _apfs_fs_key(key)[1] != APFS_TYPE_DIR_REC:
+                    continue
+                name = key[name_at:].split(b"\x00")[0]
+                if len(name) >= 6 and name.isascii() and b"." in name[1:]:
+                    picks.append((block, block * bs + keys_at + k + name_at, name.decode()))
+                    break
+            if len(picks) == 3:
+                break
+        raw[picks[0][1]], raw[picks[1][1]], raw[picks[2][1] + 2] = 0xFF, 0xFE, 0
+        for block in {pick[0] for pick in picks}:
+            reseal(raw, block)
+        got = {p.rsplit("/", 1)[-1] for p in listed(walker(raw))}
+        want = {"%FF" + picks[0][2][1:], "%FE" + picks[1][2][1:],
+                picks[2][2][:2] + "%00" + picks[2][2][3:]}
+        with sqlite3.connect(":memory:") as db:
+            db.execute("create table t (n text)")
+            db.executemany("insert into t values (?)", [(n,) for n in want])
+        return (want <= got and not any("\ufffd" in n or "\x00" in n for n in got)
+                and _apfs_name(b"a\xffb\x00") != _apfs_name(b"a\xfeb\x00")
+                and _apfs_name(b"a\x00b") != _apfs_name(b"a\x00c"))
+
+    def long_volume_name():
+        def named(text):
+            raw = bytearray(clean)
+            block = walker(raw).volumes[0][1]
+            raw[block * bs + 704:block * bs + 960] = text.encode().ljust(256, b"\x00")
+            reseal(raw, block)
+            w = walker(raw)
+            return w.volumes[0][2], [n for n, _node in w.listdir(w.root)]
+        return all(named(t) == (t, [t]) for t in ("L" * 90, "S" * 63, "M" * 255))
 
     cases = (
         ("an APFS leaf read as zeros is recorded, and the rest of the volume still lists",
@@ -28838,6 +29102,17 @@ def _apfs_reader_checks():
          size_past_extents),
         ("an APFS extent past the container is refused, not read from what follows it",
          past_container),
+        ("an APFS file cut by the image's end counts only the bytes the image holds, not "
+         "the zeros holding a missing run's place", cut_count),
+        ("a damaged root on an APFS volume held in the clear is not called locked ciphertext",
+         damaged_clear),
+        ("a zeroed root on an APFS ciphertext volume is not called read in the clear",
+         zero_root_cipher),
+        ("a GPT-typed APFS partition whose block 0 lost its magic is read from a copy, or "
+         "recorded when no copy is left", typed_magic),
+        ("an APFS name that does not decode, or holds a NUL, keeps its bytes as %XX",
+         stored_names),
+        ("an APFS volume name is read to the length the format holds", long_volume_name),
     )
     out = []
     try:
@@ -28847,6 +29122,7 @@ def _apfs_reader_checks():
                 out.append((label, None if got is None else bool(got)))
             except Exception as exc:                 # pylint: disable=broad-except
                 out.append((f"{label} ({type(exc).__name__}: {exc})", False))
+            gc.collect()                             # a patched walker holds a whole image
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return out
@@ -31562,6 +31838,10 @@ def _identify_fs(fh, base, size=None):
     yaffs = identify_yaffs(fh, base, size)
     if yaffs:
         return yaffs
+
+    apfs = identify_apfs(fh, base, damaged=True)
+    if apfs:
+        return apfs
 
     # Not ext, not qnx6, not IFS, not FAT, not a QNX flash filesystem. Report
     # the leading bytes so there is a lead to follow, rather than inventing a
@@ -43125,7 +43405,7 @@ def self_test():
                 enc_note = f"raised {type(exc).__name__}: {exc}"
             cond = (enc_states == [None, "locked"] and enc_secret == 0 and not enc_parsed
                     and enc_matched == len(enc_sums) and enc_matched > 0
-                    and "SECRETVOL is encrypted, and its blocks are ciphertext" in enc_note
+                    and "SECRETVOL is flagged encrypted and could not be read" in enc_note
                     and any("SECRETVOL" in ln and "locked" in ln for ln in enc_report)
                     and any(ln.startswith("note") and "ciphertext" in ln for ln in enc_report))
             if not cond:
@@ -43180,9 +43460,10 @@ def self_test():
             print(f"  [{'PASS' if cond else 'FAIL'}] an APFS volume flagged encrypted whose "
                   f"blocks the image holds in the clear is read ({n1} of {n0} entries)")
             # and the same volume with its tree's root node as ciphertext would be
-            root = w1.fs_root_block
             noise = b"".join(_hl4.sha256(b"%d" % k).digest() for k in range(bs // 32))
-            apfs_raw[root * bs:(root + 1) * bs] = noise
+            # every node the volume maps: one bad root among readable nodes is damage
+            for mapped in set(w1._read_omap(struct.unpack_from("<Q", sb, 128)[0]).values()):  # pylint: disable=protected-access
+                apfs_raw[mapped * bs:(mapped + 1) * bs] = noise
             try:
                 w2 = ApfsWalker(_io4.BytesIO(bytes(apfs_raw)), 0)
                 n2 = sum(1 for _ in walk_all(w2))
