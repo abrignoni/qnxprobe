@@ -8529,16 +8529,19 @@ def _apfs_fs_key(key):
 
 def _apfs_name(raw):
     """A directory record's or attribute's stored name as text. The stored length counts
-    a final NUL, which is trimmed. A NUL inside the name is kept as %00, and bytes that
-    do not decode as %XX, so two different stored names stay different."""
-    return raw.rstrip(b"\x00").decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+    a final NUL, which is trimmed. A NUL inside the name is kept as %00, a / as %2F so it
+    invents no folder, and bytes that do not decode as %XX, so two different stored names
+    stay different."""
+    return (raw.rstrip(b"\x00").decode("utf-8", "qnxprobe-name")
+            .replace("\x00", "%00").replace("/", "%2F"))
 
 
 def _apfs_volume_name(sb):
     """apfs_volname, a NUL-terminated string in a field of APFS_VOLNAME_LEN bytes (Apple
-    File System Reference, 2020-06-22). What follows the first NUL is not the name."""
+    File System Reference, 2020-06-22). What follows the first NUL is not the name. The
+    name becomes a folder, so a / in it is kept as %2F."""
     field = sb[APFS_VOLNAME_OFF:APFS_VOLNAME_OFF + APFS_VOLNAME_LEN]
-    return field.split(b"\x00")[0].decode("utf-8", "qnxprobe-name")
+    return field.split(b"\x00")[0].decode("utf-8", "qnxprobe-name").replace("/", "%2F")
 
 
 def _apfs_xfields(blob, off):
@@ -29049,14 +29052,16 @@ def _apfs_reader_checks():
                 if len(name) >= 6 and name.isascii() and b"." in name[1:]:
                     picks.append((block, block * bs + keys_at + k + name_at, name.decode()))
                     break
-            if len(picks) == 3:
+            if len(picks) == 4:
                 break
         raw[picks[0][1]], raw[picks[1][1]], raw[picks[2][1] + 2] = 0xFF, 0xFE, 0
+        raw[picks[3][1] + 2] = 0x2F
         for block in {pick[0] for pick in picks}:
             reseal(raw, block)
         got = {p.rsplit("/", 1)[-1] for p in listed(walker(raw))}
         want = {"%FF" + picks[0][2][1:], "%FE" + picks[1][2][1:],
-                picks[2][2][:2] + "%00" + picks[2][2][3:]}
+                picks[2][2][:2] + "%00" + picks[2][2][3:],
+                picks[3][2][:2] + "%2F" + picks[3][2][3:]}
         with sqlite3.connect(":memory:") as db:
             db.execute("create table t (n text)")
             db.executemany("insert into t values (?)", [(n,) for n in want])
@@ -29072,7 +29077,8 @@ def _apfs_reader_checks():
             reseal(raw, block)
             w = walker(raw)
             return w.volumes[0][2], [n for n, _node in w.listdir(w.root)]
-        return all(named(t) == (t, [t]) for t in ("L" * 90, "S" * 63, "M" * 255))
+        return (all(named(t) == (t, [t]) for t in ("L" * 90, "S" * 63, "M" * 255))
+                and named("a/b") == ("a%2Fb", ["a%2Fb"]))
 
     cases = (
         ("an APFS leaf read as zeros is recorded, and the rest of the volume still lists",
@@ -29110,7 +29116,7 @@ def _apfs_reader_checks():
          zero_root_cipher),
         ("a GPT-typed APFS partition whose block 0 lost its magic is read from a copy, or "
          "recorded when no copy is left", typed_magic),
-        ("an APFS name that does not decode, or holds a NUL, keeps its bytes as %XX",
+        ("an APFS name that does not decode, or holds a NUL or a /, keeps its bytes as %XX",
          stored_names),
         ("an APFS volume name is read to the length the format holds", long_volume_name),
     )

@@ -959,6 +959,10 @@ volume. Nothing here reads a snapshot: what is walked is the volume as the newes
 checkpoint leaves it. The identification lines give the number of snapshots a volume
 records, and say nothing about what they hold.
 
+A stored name that does not decode keeps those bytes as `%XX`, and a NUL or `/` inside one
+file, attribute or volume name becomes `%00` or `%2F`, so it cannot invent a folder. A
+volume name is read to the 256 bytes the format holds.
+
 Two volumes of a container can carry one name. The first keeps it as its folder and a
 later one gets `_2`, `_3` and so on. Names that differ only in case keep their own
 spelling, so they share a folder if the zip is extracted where case is ignored.
