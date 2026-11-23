@@ -372,10 +372,10 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 (`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
-not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
-time, and for NTFS, ReFS, HFS+ and F2FS for a value out of their range too. APFS keeps
-every stored time, so a time before 1970 gets a row and one from 2100 to 2107 is the
-member's date. Only a stored 0 is no time there.
+not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or F2FS, whose readers use 0 for no time,
+and for NTFS, ReFS, HFS+ and F2FS for a value out of their range too. APFS keeps every
+stored time. Apple's reference gives the field no unset value, so a stored 0 gets a row
+like any other time before 1980, and a time from 2100 to 2107 is the member's date.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -988,15 +988,28 @@ is not read as a hole. A volume written by another implementation was not measur
 file flagged compressed whose `com.apple.decmpfs` attribute is gone is refused rather than
 written as an empty file.
 
-A block 0 that fails its checksum or is all zero is replaced by a valid superblock copy
-from the checkpoint descriptor area, found through what block 0 still says, in the 64
-blocks after it, or, for a partition the GPT types as APFS, up to 1 GiB in. A block 0 that
-lost its magic and holds other bytes is read the same way in a partition the GPT types as
-APFS, once no other filesystem has claimed the partition. If no valid copy is found there,
-the partition still gets a record with `extract_error` and exits 1. Without that GPT type,
-a block 0 with other bytes and no magic is not recognized as APFS, and neither is a bare
-container whose block 0 is zero and whose descriptor area starts further away. A block 0
-that passes its checksum is used exactly as before.
+A block 0 that keeps its magic and fails its checksum is replaced by a valid superblock
+copy from the checkpoint descriptor area, found through what block 0 still says or in the
+64 blocks after it. A block 0 with no magic (zero, 0xFF or other bytes) is read the same
+way in a partition the GPT types as APFS, up to 1 GiB in, once no other filesystem has
+claimed the partition. If no valid copy is found there, the partition still gets a record
+with `extract_error` and exits 1.
+
+Without that GPT type a region with no magic is not read as APFS, because it could be an
+old container left behind a filesystem this tool does not identify. If no filesystem claims
+it and it holds valid checkpoint copies, it gets a record that names the blocks, says the
+region was not read, and says it may be a damaged container or a leftover from an earlier
+one. Copies are looked for in the first 64 blocks and then on a sample of blocks up to
+1 GiB in, so a small descriptor area far from the start can be missed. A block 0 that
+passes its checksum is used exactly as before.
+
+If the descriptor area holds a later transaction than the newest superblock that passes
+its checksum, the older checkpoint is read, as it should be after an interrupted write,
+and `note` in `volumes.json` names both transactions and says newer data may exist. A
+volume superblock that fails its checksum is named in `damage_first`, because its name and
+other fields may be wrong. A `com.apple.decmpfs` attribute of type 0x80000001, which xnu's
+`bsd/sys/decmpfs.h` names `DATALESS_CMPFS_TYPE`, on a file not flagged compressed is
+counted in `note`, not as damage, and the data stream is read as stored.
 
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
 Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are
