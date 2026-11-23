@@ -29325,6 +29325,29 @@ def _ext_reader_checks():
         w = walker(img)
         return read(w, ino, 65536) == body and not w.damage
 
+    def hurd_not_compared():
+        """e2fsck does not compare i_blocks on a volume the Hurd created. The same inode on
+        a Linux-created volume is the control that shows the comparison is live."""
+        def build(creator):
+            img = bytearray(sparse2)
+            ino = number(img, "hole_middle.bin")
+            at = inode_at(img, ino)
+            spare = u32(img, 1024 + 4) - 8
+            img[spare * 4096:(spare + 1) * 4096] = bytes(4096)
+            struct.pack_into("<I", img, at + 4, 65536)
+            struct.pack_into("<I", img, at + 88, spare)
+            struct.pack_into("<I", img, at + 28, u32(img, at + 28) + 2 * 8)   # one too many
+            struct.pack_into("<I", img, 1024 + 72, creator)
+            return img, ino
+        img, ino = build(1)
+        w = walker(img)
+        want = read(walker(sparse2), ino, 24576) + bytes(65536 - 24576)
+        same = read(w, ino, 65536) == want
+        linux, lino = build(0)
+        control = walker(linux)
+        read(control, lino, 65536)
+        return same and not getattr(w, "damage", []) and bool(getattr(control, "damage", []))
+
     def past_volume():
         img = bytearray(sparse4)
         at = inode_at(img, number(img, "dir/tiny.txt"))
@@ -29410,6 +29433,8 @@ def _ext_reader_checks():
         real_hole_kept)
     row("ext: a valid sparse file with a value in an EA inode is not taken for damage",
         ea_inode_charge)
+    row("ext: i_blocks is not compared on a volume the Hurd created, as e2fsck does not",
+        hurd_not_compared)
     row("ext damage: an extent past the end of the volume is recorded, and what follows the "
         "volume is not exported", past_volume)
     row("ext damage: a self-referencing extent index stops at once", index_loop)
