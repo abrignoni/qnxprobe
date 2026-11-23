@@ -37325,6 +37325,640 @@ def _f2fs_marker_check(image_gz):
     return has_bit, len(blocks), in_free
 
 
+def _f2fs_reader_checks():
+    """[(label, passed or None for a skip)] for how the F2FS reader treats damage, the
+    roll-forward log, compression, encryption flags, names and times. Known data is what
+    the Linux kernel read back from the volumes it wrote (tools/make_f2fs_kernel_fixtures.py
+    and the older F2FS fixture scripts). Damage is one field or block patched, in memory,
+    into a committed fixture."""
+    import gzip
+    import hashlib
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    need = ("f2fs-fixture.img.gz", "f2fs-fixture-free.img.gz", "f2fs-fixture-holes.img.gz",
+            "f2fs-fixture.free.sha256", "f2fs-fixture.holes.sha256", "f2fs-rollforward.img.gz",
+            "f2fs-rollforward.sha256", "f2fs-lz4.img.gz", "f2fs-lz4.sha256")
+    absent = [n for n in need if not os.path.isfile(os.path.join(here, n))]
+    if absent:
+        return [(f"the F2FS fixtures are not beside this script ({', '.join(absent)}), so the "
+                 "F2FS reader's damage handling was not checked", None)]
+    BS = 4096
+
+    class Image:
+        """A fixture held without its trailing zero blocks."""
+
+        def __init__(self, stem):
+            with gzip.open(os.path.join(here, stem + ".img.gz"), "rb") as gz:
+                data = gz.read()
+            self.size = struct.unpack_from("<Q", data, 1024 + 36)[0] * BS
+            self.raw = bytearray(data[:(len(data.rstrip(b"\0")) + BS - 1) // BS * BS])
+
+        def apply(self, edits):
+            undo = []
+            for off, new in edits:
+                if off + len(new) > len(self.raw):
+                    self.raw.extend(bytes(off + len(new) - len(self.raw)))
+                undo.append((off, bytes(self.raw[off:off + len(new)])))
+                self.raw[off:off + len(new)] = new
+            return undo
+
+        def restore(self, undo):
+            for off, old in reversed(undo):
+                self.raw[off:off + len(old)] = old
+
+    class Held:
+        """A file object over an Image, with the zero tail put back, or cut at ``end``."""
+
+        def __init__(self, img, end=None):
+            self.img, self.at = img, 0
+            self.end = img.size if end is None else end
+
+        def seek(self, off, whence=0):
+            self.at = off if whence == 0 else self.end + off if whence == 2 else self.at + off
+            return self.at
+
+        def tell(self):
+            return self.at
+
+        def read(self, n=-1):
+            n = self.end - self.at if n < 0 else min(n, self.end - self.at)
+            n = max(n, 0)
+            got = bytes(self.img.raw[self.at:self.at + n])
+            self.at += n
+            return got + bytes(n - len(got))
+
+    class CountedCache(dict):
+        """A block cache that stops a reader looping over a damaged size."""
+        left = 200000
+
+        def get(self, *args):
+            self.left -= 1
+            if self.left < 0:
+                raise OverflowError("the read did not stop")
+            return super().get(*args)
+
+    full, free_v, holes, roll, lz4 = (Image("f2fs-fixture"), Image("f2fs-fixture-free"),
+                                      Image("f2fs-fixture-holes"), Image("f2fs-rollforward"),
+                                      Image("f2fs-lz4"))
+
+    def known(name):
+        out = {}
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() and not line.startswith("#"):
+                    digest, path = line.rstrip("\n").split("  ", 1)
+                    out[path] = digest
+        return out
+
+    want_free, want_holes = known("f2fs-fixture.free.sha256"), known("f2fs-fixture.holes.sha256")
+    want_roll, want_lz4 = known("f2fs-rollforward.sha256"), known("f2fs-lz4.sha256")
+
+    def walker(img, end=None):
+        return F2fsWalker(Held(img, end), 0)
+
+    def files(w):
+        return {p: (n, s) for p, n, s, _m in collect(w, w.root) if s is not None}
+
+    def matches(w, want):
+        have = files(w)
+        hit = 0
+        for path, digest in want.items():
+            if path in have:
+                data = b"".join(w.read_file(*have[path]))
+                hit += len(data) == have[path][1] and hashlib.sha256(data).hexdigest() == digest
+        return hit
+
+    def with_edits(img, edits, check):
+        undo = img.apply(edits)
+        try:
+            return check()
+        finally:
+            img.restore(undo)
+
+    def crc(seed, data):
+        return binascii.crc32(data, seed ^ 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+    def cp_edits(img, w, changes):
+        """Edits to the current checkpoint block, with its checksum made right again."""
+        at = w.start_cp * BS
+        head = bytearray(img.raw[at:at + BS])
+        for off, new in changes:
+            head[off:off + len(new)] = new
+        off = struct.unpack_from("<I", head, 164)[0]
+        value = crc(F2FS_MAGIC, bytes(head[:off]))
+        if off < BS - 4:
+            value = crc(value, bytes(head[off + 4:]))
+        struct.pack_into("<I", head, off, value)
+        return [(at, bytes(head))]
+
+    def sb_edits(img, changes):
+        """Edits to superblock copy 1, with its checksum made right again."""
+        sb = bytearray(img.raw[1024:1024 + 3072])
+        for off, new in changes:
+            sb[off:off + len(new)] = new
+        struct.pack_into("<I", sb, 3068, crc(F2FS_MAGIC, bytes(sb[:3068])))
+        return [(1024, bytes(sb))]
+
+    def nat_entry(w, nid):
+        block = nid // w.nepb
+        addr = w.nat_blkaddr + (block << 1) - (block & (w.seg_blocks - 1))
+        if w._f2fs_test_bit(w.nat_bitmap, block):    # pylint: disable=protected-access
+            addr += w.seg_blocks
+        return addr * BS + (nid % w.nepb) * F2FS_NAT_ENTRY_SIZE
+
+    def largest(w):
+        path = max(files(w).items(), key=lambda kv: kv[1][1])[0]
+        return (path,) + files(w)[path]
+
+    def name_at(img, w, folder, name):
+        """The byte offset of a stored name in a folder's own blocks."""
+        ino = w.inode(folder)
+        if ino["inline"] & F2FS_INLINE_DENTRY:
+            blocks = [w.resolve(folder)]
+        else:
+            blocks = [w._block_of(ino, k)                # pylint: disable=protected-access
+                      for k in range((ino["size"] + BS - 1) // BS)]
+        for block in blocks:
+            hit = bytes(img.raw[block * BS:(block + 1) * BS]).find(name)
+            if hit >= 0:
+                return block * BS + hit
+        raise KeyError(name)
+
+    def log_blocks(img, w):
+        """The warm node log after the checkpoint, read here from its footers."""
+        seg = struct.unpack_from("<I", w.ckpt, 40)[0]
+        at = w.main_blkaddr + seg * w.seg_blocks + struct.unpack_from("<H", w.ckpt, 70)[0]
+        off = struct.unpack_from("<I", w.ckpt, 164)[0]
+        want = w.cp_ver | struct.unpack_from("<I", w.ckpt, off)[0] << 32
+        out = []
+        while len(out) < 64:
+            block = bytes(img.raw[at * BS:(at + 1) * BS])
+            if len(block) < BS or struct.unpack_from("<Q", block, BS - 12)[0] != want:
+                return out
+            out.append(at)
+            at = struct.unpack_from("<I", block, BS - 4)[0]
+        return out
+
+    def export(img, edits=(), end=None):
+        """(exit status, the volume's record, exceptions rows, {member: (crc, size)}) from
+        a real --extract."""
+        if getattr(sys, "frozen", False):
+            return None
+        work = tempfile.mkdtemp(prefix="qnxprobe-f2fs-")
+        undo = img.apply(edits)
+        try:
+            raw, out = os.path.join(work, "v.img"), os.path.join(work, "o.zip")
+            limit = img.size if end is None else end
+            with open(raw, "wb") as fh:
+                fh.write(img.raw[:limit])
+                fh.truncate(limit)
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw,
+                                   "--extract", out], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=240, check=False)
+            with zipfile.ZipFile(out) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+                rows = []
+                for name in zin.namelist():
+                    if name.endswith(".exceptions.tsv"):
+                        rows += [ln.split("\t") for ln in
+                                 zin.read(name).decode("utf-8", "replace").splitlines()[1:]]
+                members = {i.filename.split("/", 1)[-1]: (i.CRC, i.file_size)
+                           for i in zin.infolist()}
+            return done.returncode, rec, rows, members
+        finally:
+            img.restore(undo)
+            shutil.rmtree(work, ignore_errors=True)
+
+    out = []
+
+    def row(label, check):
+        try:
+            result = check()
+        except Exception as exc:                     # pylint: disable=broad-except
+            label += f" (raised {type(exc).__name__}: {str(exc)[:60]})"
+            result = False
+        out.append((label, result if result is None else bool(result)))
+
+    def clean():
+        for img, want, pack in ((free_v, want_free, 1), (holes, want_holes, 2)):
+            w = walker(img)
+            if matches(w, want) != len(want) or w.cur_pack != pack or w.damage or w.log_nodes:
+                return False
+        return True
+
+    def zero_node():
+        w0 = walker(full)
+        _path, nid, size = largest(w0)
+        at = w0.resolve(w0._nid_slot(w0.inode(nid), 0))   # pylint: disable=protected-access
+
+        def check():
+            w = walker(full)
+            try:
+                b"".join(w.read_file(nid, size))
+            except F2fsUnreadable as exc:
+                return "does not hold node" in str(exc) and any("node" in d for d in w.damage)
+            return False
+        return with_edits(full, [(at * BS, bytes(BS))], check)
+
+    def wrong_node():
+        w0 = walker(free_v)
+        have = sorted(files(w0).values())
+        first, other = have[0][0], have[1][0]
+        spot = nat_entry(w0, first) + 5
+
+        def check():
+            w = walker(free_v)
+            return w.entry(first) is None and any("does not hold node" in d for d in w.damage)
+        return with_edits(free_v, [(spot, struct.pack("<I", w0.resolve(other)))], check)
+
+    def lost_folder():
+        w0 = walker(full)
+        folder = next((p, n) for p, n, m, _s, _t, _r in walk_all(w0) if m & S_IFMT == S_IFDIR)
+        at = w0.resolve(folder[1])
+        got = export(full, [(at * BS, bytes(BS))])
+        if got is None:
+            return None
+        rc, rec, rows, _members = got
+        return rc == 1 and rec.get("damage_recorded", 0) >= 1 and any(
+            r[0] == folder[0] and r[2] == "FAILED" for r in rows)
+
+    def cut_volume():
+        w0 = walker(free_v)
+        end = w0.main_blkaddr * BS
+        got = export(free_v, end=end)
+        if got is None:
+            return None
+        rc, rec, _rows, _members = got
+        return (rc == 1 and rec.get("folders_not_read", 0) >= 1
+                and rec.get("extends_past_image_by_bytes") == free_v.size - end
+                and "short of that" in (rec.get("note") or ""))
+
+    def cut_under_node():
+        w0 = walker(full)
+        _path, nid, size = largest(w0)
+        ino = w0.inode(nid)
+        node = w0.resolve(w0._nid_slot(ino, 0))          # pylint: disable=protected-access
+        under = min(w0.addrs_per_block, (size + BS - 1) // BS - ino["addrs_in_inode"])
+        w = walker(full, node * BS)
+        before = EOF_SHORTFALL["bytes"]
+        data = b"".join(w.read_file(nid, size))
+        return len(data) == size and EOF_SHORTFALL["bytes"] - before >= under * BS
+
+    def names():
+        w0 = walker(free_v)
+        plain = [n for n, c in w0.listdir(w0.root)
+                 if w0.entry(c) and w0.entry(c)[0] & S_IFMT == S_IFREG and len(n) >= 4
+                 and n.isascii()][:4]
+        stored = [p.encode() for p in plain]
+        new = [b"\xff" + stored[0][1:], b"\xfe" + stored[1][1:],
+               stored[2][:1] + b"/" + stored[2][2:], stored[3][:1] + b"\x00" + stored[3][2:]]
+        edits = [(name_at(free_v, w0, w0.root, s), n) for s, n in zip(stored, new)]
+
+        def check():
+            w = walker(free_v)
+            got = {n for n, _c in w.listdir(w.root)}
+            wanted = {"%FF" + plain[0][1:], "%FE" + plain[1][1:],
+                      plain[2][:1] + "%2F" + plain[2][2:], plain[3][:1] + "%00" + plain[3][2:]}
+            if not wanted <= got or any(0xD800 <= ord(ch) <= 0xDFFF for n in got for ch in n):
+                return False
+            db = sqlite3.connect(":memory:")
+            db.execute("create table t (n text primary key)")
+            db.executemany("insert into t values (?)", [(n,) for n in sorted(got)])
+            return db.execute("select count(*) from t").fetchone()[0] == len(got)
+        return with_edits(free_v, edits, check)
+
+    def bad_cp_crc():
+        w0 = walker(free_v)
+        at = w0.start_cp * BS + 192 + struct.unpack_from("<I", w0.ckpt, 156)[0]
+
+        def check():
+            w = walker(free_v)
+            return (w.cur_pack != w0.cur_pack and matches(w, want_free) == len(want_free)
+                    and any("fails its checksum" in d for d in w.damage))
+        return with_edits(free_v, [(at, bytes([free_v.raw[at] ^ 0x80]))], check)
+
+    def bad_sb_crc():
+        w0 = walker(free_v)
+
+        def check():
+            w = walker(free_v)
+            return (matches(w, want_free) == len(want_free)
+                    and any("copy 2 was read" in d for d in w.damage))
+        return with_edits(free_v, [(1024 + 84, struct.pack("<I", w0.nat_blkaddr + 512))], check)
+
+    def bad_pointer():
+        w0 = walker(full)
+        _path, nid, size = largest(w0)
+        ino = w0.inode(nid)
+        at = w0.resolve(nid) * BS + ino["iaddr_off"]
+
+        def check():
+            w = walker(full)
+            try:
+                b"".join(w.read_file(nid, size))
+            except F2fsUnreadable as exc:
+                return "outside the main area" in str(exc)
+            return False
+        return with_edits(full, [(at, struct.pack("<I", 1))], check)
+
+    def signed_times():
+        w0 = walker(free_v)
+        nid = sorted(files(w0).values())[0][0]
+        at = w0.resolve(nid) * BS + 48
+
+        def check():
+            w = walker(free_v)
+            value = w.entry(nid)[2]
+            return value == -315619200 and _zip_time_lost(value, w, nid) is not None
+        first = with_edits(free_v, [(at, struct.pack("<q", -315619200))], check)
+
+        def zero():
+            w = walker(free_v)
+            return w.entry(nid)[2] == 0 and _zip_time_lost(0, w, nid) is not None
+        return first and with_edits(free_v, [(at, bytes(8))], zero)
+
+    def huge_file():
+        w0 = walker(free_v)
+        nid = sorted(files(w0).values())[0][0]
+        at = w0.resolve(nid) * BS + 16
+
+        def check():
+            w = walker(free_v)
+            try:
+                next(iter(w.read_file(nid, 1 << 60)))        # one step: the old read never ends
+            except F2fsUnreadable as exc:
+                return "a file can hold" in str(exc)
+            return False
+        return with_edits(free_v, [(at, struct.pack("<Q", 1 << 60))], check)
+
+    def huge_folder():
+        w0 = walker(full)
+        folder = next(n for _p, n, m, _s, _t, _r in walk_all(w0) if m & S_IFMT == S_IFDIR
+                      and not w0.inode(n)["inline"] & F2FS_INLINE_DENTRY)
+        at = w0.resolve(folder) * BS + 16
+
+        def check():
+            w = walker(full)
+            w._cache = CountedCache()                    # pylint: disable=protected-access
+            listed = w.listdir(folder)
+            return bool(listed) and w.folders_not_read == 1
+        return with_edits(full, [(at, struct.pack("<Q", 1 << 50))], check)
+
+    def payload_bitmap():
+        w0 = walker(free_v)
+        nat_len = BS + 64
+        spot = (BS - 196 + 8) * 8 + 5                    # a bit in the payload block
+        flags = struct.unpack_from("<I", w0.ckpt, 132)[0] | F2FS_CP_LARGE_NAT_BITMAP
+        edits = sb_edits(free_v, [(1664, struct.pack("<I", 1))])
+        edits += cp_edits(free_v, w0, [(132, struct.pack("<I", flags)),
+                                       (160, struct.pack("<I", nat_len))])
+        edits.append(((w0.start_cp + 1) * BS + 8, bytes([0x80 >> 5])))
+
+        def check():
+            w = walker(free_v)
+            return w._f2fs_test_bit(w.nat_bitmap, spot) == 1  # pylint: disable=protected-access
+        return with_edits(free_v, edits, check)
+
+    def compressed_read():
+        w = walker(lz4)
+        return matches(w, want_lz4) == len(want_lz4) and not w.damage
+
+    def other_algorithm():
+        w0 = walker(lz4)
+        nid, size = files(w0)["compressible.bin"]
+        at = w0.resolve(nid) * BS + 392
+
+        def check():
+            w = walker(lz4)
+            try:
+                b"".join(w.read_file(nid, size))
+            except F2fsUnreadable as exc:
+                return "zstd" in str(exc)
+            return False
+        return with_edits(lz4, [(at, bytes([2]))], check)
+
+    def bad_cluster():
+        w0 = walker(lz4)
+        nid, size = files(w0)["compressible.bin"]
+        ino = w0.inode(nid)
+        block = next(a for a in (w0._block_of(ino, k) for k in range(1, 4))   # pylint: disable=protected-access
+                     if a not in (F2FS_NULL_ADDR, F2FS_NEW_ADDR, F2FS_COMPRESS_ADDR))
+
+        def check():
+            w = walker(lz4)
+            try:
+                b"".join(w.read_file(nid, size))
+            except F2fsUnreadable as exc:
+                return "compressed" in str(exc) and any("cluster" in d for d in w.damage)
+            return False
+        return with_edits(lz4, [(block * BS, struct.pack("<I", 1 << 30))], check)
+
+    def journal_count():
+        w0 = walker(holes)
+        at = (w0.start_cp + struct.unpack_from("<I", w0.ckpt, 140)[0]) * BS
+
+        def check():
+            w = walker(holes)
+            return not w.nat_j and any("NAT journal" in d for d in w.damage)
+        return with_edits(holes, [(at, struct.pack("<H", 300))], check)
+
+    def short_extra():
+        w0 = walker(free_v)
+        nid = sorted(files(w0).values())[0][0]
+        at = w0.resolve(nid) * BS + 360
+
+        def check():
+            return walker(free_v).stamps(nid)[0] == 0
+        return with_edits(free_v, [(at, struct.pack("<H", 12))], check)
+
+    def two_devices():
+        path = b"second-device".ljust(64, b"\0") + struct.pack("<I", 100)
+        first = b"first-device".ljust(64, b"\0") + struct.pack("<I", 100)
+
+        def check():
+            w = walker(free_v)
+            return "2 devices" in (w.volume_note or "") and "second-device" in w.volume_note
+        return with_edits(free_v, sb_edits(free_v, [(2201, first + path)]), check)
+
+    def not_clean():
+        w0 = walker(free_v)
+        flags = (w0.cp_flags & ~F2FS_CP_UMOUNT) | F2FS_CP_FASTBOOT
+
+        def check():
+            w = walker(free_v)
+            return "not marked as a clean unmount" in (w.volume_note or "")
+        return with_edits(free_v, cp_edits(free_v, w0, [(132, struct.pack("<I", flags))]), check)
+
+    def log_read():
+        w = walker(roll)
+        return matches(w, want_roll) == len(want_roll) == 21 and w.log_nodes == 20
+
+    def log_export():
+        got = export(roll)
+        if got is None:
+            return None
+        rc, rec, rows, members = got
+        marked = [r for r in rows if r[2] == "ROLL_FORWARD"]
+        return (rc == 0 and rec["files"] == 21 and len(marked) == 20
+                and rec["exceptions"].get("roll_forward") == 20
+                and "roll-forward log" in (rec.get("note") or "")
+                and all(r[1].split("/", 1)[-1] in members for r in marked))
+
+    def log_not_free():
+        w = walker(roll)
+        runs = w.free_extents()
+        starts = [a for a, _n in runs]
+
+        def is_free(block):
+            off = block * BS
+            i = bisect.bisect_right(starts, off) - 1
+            return i >= 0 and off < runs[i][0] + runs[i][1]
+        blocks = log_blocks(roll, w)
+        return len(blocks) == 20 and not any(is_free(b) for b in blocks)
+
+    def log_stale():
+        w0 = walker(roll)
+        first = log_blocks(roll, w0)[0]
+        ver = struct.unpack_from("<Q", roll.raw, first * BS + BS - 12)[0]
+
+        def check():
+            w = walker(roll)
+            return w.log_nodes == 0 and not w.log_refused and len(files(w)) == 1
+        return with_edits(roll, [(first * BS + BS - 12, struct.pack("<Q", ver - 1))], check)
+
+    def log_cut():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+
+        def check():
+            w = walker(roll)
+            have = files(w)
+            return (w.log_nodes == 5 and not w.log_refused and len(have) == 6
+                    and matches(w, {p: d for p, d in want_roll.items() if p in have}) == 6)
+        return with_edits(roll, [(blocks[5] * BS, bytes(BS))], check)
+
+    def log_loop():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+
+        def check():
+            w = walker(roll)
+            return ("loops" in (w.log_refused or "") and w.log_nodes == 0
+                    and len(files(w)) == 1 and w.folders_not_read == 1)
+        return with_edits(roll, [(blocks[6] * BS + BS - 4, struct.pack("<I", blocks[2]))], check)
+
+    def log_existing_inode():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+        held = walker(roll)
+        kept = next(n for n, _s in files(held).values() if n not in held._rf)  # pylint: disable=protected-access
+
+        def check():
+            w = walker(roll)
+            return "already holds" in (w.log_refused or "") and w.log_nodes == 0
+        return with_edits(roll, [(blocks[0] * BS + BS - 24, struct.pack("<II", kept, kept))], check)
+
+    def log_direct_node():
+        """Crafted: a log copy of a held file's first direct node, with one address moved
+        to a free block. The kernel volume's log holds inodes only, so this is the one row
+        that reaches a direct node, and it rests on reading recovery.c and gc.c."""
+        w0 = walker(full)
+        _path, nid, size = largest(w0)
+        ino = w0.inode(nid)
+        dnode = w0._nid_slot(ino, 0)                     # pylint: disable=protected-access
+        seg = struct.unpack_from("<I", w0.ckpt, 40)[0]
+        first = w0.main_blkaddr + seg * w0.seg_blocks + struct.unpack_from("<H", w0.ckpt, 70)[0]
+        free_block = first + 1
+        off = struct.unpack_from("<I", w0.ckpt, 164)[0]
+        want = w0.cp_ver
+        if w0.cp_flags & 0x40:
+            want |= struct.unpack_from("<I", w0.ckpt, off)[0] << 32
+        node = bytearray(full.raw[w0.resolve(dnode) * BS:(w0.resolve(dnode) + 1) * BS])
+        struct.pack_into("<I", node, 5 * 4, free_block)
+        flag = struct.unpack_from("<I", node, BS - 16)[0] | 2     # the fsync mark
+        struct.pack_into("<I", node, BS - 16, flag)
+        struct.pack_into("<Q", node, BS - 12, want)
+        struct.pack_into("<I", node, BS - 4, 0)
+        mark = b"LOG-BLOCK-".ljust(BS, b"x")
+        before = b"".join(w0.read_file(nid, size))
+        at = (ino["addrs_in_inode"] + 5) * BS
+
+        def check():
+            w = walker(full)
+            got = b"".join(w.read_file(nid, size))
+            return (w.log_nodes == 1 and not w.log_refused and got[at:at + BS] == mark
+                    and got[:at] == before[:at] and got[at + BS:] == before[at + BS:])
+        return with_edits(full, [(first * BS, bytes(node)), (free_block * BS, mark)], check)
+
+    def encrypted():
+        w0 = walker(free_v)
+        path, (nid, size) = next((p, v) for p, v in sorted(files(w0).items())
+                                 if v[1] % BS and v[1] > 3000
+                                 and not w0.inode(v[0])["inline"] & F2FS_INLINE_DATA)
+        edits = sb_edits(free_v, [(2180, struct.pack("<I", w0.feature | F2FS_FEAT_ENCRYPT))])
+        at = w0.resolve(nid) * BS + 2
+        edits.append((at, bytes([free_v.raw[at] | F2FS_FADVISE_ENCRYPT])))
+        got = export(free_v, edits)
+        if got is None:
+            return None
+        rc, rec, rows, members = got
+        marked = [r for r in rows if r[2] == "ENCRYPTED"]
+        stored = -(-size // BS) * BS
+        note = rec.get("note") or ""
+        return (rc == 0 and members.get(path, (0, 0))[1] == stored and len(marked) == 1
+                and marked[0][0] == path and f"{size:,}" in marked[0][3]
+                and (rec.get("exceptions") or {}).get("encrypted") == 1 and not rec.get("failed")
+                and "1 file(s) are flagged encrypted" in note and "without the keys" in note)
+
+    row("F2FS clean volumes: every known file reads, the same checkpoint pack is chosen, no "
+        "damage is recorded and real holes stay holes", clean)
+    row("F2FS: a zeroed direct node refuses the file instead of reading as a hole", zero_node)
+    row("F2FS: a NAT entry aimed at another file's inode is not read as this file", wrong_node)
+    row("F2FS: a folder whose inode is zeroed is a FAILED row and exit 1", lost_folder)
+    row("F2FS: a copy cut before the main area exits 1 and records how much is missing", cut_volume)
+    row("F2FS: every block under a node past the image's end counts as missing", cut_under_node)
+    row("F2FS names: undecodable bytes are %XX, a stored / is %2F, a NUL is %00, and all go "
+        "into SQLite as distinct names", names)
+    row("F2FS: a checkpoint pack that fails its checksum falls back to the other and says so",
+        bad_cp_crc)
+    row("F2FS: a superblock copy that fails its checks falls back to copy 2 and says so",
+        bad_sb_crc)
+    row("F2FS: a data pointer outside the main area refuses the file", bad_pointer)
+    row("F2FS times: a pre-1970 time stays signed and a stored 0 is recorded", signed_times)
+    row("F2FS: a file size past what the format allows is refused at once", huge_file)
+    row("F2FS: a folder size past what the format allows ends and is recorded", huge_folder)
+    row("F2FS: a version bitmap that runs into the checkpoint payload is read whole",
+        payload_bitmap)
+    row("F2FS compression: real LZ4 and plain clusters match what the kernel read back",
+        compressed_read)
+    row("F2FS compression: another algorithm is refused by name", other_algorithm)
+    row("F2FS compression: a cluster with a bad length is refused and recorded", bad_cluster)
+    row("F2FS: a NAT journal count past its capacity is not parsed", journal_count)
+    row("F2FS: crtime is not read from an extra area too short to hold it", short_extra)
+    row("F2FS: a multi-device superblock is named in the volume note", two_devices)
+    row("F2FS: a checkpoint that is not a clean unmount is in the volume note", not_clean)
+    row("F2FS roll-forward: all 21 files of a kernel crash-state image match the kernel's "
+        "read-back", log_read)
+    row("F2FS roll-forward: the export labels each of the 20 replayed files and exits 0",
+        log_export)
+    row("F2FS roll-forward: replayed node blocks are not reported as free space", log_not_free)
+    row("F2FS roll-forward: a first node from another checkpoint ends the log with nothing "
+        "applied", log_stale)
+    row("F2FS roll-forward: a chain cut after 5 nodes applies those 5", log_cut)
+    row("F2FS roll-forward: a looped chain applies nothing and is recorded", log_loop)
+    row("F2FS roll-forward: a log inode recreating a held inode stops recovery", log_existing_inode)
+    row("F2FS roll-forward: a crafted direct node in the log changes the one block it moves",
+        log_direct_node)
+    row("F2FS encryption: a flagged file is exported as stored to the end of its block, with "
+        "its logical size in an ENCRYPTED row, a counted note and exit 0 (flag only: nothing "
+        "is decrypted)", encrypted)
+    return out
+
+
 def _ntfs_fixture_check(image_gz, listing):
     """Walk the committed NTFS fixture and compare every file against the
     hashes an independent reader recorded from the same image.
@@ -43402,6 +44036,10 @@ def self_test():
             lvm_checks += _raid_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the RAID checks ran ({type(exc).__name__}: {exc})", False)]
+        try:
+            lvm_checks += _f2fs_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the F2FS reader checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
             if cond is None:
                 print(f"  [SKIP] {label}")

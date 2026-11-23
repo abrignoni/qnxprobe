@@ -372,8 +372,11 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 (`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
-not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
-time, and for the last five for a value out of their range too.
+not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
+time, and for the last four for a value out of their range too. F2FS keeps the signed value
+it stores, so a stored 0 is recorded as 1970-01-01. An F2FS file flagged encrypted gets an
+`ENCRYPTED` row, and one that takes anything from the roll-forward log a `ROLL_FORWARD` row.
+Neither changes the exit status.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -2283,10 +2286,35 @@ Address Table, choosing the current copy of each NAT block from the active check
 bitmap and applying any override in the checkpoint's NAT journal, exactly as the kernel
 does.
 
-What it does not do: a file with per-file encryption (the norm on a real Android
-`/data`) is listed and its content refused, since the volume holds no key, and its name
-is shown as stored; a compressed file (LZ4/LZO/zstd clusters) is listed with its
-recorded size and not decompressed. See [What it does not do](#what-it-does-not-do).
+Files fsynced after the last checkpoint are read too. A copy of a running or crashed
+device can hold them only in the roll-forward log, so the reader replays that log in
+memory by the rules of `fs/f2fs/recovery.c`. The walk starts at the next free block of the
+warm node log, and a node counts only if its footer carries this checkpoint's version, and
+its checksum when the checkpoint's flags say so. Anything the kernel would stop recovery on
+leaves the checkpoint's state in place and is recorded. The image is never written, and each
+file that takes anything from the log has a `ROLL_FORWARD` row in the exceptions table.
+Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
+files match the kernel's read-back hashes, where 1.87 listed 1.
+
+Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
+is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
+A compressed cluster in LZO, LZO-RLE or zstd is refused by name.
+
+Encryption: a file with per-file encryption (the norm on a real Android `/data`) is
+exported as stored, with an `ENCRYPTED` row that gives its logical size. The member runs
+to the end of the block holding the last byte, because fscrypt encrypts whole data units
+and ciphertext cut at the file size could not be decrypted. Nothing is decrypted. A name in
+an encrypted folder is shown as stored, with `%XX` where it does not decode, and is not the
+real name. A file that is both encrypted and holds compressed clusters is refused. This
+path has been run on inodes with the flag patched in, not on a real fscrypt volume.
+
+Damage is recorded and not read through. A node whose footer names another node or inode,
+an address outside the main area, a size past what the format allows or a checkpoint or
+superblock copy that fails its checksum is named in `damage_first`. A bad copy falls back to
+the good one. A file under a damaged node is refused, a folder that cannot be read in full
+counts in `folders_not_read`, and a name whose inode cannot be read is a `FAILED` row. A real
+hole, a node id of 0 or a block address of 0, stays a hole. See
+[What it does not do](#what-it-does-not-do).
 
 Validated against two independent readers. On a fixture `mkfs.f2fs` and `sload.f2fs` wrote
 (`tools/make_f2fs_fixture.sh`), every file inside the inode matches what `sha256sum`
@@ -4254,8 +4282,8 @@ above are in this README only for now.)
   with encrypted filenames are flagged, not opened; an APFS volume the image holds
   decrypted is read (see APFS above). A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
   protected only by a TPM is named and not read.
-  On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
-  its content refused rather than guessed at.
+  On F2FS, a real Android `/data` uses per-file encryption: such a file is exported as
+  stored and labelled, and nothing is decrypted (see [F2FS](#f2fs)).
 - **LVM2: linear, striped, RAID1, mirror and RAID4/5/6/10 logical volumes are read.** A
   RAID0 volume, a thin, cache, VDO or snapshot volume, or one with a run on a physical
   volume missing from the images given, is named in the report with why and not read (see
@@ -4284,8 +4312,8 @@ above are in this README only for now.)
 - **ReFS: the newest checkpoint, without the log.** Changes still only in the metadata
   log are counted and reported, not applied; deleted files and free space are not read; ReFS
   1.x and 2.x are identified and refused. See [ReFS](#refs).
-- **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
-  LZO or zstd clusters is listed with its recorded size and not decompressed.
+- **F2FS compression: LZ4 only.** A compressed cluster in LZO, LZO-RLE or zstd is refused
+  by name. Clusters that are not compressed are read in any of them.
 - **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
   Two independent readers are the oracles: f2fs-tools' `dump.f2fs` for inline data,
   directories, the inode's own pointers and direct and single-indirect node blocks, and
