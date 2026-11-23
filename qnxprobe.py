@@ -2731,12 +2731,13 @@ class Fat32Walker:
         self._crossed = set()
         self._deleted_runs = {}                      # a deleted folder's cluster -> clusters read
         self._slots_checked = set()
+        self._link_bits = False                      # False: the copies are not compared yet
         bpb = read_at(fh, base, 512)
         if self.FAT_BITS == 32:
-            copy = _fat32_boot_copy(fh, base, bpb)
+            copy = _fat32_boot_copy(fh, base, bpb, typed=True)
             if copy is not None:
                 bpb = copy
-                self._record("the boot sector is all zeros, so this volume was read from the "
+                self._record("the boot sector is not valid, so this volume was read from the "
                              "backup copy of it at sector 6")
         # The state byte: offset 37, or 65 on FAT32. Microsoft's specification calls it
         # reserved. Linux sets bit 0 (FAT_STATE_DIRTY) at mount and clears it at unmount
@@ -3001,6 +3002,86 @@ class Fat32Walker:
             seen.add(clus)
             yield clus
             clus = self._fat_next(clus)
+
+    def _differing_links(self):
+        """One bit per cluster whose entry differs between the FAT copies, or None when they
+        all agree or only one counts. Read once, in blocks, and the bitmap is made only if a
+        block differs, so it is at most one bit per cluster. An entry a copy does not hold,
+        past the end of the image, is not a difference."""
+        if self._link_bits is not False:
+            return self._link_bits
+        self._link_bits = None
+        if len(self._tables) < 2 or not self.cluster_count or self._unusable:
+            return None
+        last = self.cluster_count + 2
+        width, _fmt, mask, _eoc, code = _FAT_ENTRY[self.FAT_BITS]
+        bits = None
+
+        def mark(clus):
+            nonlocal bits
+            if bits is None:
+                bits = bytearray(last // 8 + 1)
+            bits[clus >> 3] |= 1 << (clus & 7)
+
+        if width is None:
+            tables = [read_at(self.fh, s, last + last // 2 + 2) for s in self._tables]
+            if any(t != tables[0] for t in tables[1:]):
+                for clus in range(2, last):
+                    off = clus + clus // 2
+                    held = {v for v in (_fat12_entry(t[off:off + 2], clus & 1) for t in tables)
+                            if v is not None}
+                    if len(held) > 1:
+                        mark(clus)
+        else:
+            pos = 0
+            while pos < last:
+                want = min(FAT_SCAN_ENTRIES, last - pos)
+                blocks = [read_at(self.fh, s + pos * width, want * width) for s in self._tables]
+                if any(b != blocks[0] for b in blocks[1:]):
+                    tables = []
+                    for raw in blocks:
+                        words = array.array(code)
+                        words.frombytes(raw[:len(raw) // width * width])
+                        if sys.byteorder != "little":
+                            words.byteswap()
+                        tables.append(words)
+                    for i in range(want):
+                        if pos + i >= 2:
+                            held = {t[i] & mask for t in tables if i < len(t)}
+                            if len(held) > 1:
+                                mark(pos + i)
+                pos += want
+        self._link_bits = bits
+        return bits
+
+    def valid_data_note(self, node, held):
+        """(issue, detail) for this file's row in the exceptions table when its chain
+        followed a link the FAT copies disagree on, else None. The link out of the last
+        cluster the size needs is not followed, so it does not count. Which copy is right is
+        not known, and the table in use is still the one read. This does not change the exit
+        status. Named for the hook extract_to_zip() calls for each file (_valid_data_note)."""
+        bits = self._differing_links()
+        if bits is None:
+            return None
+        clus, size, is_dir = node
+        if is_dir or not size:
+            return None
+        need = (size + self.cluster_bytes - 1) // self.cluster_bytes
+        for done, cur in enumerate(self._chain(clus), 1):
+            if done >= need:
+                return None
+            if not bits[cur >> 3] & (1 << (cur & 7)):
+                continue
+            used = self._fat_value(cur)
+            other = next(((k, v) for k, v in ((k, self._fat_value(cur, s))
+                                              for k, s in enumerate(self._tables))
+                          if v is not None and v != used), None)
+            return ("FAT_COPIES_DIFFER",
+                    f"the FAT copies disagree at cluster {cur:#x}, {done * self.cluster_bytes:,} "
+                    f"bytes into the file: the table in use links it to {used:#x} and FAT "
+                    f"{other[0]} to {other[1]:#x}. The table in use was followed, so the bytes "
+                    f"from there may not be the file's")
+        return None
 
     def _chain_stop(self, value, last, seen):
         """Why a chain stops at the link ``value`` read from cluster ``last``, or None at
@@ -3283,11 +3364,14 @@ class Fat32Walker:
             self._folder_names.setdefault(first, name)
         elif not size:
             return                                   # a stale cluster on an empty file holds nothing
-        held = self._firsts.setdefault(first, (parent, name))
-        if held != (parent, name):
+        held = self._firsts.setdefault(first, (parent, name, is_sub, size))
+        if held[:2] != (parent, name):
+            # collect() visits a node once, so of two folders with one node only the first
+            # is listed. A file and a folder on one cluster are both listed.
+            both = is_sub and held[2] and held[3] == size
             self._record(f"{name!r} and {held[1]!r} both start at cluster {first:#x}, so one "
-                         f"holds the other's data" + (" and only the first folder is listed"
-                                                      if is_sub else ""))
+                         f"holds the other's data"
+                         + (" and only the first folder is listed" if both else ""))
 
     def listdir_records(self, node):
         """(name, node, recorded times as stored) for every entry.
@@ -3635,8 +3719,9 @@ class Fat32Walker:
         says so in ``assumed_contiguous``, because the volume cannot confirm it.
         A file is ``recoverable`` when nothing on the volume contradicts it: every
         cluster that read would touch is on the volume, in the image, free in every
-        FAT copy that counts and claimed by no other surviving deleted entry. A
-        cluster since handed to a live file contradicts the assumption, and two
+        FAT copy that counts, claimed by no other surviving deleted entry, and not the
+        first cluster of a folder (one opening with a "." entry that names it, then
+        ".."). A cluster since handed to a live file contradicts the assumption, and two
         deleted entries on one cluster cannot both hold it. The volume does not record
         which of them wrote last, so neither is read, and both are listed with the
         reason.
@@ -3737,12 +3822,32 @@ class Fat32Walker:
                 ok, reason = False, ("the run its size would need may overlap a deleted entry "
                                      "whose first cluster is ambiguous, and the volume does "
                                      "not record which wrote last")
+            if ok:
+                folder = self._run_opens_folder(first, need)
+                if folder is not None:
+                    ok, reason = False, (f"cluster {folder:#x} of the run its size would need "
+                                         f"opens as a folder (a \".\" entry naming that cluster, "
+                                         f"then \"..\"), so the run is not this file's")
             if cut:
                 note = "a part of its long name is gone, so the name is incomplete"
                 reason = reason or note
                 self._record(f"deleted file {name!r} at cluster {first:#x}: {note}")
             yield FatDeletedFile(name, parent, False, sz, first, ok, reason,
                                  need > 1, times, in_deleted, (first, sz, False))
+
+    def _run_opens_folder(self, first, count):
+        """The first cluster of a run that opens with a "." entry naming that same cluster,
+        then "..", or None. That is a folder's first cluster, whether or not any entry still
+        names the folder, so the volume itself says the cluster was not a file's."""
+        for clus in range(first, first + count):
+            raw = read_at(self.fh, self._cluster_off(clus), 64)
+            if (len(raw) == 64 and raw[:11] == _FAT_DOT_NAMES[0]
+                    and raw[32:43] == _FAT_DOT_NAMES[1]):
+                low = struct.unpack_from("<H", raw, 26)[0]
+                high = struct.unpack_from("<H", raw, 20)[0] if self.FAT_BITS == 32 else 0
+                if (high << 16 | low) == clus:
+                    return clus
+        return None
 
     def _looks_like_dir(self, clus):
         """A FAT directory opens with its "." and ".." entries."""
@@ -14127,8 +14232,9 @@ def _run_shortfall(w, node):
 
 
 def _valid_data_note(w, node, held):
-    """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength,
-    else None. None for any other walker."""
+    """(issue, detail) for a file's own row in the exceptions table, else None: an exFAT
+    file whose ValidDataLength differs from its DataLength, or a FAT file whose chain
+    crosses a link the FAT copies disagree on. None for any other walker."""
     report = getattr(w, "valid_data_note", None)
     if report is None:
         return None
@@ -15029,8 +15135,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip. The
-    two ValidDataLength counts appear only when not zero and do not change the exit
-    status."""
+    two ValidDataLength counts and the count of FAT files whose chain crosses a link the
+    FAT copies disagree on appear only when not zero and do not change the exit status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -15049,8 +15155,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                "renamed": counts["RENAMED"],
                "time_not_held": counts["TIME_NOT_HELD"]}
     for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
-                       ("valid_data_damaged", "VALID_DATA_DAMAGED")):
-        if counts[issue]:                            # neither is a failure or a short read
+                       ("valid_data_damaged", "VALID_DATA_DAMAGED"),
+                       ("fat_copies_differ", "FAT_COPIES_DIFFER")):
+        if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
     try:
@@ -15067,6 +15174,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     if name and not quiet:
         valid = ", each exFAT file whose ValidDataLength differs from its size" if (
             counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
+        if counts["FAT_COPIES_DIFFER"]:
+            valid += ", each FAT file whose chain crosses a link the FAT copies disagree on"
         _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
              f"hold: {name}")
 
@@ -19938,18 +20047,79 @@ def _fat32_table_missing(fh, base, b):
     return first[0] == 0 or not _fat_dir_cluster_ok(first, root=True)
 
 
-def _fat32_boot_copy(fh, base, sector):
-    """The backup boot sector, when the boot sector itself is all zeros (what an imager
-    writes for a sector it could not read) and the copy holds up, else None.
+# MBR partition types that say FAT: FAT12, FAT16 small and large, FAT32 CHS and LBA, FAT16
+# LBA, the hidden form of each (type + 0x10), and the EFI system partition. The GPT type of
+# an EFI system partition, which the UEFI specification defines as FAT.
+_FAT_MBR_TYPES = frozenset((0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E,
+                            0x11, 0x14, 0x16, 0x1B, 0x1C, 0x1E, 0xEF))
+_EFI_SYSTEM_GUID = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+
+
+def _fat_partition_type(fh, base):
+    """What the partition table calls the region at ``base``, as text, when that is a FAT
+    type, else None. A bare image has no table and so gives no sign it was FAT."""
+    gpt = parse_gpt(fh)
+    ss = gpt.sector_size if gpt is not None else SECTOR
+    for _idx, _name, guid, first, _last in gpt or ():
+        if first * ss == base and str(guid).lower() == _EFI_SYSTEM_GUID:
+            return "EFI system partition"
+    for _idx, kind, start, _count in parse_mbr(fh) or ():
+        if start * ss == base and kind in _FAT_MBR_TYPES:
+            return f"MBR type {kind:#04x}"
+        if kind not in EXT_PARTITION_TYPES:
+            continue
+        cur, steps = start, 0
+        while cur and steps < 64:
+            ebr = read_at(fh, cur * ss, 512)
+            if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
+                break
+            first = struct.unpack_from("<I", ebr, 446 + 8)[0]
+            if (cur + first) * ss == base and ebr[446 + 4] in _FAT_MBR_TYPES:
+                return f"MBR type {ebr[446 + 4]:#04x}"
+            nxt = struct.unpack_from("<I", ebr, 462 + 8)[0]
+            cur = start + nxt if nxt else 0
+            steps += 1
+    return None
+
+
+def _fat_not_read_note(fh, base):
+    """What to record for a partition typed FAT that no filesystem claimed, else None. A
+    boot sector the image does not hold is reported as a cut image instead."""
+    if len(read_at(fh, base, 512)) < 512:
+        return None
+    typed = _fat_partition_type(fh, base)
+    if typed is None:
+        return None
+    return (f"the partition table types this partition FAT ({typed}), its boot sector is not "
+            f"valid, and it was not read")
+
+
+def _fat32_primary_ok(fh, base, sector):
+    """True when a boot sector names FAT32 and describes a usable layout."""
+    return (sector[510:512] == b"\x55\xaa" and sector[82:90] in (b"FAT32   ", b"TFAT32  ")
+            and _fat32_geometry(sector) is not None
+            and not _fat32_table_missing(fh, base, sector))
+
+
+def _fat32_boot_copy(fh, base, sector, typed=False):
+    """The backup boot sector, when the boot sector cannot be used and the copy holds up,
+    else None.
+
+    An all-zero sector is what an imager writes for one it could not read. With ``typed``,
+    any other boot sector that fails validation (0xFF, noise, an impossible geometry) also
+    counts, but only on a partition the table types FAT, since a bare image gives no sign
+    it was FAT.
 
     Microsoft's specification recommends 6 for BPB_BkBootSec and no other value, and the
     field itself is in the lost sector, so sector 6 is where this looks, for each sector
-    size the format has. The copy
-    must name FAT32, say it is at sector 6, have a usable geometry and put a table where it
-    says one is: entry 0 opens with the media byte and two 0xFF bytes. A FAT32 that really
-    starts six sectors further on fails that last test here, because its reserved area
-    lies where its FAT would have to be."""
-    if len(sector) < 512 or any(sector):
+    size the format has. The copy must name FAT32, say it is at sector 6, have a usable
+    geometry and put a table where it says one is: entry 0 opens with the media byte and
+    two 0xFF bytes. A FAT32 that really starts six sectors further on fails that last test
+    here, because its reserved area lies where its FAT would have to be."""
+    if len(sector) < 512:
+        return None
+    if any(sector) and (not typed or _fat32_primary_ok(fh, base, sector)
+                        or _fat_partition_type(fh, base) is None):
         return None
     for bps in (512, 1024, 2048, 4096):
         copy = read_at(fh, base + 6 * bps, 512)
@@ -20007,7 +20177,7 @@ def _tfat_lines(fh, base, b, bits):
     return lines
 
 
-def identify_fat(fh, base):
+def identify_fat(fh, base, typed=False):
     """Return (kind, lines) for a FAT32, FAT16, FAT12 or exFAT volume at base, else None.
 
     exFAT names itself in bytes 3..11 of the boot sector. FAT32 is recognised
@@ -20023,7 +20193,10 @@ def identify_fat(fh, base):
     b = read_at(fh, base, 512)
     if b[3:11] == BDE_SIGNATURE or (b[3:11] == BDE_TOGO_SIGNATURE and b[424:440] == BDE_GUID):
         return None                  # a BitLocker header: identify_bitlocker's, not a FAT volume
-    from_copy = _fat32_boot_copy(fh, base, b)
+    # A sector naming FAT32 is its own claim. Any other is tried only with ``typed``, once
+    # no other filesystem has claimed a partition the table types FAT (_identify_fs).
+    from_copy = _fat32_boot_copy(fh, base, b,
+                                 typed=typed or b[82:90] in (b"FAT32   ", b"TFAT32  "))
     if from_copy is not None:
         b = from_copy
     if len(b) < 512 or b[510:512] != b"\x55\xaa":
@@ -20050,7 +20223,7 @@ def identify_fat(fh, base):
             f"volume       {human(total)}",
         ]
         if from_copy is not None:
-            lines.append("boot sector  all zeros; read from its backup copy at sector 6")
+            lines.append("boot sector  not valid; read from its backup copy at sector 6")
         if _fat32_geometry(b) is None or _fat32_table_missing(fh, base, b):
             lines.append("not read     its boot sector does not describe a usable layout")
         if b[82:90] in TFAT_TYPE_STRINGS:
@@ -31898,6 +32071,12 @@ def _identify_fs(fh, base, size=None):
     if yaffs:
         return yaffs
 
+    # Nothing claimed it. If the table types it FAT, a lost boot sector may have a backup.
+    if _fat_partition_type(fh, base):
+        fat = identify_fat(fh, base, typed=True)
+        if fat:
+            return fat
+
     # Not ext, not qnx6, not IFS, not FAT, not a QNX flash filesystem. Report
     # the leading bytes so there is a lead to follow, rather than inventing a
     # signature for it.
@@ -32600,7 +32779,7 @@ def volumes(fh, size=None):
                 if vol["walker"] is None:
                     vol["note"] = "recognised, but no walker for this kind"
             else:
-                vol["note"] = "not a filesystem this tool reads"
+                vol["note"] = _fat_not_read_note(fh, base) or "not a filesystem this tool reads"
         except IfsUnsupported as exc:
             vol["note"] = f"contents not read: {exc}"
         except Exception as exc:
@@ -35354,6 +35533,18 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     ext_name = _l or _m.strip("/").replace("/", "_")
                 wanted = (only is None or only.lower() in lab.lower()
                           or (ext_name and only.lower() in ext_name.lower()))
+
+                fat_note = None if kind else _fat_not_read_note(fh, b)
+                if fat_note:
+                    print(f"        {fat_note}")
+                    if zf is not None and wanted:
+                        vol = _zip_names(zf).volume(
+                            name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                            (".exceptions.tsv",))
+                        _zip_volume_not_read(zf, manifest, vol, image_rec, ValueError(fat_note),
+                                             lba=b // ss, offset_bytes=b,
+                                             partition_size_bytes=sz,
+                                             filesystem="not recognised")
 
                 if do_triage and kind and kind.startswith("ext"):
                     esb = read_at(fh, b + EXT_SB_OFF, 1024)
@@ -38708,6 +38899,100 @@ def _fat_reader_checks():
         return (set(by_name(w)) == {"A%2FB.TXT", "c%2Fd long name.txt"}
                 and [d.name for d in w.deleted_files()] == ["e%2Ff long name.txt"])
 
+    def in_mbr(lab, type_byte):
+        disk = bytearray(2048 * 512) + bytes(lab.img)
+        disk[446 + 4] = type_byte
+        struct.pack_into("<II", disk, 446 + 8, 2048, struct.unpack_from("<I", lab.img, 32)[0])
+        disk[510:512] = b"\x55\xaa"
+        return disk
+
+    def copies_disagree_on_a_link():
+        import zipfile
+        lab = Lab(16, 5000, keep=64)
+        lab.chain([10, 11, 12])
+        lab.chain([20, 21])
+        lab.root([short(b"ONE     BIN", first=10, size=3 * 512),
+                  short(b"TWO     BIN", first=20, size=2 * 512)])
+        lab.link(11, 30, copies=(1,))                # the second table says something else
+        lab.link(21, 40, copies=(1,))                # past what TWO's size follows
+        w = lab.walker()
+        issues, log, rec = [], [], {}
+        with zipfile.ZipFile(io.BytesIO(), "w") as zf:
+            extract_to_zip(zf, w, "v", collect(w, w.root), log, issues=issues)
+            _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+        found = {r[0]: r[3] for r in issues if r[2] == "FAT_COPIES_DIFFER"}
+        return (set(found) == {"ONE.BIN"} and "cluster 0xb" in found["ONE.BIN"]
+                and "links it to 0xc and FAT 1 to 0x1e" in found["ONE.BIN"]
+                and rec["exceptions"]["fat_copies_differ"] == 1 and w.folders_not_read == 0)
+
+    def bad_boot_uses_backup():
+        noise = bytes((i * 113 + 7) & 0xFF for i in range(512))
+        lab = Lab(32, 70000, keep=64)
+        lab.root([short(b"KEPT    BIN", first=10, size=4)])
+        lab.chain([10])
+        lab.put(10, b"KEPT")
+        for fill in (b"\xff" * 512, noise):
+            disk = in_mbr(lab, 0x0C)
+            disk[1 << 20:(1 << 20) + 512] = fill
+            fh = io.BytesIO(bytes(disk))
+            if identify_fs(fh, 1 << 20, len(lab.img))[0] != "fat32":
+                return False
+            w = Fat32Walker(fh, 1 << 20)
+            if read(w, by_name(w)["KEPT.BIN"]) != b"KEPT" or "backup" not in damage(w):
+                return False
+            bare = bytearray(lab.img)                # no table, so no sign it was FAT
+            bare[:512] = fill
+            if identify_fs(io.BytesIO(bytes(bare)), 0, len(bare))[0] == "fat32":
+                return False
+        return True
+
+    def bad_boot_is_recorded():
+        import contextlib, shutil, tempfile, zipfile
+        noise = bytes((i * 113 + 7) & 0xFF for i in range(512))
+        lab = Lab(16, 5000, keep=64)
+        work = tempfile.mkdtemp(prefix="qnxprobe-fatboot-")
+        try:
+            def run(type_byte):
+                disk = in_mbr(lab, type_byte)
+                disk[1 << 20:(1 << 20) + 512] = noise
+                raw = os.path.join(work, "disk.img")
+                with open(raw, "wb") as out:
+                    out.write(disk)
+                manifest = []
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(raw, extract="x.zip", zf=zf, manifest=manifest)
+                return manifest
+            typed, other = run(0x06), run(0x83)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return (len(typed) == 1 and _volumes_not_read(typed) == 1
+                and "types this partition FAT (MBR type 0x06)" in typed[0]["extract_error"]
+                and "boot sector is not valid" in typed[0]["extract_error"] and not other)
+
+    def run_crossing_a_folder():
+        for bits, clusters in ((12, 300), (16, 5000), (32, 5000)):
+            def volume(names):
+                lab = Lab(bits, clusters, keep=64)
+                lab.root([short(b"\xe5RAG    BIN", first=10, size=4 * 512)])
+                lab.put(12, b"".join(bytes(s) for s in (short(b".          ", 0x10, names),
+                                                        short(b"..         ", 0x10, 0))))
+                return [d for d in lab.walker().deleted_files() if not d.is_dir]
+            own, elsewhere = volume(12), volume(40)
+            if (len(own) != 1 or own[0].recoverable or "opens as a folder" not in own[0].reason
+                    or own[0].content_unverified or not elsewhere[0].recoverable):
+                return False
+        return True
+
+    def file_and_folder_on_one_cluster():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"DATA    BIN", first=20, size=512), short(b"SUB        ", 0x10, 20)])
+        lab.chain([20])
+        w = lab.walker()
+        w.listdir(w.root)
+        text = damage(w)
+        return "both start at cluster 0x14" in text and "only the first folder" not in text
+
     rows = (
         (high_word, "a deleted FAT32 entry with a zero high word on a volume over 65,535 "
                     "clusters is recoverable only when one cluster with its low word fits, "
@@ -38793,6 +39078,16 @@ def _fat_reader_checks():
                           "entries"),
         (lost_chain_is_a_note, "a lost chain holding no folder entries is a counted note with "
                                "exit 0, and says so when the boot state byte is set"),
+        (copies_disagree_on_a_link, "a FAT file whose chain follows a link the copies disagree "
+                                    "on gets its own exceptions row, with no exit change"),
+        (bad_boot_uses_backup, "on a partition typed FAT a boot sector of 0xFF or noise is "
+                               "replaced by the backup, and a bare image gets no such guess"),
+        (bad_boot_is_recorded, "a partition typed FAT with no valid boot sector has a "
+                               "volumes.json record and counts for exit 1"),
+        (run_crossing_a_folder, "a deleted file whose run crosses a cluster opening as its own "
+                                "folder is not recoverable, on FAT12, FAT16 and FAT32"),
+        (file_and_folder_on_one_cluster, "a file and a folder on one cluster are not said to "
+                                         "leave only the first folder listed"),
         (state_byte_by_width, "the boot state byte is read at offset 65 on FAT32 and 37 on "
                               "FAT12 and FAT16, and decides whether a lost chain is a loss"),
         (boot_copy_has_no_state, "unreached clusters on a volume read from its backup boot "

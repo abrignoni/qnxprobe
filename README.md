@@ -546,7 +546,8 @@ the image. A request for the recorded size or more returns what it did before.
 What the reader found goes in the walker's `damage` list, which an export writes to
 `volumes.json` as `damage_recorded` and `damage_first`. A record states what was found.
 `folders_not_read` and exit 1 mean something was lost or could not be read: a folder not
-read to its end, or clusters no live chain reaches that hold folder entries.
+read to its end, clusters no live chain reaches that hold folder entries, or such clusters
+on a volume whose boot state byte is clear (see below).
 
 - **A chain ends at any table value that is not a cluster of the volume:** a free entry,
   the bad-cluster mark, or a link past the last cluster. A file read also ends at the first
@@ -588,10 +589,20 @@ read to its end, or clusters no live chain reaches that hold folder entries.
 - **Free space.** A cluster is free only when every FAT copy that holds its entry says so,
   so one copy with a sector lost to zeros cannot turn live files into unallocated space.
   The count of clusters the copies differ on is in the `--unallocated` output.
-- **Boot sector.** When a FAT32 boot sector is all zeros, the backup at sector 6 is used if
-  it has a usable geometry and a table where it says one is, and the report says so. A
-  FAT32 boot sector that describes no usable layout is named as not read, and nothing is
-  exported from it.
+- **Boot sector.** A FAT32 boot sector that is all zeros is replaced by the backup at
+  sector 6, if the copy has a usable geometry and a table where it says one is. On a
+  partition the table types FAT, the same applies to a boot sector that fails validation any
+  other way (0xFF, noise, an impossible geometry), once no other filesystem has claimed the
+  partition. The record says the backup was used. When a partition typed FAT has no valid
+  boot sector and no usable backup (FAT12 and FAT16 have none), `volumes.json` says so in
+  `extract_error` and the run exits 1. A bare image with no partition table gives no sign it
+  was FAT, so a bad boot sector there is reported only as not recognised. A FAT32 boot
+  sector that describes no usable layout and has no usable backup is named as not read.
+- **FAT copies that disagree.** When a file's chain follows a link the FAT copies hold
+  differently, it gets a `FAT_COPIES_DIFFER` row in the exceptions table, counted as
+  `fat_copies_differ`, naming the cluster and both values. Which copy is right is not known,
+  so the table in use is still the one read, and the file's bytes from that point may not
+  be its own. The row does not change the exit status.
 - **Active table.** With FAT32 mirroring off (`BPB_ExtFlags` bit 7), chains, free space
   and deleted-file checks use only the table that field names, because the others are
   stale by definition. TFAT is left out of this, as described below.
@@ -1747,7 +1758,8 @@ FAT16 volumes, one such file returned exactly another file's bytes and a 10-clus
 and what `read_deleted()` returns for it is a candidate to check.
 
 A FAT file is `recoverable` when every cluster of that run is on the volume, in the image,
-free in every FAT copy that counts, and claimed by no other surviving deleted entry. When two deleted entries' runs overlap, the
+free in every FAT copy that counts, claimed by no other surviving deleted entry, and not a
+folder's first cluster (one that opens with a `.` entry naming it, then `..`). When two deleted entries' runs overlap, the
 volume does not record which wrote last, so both are listed and neither is read. A run
 is claimed only up to its first cluster in use, and a deleted folder claims only clusters
 that were read as its entries. When the other entry has the same first cluster and size,
