@@ -2719,6 +2719,7 @@ class Fat32Walker:
         self._claimed = None                         # one bit per cluster a chain has reached
         self._chains_read = set()
         self._crossed = set()
+        self._deleted_runs = {}                      # a deleted folder's cluster -> clusters read
         bpb = read_at(fh, base, 512)
         if self.FAT_BITS == 32:
             copy = _fat32_boot_copy(fh, base, bpb)
@@ -2781,7 +2782,10 @@ class Fat32Walker:
                 if ext & 0x80 and bpb[82:90] not in TFAT_TYPE_STRINGS:
                     active = ext & 0x0F
                     if active < self.nfats:
+                        # the others are stale by definition, so they have no vote on what
+                        # is free and no link worth naming
                         self.fat_start = self._tables[active]
+                        self._tables = [self.fat_start]
                     else:
                         self._record(f"BPB_ExtFlags names FAT {active} as the active table and "
                                      f"the volume has {self.nfats}, so FAT 0 was read")
@@ -2914,9 +2918,11 @@ class Fat32Walker:
         stop = None
         gaps = 0
         gap_first = None
+        walked = 0
         cur = clus
         while True:
             seen.add(cur)
+            walked += 1
             if track:
                 self._claim(clus, cur)
             part = read_at(self.fh, self._cluster_off(cur), self.cluster_bytes)
@@ -2932,7 +2938,7 @@ class Fat32Walker:
             if not self._chain_goes_on(val) or val in seen:
                 stop = self._chain_stop(val, cur, seen)
                 break
-            if len(out) >= _FAT_DIR_MAX:
+            if walked * self.cluster_bytes >= _FAT_DIR_MAX:   # clusters the image lacks too
                 stop = f"its chain runs past the {_FAT_DIR_MAX:,} bytes a FAT folder can hold"
                 break
             cur = val
@@ -3132,6 +3138,8 @@ class Fat32Walker:
 
         In a deleted folder every entry counts as deleted, marked or not: the Windows FAT
         driver was measured freeing a folder and leaving its children's entries unmarked.
+        The high word rule below is for entries marked deleted. An unmarked child was never
+        through a delete, so its stored high word stands, zero included.
         """
         raw = self._deleted_folder_bytes(node) if in_deleted_dir else self._folder_bytes(node)
         out, lfn = [], []
@@ -3159,13 +3167,15 @@ class Fat32Walker:
             first = ((hi << 16) | lo) if self.FAT_BITS == 32 else lo
             sz = struct.unpack_from("<I", e, 28)[0]
             is_dir = bool(attr & 0x10)
-            # Windows zeroes the high word when it deletes an entry, so on a volume with
-            # clusters above 65,535 a zero there does not say where the file was. The low
-            # word still does when only one cluster number with it fits the volume.
+            # Windows zeroes the high word when it marks an entry deleted, so on a volume
+            # with clusters above 65,535 a zero there does not say where the file was. The
+            # low word still does when only one cluster number with it fits the volume. A
+            # folder is placed by its own "." entry instead (_folder_by_dot). A file of
+            # size 0 with a low word of 0 or 1 simply has no cluster.
             unknown = False
             if (self.FAT_BITS == 32 and marked and not hi and self.cluster_count > 0xFFFF
-                    and (lo >= 2 or (sz and not is_dir))):
-                only = self._only_cluster(lo)
+                    and (lo >= 2 or sz or is_dir)):
+                only = None if is_dir else self._only_cluster(lo)
                 if only is None:
                     unknown = True
                 else:
@@ -3197,7 +3207,9 @@ class Fat32Walker:
         its first cluster, for its recorded size when the entry keeps one (Windows does)
         and otherwise until its end marker. The run stops at a cluster any FAT copy marks
         in use, at the end of the image, and at a cluster that does not parse as folder
-        entries. Stopping before the end marker is recorded."""
+        entries. An end marker counts only as a slot that is zero in all 32 bytes, because
+        MP4 and HEIC data also open with 00 00 00. Reading less than the recorded size, or
+        stopping before an end marker, is recorded."""
         first, size, _ = node
         cb = self.cluster_bytes
         limit = (min(size, _FAT_DIR_MAX) + cb - 1) // cb if size else _FAT_DIR_MAX // cb
@@ -3206,6 +3218,7 @@ class Fat32Walker:
         out = bytearray()
         stop = None
         ended = False
+        blank = bytes(32)
         for n in range(limit):
             cur = first + n
             if n and self._first_used(cur, 1) is not None:
@@ -3216,21 +3229,30 @@ class Fat32Walker:
                 out += part
                 stop = f"the image ends inside cluster {cur:#x}"
                 break
-            if n and part[0] == 0:
+            if n and part[:32] == blank:
                 ended = True                         # a cluster that opens with the end marker
                 break
             if n and not _fat_dir_cluster_ok(part):
                 stop = f"cluster {cur:#x} does not read as folder entries"
                 break
             out += part
-            if _fat_has_end(part):
-                ended = True
+            at = next((i for i in range(0, cb - 31, 32) if part[i] == 0), None)
+            if at is not None:
+                if part[at:at + 32] == blank:
+                    ended = True
+                else:
+                    stop = f"a slot of cluster {cur:#x} opens with 0x00 and is not an end marker"
                 break
-        if stop and not ended:
-            whole = f" of the {size:,} its entry records" if size else ""
+        self._deleted_runs[first] = max(len(out) // cb, 1)
+        if size and len(out) < size:
+            why = stop or "an end marker came first"
+            self._record(f"deleted folder at cluster {first:#x}: only {len(out):,} of the "
+                         f"{size:,} bytes its entry records were read as one run ({why}), so "
+                         f"any entries in the rest are not listed")
+        elif stop and not ended:
             self._record(f"deleted folder at cluster {first:#x}: {stop}, so only its first "
-                         f"{len(out):,} bytes{whole} were read as one run and any entries "
-                         f"after them are not listed")
+                         f"{len(out):,} bytes were read as one run and any entries after them "
+                         f"are not listed")
         return bytes(out)
 
     def _first_used(self, first, count):
@@ -3260,49 +3282,15 @@ class Fat32Walker:
             pos += n
         return None
 
-    def deleted_files(self, *, min_size=0, max_depth=None):
-        """Yield the deleted directory entries of the whole volume.
-
-        A FAT32 delete writes 0xE5 over the first byte of the entry and frees
-        its clusters in the FAT; everything else stays. So the name (rebuilt
-        from the long-name fragments, whose ordinals the same 0xE5 destroys),
-        the first cluster, the size and the recorded times are all still
-        there. What is gone is the chain: the FAT entries that said where the
-        second cluster onward lay are zeroed. Reading a file longer than one
-        cluster therefore assumes it was written in one run, and the result
-        says so in ``assumed_contiguous``, because the volume cannot confirm it.
-        A file is ``recoverable`` only while every cluster that read would
-        touch is on the volume, in the image and free in every FAT copy; a
-        cluster since handed to a live file means the assumption is already
-        false, and the file is reported as having existed rather than read.
-
-        On a volume of more than 65,535 clusters the Windows driver's zeroed high
-        word leaves only the low word. When exactly one cluster number with that low
-        word fits the volume, that is the first cluster. Otherwise the entry is listed
-        with a ``first_cluster`` of 0, is not recoverable, and ``reason`` says the first
-        cluster is ambiguous.
-
-        Live directories are walked to find deleted files inside them, and a
-        deleted directory whose first cluster is free in every copy and still
-        parses as a directory (it opens with "." and "..") is walked too, along
-        its run of clusters, since a deleted folder of photographs is the common
-        case on a card. Every entry in it counts as deleted, and has
-        ``in_deleted_dir`` set. ``max_depth``, when given, limits how many
-        folders deep the walk goes; by default only a folder already visited
-        stops it.
-        """
-        if self._unusable:
-            self._folder_lost(self.root[0], self._unusable)
-            return
+    def _deleted_entries(self, max_depth):
+        """Every deleted entry of the volume in walk order, as (parent, name, first cluster,
+        size, is_dir, times, first cluster not known, long name cut, in a deleted folder)."""
         seen = set()
 
         def one_folder(node, depth, in_deleted):
-            """The folder's records, and a (node, depth, in_deleted) for each folder to
-            go into, in the order the walk reaches them."""
+            """The folder's entries, and a (node, depth, in_deleted) for each folder to go
+            into, in the order the walk reaches them."""
             for name, first, sz, is_dir, times, unknown, cut in self._deleted_in(node, in_deleted):
-                lost = (f"its first cluster is ambiguous: this volume has more than 65,535 "
-                        f"clusters and the entry's high word is zero, as a Windows delete "
-                        f"leaves it, and the low word {first:#x} does not identify one cluster")
                 if is_dir:
                     if unknown:
                         # a folder records its own first cluster in its "." entry
@@ -3311,43 +3299,11 @@ class Fat32Walker:
                             first, unknown = found, False
                     ok_dir = (not unknown and first >= 2 and self._first_used(first, 1) is None
                               and self._looks_like_dir(first))
-                    yield FatDeletedFile(name, node[0], True, 0, 0 if unknown else first, False,
-                                         f"directory; {lost}" if unknown else "directory",
-                                         False, times, in_deleted, None)
+                    yield (node[0], name, first, sz, True, times, unknown, False, in_deleted)
                     if ok_dir:
                         yield ((first, sz, True), depth + 1, True)
                     continue
-                if sz < min_size:
-                    continue
-                if unknown:
-                    yield FatDeletedFile(name, node[0], False, sz, 0, False, lost, False,
-                                         times, in_deleted, None)
-                    continue
-                if first < 2 or not sz:
-                    yield FatDeletedFile(name, node[0], False, sz, first, False,
-                                         "no cluster recorded" if first < 2 else "empty",
-                                         False, times, in_deleted, None)
-                    continue
-                need = (sz + self.cluster_bytes - 1) // self.cluster_bytes
-                ok, reason = True, ""
-                if self.cluster_count and first + need > self.cluster_count + 2:
-                    ok, reason = False, ("the run its size would need goes past the last "
-                                         "cluster of this volume")
-                elif self._first_used(first, need) is not None:
-                    # a cluster in the assumed run belongs to a live file:
-                    # either this file was fragmented or it has since been
-                    # overwritten, and either way the run cannot be read as it
-                    ok, reason = False, ("the run its size would need crosses a live "
-                                         "file, so it was fragmented or is overwritten")
-                elif not read_at(self.fh, self._cluster_off(first + need - 1)
-                                 + (sz - 1) % self.cluster_bytes, 1):
-                    ok, reason = False, "the run its size would need goes past the end of the image"
-                if cut:
-                    note = "a part of its long name is gone, so the name is incomplete"
-                    reason = reason or note
-                    self._record(f"deleted file {name!r} at cluster {first:#x}: {note}")
-                yield FatDeletedFile(name, node[0], False, sz, first, ok, reason,
-                                     need > 1, times, in_deleted, (first, sz, False))
+                yield (node[0], name, first, sz, False, times, unknown, cut, in_deleted)
             # deleted files can sit in any live subdirectory too. Inside a deleted folder
             # the entries above have already gone through every subfolder.
             if not in_deleted:
@@ -3370,10 +3326,184 @@ class Fat32Walker:
             except StopIteration:
                 stack.pop()
                 continue
-            if isinstance(item, FatDeletedFile):
-                yield item
-            else:
+            if len(item) == 3:
                 enter(*item)
+            else:
+                yield item
+
+    def _contested_clusters(self, max_depth):
+        """([(first, end)] of the clusters two or more deleted entries lay claim to, sorted
+        and not overlapping; a 65,536-byte map of the low words an entry with an ambiguous
+        first cluster could cover, or None).
+
+        A file claims the run its size assumes, up to the first cluster in use, since the
+        assumption is already false past that. A deleted folder claims the clusters read as
+        its entries. Its recorded size is not used, because folder clusters lie between
+        their files' clusters. An empty file claims nothing. Only integers are kept, so a
+        volume with many deleted entries does not hold them all in memory."""
+        starts, ends = array.array("Q"), array.array("Q")
+        folders = set()
+        maybe = None
+        self._deleted_runs = {}
+        cb = self.cluster_bytes
+        for _p, _n, first, sz, is_dir, _t, unknown, _c, _d in self._deleted_entries(max_depth):
+            if unknown:
+                count = 1 if is_dir else (sz + cb - 1) // cb
+                if maybe is None:
+                    maybe = bytearray(0x10000)
+                if count >= 0x10000:
+                    maybe[:] = b"\x01" * 0x10000
+                else:
+                    low = first & 0xFFFF
+                    stop = min(low + count, 0x10000)
+                    maybe[low:stop] = b"\x01" * (stop - low)
+                    if low + count > 0x10000:
+                        maybe[:low + count - 0x10000] = b"\x01" * (low + count - 0x10000)
+                continue
+            if first < 2:
+                continue
+            if is_dir:
+                folders.add(first)
+                continue
+            if not sz:
+                continue
+            end = first + (sz + cb - 1) // cb
+            if self.cluster_count:
+                end = min(end, self.cluster_count + 2)
+            if end <= first:
+                continue
+            used = self._first_used(first, end - first)
+            end = end if used is None else used
+            if end > first:
+                starts.append(first)
+                ends.append(end)
+        for first in folders:
+            starts.append(first)
+            ends.append(first + self._deleted_runs.get(first, 1))
+        opens, closes = sorted(starts), sorted(ends)
+        out = []
+        depth = i = j = 0
+        begin = None
+        while j < len(closes):
+            if i < len(opens) and opens[i] < closes[j]:
+                depth += 1
+                if depth == 2:
+                    begin = opens[i]
+                i += 1
+            else:
+                depth -= 1
+                if depth == 1 and closes[j] > begin:
+                    out.append((begin, closes[j]))
+                j += 1
+        return out, maybe
+
+    def deleted_files(self, *, min_size=0, max_depth=None):
+        """Yield the deleted directory entries of the whole volume.
+
+        A FAT32 delete writes 0xE5 over the first byte of the entry and frees
+        its clusters in the FAT; everything else stays. So the name (rebuilt
+        from the long-name fragments, whose ordinals the same 0xE5 destroys),
+        the first cluster, the size and the recorded times are all still
+        there. What is gone is the chain: the FAT entries that said where the
+        second cluster onward lay are zeroed. Reading a file longer than one
+        cluster therefore assumes it was written in one run, and the result
+        says so in ``assumed_contiguous``, because the volume cannot confirm it.
+        A file is ``recoverable`` only while every cluster that read would
+        touch is on the volume, in the image, free in every FAT copy that counts
+        and claimed by no other deleted entry; a cluster since handed to a live
+        file means the assumption is already false, and two deleted entries on one
+        cluster cannot both hold it. The volume does not record which of them wrote
+        last, so neither is read, and both are listed with the reason.
+
+        On a volume of more than 65,535 clusters the Windows driver's zeroed high
+        word leaves only the low word of an entry marked deleted. The candidates are
+        that word plus a multiple of 65,536, within clusters 2 to the last. When
+        exactly one fits, that is the first cluster. Otherwise the entry is listed
+        with a ``first_cluster`` of 0, is not recoverable, and ``reason`` says the first
+        cluster is ambiguous. A folder is placed only by a free candidate whose "."
+        entry names it. An unmarked child of a deleted folder keeps its stored high word.
+
+        Live directories are walked to find deleted files inside them, and a
+        deleted directory whose first cluster is free in every copy and still
+        parses as a directory (it opens with "." and "..") is walked too, along
+        its run of clusters, since a deleted folder of photographs is the common
+        case on a card. Every entry in it counts as deleted, and has
+        ``in_deleted_dir`` set. ``max_depth``, when given, limits how many
+        folders deep the walk goes; by default only a folder already visited
+        stops it.
+        """
+        if self._unusable:
+            self._folder_lost(self.root[0], self._unusable)
+            return
+        contested, maybe = self._contested_clusters(max_depth)
+        heads = [a for a, _b in contested]
+
+        def overlaps(first, end):
+            at = bisect.bisect_right(heads, end - 1) - 1
+            return at >= 0 and contested[at][1] > first
+
+        def may_overlap(first, end):
+            if maybe is None:
+                return False
+            if end - first >= 0x10000:
+                return maybe.find(1) != -1
+            low, stop = first & 0xFFFF, (first & 0xFFFF) + end - first
+            if stop <= 0x10000:
+                return maybe.find(1, low, stop) != -1
+            return maybe.find(1, low) != -1 or maybe.find(1, 0, stop - 0x10000) != -1
+
+        for parent, name, first, sz, is_dir, times, unknown, cut, in_deleted \
+                in self._deleted_entries(max_depth):
+            lost = (f"its first cluster is ambiguous: this volume has more than 65,535 "
+                    f"clusters and the entry's high word is zero, as a Windows delete "
+                    f"leaves it, and the low word {first:#x} does not identify one cluster")
+            if is_dir:
+                if unknown:
+                    lost = (f"its first cluster is ambiguous: its high word is zero on a volume "
+                            f"of more than 65,535 clusters, and no one free cluster with the "
+                            f"low word {first:#x} opens with a \".\" entry naming itself")
+                yield FatDeletedFile(name, parent, True, 0, 0 if unknown else first, False,
+                                     f"directory; {lost}" if unknown else "directory",
+                                     False, times, in_deleted, None)
+                continue
+            if sz < min_size:
+                continue
+            if unknown:
+                yield FatDeletedFile(name, parent, False, sz, 0, False, lost, False,
+                                     times, in_deleted, None)
+                continue
+            if first < 2 or not sz:
+                yield FatDeletedFile(name, parent, False, sz, first, False,
+                                     "no cluster recorded" if first < 2 else "empty",
+                                     False, times, in_deleted, None)
+                continue
+            need = (sz + self.cluster_bytes - 1) // self.cluster_bytes
+            ok, reason = True, ""
+            if self.cluster_count and first + need > self.cluster_count + 2:
+                ok, reason = False, ("the run its size would need goes past the last "
+                                     "cluster of this volume")
+            elif self._first_used(first, need) is not None:
+                # a cluster in the assumed run belongs to a live file:
+                # either this file was fragmented or it has since been
+                # overwritten, and either way the run cannot be read as it
+                ok, reason = False, ("the run its size would need crosses a live "
+                                     "file, so it was fragmented or is overwritten")
+            elif not read_at(self.fh, self._cluster_off(first + need - 1)
+                             + (sz - 1) % self.cluster_bytes, 1):
+                ok, reason = False, "the run its size would need goes past the end of the image"
+            elif overlaps(first, first + need):
+                ok, reason = False, ("the run its size would need overlaps another deleted "
+                                     "entry's, and the volume does not record which wrote last")
+            elif may_overlap(first, first + need):
+                ok, reason = False, ("the run its size would need may overlap a deleted entry "
+                                     "whose first cluster is ambiguous, and the volume does "
+                                     "not record which wrote last")
+            if cut:
+                note = "a part of its long name is gone, so the name is incomplete"
+                reason = reason or note
+                self._record(f"deleted file {name!r} at cluster {first:#x}: {note}")
+            yield FatDeletedFile(name, parent, False, sz, first, ok, reason,
+                                 need > 1, times, in_deleted, (first, sz, False))
 
     def _looks_like_dir(self, clus):
         """A FAT directory opens with its "." and ".." entries."""
@@ -3383,21 +3513,22 @@ class Fat32Walker:
     def _only_cluster(self, low):
         """The cluster a low word must mean when its high word is gone, or None. The
         candidates are low + k * 65536 within clusters 2 to count + 1, and exactly one has
-        to fit. A low word of 0 or 1 is not answered: it can also mean no cluster at all."""
+        to fit. Clusters 0 and 1 are no file's, so a low word of 0 or 1 starts at k = 1."""
         top = self.cluster_count + 1
-        if low < 2 or low > top or low + 0x10000 <= top:
+        first = low if low >= 2 else low + 0x10000
+        if first > top or first + 0x10000 <= top:
             return None
-        return low
+        return first
 
     def _folder_by_dot(self, low):
         """The first cluster of a deleted folder whose entry kept only its low word, or
-        None. A folder's "." entry records the folder's own first cluster, so a candidate
-        is accepted on what the folder itself says, and only when exactly one candidate
-        with that low word says it."""
+        None. A candidate has to be free in the FAT and open with a "." entry that names
+        that same cluster, so a live folder sharing the low word is never taken for it, and
+        exactly one candidate has to qualify."""
         hits = []
-        for high in range(((self.cluster_count + 1) >> 16) + 1):
-            cand = (high << 16) | low
-            if not self._chain_goes_on(cand) or not self._looks_like_dir(cand):
+        for cand in range(low if low >= 2 else low + 0x10000, self.cluster_count + 2, 0x10000):
+            if (not self._chain_goes_on(cand) or self._first_used(cand, 1) is not None
+                    or not self._looks_like_dir(cand)):
                 continue
             dot = read_at(self.fh, self._cluster_off(cand), 32)
             if (dot[11] & 0x10 and (struct.unpack_from("<H", dot, 20)[0] << 16
@@ -3575,20 +3706,33 @@ def _dos_date(date):
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 
+def _fat_day_ok(date):
+    """True when a FAT date word names a real calendar day."""
+    try:
+        datetime.date(1980 + ((date >> 9) & 0x7F), (date >> 5) & 0x0F, date & 0x1F)
+    except ValueError:
+        return False
+    return True
+
+
 def _fat_stamp(date, time_, tenths=0):
     """A FAT directory entry's date and time as _dos_stamp gives them. A stored pair that
-    is no valid reading keeps its two words as text, since a blank would say no time was
-    recorded."""
+    is no valid reading, a 30 February included, keeps its two words as text, since a
+    blank would say no time was recorded."""
+    if not date:
+        return ""
     shown = _dos_stamp(date, time_, tenths)
-    if shown or not date:
+    if shown and _fat_day_ok(date):
         return shown
     return f"not a valid time (stored date word {date:#06x}, time word {time_:#06x})"
 
 
 def _fat_date(date):
     """A FAT last-access date as _dos_date gives it, or its stored word when invalid."""
+    if not date:
+        return ""
     shown = _dos_date(date)
-    if shown or not date:
+    if shown and _fat_day_ok(date):
         return shown
     return f"not a valid date (stored date word {date:#06x})"
 
@@ -3668,26 +3812,59 @@ def _fat_has_end(raw):
     return any(raw[i] == 0 for i in range(0, len(raw), 32))
 
 
-def _fat_dir_cluster_ok(raw):
-    """True when every slot of a cluster, up to an end marker, can be a directory entry:
-    a long-name slot with its type and cluster fields zero, or a short entry with no
-    control character in its name, no attribute bit above 0x20, and only the two case
-    flags in its reserved byte. The test for a further cluster of a deleted folder,
-    whose chain is gone, so that a file's data is not listed as entries."""
+# Bytes Microsoft's FAT specification does not allow in a short name, with a-z: short
+# names are stored in upper case and the case flags in byte 12 say otherwise.
+_FAT_NOT_IN_SHORT = frozenset(b'"*+,./:;<=>?[\\]|abcdefghijklmnopqrstuvwxyz')
+
+
+def _fat_short_field_ok(field):
+    """True for a space-padded part of a short name: legal bytes, then only spaces."""
+    text = bytes(field).rstrip(b" ")
+    return not any(b <= 0x20 or b in _FAT_NOT_IN_SHORT for b in text)
+
+
+def _fat_dir_cluster_ok(raw, root=False):
+    """True when every slot of a cluster, up to an end marker, can be a directory entry.
+    The test for a further cluster of a deleted folder, whose chain is gone, so that a
+    file's data is not listed as entries.
+
+    An end marker is a slot of 32 zero bytes. A long-name slot has a real ordinal or the
+    deleted mark, and zero type and cluster fields. A short entry has a legal space-padded
+    name, no attribute bit above 0x20 and no volume-label bit, only the two case flags in
+    its reserved byte, and a write date and time that are real, with any other stored date
+    real too. ``root`` is the looser test for a root folder, which can hold a volume label
+    and which a formatter may leave undated."""
+    blank = bytes(32)
     for i in range(0, len(raw) - 31, 32):
-        if raw[i] == 0:
-            break
-        attr = raw[i + 11]
+        e = bytes(raw[i:i + 32])
+        if e[0] == 0:
+            return root or e == blank
+        attr = e[11]
         if attr == 0x0F:
-            if raw[i + 12] or raw[i + 26] or raw[i + 27]:
+            if e[12] or e[26] or e[27]:
+                return False
+            if e[0] != 0xE5 and e[0] & ~0x40 not in range(1, 21):
                 return False
             continue
-        if attr & 0xC0 or raw[i + 12] & ~0x18:
+        if attr & 0xC0 or e[12] & ~0x18 or (attr & 0x08 and not root):
             return False
-        if raw[i] < 0x20 and raw[i] != 0x05:
+        if e[:11] in _FAT_DOT_NAMES:
+            continue
+        lead = e[0] if e[0] not in (0x05, 0xE5) else 0x41     # any legal letter stands in
+        if (lead == 0x20 or not _fat_short_field_ok(bytes([lead]) + e[1:8])
+                or not _fat_short_field_ok(e[8:11])):
             return False
-        if any(b < 0x20 for b in raw[i + 1:i + 11]):
+        if root:
+            continue
+        write_date = struct.unpack_from("<H", e, 24)[0]
+        write_time = struct.unpack_from("<H", e, 22)[0]
+        if (not write_date or not _fat_day_ok(write_date) or write_time >> 11 > 23
+                or (write_time >> 5) & 0x3F > 59 or write_time & 0x1F > 29 or e[13] > 199):
             return False
+        for at in (16, 18):
+            other = struct.unpack_from("<H", e, at)[0]
+            if other and not _fat_day_ok(other):
+                return False
     return True
 
 
@@ -3725,7 +3902,9 @@ def _fat_deleted_long_name(parts, entry):
     compared directly. It can be run backwards instead: the short name's other ten bytes
     and the checksum fix what that first byte was, and it has to be the letter the long
     name starts with. A long name whose last slot was reused has no terminator and still
-    reads as a whole name, so its extension is compared with the short entry's."""
+    reads as a whole name, so its extension is compared with the short entry's, the way
+    the short name is built: spaces dropped, upper case. An extension holding anything
+    but ASCII maps through a code page this does not know, so it is not compared."""
     if not parts or len({check for _chars, check in parts}) != 1:
         return None
     lead = parts[0][1]
@@ -3750,9 +3929,10 @@ def _fat_deleted_long_name(parts, entry):
         if ext and dot < 0:
             cut = True
         elif ext:
-            stem = name[dot + 1:].upper()
-            cut = len(stem) < len(ext) or any(a != b and b.isascii() and b.isalnum()
-                                              for a, b in zip(ext, stem))
+            stem = name[dot + 1:].replace(" ", "").upper()
+            if stem.isascii():
+                cut = len(stem) < len(ext) or any(a != b and b.isalnum()
+                                                  for a, b in zip(ext, stem))
     return name, cut
 
 
@@ -19495,7 +19675,7 @@ def _fat32_table_missing(fh, base, b):
     first = read_at(fh, base + (reserved + nfats * spf + (root - 2) * spc) * bps, spc * bps)
     if len(first) < spc * bps:
         return False
-    return first[0] == 0 or not _fat_dir_cluster_ok(first)
+    return first[0] == 0 or not _fat_dir_cluster_ok(first, root=True)
 
 
 def _fat32_boot_copy(fh, base, sector):
@@ -37863,6 +38043,136 @@ def _fat_reader_checks():
         got = [d.name for d in lab.walker().deleted_files() if not d.is_dir]
         return got == ["_EEP.BIN"]
 
+    def overlap_refused():
+        lab = Lab(16, 5000, keep=100)
+        lab.root([short(b"\xe5LPHA   BIN", first=10, size=1024),
+                  short(b"\xe5RAVO   BIN", first=11, size=512),
+                  short(b"\xe5LONE   BIN", first=20, size=512)])
+        got = {d.name: d for d in lab.walker().deleted_files()}
+        proved = Lab(32, 70000, keep=5200)
+        # 5,000 fits one cluster; 4,000 fits two, and its run from 4,000 would reach 5,000
+        proved.root([short(b"\xe5NLY    BIN", first=5000, size=512),
+                     short(b"\xe5AYBE   BIN", first=4000, size=1100 * 512)])
+        one = {d.name: d for d in proved.walker().deleted_files()}
+        return (len(got) == 3 and not got["_LPHA.BIN"].recoverable
+                and not got["_RAVO.BIN"].recoverable and "overlaps" in got["_LPHA.BIN"].reason
+                and "overlaps" in got["_RAVO.BIN"].reason and got["_LONE.BIN"].recoverable
+                and not one["_NLY.BIN"].recoverable and "may overlap" in one["_NLY.BIN"].reason)
+
+    def deleted_folder_lab(later, size=0):
+        lab = Lab(16, 5000, keep=200)
+        lab.root([short(b"\xe5ONE       ", 0x10, 20, size)])
+        first = [short(b".          ", 0x10, 20), short(b"..         ", 0x10, 0)]
+        first += [short(b"KID%05dBIN" % n, first=40 + n, size=100) for n in range(14)]
+        lab.put(20, b"".join(bytes(s) for s in first))
+        lab.put(21, later)
+        return lab
+
+    def short_folder_read():
+        mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x11" * 480
+        w = deleted_folder_lab(mp4, size=1536).walker()
+        got = [d for d in w.deleted_files() if not d.is_dir]
+        return len(got) == 14 and "only 512 of the 1,536 bytes" in damage(w)
+
+    def content_is_not_entries():
+        heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x22" * 488
+        mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x11" * 480
+        for body in (b"hello world", b"HELLOWORLD1", b"HELLO WORLD",
+                     b"THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG. " * 11, mp4, heic):
+            w = deleted_folder_lab(body.ljust(512, b"\x00")).walker()
+            names = [d.name for d in w.deleted_files() if not d.is_dir]
+            if len(names) != 14 or not all(n.startswith("KID") for n in names):
+                return False
+        return True
+
+    def low_word_zero_or_one():
+        lab = Lab(32, 70000, keep=65600)
+        lab.root([short(b"\xe5ERO    BIN", first=0, size=4),
+                  short(b"\xe5MPTY   BIN", first=0, size=0),
+                  short(b"\xe5OLDER     ", 0x10, 1)])
+        lab.put(0x10000, b"ZERO")
+        lab.put(0x10001, b"".join(bytes(s) for s in (
+            short(b".          ", 0x10, 0x10001), short(b"..         ", 0x10, 0),
+            short(b"\xe5HILD   BIN", first=0x10002, size=1))))
+        w = lab.walker()
+        got = {d.name: d for d in w.deleted_files()}
+        return (got["_ERO.BIN"].recoverable and got["_ERO.BIN"].first_cluster == 0x10000
+                and b"".join(w.read_deleted(got["_ERO.BIN"])) == b"ZERO"
+                and got["_MPTY.BIN"].reason == "no cluster recorded"
+                and got["_OLDER"].first_cluster == 0x10001 and "_HILD.BIN" in got)
+
+    def dot_candidate_is_free():
+        def volume(reused):
+            lab = Lab(32, 70000, keep=65600)
+            lab.root([short(b"LIVEDIR    ", 0x10, 0x10005),
+                      short(b"\xe5ONEDIR    ", 0x10, 5)])
+            lab.chain([0x10005])
+            lab.put(0x10005, b"".join(bytes(s) for s in (
+                short(b".          ", 0x10, 0x10005), short(b"..         ", 0x10, 0))))
+            if reused:
+                lab.chain([5])
+                lab.put(5, b"not a folder any more".ljust(512, b"x"))
+            else:
+                lab.put(5, b"".join(bytes(s) for s in (
+                    short(b".          ", 0x10, 5), short(b"..         ", 0x10, 0))))
+            return [d for d in lab.walker().deleted_files() if d.is_dir]
+        kept, gone = volume(False), volume(True)
+        return (len(kept) == 1 and kept[0].first_cluster == 5 and len(gone) == 1
+                and gone[0].first_cluster == 0 and "ambiguous" in gone[0].reason)
+
+    def intact_name_with_space():
+        whole = "12345678.a bc"
+        lab = Lab(16, 5000, keep=64)
+        lab.root(long_slots(whole, b"12345678ABC", deleted=True)
+                 + [short(b"\xe52345678ABC", first=10, size=4)])
+        w = lab.walker()
+        got = [d for d in w.deleted_files() if not d.is_dir]
+        return len(got) == 1 and got[0].name == whole and not got[0].reason and not damage(w)
+
+    def mirroring_off():
+        for active in (0, 1):
+            lab = Lab(32, 5000, keep=200)
+            lab.root([short(b"\xe5RASED  BIN", first=100, size=1000)])
+            struct.pack_into("<H", lab.img, 40, 0x80 | active)
+            for c in (100, 101):
+                lab.link(c, 0x0FFFFFFF, copies=(1 - active,))     # the stale table
+            w = lab.walker()
+            got = [d for d in w.deleted_files() if not d.is_dir]
+            if not (len(got) == 1 and got[0].recoverable and not w.free_space_note
+                    if hasattr(w, "free_space_note") else False):
+                return False
+            at = lab.off(100)
+            if not any(o <= at < o + n for o, n in w.free_extents()):
+                return False
+            if getattr(w, "free_space_note", None):
+                return False
+        return True
+
+    def impossible_day():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"ODD     BIN", first=10, size=1, date=(46 << 9) | (2 << 5) | 30)])
+        _, _, times = lab.walker().listdir_records((0, 0, True))[0]
+        return "not a valid" in times["modified"] and "0x5c5e" in times["modified"]
+
+    def folder_cap_counts_gaps():
+        class Counting(io.BytesIO):
+            reads = 0
+
+            def read(self, *args):
+                Counting.reads += 1
+                return super().read(*args)
+
+        lab = Lab(16, 30000, keep=8)
+        lab.root([short(b"SUB        ", 0x10, 3)])
+        lab.put(3, b"\xe5" * 32)
+        lab.chain(list(range(3, 20003)))
+        w = Fat16Walker(Counting(bytes(lab.img)), 0)
+        node = by_name(w)["SUB"]
+        Counting.reads = 0
+        w.listdir(node)
+        # 4,096 clusters is the most a folder holds, at two reads each
+        return Counting.reads <= 8200 and w.folders_not_read == 1
+
     rows = (
         (high_word, "a deleted FAT32 entry with a zero high word on a volume over 65,535 "
                     "clusters is recoverable only when one cluster with its low word fits, "
@@ -37903,6 +38213,23 @@ def _fat_reader_checks():
         (deleted_name_of_another, "deleted long-name slots whose checksum cannot be the short "
                                   "entry's are not used for its name"),
         (deep_deleted, "a deleted FAT file 40 folders deep is listed"),
+        (overlap_refused, "deleted FAT entries whose assumed runs overlap are listed and not "
+                          "recoverable, including an overlap with an ambiguous entry"),
+        (short_folder_read, "a deleted FAT folder read short of its recorded size is recorded, "
+                            "and MP4 data opening with zeros is not its end marker"),
+        (content_is_not_entries, "text, MP4 and HEIC bytes after a deleted folder's first "
+                                 "cluster are not listed as its entries"),
+        (low_word_zero_or_one, "a deleted FAT32 file or folder with a low word of 0 or 1 is "
+                               "placed when one cluster fits, and an empty file has no cluster"),
+        (dot_candidate_is_free, "a deleted FAT32 folder is never placed at a live folder's "
+                                "cluster that shares its low word"),
+        (intact_name_with_space, "an intact deleted long name with a space in its extension "
+                                 "is not called cut"),
+        (mirroring_off, "with FAT32 mirroring off, only the active table decides what is free "
+                        "and what is recoverable"),
+        (impossible_day, "a stored 30 February is shown as its stored words, not as a date"),
+        (folder_cap_counts_gaps, "clusters the image lacks count toward the most a FAT folder "
+                                 "can hold, so a damaged chain is not walked to its end"),
     )
     out = []
     for check, text in rows:
