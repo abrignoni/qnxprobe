@@ -2036,7 +2036,7 @@ class Qnx6Walker:
             EOF_SHORTFALL["bytes"] = tally + cut    # only this file's bytes
             if cut:
                 unread += cut
-                why = "a block the image did not return (past its end, or a read error)"
+                why = "data the image did not return (past its end, or a read error)"
                 why_count[why] = why_count.get(why, 0) + 1
             if len(buf) < self.bs:
                 buf = buf + bytes(self.bs - len(buf))
