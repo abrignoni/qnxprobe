@@ -7249,7 +7249,7 @@ class ApfsWalker:
         self._bad_volumes = {}                      # volume index -> why it cannot be read
         self._stream_lines = set()                  # streams already recorded as cut
         self._nodes_lost = 0                        # tree subtrees that could not be read
-        self._crypt_unknown = set()                 # locked, but ciphertext is not shown
+        self._crypt_unknown = {}                    # locked, ciphertext not shown: index -> why
         self._vol_folders = None
         head, head_fault = _apfs_head(fh, base)
         if head is None:
@@ -7545,13 +7545,19 @@ class ApfsWalker:
             vol_omap_oid, root_oid = struct.unpack_from("<QQ", sb, 128)
             saved = self._current, self._volume_omap
             found = "unknown"
+            why = ("the root node fails its check and no other node shows whether the blocks "
+                   "are ciphertext or damaged")
             try:
                 # as in _open_volume: the volume's own map is read with nothing current
                 self._current, self._volume_omap = None, {}
-                found = self._blocks_state(self._read_omap(
-                    vol_omap_oid, f"{self._volume_label(index)}'s object map"), root_oid)
-            except (ValueError, OSError, struct.error):
+                omap = self._read_omap(vol_omap_oid, f"{self._volume_label(index)}'s object map")
+                if root_oid not in omap:
+                    why = ("its object map does not name the root node and no other node shows "
+                           "whether the blocks are ciphertext or damaged")
+                found = self._blocks_state(omap, root_oid)
+            except (ValueError, OSError, struct.error) as exc:
                 found = "unknown"
+                why = f"{exc}, so whether its blocks are ciphertext cannot be told"
             finally:
                 self._current, self._volume_omap = saved
             state = "clear" if found == "clear" else "locked"
@@ -7559,7 +7565,7 @@ class ApfsWalker:
             if state == "locked" and key is not None and self._apply_key(index, sb, key):
                 state = "unlocked"
             elif state == "locked" and found == "unknown":
-                self._crypt_unknown.add(index)
+                self._crypt_unknown[index] = why
         self._crypt[index] = state
         return state
 
@@ -7695,12 +7701,15 @@ class ApfsWalker:
 
     def _unknown_text(self, indexes):
         """What can be said of flagged-encrypted volumes whose blocks show neither."""
-        one = len(indexes) == 1
-        return (f"{', '.join(self._volume_label(i) for i in indexes)} "
-                f"{'is' if one else 'are'} flagged encrypted and could not be read: the "
-                f"root node fails its check and no other node shows whether the blocks are "
-                f"ciphertext or damaged, so {'its' if one else 'their'} files are not listed "
-                f"or extracted")
+        parts = []
+        for why in dict.fromkeys(self._crypt_unknown[i] for i in indexes):
+            which = [i for i in indexes if self._crypt_unknown[i] == why]
+            one = len(which) == 1
+            parts.append(f"{', '.join(self._volume_label(i) for i in which)} "
+                         f"{'is' if one else 'are'} flagged encrypted and could not be read: "
+                         f"{why}, so {'its' if one else 'their'} files are not listed or "
+                         f"extracted")
+        return "; ".join(parts)
 
     @property
     def not_read_note(self):
@@ -28973,7 +28982,7 @@ def _apfs_reader_checks():
             raw[root * bs + at] ^= 0x01
             w = walker(raw)
             listed(w)
-            record = w.not_read_note or ""
+            record = getattr(w, "not_read_note", "") or ""
             out = (out and w.encryption(0) == "clear" and "ciphertext" not in (w.note or "")
                    and "locked" not in record and "could not be read" in record)
         # with every node the volume maps unreadable, it is called ciphertext
@@ -28984,6 +28993,17 @@ def _apfs_reader_checks():
             raw[block * bs:(block + 1) * bs] = hashlib.sha256(b"%d" % n).digest() * (bs // 32)
         w = walker(raw)
         return out and w.encryption(0) == "locked" and "blocks are ciphertext" in (w.note or "")
+
+    def lost_map_named():
+        """A flagged volume whose object map is gone: that is the cause it must give."""
+        raw = bytearray(clean)
+        w = flagged(raw)
+        vomap = struct.unpack_from("<Q", w.block(w.volumes[0][1]), 128)[0]
+        raw[vomap * bs:(vomap + 1) * bs] = bytes(bs)
+        w = walker(raw)
+        note = w.note or ""
+        return (w.encryption(0) == "locked" and "object map" in note
+                and "blocks are ciphertext in" not in note and "root node fails" not in note)
 
     def zero_root_cipher():
         if ewfprobe is None:
@@ -29114,6 +29134,8 @@ def _apfs_reader_checks():
          damaged_clear),
         ("a zeroed root on an APFS ciphertext volume is not called read in the clear",
          zero_root_cipher),
+        ("a flagged APFS volume whose object map is gone says that, not that it is ciphertext",
+         lost_map_named),
         ("a GPT-typed APFS partition whose block 0 lost its magic is read from a copy, or "
          "recorded when no copy is left", typed_magic),
         ("an APFS name that does not decode, or holds a NUL or a /, keeps its bytes as %XX",
