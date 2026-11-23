@@ -569,8 +569,9 @@ is counted in `folders_not_read`, and the run then exits 1.
 - **Names.** A long name is used only when its entries are in order and carry the short
   entry's checksum; otherwise the short name is the one reported. A first byte of `0x05`
   in a short name reads as `0xE5`. The volume does not say which OEM code page its short
-  names use, so none is assumed: a byte above `0x7F` is kept as a lone surrogate, and in
-  a zip member name it appears as `%XX`, so two different stored names stay different.
+  names use, so none is assumed: a byte above `0x7F` is kept as a lone surrogate, and a
+  zip member name carries the `%XX` escape of that surrogate (byte `0x82` is `%ED%B2%82`),
+  so two different stored names stay different.
 - **Times.** A stored date or time that is not a valid reading is shown with its raw
   words, not as a blank.
 
@@ -1727,7 +1728,9 @@ Validated the same way as NTFS. `tools/make_fat_deleted_fixtures.sh` builds a FA
 an exFAT image, each with a folder of two photographs and one fragmented photograph,
 created and then deleted; the self-test recovers them from the directory entries and
 matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers the same
-bytes from the same entries. The fragmented file that lands across reused space is
+bytes from the same entries. The FAT32 fixture has 129,022 clusters, so at its real size
+its entries fall under the zero high word rule above and are not recoverable: the
+self-test compares the bytes with its recorded size cut in memory to 65,535 clusters. The fragmented file that lands across reused space is
 refused by this reader and is the one case `icat` will read on the contiguous
 assumption; refusing it is the deliberate choice not to present bytes the entry cannot
 vouch for.
