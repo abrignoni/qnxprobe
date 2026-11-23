@@ -338,12 +338,18 @@ Since 1.87 a write that fails partway (the disk fills, the temporary copy cannot
 back) is taken back out of the zip, so no truncated member stays under the file's real
 name and the members after it still extract. The file counts as `FAILED`. `--extract`
 always writes a new regular file, which can be cut back. From Python, an output that cannot
-seek keeps the bytes already written, and no member names them.
+seek keeps the bytes already written, and no member names them. If the disk stays full
+and the zip's central directory cannot be written, the run prints `THE ZIP IS NOT USABLE`
+and exits 1. A `volumes.json` that cannot be written is also reported and exits 1, and
+the zip is still closed.
 
 Inside a volume the first file to hold a name keeps it. A later file whose name clashes,
-ignoring case and Unicode normalization, gets `.dup-<n>`. A file that clashes with a
-folder is the one renamed, so the folder's files keep their paths. A name longer than 255
-bytes of UTF-8 keeps its start and a short last extension around a hash.
+ignoring case and Unicode normalization, gets `.dup-<n>`. So does one that would land on
+the same file when Python extracts the zip on Windows, where `:<>|"?*` become `_` and
+trailing dots and spaces are removed (`a?` and `a_`, `b.` and `b`). The first holder keeps
+its stored spelling, so `a?` stays `a?` when nothing clashes with it. A file that clashes
+with a folder is the one renamed, so the folder's files keep their paths. A name longer
+than 255 bytes of UTF-8 keeps its start and a short last extension around a hash.
 
 A filesystem volume with anything to record gets `<volume>.exceptions.tsv` beside its
 folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
@@ -358,7 +364,10 @@ Since 1.68 a member's name is made safe before it is written: a stored name of `
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
 backslash, colon or control character are written escaped as `%XX`, so no member can
 land outside the folder it is extracted into, start at a root, or be cut short by a
-NUL. Ordinary names are kept exactly as stored. Each renamed member is logged as
+NUL. A name that is only a Windows device name (`NUL`, `CON`, `PRN`, `AUX`, `COM1` to
+`COM9`, `LPT1` to `LPT9`, in any case, with or without trailing dots or spaces) has its
+first letter escaped, so `nul` is held as `%6Eul`. A name with an extension, such as
+`aux.c`, is not changed. Ordinary names are kept exactly as stored. Each renamed member is logged as
 `RENAMED <volume>/<name as stored> stored as <member>`. Damage a reader recorded while
 walking a volume (a structure that failed its check, a record it could not resolve) is
 printed under `--list` as `DAMAGE`, counted on the extraction line as `DAMAGED`, with
