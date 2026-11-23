@@ -2303,7 +2303,9 @@ inode nodes only, so replay of a direct node has been run on a crafted log and n
 kernel wrote. One step of the kernel's is not done: when the log gives a file a block the
 checkpoint still marks in use, the kernel takes it from the earlier owner through the
 segment summary. This reader records that in `damage_first` and leaves the earlier owner as
-it was, so that block can then appear in both files.
+it was, so that block can then appear in both files. That does not apply after an atomic
+write commit: there the earlier owner is an orphan copy-on-write inode, which the kernel
+frees before replay and no folder names.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
@@ -2324,8 +2326,29 @@ an address outside the main area, a size past what the format allows or a checkp
 superblock copy that fails its checksum is named in `damage_first`. A bad copy falls back to
 the good one. A file under a damaged node is refused, a folder that cannot be read in full
 counts in `folders_not_read`, and a name whose inode cannot be read is a `FAILED` row. A real
-hole, a node id of 0 or a block address of 0, stays a hole. See
-[What it does not do](#what-it-does-not-do).
+hole, a node id of 0 or a block address of 0, stays a hole.
+
+Five checks catch one bad sector that would otherwise read as valid. Each was measured on the
+known-data volumes before it was used, and none fires on an intact one:
+
+- An inode that fails its checksum (`f2fs_inode_chksum`) is a `FAILED` row. In the log it costs
+  only that inode, which stays as the checkpoint holds it. An inode that says it has no
+  checksum, on a volume with the feature, is counted in `damage_first`, because damage can
+  clear the flag that says so.
+- A log whose chain stops while later blocks of its segment still carry this checkpoint's
+  version is recorded as cut, and the run exits 1. A fault in the footer of the log's last
+  node leaves nothing after it, so it cannot be seen this way, and the files in that node are
+  missing with no record.
+- Fewer inodes reached than the checkpoint's `valid_inode_count`, after orphans and quota
+  inodes, is recorded with both numbers, and the run exits 1.
+- A name that does not match its stored hash is recorded and kept, since it may be the only
+  trace of the entry. Casefolded and encrypted folders hash another input and are not checked.
+- A file whose `i_blocks` is more than its block map accounts for gets a `BLOCKS_UNREACHED`
+  row, and the run exits 1. This covers compressed files. A direct node sector read as 0xFF
+  looks like reserved blocks (`NEW_ADDR`), which are valid and read as zeros, so it is not
+  caught.
+
+See [What it does not do](#what-it-does-not-do).
 
 Validated against two independent readers. On a fixture `mkfs.f2fs` and `sload.f2fs` wrote
 (`tools/make_f2fs_fixture.sh`), every file inside the inode matches what `sha256sum`
@@ -4334,13 +4357,13 @@ above are in this README only for now.)
   1.x and 2.x are identified and refused. See [ReFS](#refs).
 - **F2FS compression: LZ4 only.** A compressed cluster in LZO, LZO-RLE or zstd is refused
   by name. Clusters that are not compressed are read in any of them.
-- **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
+- **F2FS is validated on volumes built for the test, not on a real device's.**
   Two independent readers are the oracles: f2fs-tools' `dump.f2fs` for inline data,
   directories, the inode's own pointers and direct and single-indirect node blocks, and
-  the Linux kernel driver itself for files full of holes. No real F2FS volume is in the
-  test corpus, so the NAT-journal override is implemented and sourced but not exercised (a
-  cleanly unmounted image has an empty journal), and the double-indirect path (past about
-  8 GiB in one file) is not exercised at all.
+  the Linux kernel driver's own read-back for the kernel-written fixtures, one of which
+  resolves every file through the NAT journal. No F2FS volume from a real device is in the
+  test corpus, and the double-indirect path (past about 8 GiB in one file) has been run
+  only on crafted nodes.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
   either.
