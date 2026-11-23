@@ -371,9 +371,10 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 `exceptions`. It has one row per file that failed, read short or was renamed
 (`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. On NTFS it
-also has a `LINK` row per symbolic link and junction and a `RECORD_TORN` row per file read
-from a record that failed its update sequence check, counted as `links` and
-`records_torn`. Neither changes the exit status. Up to eight
+also has a `LINK` row per symbolic link and junction, a `RECORD_TORN` row per file read
+from a record that failed its update sequence check, and a `NAMED_STREAM` row per file or
+folder with alternate data streams, counted as `links`, `records_torn` and
+`named_streams`. None of them changes the exit status. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
 time, and for ReFS, HFS+, APFS and F2FS for a value out of their range too. An NTFS
@@ -1487,10 +1488,15 @@ for path, node, mode, size, mtime, recorded in walker.listing(streams=True):
         data = b"".join(walker.read_file(node, size))
 ```
 
-Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()`, `--extract`
-and the window's Contents pane are as they were, because a caller that asked for a folder's
-files and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser
-expecting a shortcut. `listing(streams=True)` names each stream `path:stream`, as Windows
+Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()` and the
+window's Contents pane do not return them, because a caller that asked for a folder's files
+and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser expecting
+a shortcut. `--extract` does not write a stream's bytes as a member either, but it does say
+they exist: each file or folder holding streams gets one `NAMED_STREAM` row in the
+exceptions table, with each stream's name and recorded size, the first 16 named and the
+rest counted. The root directory's row has the path `/`. `WofCompressedData` is left out
+of a file the overlay filter backs, since it is that file's own content.
+`listing(streams=True)` names each stream `path:stream`, as Windows
 does, straight after its file, with the file's modified time (NTFS keeps no dates per
 stream); a stream on the root directory is `:stream`. A caller walking the tree instead asks
 `streams(record)` for each entry. `--list` names every stream beside its file at its

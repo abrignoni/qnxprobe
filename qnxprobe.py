@@ -4415,6 +4415,7 @@ NTFS_MAX_CLUSTER = 2 << 20          # the largest cluster Windows formats
 NTFS_MAX_ATTRIBUTE_LIST = 1 << 20   # read no more of a list than this
 NTFS_DAMAGE_CAP = 1000              # lines of damage kept per volume
 NTFS_GAPS_PER_FILE = 8              # missing ranges named per file
+NTFS_STREAMS_NAMED = 16             # streams named per row; the rest are counted
 
 NTFS_ATTR_COMPRESSED = 0x0001
 NTFS_ATTR_ENCRYPTED  = 0x4000
@@ -4781,6 +4782,7 @@ class NtfsWalker:
         self._by_parent = None                   # parent record -> names, read on first need
         self._mft0 = None                        # record 0 as $MFTMirr holds it, when used
         self._mft_list_lost = False              # $MFT's own attribute list could not be read
+        self._stream_folders = {}                # path -> a folder collect() saw with streams
         self._records = {}                       # record number -> attributes
         self._alloc_bitmap = None                # $Bitmap bytes, read on first need
         self._mft_runs = None
@@ -5446,9 +5448,50 @@ class NtfsWalker:
         """The target of a symbolic link or junction as stored, "" for any other record."""
         return self._link_target(num) or ""
 
-    def is_kept_link(self, num):
-        """True for a folder-kind entry that is really a link: see entry()."""
-        return self._link_target(num) is not None
+    def note_folder(self, path, num):
+        """Told by collect() of each folder on the walk. True when this folder-kind entry
+        is really a link (see entry()), which collect() then reports as one. A plain folder
+        holding a named stream is kept here, since collect() reports files and links only,
+        and an export records it through folder_stream_rows()."""
+        if self._link_target(num) is not None:
+            return True
+        if self._stream_note(num):
+            self._stream_folders[path] = num
+        return False
+
+    def exclude_noted(self, exclude):
+        """Drop the kept folders an --exclude substring matches, as apply_exclude does."""
+        if exclude:
+            self._stream_folders = {p: n for p, n in self._stream_folders.items()
+                                    if not any(x in p for x in exclude)}
+
+    def folder_stream_rows(self):
+        """[(stored path, detail)] for the root and each kept folder that holds a stream."""
+        out = []
+        root = self._stream_note(NTFS_ROOT)
+        if root:
+            out.append(("/", root))
+        for path, num in self._stream_folders.items():
+            out.append((path, self._stream_note(num)))
+        return out
+
+    def _stream_note(self, num):
+        """The named streams of this record as text, with their recorded sizes, or None.
+        WofCompressedData is left out of a file the overlay filter backs: it is how the
+        volume stores that file's own content, and read_file() already reads it."""
+        try:
+            found = self.named_streams(num)
+            internal = WOF_STREAM if found and self._wof(num) is not None else None
+        except (NtfsUnreadable, struct.error):
+            return None
+        found = [(name, size) for name, size in found if name != internal]
+        if not found:
+            return None
+        shown = ", ".join(f"{name} ({size:,} bytes)" for name, size in found[:NTFS_STREAMS_NAMED])
+        more = len(found) - NTFS_STREAMS_NAMED
+        return (f"{len(found):,} named stream(s): {shown}"
+                + (f", and {more:,} more" if more > 0 else "")
+                + "; their bytes are not zip members")
 
     def export_notes(self, num):
         """[(issue, detail)] an export records for this entry beside any member: a link's
@@ -5474,6 +5517,9 @@ class NtfsWalker:
                                 f"{_ntfs_time_text(stored[0])}; modified "
                                 f"{_ntfs_time_text(stored[1])}; accessed "
                                 f"{_ntfs_time_text(stored[2])}"))
+        streams = self._stream_note(num)
+        if streams:
+            out.append(("NAMED_STREAM", streams))
         return out
 
     def short_reason(self, num):
@@ -13785,6 +13831,17 @@ def _walker_notes(w, node):
         return []
 
 
+def _walker_folder_notes(w):
+    """[(stored path, detail)] of the folders a walker holds a NAMED_STREAM row for, else []."""
+    report = getattr(w, "folder_stream_rows", None)
+    if report is None:
+        return []
+    try:
+        return report()
+    except Exception:                                # pylint: disable=broad-except
+        return []
+
+
 def _short_reason(w, node):
     """Why part of a file reads short though the image holds that offset, as text, else
     None. None for a walker that has no such case."""
@@ -13826,7 +13883,7 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
             if kept:
                 times[path] = kept
         if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
-            if getattr(w, "is_kept_link", None) is not None and w.is_kept_link(ino):
+            if getattr(w, "note_folder", None) is not None and w.note_folder(path, ino):
                 out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
             collect(w, ino, path, depth + 1, seen, out, times)
         elif (mode & 0o170000) == 0o100000:          # regular files only
@@ -14692,7 +14749,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                "time_not_held": counts["TIME_NOT_HELD"]}
     for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
                        ("valid_data_damaged", "VALID_DATA_DAMAGED"),
-                       ("links", "LINK"), ("records_torn", "RECORD_TORN")):
+                       ("links", "LINK"), ("records_torn", "RECORD_TORN"),
+                       ("named_streams", "NAMED_STREAM")):
         if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
@@ -14711,6 +14769,7 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
         valid = ", each exFAT file whose ValidDataLength differs from its size" if (
             counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
         links = ", each link with its stored target" if counts["LINK"] else ""
+        links += ", each file or folder with named streams" if counts["NAMED_STREAM"] else ""
         _say(f"{pad}every failed, short or renamed file{valid}{links}, and each time a zip "
              f"cannot hold: {name}")
 
@@ -14954,6 +15013,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
             note(path, "", "FAILED", "; ".join([_zip_reason(exc)] + why))
         if progress is not None:
             progress(volume, files, written, total_files, total_bytes)
+    for path, detail in _walker_folder_notes(w):
+        note(path, "", "NAMED_STREAM", detail)
     if names.full is not None or isinstance(zf.fp, _ZipOutput):
         taken = []
         table = 0
@@ -35018,6 +35079,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             w = walker_for(kind, fh, b, sz)
                             ents = collect(w, w.root)
                             ents, dropped = apply_exclude(ents, exclude)
+                            if getattr(w, "exclude_noted", None) is not None:
+                                w.exclude_noted(exclude)
                             log = []
                             miss = missing_past_end(b)
                             issues = []
@@ -37436,6 +37499,39 @@ def _ntfs_reader_fix_checks(image_gz):
                 and w.entry(spare[1])[0] & S_IFMT == S_IFDIR and held.get("a") == 0
                 and "b" in held and held["b"] is None and getattr(w, "readlink", str)(spare[1]) == goal)
     row("a link holding a named stream stays reachable as a file or folder", link_streams)
+
+    def stream_rows():
+        img = bytearray(clean)
+        many = [[0x61 + i // 26, 0x61 + i % 26] for i in range(18)]
+        put(img, spare[0], fresh([0x61], NTFS_ROOT, [named_stream(u) for u in many]))
+        put(img, spare[1], fresh([0x64], NTFS_ROOT, [named_stream([0x74])], is_dir=True))
+        wof = struct.pack("<IIII", 1, 2, 1, 0)
+        put(img, spare[2], fresh([0x77], NTFS_ROOT, [
+            (0xC0, resident(0xC0, struct.pack("<IHH", 0x80000017, len(wof), 0) + wof)),
+            named_stream([ord(c) for c in "WofCompressedData"])]))
+
+        class Indexed(NtfsWalker):
+            """The fixture's root index does not name the records built here."""
+
+            def listdir(self, num):
+                got = super().listdir(num)
+                return got + [("a", spare[0]), ("d", spare[1]), ("w", spare[2])] \
+                    if num == NTFS_ROOT else got
+
+        w = Indexed(io.BytesIO(bytes(img)), 0)
+        entries = [e for e in collect(w, w.root) if e[1] in spare[:3]]
+        out = zipfile.ZipFile(io.BytesIO(), "w")
+        issues = []
+        extract_to_zip(out, w, "v", entries, [], issues=issues)
+        members = [n for n in out.namelist() if ":" in n]
+        out.close()
+        got = {r[0]: r[3] for r in issues if r[2] == "NAMED_STREAM"}
+        return (not members and "w" not in got and "d" not in {e[0] for e in entries}
+                and got.get("d", "").startswith("1 named stream(s): t (8 bytes)")
+                and got.get("a", "").startswith("18 named stream(s): aa (8 bytes)")
+                and got["a"].count("(8 bytes)") == 16 and "and 2 more" in got["a"])
+    row("each file or folder with streams gets one NAMED_STREAM row and no new member",
+        stream_rows)
 
     def epoch_ticks():
         _w, _node, held = stored_time(116444736000000005)
