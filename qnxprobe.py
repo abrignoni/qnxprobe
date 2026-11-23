@@ -2738,9 +2738,13 @@ class Fat32Walker:
                 bpb = copy
                 self._record("the boot sector is all zeros, so this volume was read from the "
                              "backup copy of it at sector 6")
-        # The state byte Linux sets while a volume is mounted (FAT_STATE_DIRTY, bit 0, in
-        # include/uapi/linux/msdos_fs.h), at a different offset on FAT32.
-        self._boot_state = bpb[65 if self.FAT_BITS == 32 else 37] if len(bpb) > 65 else 0
+        # The state byte: offset 37, or 65 on FAT32. Microsoft's specification calls it
+        # reserved. Linux sets bit 0 (FAT_STATE_DIRTY) at mount and clears it at unmount
+        # (fat_set_state in fs/fat/inode.c), and Windows was measured leaving it set on a
+        # volume copied while mounted. None when the boot sector itself was lost, since
+        # the backup copy is not where a driver keeps it.
+        self._boot_state = (None if self.FAT_BITS == 32 and copy is not None else
+                            bpb[65 if self.FAT_BITS == 32 else 37] if len(bpb) > 65 else 0)
         self.bps = struct.unpack_from("<H", bpb, 11)[0]
         self.spc = bpb[13]
         self.reserved = struct.unpack_from("<H", bpb, 14)[0]
@@ -2814,7 +2818,8 @@ class Fat32Walker:
     @property
     def folders_not_read(self):
         """Nonzero when something was lost: a folder could not be read to its end, or
-        clusters no live chain reaches hold folder entries (_note_unreached)."""
+        clusters no live chain reaches hold folder entries or sit on a volume that is not
+        marked as mounted (_note_unreached)."""
         self._note_unreached()
         return self._folders_not_read
 
@@ -2823,11 +2828,14 @@ class Fat32Walker:
         live file or folder reaches. Whole chains are claimed, whatever a file's size needs,
         the bad-cluster mark is not counted, and the walk has no depth limit.
 
-        Only such clusters that hold folder entries count as a loss, because then the files
-        those folders record are not listed. Any others are a note: a real interrupted
-        Windows write left lost chains of over 120,000 clusters with every folder read and
-        every known file intact, and most of those clusters held zeros. A live empty file
-        or a deleted entry in a live folder can still name the chain, and the note says so.
+        What they mean depends on the boot state byte. When it is set the volume was not
+        cleanly unmounted, and a real interrupted Windows write left lost chains of over
+        120,000 clusters that way, with every folder read and every known file intact, so
+        they are a note unless one holds folder entries. When it is clear an interrupted
+        write does not explain them, so they count as a loss, and so do any that hold folder
+        entries whatever the byte says. FAT[1]'s clean-shutdown bit does not help: it read
+        clean on all 95 FAT16 and FAT32 volumes measured, those five captures included. A live empty file or
+        a deleted entry in a live folder can still name a chain, and the record says so.
         """
         if self._unreached_checked:
             return
@@ -2888,10 +2896,14 @@ class Fat32Walker:
             return bool(val) and val != bad_mark
 
         lost = folder_clusters = 0
+        pointed = bytearray(last // 8 + 1)
         for clus in range(2, last):
             if not unreached(clus):
                 continue
             lost += 1
+            val = value(clus)
+            if 2 <= val < last:
+                pointed[val >> 3] |= 1 << (val & 7)
             # one slot first, since nearly every cluster of a lost file fails on it
             head = read_at(self.fh, self._cluster_off(clus), 32)
             if len(head) == 32 and head[0] and _fat_dir_cluster_ok(head):
@@ -2900,29 +2912,44 @@ class Fat32Walker:
                     folder_clusters += 1
         if not lost:
             return
+        named_heads = {clus for clus in empties if unreached(clus)}
         named = sum(1 for clus in empties if unreached(clus))
         for node in walked:
             for _n, first, _s, _d, _t, unknown, _c in self._deleted_in(node, False):
                 if unknown:
                     start = first if first >= 2 else first + 0x10000
                     named += any(unreached(c) for c in range(start, last, 0x10000))
-                else:
-                    named += unreached(first)
+                elif unreached(first):
+                    named += 1
+                    named_heads.add(first)
+        heads = {clus for clus in range(2, last)
+                 if unreached(clus) and not pointed[clus >> 3] & (1 << (clus & 7))}
+        every_chain_named = bool(heads) and heads <= named_heads
         bytes_held = lost * self.cluster_bytes
         where = (f"and {named:,} live empty or deleted entries still name them" if named else
                  "with no entry in a live folder reaching them")
+        found = f"{lost:,} cluster(s) ({bytes_held:,} bytes) in use {where}"
         # damage_lines() keeps 240 characters of a line, so these stay inside that even at
         # the largest counts a FAT32 volume can hold
-        state = (f" Boot state byte {self._boot_state:#04x}: not cleanly unmounted."
-                 if self._boot_state & 0x01 else "")
+        state = self._boot_state
+        dirty = state is not None and bool(state & 0x01)
+        flag = f" Boot state byte {state:#04x}: not cleanly unmounted." if dirty else ""
         if folder_clusters:
-            self._record(f"{lost:,} cluster(s) ({bytes_held:,} bytes) in use {where}, and "
-                         f"{folder_clusters:,} hold folder entries, so their files are not "
-                         f"listed.{state}")
-            self._folders_not_read = self._folders_not_read or 1
+            self._record(f"{found}, and {folder_clusters:,} hold folder entries, so their files "
+                         f"are not listed.{flag}")
+        elif dirty:
+            self._record(f"note: {found}, as an interrupted write leaves. Not a measure of lost "
+                         f"content.{flag}")
+            return
+        elif state is None:
+            self._record(f"{found}. The boot sector is lost, so a clean unmount cannot be "
+                         f"shown, and entries that named them may be lost.")
+        elif every_chain_named:
+            self._record(f"{found}, on a volume marked clean.")
         else:
-            self._record(f"note: {lost:,} cluster(s) ({bytes_held:,} bytes) in use {where}, as "
-                         f"an interrupted write leaves. Not a measure of lost content.{state}")
+            self._record(f"{found}, on a volume marked clean, so entries that named them may "
+                         f"be lost.")
+        self._folders_not_read = self._folders_not_read or 1
 
     def _record(self, line):
         """Keep one line of damage, once, up to _FAT_DAMAGE_CAP lines."""
@@ -38434,7 +38461,7 @@ def _fat_reader_checks():
         clean = Lab(16, 5000, keep=64)
         clean.root([keep, late])
         clean_names, ok = listed(clean)
-        return (names == {"KEEP.BIN"} and gap.folders_not_read == 0
+        return (names == {"KEEP.BIN"} and gap.folders_not_read == 1
                 and "after the end marker" in damage(gap)
                 and "in use with no entry" in damage(gap)
                 and "KEEP.BIN" in odd_names and "reserved" in damage(ffs)
@@ -38604,22 +38631,51 @@ def _fat_reader_checks():
         dirty, clean = volume(1), volume(0)
         text = damage(dirty)
         kept = " ".join(damage_lines(dirty, 5)[1])   # what an export keeps of each line
-        return (dirty.folders_not_read == 0 and clean.folders_not_read == 0
+        marked = damage(clean)
+        return (dirty.folders_not_read == 0 and clean.folders_not_read == 1
                 and text.startswith("note: 2 cluster(s) (1,024 bytes) in use with no entry")
                 and "interrupted write" in text and "Not a measure of lost content" in text
-                and "Boot state byte 0x01" in kept and "state byte" not in damage(clean))
+                and "Boot state byte 0x01" in kept and "state byte" not in marked
+                and not marked.startswith("note:") and "interrupted" not in marked
+                and "marked clean, so entries that named them may be lost" in marked)
+
+    def state_byte_by_width():
+        def volume(bits, clusters, at):
+            lab = Lab(bits, clusters, keep=64)
+            lab.chain([20])
+            if at is not None:
+                lab.img[at] = 1
+            return lab.walker().folders_not_read
+        return (volume(32, 70000, 65) == 0 and volume(32, 70000, None) == 1
+                and volume(32, 70000, 37) == 1         # byte 37 is not FAT32's state byte
+                and volume(16, 5000, 37) == 0 and volume(16, 5000, 65) == 1
+                and volume(12, 300, 37) == 0 and volume(12, 300, None) == 1)
+
+    def boot_copy_has_no_state():
+        lab = Lab(32, 70000, keep=64)
+        lab.chain([20])
+        lab.img[65] = 1
+        lab.img[6 * 512 + 65] = 1                    # even a copy that says so is not used
+        lost = bytearray(lab.img)
+        lost[:512] = bytes(512)
+        w = lab.walker(lost)
+        return w.folders_not_read == 1 and "clean unmount cannot be shown" in damage(w)
 
     def named_chain_is_not_lost():
-        lab = Lab(16, 5000, keep=64)
-        lab.root([short(b"EMPTY   BIN", first=20, size=0),
-                  short(b"\xe5ONE    BIN", first=30, size=512)])
-        lab.chain([20])
-        lab.chain([30])
-        w = lab.walker()
-        text = damage(w)
+        def volume(state):
+            lab = Lab(16, 5000, keep=64)
+            lab.root([short(b"EMPTY   BIN", first=20, size=0),
+                         short(b"\xe5ONE    BIN", first=30, size=512)])
+            lab.chain([20])
+            lab.chain([30])
+            lab.img[37] = state
+            return lab.walker()
+        clean, dirty = volume(0), volume(1)
+        text = damage(clean)
         return ("2 live empty or deleted entries still name them" in text
                 and "never written" not in text and "no entry" not in text
-                and w.folders_not_read == 0)
+                and "may be lost" not in text and clean.folders_not_read == 1
+                and damage(dirty).startswith("note:") and dirty.folders_not_read == 0)
 
     def in_use_is_not_called_live():
         lab = Lab(16, 5000, keep=64)
@@ -38737,6 +38793,10 @@ def _fat_reader_checks():
                           "entries"),
         (lost_chain_is_a_note, "a lost chain holding no folder entries is a counted note with "
                                "exit 0, and says so when the boot state byte is set"),
+        (state_byte_by_width, "the boot state byte is read at offset 65 on FAT32 and 37 on "
+                              "FAT12 and FAT16, and decides whether a lost chain is a loss"),
+        (boot_copy_has_no_state, "unreached clusters on a volume read from its backup boot "
+                                 "sector count as a loss, since its state is not known"),
         (named_chain_is_not_lost, "the record does not call a chain's entry lost while a live "
                                   "empty or deleted entry still names it"),
         (in_use_is_not_called_live, "a refused deleted file's reason says its clusters are in "

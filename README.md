@@ -558,16 +558,27 @@ read to its end, or clusters no live chain reaches that hold folder entries.
   holds at that link, including an end-of-chain mark where another copy still holds a link.
   That link is not followed.
 - **Clusters nothing reaches.** The clusters the FAT marks in use that no live chain
-  reaches are counted, whole chains claimed and the bad-cluster mark left out. When any of
-  them holds folder entries, the files those folders record are not listed, so that is a
-  loss and sets exit 1. Otherwise it is a note giving the clusters and bytes. This is what
-  an interrupted write leaves (`chkdsk` turns them into `FOUND.000`), and the count does not
-  mean that much content was lost: on five Windows FAT32 captures of a large file being
-  written, every folder read, every known file matched, and the lost chains of over 120,000
-  clusters held 2 to 7 MiB of the writer's bytes and zeros. The note mentions the boot
-  sector's state byte when it is set, and any live empty or deleted entry still naming the
-  chain. A lost sector that held only file entries therefore shows as this note with exit
-  0, since nothing in what remains tells it from an interrupted write.
+  reaches are counted, whole chains claimed and the bad-cluster mark left out. What they
+  mean depends on the boot sector's state byte (offset 37, or 65 on FAT32). Microsoft's
+  specification calls it reserved. Linux sets bit 0 at mount and clears it at unmount, and
+  Windows left it set on volumes copied while mounted.
+  - **Any cluster that holds folder entries** is a loss and sets exit 1, whatever the byte
+    says, because the files those folders record are not listed.
+  - **Byte clear:** the volume says it was cleanly unmounted, so an interrupted write does
+    not explain them. That is a loss and sets exit 1. A writer that never sets the byte
+    gets the same record.
+  - **Byte set, no folder entries:** a note with the clusters and bytes, and exit 0. This
+    is what an interrupted write leaves (`chkdsk` turns them into `FOUND.000`), and the
+    count does not mean that much content was lost: on five Windows FAT32 captures of a
+    large file being written, every folder read, every known file matched, and the lost
+    chains of over 120,000 clusters held 2 to 7 MiB of the writer's bytes and zeros. A
+    sector lost on such a volume that held only file entries shows as this note too.
+  - **Boot sector lost:** the backup does not carry the byte, so a clean unmount cannot be
+    shown, and this counts as a loss.
+
+  FAT[1]'s clean-shutdown bit does not separate these: it read clean on all 95 FAT16 and
+  FAT32 volumes measured, the five captures included. The record also says when a live
+  empty or deleted entry still names the chain.
 - **Notes, which change neither the listing nor the exit status.** Slots after an
   end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
   bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
