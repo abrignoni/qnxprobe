@@ -322,15 +322,20 @@ A stored ext name that is not valid UTF-8 keeps its bytes as `%XX`, so `bad_<0xF
 `bad_%FF.bin` and two such names stay two names. A NUL or `/` stored inside one name becomes
 `%00` or `%2F`, so it cannot cut a path or invent a folder.
 
-Damage on an ext volume is recorded, not read around. A folder that cannot be read in
-full (its inode, a block past the end of the image, a record length that cannot be right)
-is counted in `folders_not_read` and named in `damage_first`, and the run exits 1. So is
-a group descriptor that points off the volume, and each name whose inode that costs gets
-a `FAILED` row. A live name whose inode is blank (mode 0) is `FAILED` the same way, and is
-never counted as a special file.
+Damage the reader can detect on an ext volume is recorded, and the limits are below. A
+folder that cannot be read in full (its inode, a block past the end of the image, a record
+length that cannot be right) is counted in `folders_not_read` and named in `damage_first`,
+and the run exits 1. So is a group descriptor that points off the volume, and each name
+whose inode that costs gets a `FAILED` row. A live name whose inode is blank (mode 0), has
+a mode that is none of the seven file types, or fails its checksum on a `metadata_csum`
+volume is `FAILED` the same way, and is never counted as a special file. A regular file
+whose size is past the largest the volume's block size and features allow (`ext4_max_size`
+for extents, `ext4_max_bitmap_size` for block maps) is `FAILED` with that size in its row.
 
-A file whose block map is partly lost or past the end of the image keeps every block the
-map still reaches, at its own offset. It is stored under the
+A file whose block map is partly lost or past the end of the image keeps the blocks of
+every map entry that can be trusted, at their own offsets. One bad sector costs the entries
+it touches, and the entries after it are kept. On `metadata_csum` volumes an extent block
+that fails its checksum is recorded. The file is stored under the
 `.SHORT-<here>-of-<size>-bytes` name, what was lost reads as zeros, and its `SHORT` row
 names the file blocks. A zero pointer counts as lost only when `i_blocks` records more
 blocks than the map reaches, counted as e2fsck counts them, values in EA inodes included.
@@ -338,6 +343,19 @@ The row then says how many bytes among the file's holes may be lost. e2fsck does
 that comparison on a volume the Hurd created, so neither does this. Only a file whose extent
 root cannot be read at all is `FAILED`. A 0-byte file has nothing to lose, so it exports
 empty with a damage note.
+
+What this cannot tell apart, on one bad sector:
+
+- A volume of one block group has no backup superblock, so losing its one superblock
+  leaves nothing that says an ext volume was there, and no record is written. Where a valid
+  backup exists at a standard position the region gets a `note` saying so, and it is not
+  read. `mkswap` and `wipefs` leave such a copy behind on an undamaged region, so this note
+  does not change the exit status.
+- Without `metadata_csum`, noise that happens to form a valid inode or a valid map entry
+  reads as one. An inode whose type disagrees with its folder entry is caught.
+- A stored size below the filesystem's maximum is treated as a real sparse file. On a volume
+  without `metadata_csum`, a damaged size there is exported as zeros up to that size, which
+  can run to terabytes.
 
 The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
 says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a
