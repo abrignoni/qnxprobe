@@ -2440,18 +2440,14 @@ class F2fsWalker:
         self.ckpt = b"".join(parts)
         self.cp_flags = struct.unpack_from("<I", self.ckpt, 132)[0]
         sit_bm = struct.unpack_from("<I", self.ckpt, 156)[0]   # sit_ver_bitmap_bytesize
-        nat_bm = struct.unpack_from("<I", self.ckpt, 160)[0]   # nat_ver_bitmap_bytesize
         # The version bitmap region begins at offset 192 (after alloc_type[16]).
         # Placement follows f2fs.h __bitmap_ptr.
         if self.cp_flags & F2FS_CP_LARGE_NAT_BITMAP:
             self.nat_bitmap = self.ckpt[192 + 4:]
-            self.sit_bitmap = self.ckpt[192 + 4 + nat_bm:]
         elif self.cp_payload > 0:
             self.nat_bitmap = self.ckpt[192:]
-            self.sit_bitmap = self.ckpt[self.bs:]
         else:
             self.nat_bitmap = self.ckpt[192 + sit_bm:]
-            self.sit_bitmap = self.ckpt[192:]
         self._load_nat_journal()
 
     def _journal_capacity(self, entry_size):
@@ -3462,9 +3458,17 @@ class F2fsWalker:
         EOF_SHORTFALL["bytes"] = before + self._read_missing
 
     def _sit_bitmap(self):
-        """The SIT version bitmap: which of a SIT block's two copies is current
-        (f2fs.h __bitmap_ptr(SIT_BITMAP)), set when the checkpoint is read."""
-        return self.sit_bitmap
+        """The SIT version bitmap: which of a SIT block's two copies is current.
+        Placement follows f2fs.h __bitmap_ptr(SIT_BITMAP): with the large-NAT-bitmap flag
+        it follows the NAT bitmap after a 4-byte checksum; with a checkpoint payload it
+        starts at the first payload block, which self.ckpt holds after the checkpoint
+        block; else it is first in the version-bitmap region at offset 192."""
+        if self.cp_flags & F2FS_CP_LARGE_NAT_BITMAP:
+            nat_len = struct.unpack_from("<I", self.ckpt, 160)[0]
+            return self.ckpt[192 + nat_len + 4:]
+        if self.cp_payload > 0:
+            return self.ckpt[self.bs:]
+        return self.ckpt[192:]
 
     def _load_sit_journal(self):
         """SIT entries updated since the table was last written live in the
@@ -44382,6 +44386,8 @@ def self_test():
             _load_sit_journal = F2fsWalker._load_sit_journal   # pylint: disable=protected-access
             _sit_entry = F2fsWalker._sit_entry                 # pylint: disable=protected-access
             _sit_bitmap = F2fsWalker._sit_bitmap               # pylint: disable=protected-access
+            _journal_capacity = F2fsWalker._journal_capacity   # pylint: disable=protected-access
+            _rf_used = None
             _f2fs_test_bit = staticmethod(F2fsWalker._f2fs_test_bit)  # pylint: disable=protected-access
             bs, seg_blocks, base = SIT_BS, SIT_SEG, SIT_BASE
             main_blkaddr, main_segs = SIT_MAIN, 2
