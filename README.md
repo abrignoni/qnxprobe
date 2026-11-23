@@ -763,7 +763,9 @@ and that volume is then recorded as not read.
 ## QNX6 superblock choice and damaged volumes
 
 The report and `volumes()` pick the superblock with one function, `qnx6_select()`, so they
-always walk the same one. The rules are the Linux driver's (`fs/qnx6/inode.c`, v6.12):
+always walk the same one. The Linux driver (`fs/qnx6/inode.c`, v6.12) refuses a volume with a
+failed copy and does not rank copies. This reader uses the driver's checksum and serial
+tests, and goes on where the driver would stop:
 
 - A copy whose checksum holds beats one that fails, whatever their serials. A failed copy
   is read only when no copy passes, and the run says so.
@@ -773,7 +775,8 @@ always walk the same one. The rules are the Linux driver's (`fs/qnx6/inode.c`, v
   another identity is not read either, and that is recorded.
 - If the first superblock is lost or damaged, the second is still found through the boot
   header's `b_sblk1` or the first copy's own block count, and has to pass its checksum.
-  When no usable copy is at those places the first 256 MiB are scanned (`--scan-limit`).
+  When no region of the image has a usable copy, the first 256 MiB are scanned
+  (`--scan-limit`).
   A superblock found only by that scan is not walked, because one copy on its own does not
   say where the volume starts. It is recorded as a volume not read, and so is a first
   superblock that kept its magic with no valid copy found, on a region nothing else claims.
@@ -830,13 +833,23 @@ an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a
 written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`, and a stored NUL as `%00`.
 A long name that fails the checksum in its directory entry is kept and recorded.
 
-A directory block of zeros holds no entries and raises nothing, so after a walk the distinct
-inodes reached are compared with the superblock's count of inodes in use (`sb_num_inodes`
-minus `sb_free_inodes`). A shortfall is recorded with both numbers and the run exits 1. The
-two were equal on all 19 superblock generations of the nine vehicle volumes and the
-QNX-written test image, which include hard links. An inode whose format bits are not a type
-QNX defines (`sys/stat.h`, including `S_IFNAM`) is recorded as damage and not counted as a
-special file.
+A directory whose first block has no valid `.` and `..` entries is recorded as a folder not
+read and the run exits 1. An inode a directory names is recorded as damage, with its path, and
+not counted as a special file when its format bits are not a type QNX defines (`sys/stat.h`,
+including `S_IFNAM`), when `QNX6FS_INO_USED` is clear (`sys/fs_qnx6.h`), or when it records
+more than 5 pointer levels.
+
+Two counts are notes and do not change the exit code. The distinct inodes reached are compared
+with the superblock's count in use (`sb_num_inodes` minus `sb_free_inodes`). A shortfall can be
+a lost directory entry, or a file that is open but unlinked on a running device, because QNX
+delays its removal until the last close and no source says how a snapshot counts it. And
+`i_nlink` is compared with the names found, so a hard-link name lost with its sector is
+recorded with the file's surviving path. On all 19 superblock generations of the nine vehicle
+volumes and the QNX-written test image, hard links included, every one of these checks is
+silent.
+
+These checks cover the specific cases named here. They are not a general test for damage: a
+damaged sector can change bytes or names and leave no record.
 
 ## QNX6 free space
 

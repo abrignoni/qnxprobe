@@ -1783,6 +1783,7 @@ QNX6_DAMAGE_CAP = 1000                   # entries a walker keeps in its damage 
 QNX6_UNUSED = "an unused pointer"        # why a block has no pointer; read as zeros in a file
 QNX6_SECTOR_SLOTS = 128                  # block pointers in one 512-byte sector
 QNX6FS_LFN_CKSUM = 0x100                 # sb_flags: long names carry a checksum (sys/fs_qnx6.h)
+QNX6FS_INO_USED = 0x01                   # i_flags, inode byte 101 (sys/fs_qnx6.h line 38)
 # Every file type QNX defines, sys/stat.h lines 205-212 (RunZeJustin/qnx660 at 47c4158e):
 # FIFO, character device, directory, S_IFNAM (QNX only), block device, regular, link, socket
 QNX6_FILE_TYPES = frozenset((0x1000, 0x2000, 0x4000, 0x5000, 0x6000, 0x8000, 0xA000, 0xC000))
@@ -1866,8 +1867,10 @@ class Qnx6Walker:
         self.fh, self.base = fh, base
         self.damage, self.folders_not_read = [], 0
         self._noted, self._short_dirs, self._ptr_cache = set(), set(), {}
-        self._parent = {}                       # inode -> the directory that named it
+        self._parent = {}                       # inode -> (directory that named it, name)
         self._not_entries = set()               # inodes entry() could not give
+        self._names_found, self._listed = {}, set()     # names per inode, directories counted
+        self._nlink = {}                        # non-directory inodes that record several names
         self._last_read = self._last_holes = None
         sb = read_at(fh, base + sb_off, 512)
         if len(sb) >= 4 and struct.unpack_from(">I", sb, 0)[0] == QNX6_MAGIC:
@@ -2030,8 +2033,37 @@ class Qnx6Walker:
         return dict(size=struct.unpack_from("<Q", raw, 0)[0],
                     mtime=struct.unpack_from("<I", raw, 20)[0],
                     mode=struct.unpack_from("<H", raw, 32)[0],
+                    nlink=struct.unpack_from("<H", raw, 34)[0],
                     ptr=list(struct.unpack_from("<16I", raw, 36)),
-                    levels=raw[100])
+                    levels=raw[100], flags=raw[101])
+
+    @staticmethod
+    def _inode_problem(ino):
+        """Why an inode a directory names is not a file, as text, else None. These fields
+        hold on every inode reached on all 19 superblock generations measured. They are a
+        check on what the inode says, and a damaged inode can still pass them."""
+        if ino["mode"] & S_IFMT not in QNX6_FILE_TYPES:
+            return ("is empty (mode 0)" if not ino["mode"]
+                    else f"has no valid file type (mode {ino['mode']:#06x})")
+        if not ino["flags"] & QNX6FS_INO_USED:
+            return "is not marked in use"
+        if ino["levels"] > QNX6_PTR_MAX_LEVELS:
+            return f"records {ino['levels']} pointer levels, more than the {QNX6_PTR_MAX_LEVELS} allowed"
+        return None
+
+    def _path_of(self, num):
+        """The path a walk found this inode at, for a record, or "" for the root."""
+        parts, seen = [], set()
+        while num != self.root and num in self._parent and num not in seen and len(parts) < 64:
+            seen.add(num)
+            num, name = self._parent[num]
+            parts.append(name)
+        return "/".join(reversed(parts))
+
+    def _at(self, num):
+        """The end of a record about this inode: its path, last so a cut keeps the rest."""
+        path = self._path_of(num)
+        return f": {path}" if path else ""
 
     def _longname(self, blk, de_ino, stored=0):
         """The long name stored in Longfile block ``blk``. A name that cannot be read
@@ -2076,32 +2108,55 @@ class Qnx6Walker:
         self.note_damage(f"directory inode {num}: {detail}")
 
     def check_inode_count(self):
-        """After a walk from the root: compare the distinct inodes it reached with what
-        the superblock says is in use (num_inodes - free_inodes). A directory block of
-        zeros has no entries and raises nothing, so this is what shows its files are
-        gone. The two are equal on every superblock generation of the nine vehicle
-        volumes and the QNX-written test image measured, hard links included."""
+        """After a walk from the root, two counted notes. Neither changes the exit status.
+
+        The distinct inodes reached against what the superblock counts in use (num_inodes
+        - free_inodes). A shortfall can be a lost directory entry, or an inode that is
+        open but unlinked on a running device: QNX delays its removal until the last close
+        and commits a snapshot meanwhile, and no source says how it is counted then.
+
+        i_nlink against the names found, for inodes recording more than one. A name of a
+        hard link can be lost with its file still reached under another name. Both pairs
+        agree on every superblock generation of the nine vehicle volumes and the
+        QNX-written test image measured, hard links included."""
         if not self.num_inodes:
             return
         used = self.num_inodes - self.free_inodes
         reached = len(({self.root} | set(self._parent)) - self._not_entries)
         if reached < used:
             self.note_damage(f"the superblock counts {used:,} inodes in use and a walk from "
-                             f"the root reached {reached:,}, so {used - reached:,} are not "
-                             f"listed and files may be missing")
-            if not self._short_dirs:
-                self.count_not_read("inode count")
+                             f"the root reached {reached:,}: files may be missing, or an inode "
+                             f"may be open but unlinked")
+        for num, links in self._nlink.items():
+            found = self._names_found.get(num, 0)
+            if found < links:
+                self.note_damage(f"inode {num} records {links:,} names and {found:,} were found, "
+                                 f"so a name may be missing; it is listed at: {self._path_of(num)}")
+
+    @staticmethod
+    def _has_dots(buf, num):
+        """Whether a directory's first block starts with its "." (naming itself) and ".."
+        entries. Every directory on all 19 superblock generations measured does, and the
+        kernel tests the same two names on the root (inode.c qnx6_checkroot)."""
+        return (len(buf) >= 2 * QNX6_DIRENT_SIZE and struct.unpack_from("<I", buf, 0)[0] == num
+                and buf[4] == 1 and buf[5:6] == b"."
+                and struct.unpack_from("<I", buf, 32)[0] != 0
+                and buf[36] == 2 and buf[37:39] == b"..")
 
     def listdir(self, num):
         ino = self.inode(num)
         if not ino:
             self._folder_short(num, "its inode could not be read, so nothing in it is listed")
             return []
-        if ino["mode"] & S_IFMT != S_IFDIR:
-            if ino["mode"] & S_IFMT not in QNX6_FILE_TYPES:
-                self._folder_short(num, f"its inode has no valid file type (mode "
-                                        f"{ino['mode']:#06x}), so nothing in it is listed")
+        problem = self._inode_problem(ino)
+        if problem:
+            self._folder_short(num, f"its inode {problem}, so nothing in it is listed"
+                                    f"{self._at(num)}")
             return []
+        if ino["mode"] & S_IFMT != S_IFDIR:
+            return []
+        first_listing = num not in self._listed
+        self._listed.add(num)
         size = ino["size"]
         need = (size + self.bs - 1) // self.bs
         limit = self._blocks_to_read(ino["levels"], need)
@@ -2119,6 +2174,9 @@ class Qnx6Walker:
             if len(buf) < self.bs:
                 lost["a block that could not be read"] = (
                     lost.get("a block that could not be read", 0) + 1)
+            if lb == 0 and not self._has_dots(buf, num):
+                self._folder_short(num, f"its first block has no valid . and .. entries, so "
+                                        f"this folder could not be read in full{self._at(num)}")
             # the kernel stops at i_size (dir.c last_entry(), lines 38-45 and 142)
             end = min(len(buf), size - lb * self.bs)
             for p in range(0, end - QNX6_DIRENT_SIZE + 1, QNX6_DIRENT_SIZE):
@@ -2149,7 +2207,9 @@ class Qnx6Walker:
                     name = name.replace("/", "%2F")
                 if name not in (".", ".."):
                     out.append((name, de_ino))
-                    self._parent[de_ino] = num
+                    self._parent[de_ino] = (num, name)
+                    if first_listing:
+                        self._names_found[de_ino] = self._names_found.get(de_ino, 0) + 1
         if lost:
             self._folder_short(num, f"{sum(lost.values()):,} of its {need:,} blocks were not read ("
                                     + "; ".join(f"{n:,} with {why}" for why, n in lost.items()) + ")")
@@ -2157,18 +2217,18 @@ class Qnx6Walker:
 
     def entry(self, num):
         ino = self.inode(num)
-        # format bits QNX does not define (0 or 0xF000, as a zeroed or erased sector
-        # leaves them) are no file: not a regular file, and not a special file
-        if not ino or ino["mode"] & S_IFMT not in QNX6_FILE_TYPES:
-            what = ("could not be read" if not ino else "is empty (mode 0)" if not ino["mode"]
-                    else f"has no valid file type (mode {ino['mode']:#06x})")
+        what = "could not be read" if not ino else self._inode_problem(ino)
+        if what:                        # not a file, and not a special file either
             self._not_entries.add(num)
             if num in self._parent:
-                self._folder_short(self._parent[num], f"it names inode {num}, which {what}, so "
-                                                      f"that entry is not listed")
+                self._folder_short(self._parent[num][0],
+                                   f"it names inode {num}, which {what}, so that entry is not "
+                                   f"listed{self._at(num)}")
             else:
                 self.note_damage(f"inode {num}: {what}, so it is not listed")
             return None
+        if ino["nlink"] > 1 and ino["mode"] & S_IFMT != S_IFDIR:
+            self._nlink[num] = ino["nlink"]
         return ino["mode"], ino["size"], ino["mtime"]
 
     def read_file(self, num, size):
@@ -36755,7 +36815,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 if r:
                     candidates.append((off, f"{label} +0x{rel:x}", *r))
 
-        if not any(not c[4] for c in candidates):
+        scanned_image = not any(not c[4] for c in candidates)
+        if scanned_image:
             print(f"  no usable superblock at the kernel's offsets; brute scanning first"
                   f" {scan_limit_mib} MiB ...")
             probed = {c[0] for c in candidates}
@@ -37037,9 +37098,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 if not kind and zf is not None and (only is None or only.lower() in lab.lower()):
                     if lost is not None and not (scanned and scanned["active"][2]["checksum_ok"]
                                                  and b <= scanned["active"][0] < b + sz):
+                        searched = (f" or in the first {scan_limit_mib} MiB" if scanned_image
+                                    else "")
                         why = (f"a qnx6 superblock at byte {lost[0]:,} kept its magic and failed "
-                               f"its checks, and no valid copy was found at the places it names "
-                               f"or in the first {scan_limit_mib} MiB, so this volume was not read")
+                               f"its checks, and no valid copy was found at the places it "
+                               f"names{searched}, so this volume was not read")
                     elif lost is None and b not in placed and b + BOOTBLOCK_SIZE + 512 > size \
                             and _qnx6_boot_second(fh, b):
                         why = (f"a qnx6 boot header at byte {b:,} puts the first superblock at "
@@ -40416,12 +40479,14 @@ def _qnx6_reader_checks():
     def levels_and_loop():
         lv = bytearray(base)
         lv[inode_at(lv, 5) + 100] = 255
-        man, got, _s, tables = run(lv)
+        man, got, _s, _tables = run(lv)
         loop = bytearray(base)
         at = indirect_at(loop, 5)
         struct.pack_into("<I", loop, at + 3 * 4, at // bs - first_blk)
         man2, got2, _s, tables2 = run(loop)
-        return (man[0]["short"] == 1 and "big.bin" not in got and "levels" in tables
+        return (not any(n.startswith("big.bin") for n in got) and man[0].get("folders_not_read") == 1
+                and any("255 pointer levels" in d and d.endswith(": big.bin")
+                        for d in man[0]["damage_first"])
                 and man2[0]["short"] == 1 and "big.bin" not in got2 and "own pointer block" in tables2)
     row("qnx6: impossible pointer levels and a pointer back to its own block are refused",
         levels_and_loop)
@@ -40542,13 +40607,90 @@ def _qnx6_reader_checks():
         linked[at:at + QNX6_DIRENT_SIZE] = struct.pack("<IB", 3, 8) + b"hard.txt".ljust(27, b"\0")
         man3, got3, _s, _t = run(linked)
         return (not got and man[0].get("folders_not_read") == 1
-                and any("counts 6 inodes" in d and "reached 1," in d for d in man[0]["damage_first"])
+                and any("counts 6 inodes" in d and "reached 1:" in d for d in man[0]["damage_first"])
                 and "sub/small.txt" not in got2 and man2[0].get("folders_not_read") == 1
-                and any("counts 6 inodes" in d and "reached 5," in d for d in man2[0]["damage_first"])
+                and any("counts 6 inodes" in d and "reached 5:" in d for d in man2[0]["damage_first"])
                 and got3.get("hard.txt") == want["sub/small.txt"] and not man3[0].get("damage_recorded")
                 and not man3[0].get("folders_not_read"))
-    row("qnx6: a zeroed directory sector is caught by the superblock's inode count and exits "
-        "1, and a hard link does not trip it", dir_sector)
+    row("qnx6: a zeroed directory sector loses its . and .. and exits 1, the inode count "
+        "notes the shortfall, and a hard link does not trip it", dir_sector)
+
+    def unlinked_inode():
+        img = bytearray(base)                       # in use, with no directory entry
+        p = root_entry(img, b"big.bin")
+        img[p:p + QNX6_DIRENT_SIZE] = bytes(QNX6_DIRENT_SIZE)
+        man, got, _s, _t = run(img)
+        keep = {k: v for k, v in want.items() if k != "big.bin"}
+        return (got == keep and not man[0].get("folders_not_read") and _volumes_not_read(man) == 0
+                and any("counts 6 inodes" in d and "open but unlinked" in d
+                        for d in man[0]["damage_first"]))
+    row("qnx6: an inode in use with no name is a counted note and does not change the exit "
+        "status", unlinked_inode)
+
+    def dots_gone():
+        img = bytearray(base)
+        at = block_of(img, 2)
+        img[at:at + 2 * QNX6_DIRENT_SIZE] = bytes(2 * QNX6_DIRENT_SIZE)     # the rest survives
+        man, got, _s, _t = run(img)
+        return (got == want and man[0].get("folders_not_read") == 1
+                and any("no valid . and .." in d and d.endswith(": sub")
+                        for d in man[0]["damage_first"]))
+    row("qnx6: a directory whose first block has no valid . and .. is a folder not read, and "
+        "the record names it", dots_gone)
+
+    def noise_type():
+        unused = bytearray(base)                    # a valid type, not marked in use
+        at = inode_at(unused, 3)
+        struct.pack_into("<H", unused, at + 32, 0x1000 | 0o644)
+        unused[at + 101] = 0
+        man, got, _s, _t = run(unused)
+        deep = bytearray(base)                      # a valid type, impossible levels
+        at = inode_at(deep, 3)
+        struct.pack_into("<H", deep, at + 32, 0xA000 | 0o777)
+        deep[at + 100] = 200
+        man2, got2, _s, _t = run(deep)
+        return all("sub/small.txt" not in g and m[0]["symlinks_or_special_skipped"] == 0
+                   and m[0].get("folders_not_read") == 1
+                   and any(d.endswith(": sub/small.txt") for d in m[0]["damage_first"])
+                   for m, g in ((man, got), (man2, got2)))
+    row("qnx6: an inode not marked in use or with impossible levels is damage, named in the "
+        "record and not counted as special", noise_type)
+
+    def lost_link_name():
+        img = bytearray(base)
+        struct.pack_into("<H", img, inode_at(img, 3) + 34, 2)
+        at = block_of(img, 1) + 512                 # the second name, alone in its sector
+        img[at:at + QNX6_DIRENT_SIZE] = struct.pack("<IB", 3, 8) + b"hardlink".ljust(27, b"\0")
+        man, got, _s, _t = run(img)
+        cut = bytearray(img)
+        cut[at:at + 512] = bytes(512)
+        man2, got2, _s, _t = run(cut)
+        return (got.get("hardlink") == want["sub/small.txt"] and not man[0].get("damage_recorded")
+                and "hardlink" not in got2 and got2.get("sub/small.txt") == want["sub/small.txt"]
+                and not man2[0].get("folders_not_read") and _volumes_not_read(man2) == 0
+                and any("inode 3 records 2 names and 1 were found" in d
+                        and d.endswith("sub/small.txt") for d in man2[0]["damage_first"]))
+    row("qnx6: a hard-link name lost with its sector is a note naming the inode and the "
+        "file's other path", lost_link_name)
+
+    def not_scanned_wording():
+        lost = bytearray(base)
+        lost[0:16] = bytes(16)
+        lost[0x2000 + 4:0x2000 + 512] = bytes(508)
+        lost = bytes(lost) + bytes(1 << 20)
+        one, two = 2048, 2048 + (len(base) + 511) // 512 + 8
+        disk = bytearray(two * 512 + len(lost) + 4096)
+        for i, (lba, data) in enumerate(((one, base), (two, lost))):
+            nsec = (len(data) + 511) // 512
+            disk[446 + 16 * i:462 + 16 * i] = (bytes([0, 0, 0, 0, 0xB1, 0, 0, 0])
+                                               + struct.pack("<II", lba, nsec))
+            disk[lba * 512:lba * 512 + len(data)] = data
+        disk[510:512] = b"\x55\xaa"
+        man, _g, _s, _t = run(disk)
+        errors = [r.get("extract_error", "") for r in man if r.get("extract_error")]
+        return (len(errors) == 1 and "kept its magic" in errors[0]
+                and "at the places it names, so" in errors[0] and "MiB" not in errors[0])
+    row("qnx6: the not-read record names a scan only when the scan ran", not_scanned_wording)
 
     def area_lost():
         for at, serial, known, area in ((second, 10, want_old, "second"), (0x2000, 11, want, "first")):
