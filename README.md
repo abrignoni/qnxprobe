@@ -251,8 +251,9 @@ bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as o
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
-(files that could not be read, which are not in the zip) and, on a
-volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
+(files that could not be read, which are not in the zip), on a
+volume that does, `extends_past_image_by_bytes`, and on an ext volume with something to
+say about the whole volume, `note`. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -313,9 +314,28 @@ back a shorter file with its pages in the wrong order. The two ext fixtures unde
 `tests/fixtures/` hold a hole first, a hole in the middle, a trailing hole past the
 last block, a file that is nothing but hole and a 3 MiB file with data at both ends,
 built with `mke2fs -d` from one tree (`tools/make_ext_fixtures.sh`); the self-test
-requires every one to hash to what `sha256sum` recorded over that tree. A file whose
-data is inline in its inode is read when it fits the inode's 60 bytes and refused,
-by name, when the rest lives in an extended attribute this does not read.
+requires every one to hash to what `sha256sum` recorded over that tree. A file or
+folder whose data is inline in its inode is read from the inode's 60 bytes and its
+`system.data` attribute. Past what those two hold, a file reads as zeros, as it does in
+the kernel. `meta_bg` volumes are read through the descriptor block of each meta group.
+
+Damage on an ext volume is recorded, not read around. A folder that cannot be read in
+full (its inode, a block past the end of the image, a record length that cannot be right)
+is counted in `folders_not_read` and named in `damage_first`, and the run exits 1. So is
+a group descriptor that points off the volume, and each name whose inode that costs gets
+a `FAILED` row. A file whose extent tree or indirect blocks cannot be followed is
+`FAILED` with the reason and is not in the zip, because a lost piece of the map reads
+like a hole and would export as zeros. An indirect block of zeros is treated as lost
+only when `i_blocks` records more blocks than the map reaches. Without that it is a hole.
+
+The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
+says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a
+`note` saying it was read without replaying the journal, so newer committed data may
+exist there. Whether any does is not checked.
+
+A file flagged encrypted (fscrypt) is `FAILED` and its content is not read. A flagged
+folder's names are listed as stored, not decrypted, and the `note` counts those folders.
+This was tested on the flag alone, with no real fscrypt ciphertext.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
@@ -475,7 +495,9 @@ Since 1.76, `times(node)` on the ext2/3/4, APFS and HFS+ walkers gives a file's 
 folder's times in the shape the Btrfs walker already used: a dict of `modified`,
 `accessed`, `changed` and `created`, each `(seconds, nanoseconds)` since 1970-01-01
 UTC or `None` where the volume holds no value, and `None` for a node with no inode or
-record. `entry()` is unchanged.
+record. On ext, `entry()` takes its modified time from this reading, so a date before
+1970 or after 2106 reaches the zip's record as stored. On APFS and HFS+ `entry()` is
+unchanged.
 
 | | modified | accessed | changed | created | also |
 | --- | --- | --- | --- | --- | --- |
