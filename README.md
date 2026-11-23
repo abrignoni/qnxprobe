@@ -369,7 +369,9 @@ than 255 bytes of UTF-8 keeps its start and a short last extension around a hash
 A filesystem volume with anything to record gets `<volume>.exceptions.tsv` beside its
 folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 `exceptions`. It has one row per file that failed, read short or was renamed
-(`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
+(`stored_path`, `zip_member`, `issue`, `detail`), `NAMED_STREAM` rows for what an HFS+ file
+or folder holds beside its data (counted as `named_streams`, not a failure), and
+`TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
@@ -1183,16 +1185,47 @@ into the volume together with a geometry that has to make sense.
 
 What it reads: the catalog B-tree in both its index and leaf forms, forks whose
 fragments outgrew the eight extent descriptors a catalog record holds and continue in
-the extents overflow tree, symbolic links, hard links through the private directory
-the volume keeps their indirect nodes in, and files compressed with the `decmpfs`
-attribute (zlib, LZVN, LZFSE or stored, since 1.74), whether the compressed data sits
-in the attribute or in the resource fork behind a block table. A `--list` names a resource fork that carries
-anything, because that is content the file's own size does not account for. HFSX, the
-case-sensitive variant, is read the same way and reported as itself.
+the extents overflow tree (the catalog's and attributes tree's own forks too), symbolic
+links, hard links through the private directory the volume keeps their indirect nodes
+in, directory hard links, and files compressed with the `decmpfs` attribute (zlib, LZVN,
+LZFSE or stored, since 1.74), whether the compressed data sits in the attribute or in
+the resource fork behind a block table. HFSX, the case-sensitive variant, is read the
+same way and reported as itself. A volume in an Apple Partition Map is found from the
+map's entries, on a disk with no GPT.
+
+A directory hard link is a folder at every name it
+has, with its contents under each, so a path macOS shows is a path in the export. The
+folder also stays where the volume stores it, under `.HFS+ Private Directory Data`. A
+link back into a folder already open on the same path is not followed and is recorded.
+The first name of each linked folder is always listed in full. After 500,000 entries of
+repeated contents a later name lists nothing, and the volume's `note` counts those names.
+
+A resource fork or an extended attribute a user can see is not exported as a member. Each
+file or folder holding any gets one `NAMED_STREAM` row in the exceptions table, with each
+stream's name and size (eight are named, then a count), and `--list` names them.
+`com.apple.decmpfs`, a resource fork holding the file's compressed data and the
+`com.apple.system.*` names are how the volume stores the file, so they are left out. A
+file with an empty data fork and a resource fork stays a 0-byte member with that row.
+
+A pending journal is recorded and not replayed. When a volume was not cleanly unmounted,
+its `note` says so and gives the bytes of transactions the journal holds: newer data may
+exist there, and the listing shows the blocks as stored.
+
+Damage is recorded in `damage_first`. A catalog node that fails its checks does not end a
+listing: the leaves still readable are read by node number, using the tree's own map so a
+freed node's old records are not listed as live, and what could not be read counts in
+`folders_not_read` and makes the exit status 1. A folder whose record is lost is listed
+from its thread record, with no dates, or as `lost-folder-<id>` when that is lost too. A
+fork's extents each stay at their own file offset: a range that cannot be read is zeros,
+the file is named `SHORT`, and its row says which blocks. A primary volume header that is
+not valid is replaced by the alternate at the end of the volume, and the record says so.
 
 Names are given as macOS shows them. The catalog stores a `:` in a name as `/` (a file
 made as `a:b.txt` is stored as `a/b.txt`), and since 1.75 the two are swapped back;
-before, such a name read as a folder `a` holding `b.txt`, which is not on the volume.
+before, such a name read as a folder `a` holding `b.txt`, which is not on the volume. A
+stored `:` would become a `/` inside one name, so it is written `%2F`. A NUL is `%00`, as
+in the private folder `%00%00%00%00HFS+ Private Data`, and a UTF-16 unit that does not
+decode is `%XX` of its stored bytes.
 
 What it does not do: a file compressed with LZBITMAP is listed with its recorded size
 and refuses to be read, naming the method. See
