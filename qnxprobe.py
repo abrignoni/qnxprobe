@@ -3678,7 +3678,10 @@ class ExfatWalker:
                     continue
                 need = (size + self.cluster_bytes - 1) // self.cluster_bytes
                 ok, reason, chain = True, "", None
-                if contiguous:
+                if contiguous and self.cluster_count and first + need > self.cluster_count + 2:
+                    # the length is damaged: listing its clusters could exhaust memory
+                    ok, reason = False, "its recorded length runs past the end of the volume"
+                elif contiguous:
                     chain = list(range(first, first + need))
                 else:
                     chain, c, s2 = [], first, set()
@@ -31991,6 +31994,13 @@ def _exfat_nofatchain_checks():
         return ({e.name for e in listed(free)[0].deleted_files()} == {"OLD", "ONE.TXT", "TWO.TXT"}
                 and {e.name for e in listed(taken)[0].deleted_files()} == {"OLD", "ONE.TXT"})
 
+    def deleted_length_past_volume():
+        gone = _exfat_entry_set("HUGE.BIN", 20, 1 << 56, in_use=False)
+        w, _names = listed(_exfat_run_image(b"".join(sets[:42]) + filler * 2 + gone))
+        found = list(w.deleted_files())
+        return (len(found) == 1 and found[0].name == "HUGE.BIN" and not found[0].recoverable
+                and "past the end of the volume" in found[0].reason)
+
     full = b"".join(sets[:42]) + filler * 2          # one cluster with every slot used
     secret = _exfat_entry_set("secret.txt", 0, 0)
     first42 = [f"big/f{n:03}.txt" for n in range(42)]
@@ -32114,6 +32124,8 @@ def _exfat_nofatchain_checks():
              ran(deleted_later_cluster)),
             ("a deleted NoFatChain folder is read through its free clusters and stops at one "
              "allocated again", ran(deleted_folder_reused)),
+            ("a deleted exFAT entry whose length runs past the volume is listed as not "
+             "recoverable", ran(deleted_length_past_volume)),
             ("an exFAT folder size that is not a whole number of clusters is read to the end "
              "of its last cluster and recorded", ran(size_not_whole_clusters)),
             ("an exFAT folder size too large stops at another entry's first cluster, even one "
