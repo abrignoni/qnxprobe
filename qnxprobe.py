@@ -1866,6 +1866,7 @@ class ExtWalker:
         self._folder_parents = {}
         self._unread = {}                               # (folder, name) -> inode, for unread_entries
         self._encrypted_folders = set()
+        self.encrypted_files = 0                        # set by the export from its table
         self._tables = {}
         self._inodes = collections.OrderedDict()
         notes = []
@@ -1884,9 +1885,14 @@ class ExtWalker:
     def volume_note(self):
         """What the reader says about the volume as a whole, without the damage, or None."""
         parts = list(self._static_notes)
+        if self.encrypted_files:
+            parts.append(f"{self.encrypted_files:,} file(s) are flagged encrypted (fscrypt) and "
+                         "were exported as stored: their content and any encrypted names are "
+                         "not readable without the keys")
         if self._encrypted_folders:
             parts.append(f"{len(self._encrypted_folders):,} folder(s) carry the encrypted flag: "
-                         "their names are shown as stored and were not decrypted")
+                         "the names in them are shown as stored, with %XX where they do not "
+                         "decode, and are not to be read as the real names")
         return "; ".join(parts) or None
 
     @property
@@ -2394,13 +2400,22 @@ class ExtWalker:
             out["created"] = stamp(0x90, 0x94)
         return out
 
+    def valid_data_note(self, node, _held):
+        """("ENCRYPTED", detail) for the exceptions table when this inode carries
+        EXT4_ENCRYPT_FL, else None. The stored bytes are exported, so an examiner who later
+        holds the keys can use them. The flag is all this says: nothing is decrypted."""
+        raw = self.inode(node)
+        if raw and struct.unpack_from("<I", raw, 32)[0] & EXT4_ENCRYPT_FL:
+            return ("ENCRYPTED", "the inode is flagged encrypted (fscrypt) and no key is held: "
+                                 "its content was exported as stored and was not decrypted")
+        return None
+
     def read_file(self, num, size):
-        """Yield the file's bytes, exactly ``size`` of them, holes and all."""
+        """Yield the file's bytes, exactly ``size`` of them, holes and all. A file flagged
+        encrypted is read the same way, as stored (see valid_data_note)."""
         raw = self.inode(num)
         if not raw:
             raise ExtUnreadable(f"inode {num} cannot be read")
-        if struct.unpack_from("<I", raw, 32)[0] & EXT4_ENCRYPT_FL:
-            raise ExtUnreadable("the file is encrypted (fscrypt); its content is not read")
         try:
             runs = self._runs(raw, num, -(-size // self.bs))
         except ExtUnreadable as exc:
@@ -13514,8 +13529,8 @@ def _run_shortfall(w, node):
 
 
 def _valid_data_note(w, node, held):
-    """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength,
-    else None. None for any other walker."""
+    """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength, or
+    an ext file is flagged encrypted, else None. None for any other walker."""
     report = getattr(w, "valid_data_note", None)
     if report is None:
         return None
@@ -14416,8 +14431,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip. The
-    two ValidDataLength counts appear only when not zero and do not change the exit
-    status."""
+    two ValidDataLength counts and the count of files exported as stored because they are
+    flagged encrypted appear only when not zero and do not change the exit status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -14436,8 +14451,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                "renamed": counts["RENAMED"],
                "time_not_held": counts["TIME_NOT_HELD"]}
     for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
-                       ("valid_data_damaged", "VALID_DATA_DAMAGED")):
-        if counts[issue]:                            # neither is a failure or a short read
+                       ("valid_data_damaged", "VALID_DATA_DAMAGED"),
+                       ("encrypted", "ENCRYPTED")):
+        if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
     try:
@@ -14454,6 +14470,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     if name and not quiet:
         valid = ", each exFAT file whose ValidDataLength differs from its size" if (
             counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
+        if counts["ENCRYPTED"]:
+            valid += ", each file flagged encrypted and exported as stored"
         _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
              f"hold: {name}")
 
@@ -28838,7 +28856,8 @@ def _ext_reader_checks():
                     if name.endswith(".exceptions.tsv"):
                         rows += [ln.split("\t") for ln in
                                  zin.read(name).decode("utf-8", "replace").splitlines()[1:]]
-            return done.returncode, rec, rows
+                crcs = {i.filename.split("/", 1)[-1]: (i.CRC, i.file_size) for i in zin.infolist()}
+            return done.returncode, rec, rows, crcs
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -28904,7 +28923,7 @@ def _ext_reader_checks():
         got = export(cut)
         if got is None:
             return None
-        rc, rec, _rows = got
+        rc, rec, _rows, _crcs = got
         return (rc == 1 and rec.get("folders_not_read") == 1 and rec.get("damage_recorded", 0) >= 1
                 and rec.get("extends_past_image_by_bytes") == len(sparse4) - len(cut))
 
@@ -29081,19 +29100,32 @@ def _ext_reader_checks():
         return w.entry(ino)[2] < 0 and w.entry(ino)[2] == w.times(ino)["modified"][0]
 
     def encrypted():
+        """One flagged file in a flagged folder, on a volume whose other files are not."""
         img = bytearray(sparse4)
-        for path in ("dir/tiny.txt",):
-            at = inode_at(img, number(img, path))
-            struct.pack_into("<I", img, at + 32, u32(img, at + 32) | 0x800)
-        folder = inode_at(img, number_of_folder(img, "dir"))
+        at = inode_at(img, number(img, "dir/tiny.txt"))
+        struct.pack_into("<I", img, at + 32, u32(img, at + 32) | 0x800)
+        ino = number_of_folder(img, "dir")
+        folder = inode_at(img, ino)
         struct.pack_into("<I", img, folder + 32, u32(img, folder + 32) | 0x800)
         w = walker(img)
-        ino = next(i for p, i, _s, _m in collect(w, w.root) if p == "dir/tiny.txt")
-        try:
-            read(w, ino, 5)
-        except ExtUnreadable as exc:
-            return "encrypted" in str(exc) and "encrypted flag" in (w.note or "")
-        return False
+        block = w._runs(w.inode(ino))[0][2] * 4096      # pylint: disable=protected-access
+        p = 0
+        while bytes(img[block + p + 8:block + p + 16]) != b"tiny.txt":
+            p += struct.unpack_from("<H", img, block + p + 4)[0]
+        img[block + p + 8:block + p + 16] = b"\xfa\xfb\xfc\xfd\xfe\xff\xf0\xf1"
+        got = export(bytes(img))
+        if got is None:
+            return None
+        rc, rec, rows, crcs = got
+        name = "dir/%FA%FB%FC%FD%FE%FF%F0%F1"
+        marked = [r for r in rows if len(r) > 2 and r[2] == "ENCRYPTED"]
+        note = rec.get("note") or ""
+        return (rc == 0 and crcs.get(name) == (binascii.crc32(b"tiny\n"), 5)
+                and [r[0] for r in marked] == [name] and not rec.get("failed")
+                and (rec.get("exceptions") or {}).get("encrypted") == 1
+                and "1 file(s) are flagged encrypted" in note
+                and "without the keys" in note and "not to be read as the real names" in note
+                and "one_block.bin" in crcs)
 
     def number_of_folder(img, name):
         w = walker(img)
@@ -29115,8 +29147,9 @@ def _ext_reader_checks():
         "no surrogate, and a valid name is unchanged", raw_names)
     row("ext times: the zip date comes from the kernel's reading, so a 1961 mtime is not 2097",
         signed_time)
-    row("ext encryption: a file flagged encrypted is refused and a flagged folder's names are "
-        "marked as stored (flag only: no real fscrypt ciphertext was read)", encrypted)
+    row("ext encryption: on a volume with some files flagged, a flagged file is exported as "
+        "stored with an ENCRYPTED row, its name as %XX, a counted note and exit 0 (flag only: "
+        "nothing is decrypted)", encrypted)
     return out
 
 
@@ -35125,6 +35158,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         issues.extend((p, "", "FAILED", f"its inode ({i:,}) cannot be read, so "
                                        "it is not exported, and if it is a folder neither is "
                                        "anything under it", 1) for p, i, _s, _m in unread)
+                        w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
                         if manifest is not None:
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)
                             manifest.append({

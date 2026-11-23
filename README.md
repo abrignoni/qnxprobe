@@ -335,9 +335,12 @@ says so instead of calling it cleanly unmounted, and its record in `volumes.json
 `note` saying it was read without replaying the journal, so newer committed data may
 exist there. Whether any does is not checked.
 
-A file flagged encrypted (fscrypt) is `FAILED` and its content is not read. A flagged
-folder's names are listed as stored, not decrypted, and the `note` counts those folders.
-The self-test proves this on the flag alone, and nothing here decrypts anything.
+A file flagged encrypted (fscrypt) is exported as stored, so an examiner who later holds
+the keys can still use it. Each one gets an `ENCRYPTED` row in the exceptions table, the
+volume's `exceptions` counts them as `encrypted`, and its `note` gives the count. This
+alone does not change the exit status. A flagged folder's names are shown as stored, with
+`%XX` where they do not decode, and are not the real names. Nothing here decrypts anything,
+and the flag is all the self-test proves.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
