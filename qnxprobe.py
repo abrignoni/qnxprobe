@@ -30885,6 +30885,12 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
     print()
 
 
+def _files_not_exported(manifest):
+    """How many files the run's volumes counted as failed, for the exit status: a zip
+    that opens can still be missing files, and a script may read only the status."""
+    return sum(rec.get("failed") or 0 for rec in manifest or [])
+
+
 def _logical_stream_self_check():
     """An entry stored under a file: the file keeps its name and the entry sits beside it."""
     class Entry:
@@ -36011,6 +36017,10 @@ def self_test():
                 ("an L01, Lx01 or AD1 extracts with unique members, says what read short, "
                  "failed or was left out, and checks the hashes it stores",
                  _logical_self_check()),
+                ("a run that could not export every file is counted for the exit status",
+                 _files_not_exported([{"failed": 2}, {"failed": 0}, {"volume": "v"}]) == 2
+                 and _files_not_exported([{"failed": 0}]) == 0
+                 and _files_not_exported(None) == 0),
                 ("an entry stored under a file leaves the file its own name",
                  _logical_stream_self_check()),
                 *_zip_export_checks(),
@@ -40981,5 +40991,9 @@ if __name__ == "__main__":
             ua_written = [r for r in unalloc_log if r["status"] == "written"]
             print(f"\nwrote free space of {len(ua_written)} of {len(unalloc_log)} volumes to "
                   f"{args.unallocated}  ({sum(r['bytes'] for r in ua_written):,} bytes)")
-    if refused or not zip_whole:
+    not_exported = _files_not_exported(manifest)
+    if not_exported:
+        print(f"\n{not_exported:,} file(s) could not be exported. Each is named in the "
+              f"zip's tables.", file=sys.stderr)
+    if refused or not zip_whole or not_exported:
         sys.exit(1)
