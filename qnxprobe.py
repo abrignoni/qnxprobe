@@ -8151,7 +8151,6 @@ HFSP_BAD_BLOCK_FILE  = 5                # kHFSBadBlockFileID
 HFSP_ATTRIBUTES_FILE = 8                # kHFSAttributesFileID
 HFSP_VOL_UNMOUNTED    = 0x00000100      # kHFSVolumeUnmountedMask
 HFSP_VOL_JOURNALED    = 0x00002000      # kHFSVolumeJournaledMask
-HFSP_VOL_NODES_ZEROED = 0x80000000      # 1 << kHFSUnusedNodeFixBit
 HFSP_ATTR_INLINE, HFSP_ATTR_FORK = 0x10, 0x20    # kHFSPlusAttrInlineData, ForkData
 HFSP_DAMAGE_CAP = 1000                  # items kept in a walker's damage list
 HFSP_STREAMS_NAMED = 8                  # streams named per file in its NAMED_STREAM row
@@ -8268,20 +8267,17 @@ class _HfsNodeDamage(Exception):
 
     def __init__(self, tree, number, why):
         super().__init__(f"{tree.name} B-tree node {number:,}: {why}")
+        self.tree, self.number = tree, number
 
 
 class _HfsTree:
     """One B-tree of the volume, addressed by node number through its own fork.
 
     find() and walk_from() raise _HfsNodeDamage at a node that fails its checks, so a
-    damaged node cannot read as the end of a folder. salvage() then reads every node
-    the tree still has, by number."""
+    damaged node cannot read as the end of a folder."""
 
     def __init__(self, vol, size, extents, name):
         self.vol, self.size, self.extents, self.name = vol, size, extents, name
-        self._scanned = None
-        self.lost_nodes = 0                     # allocated nodes salvage() could not use
-        self.unscanned = None                   # why salvage() could not run, as text
         # the shortest key a record of this tree can have (TN1150: HFSPlusCatalogKey,
         # HFSPlusExtentKey, HFSPlusAttrKey), so a sector of zeros inside a node is not
         # read as records with empty keys
@@ -8497,88 +8493,6 @@ class _HfsTree:
                 yield key, data
             node_no = desc[1]
 
-    def _node_map(self):
-        """The tree's allocation bitmap as bytes (bit set means the node is in use, most
-        significant bit first, TN1150 "Map Record"), from the header node's third record
-        and any map nodes after it, or None when the header node cannot be read."""
-        if not self.header_ok:
-            return None
-        node = self.node(0)
-        if self.problem(node, (HFSP_HEADER,)):
-            return None
-        desc, recs = self.records(node)
-        if len(recs) < 3:
-            return None
-        # a map record has no key: its bytes run between its two offsets
-        at = struct.unpack_from(">H", node, len(node) - 6)[0]
-        end = struct.unpack_from(">H", node, len(node) - 8)[0]
-        bits = bytearray(node[at:end])
-        next_map, seen = desc[1], {0}
-        while next_map and next_map not in seen and next_map < self.node_count:
-            seen.add(next_map)
-            page = self.node(next_map)
-            if self.problem(page, (HFSP_MAP,)):
-                break                           # nodes past this are treated as not in use
-            start = struct.unpack_from(">H", page, len(page) - 2)[0]
-            stop = struct.unpack_from(">H", page, len(page) - 4)[0]
-            bits += page[start:stop]
-            next_map = struct.unpack_from(">I", page, 0)[0]
-        return bytes(bits)
-
-    def _infer_node_size(self):
-        """The node size a damaged header no longer states: the one at which the most nodes
-        pass their checks, over the first 64 nodes of each candidate."""
-        best, best_good = None, 0
-        for size in (4096, 8192, 16384, 32768, 2048, 1024, 512):
-            self.node_size = size
-            good = sum(1 for n in range(1, min(self.node_count, 65))
-                       if self.problem(self.node(n), (HFSP_LEAF, HFSP_INDEX)) is None)
-            if good > best_good:
-                best, best_good = size, good
-        self.node_size = best or 4096
-        return best is not None
-
-    def salvage(self, key_of):
-        """Every leaf record that can still be read, in key order, found by node number
-        rather than through the index or the leaf chain.
-
-        A node that is not in use can keep old records, which must not read as live ones.
-        The tree's own map says which nodes are in use. With the map lost, only a catalog
-        whose volume sets kHFSUnusedNodeFixBit (its unused nodes were zero-filled,
-        hfs_format.h) can be scanned; any other tree then gives nothing and ``unscanned``
-        says why."""
-        if self._scanned is not None:
-            return self._scanned
-        self._scanned = out = []
-        bitmap = self._node_map()
-        if bitmap is None:
-            if self.name != "catalog" or not self.vol.attributes & HFSP_VOL_NODES_ZEROED:
-                self.unscanned = (f"the {self.name} tree's header or map is damaged and the "
-                                  "volume does not record that its unused nodes were zeroed, "
-                                  "so a live node cannot be told from an old one")
-                return out
-            if not self.header_ok and not self._infer_node_size():
-                self.unscanned = f"no {self.name} node passes its checks at any node size"
-                return out
-        leaves = []
-        for number in range(1, self.node_count):
-            if bitmap is not None and not (number >> 3 < len(bitmap)
-                                           and bitmap[number >> 3] & (0x80 >> (number & 7))):
-                continue
-            node = self.node(number)
-            if self.problem(node, (HFSP_LEAF, HFSP_INDEX, HFSP_MAP)):
-                if bitmap is not None or any(node):
-                    self.lost_nodes += 1
-                continue
-            desc, recs = self.records(node)
-            if desc[0] == HFSP_LEAF and recs:
-                first = key_of(recs[0][0])
-                leaves.append((first is None, first if first is not None else 0, number, recs))
-        leaves.sort(key=lambda leaf: leaf[:3])
-        for leaf in leaves:
-            out.extend(leaf[3])
-        return out
-
 
 class HfsPlusWalker:
     """List and read files from an HFS+ or HFSX volume, same interface as the
@@ -8608,8 +8522,10 @@ class HfsPlusWalker:
     and is counted in ``note``, so nested links cannot multiply a listing without
     bound. The first name of each folder is always listed in full.
 
-    ``damage`` records what failed a check, and ``folders_not_read`` counts the catalog
-    nodes whose records could not be read, so a loss is never an empty listing.
+    A B-tree node that fails its checks is never read as the end of a folder. The walk
+    keeps what it reached and nothing is rebuilt from raw nodes. ``damage`` records what
+    failed, and ``folders_not_read`` counts the folders whose listing stopped at a damaged
+    node and is at least 1 when any tree node a read needed could not be used.
     """
 
     root = HFSP_ROOT
@@ -8640,9 +8556,6 @@ class HfsPlusWalker:
             self._attrs = _HfsTree(self, *_hfs_fork(vh, 352), "attributes")
         except (ValueError, struct.error):
             self._attrs = None                 # a volume with no attributes tree
-        for tree in (self._extents, self._attrs):
-            if tree is not None and not tree.header_ok:
-                self._damaged(f"the {tree.name} tree's header node is not valid")
         self.catalog_node_size = self._catalog.node_size
         self.catalog_depth = self._catalog.depth
         self._cache = {}
@@ -8653,11 +8566,9 @@ class HfsPlusWalker:
         self._dangling = set()
         self._map_short = {}
         self._checked = False
-        self._salvaged = None                  # parent id -> children, once the catalog is damaged
-        self._salvaged_ids = {}
-        self._extent_salvage = None
-        self._attr_salvage = None
-        self._attrs_lost = False
+        self._cut_folders = set()              # folders whose listing stopped at a damaged node
+        self._tree_faults = set()              # (tree, node) already recorded
+        self._attr_cut = set()                 # ids whose attribute lookup met a damaged node
         self._folder_names = {}                # folder id -> (parent id, name), for stream_rows
         self._link_vnodes = {}                 # node past the base -> (id, open folders, repeat, shut)
         self._link_keys = {}
@@ -8665,6 +8576,11 @@ class HfsPlusWalker:
         self._link_repeated = 0
         self._links_held = set()
         self._journal_note = self._journal_state()
+        for tree in (self._extents, self._attrs):
+            if tree is not None and not tree.header_ok:
+                # counted as a loss only when a read needs this tree (_tree_fault)
+                self._tree_faults.add((tree.name, 0))
+                self._damaged(f"the {tree.name} tree's header node is not valid")
         for tree, cnid in ((self._catalog, HFSP_CATALOG_FILE), (self._attrs, HFSP_ATTRIBUTES_FILE)):
             if tree is None:
                 continue
@@ -8683,6 +8599,15 @@ class HfsPlusWalker:
             self.damage.append(text)
         elif len(self.damage) == HFSP_DAMAGE_CAP:
             self.damage.append(f"more damage than the {HFSP_DAMAGE_CAP:,} items listed here")
+
+    def _tree_fault(self, exc, detail=None):
+        """A B-tree node a read needed could not be used: record it once, and count that
+        what it held may be lost."""
+        key = (exc.tree.name, exc.number)
+        if key not in self._tree_faults:
+            self._tree_faults.add(key)
+            self._damaged(f"{exc}; what it holds is not read" + (f" ({detail})" if detail else ""))
+        self.folders_not_read = max(self.folders_not_read, 1)
 
     def _journal_state(self):
         """Text for ``note`` when the volume was not cleanly unmounted or its journal holds
@@ -8755,27 +8680,29 @@ class HfsPlusWalker:
     def _cat_parent(key):
         return struct.unpack_from(">I", key, 0)[0] if len(key) >= 4 else None
 
-    @staticmethod
-    def _cat_sort(key):
-        """A catalog key's place among leaves when the tree's own order cannot be used."""
-        return (struct.unpack_from(">I", key, 0)[0], key[6:]) if len(key) >= 6 else None
-
     def _check_catalog(self):
         """Once, before the first listing: walk the leaf chain and compare what it holds
         with the tree header's record count and the volume header's file and folder counts
-        (which leave out the root folder, TN1150). A chain that does not hold what the
-        header says moves the walker to salvage, so nothing is lost to a broken link."""
+        (which leave out the root folder, TN1150). What does not agree is recorded."""
         if self._checked:
             return
         self._checked = True
         tree = self._catalog
         if not tree.header_ok:
-            self._salvage_catalog("the catalog tree's header node is damaged")
+            self._tree_fault(_HfsNodeDamage(tree, 0, "the tree's header node is not valid"))
             return
         records = files = folders = fork_blocks = 0
+        last_parent = 0
         try:
-            for _key, data in tree.walk_from(tree.first_leaf):
+            for key, data in tree.walk_from(tree.first_leaf):
                 records += 1
+                parent = self._cat_parent(key)
+                if parent is not None:
+                    if parent < last_parent:
+                        self._damaged(f"the catalog's leaf chain goes back from parent id "
+                                      f"{last_parent:,} to {parent:,}, so its order is damaged")
+                        self.folders_not_read = max(self.folders_not_read, 1)
+                    last_parent = max(last_parent, parent)
                 if len(data) >= 2:
                     kind = struct.unpack_from(">H", data, 0)[0]
                     files += kind == HFSP_FILE
@@ -8783,17 +8710,20 @@ class HfsPlusWalker:
                     if kind == HFSP_FILE and len(data) >= 248:
                         fork_blocks += self._check_forks(data)
         except _HfsNodeDamage as exc:
-            self._salvage_catalog(str(exc))
+            self._tree_fault(exc, f"{records:,} of the {tree.leaf_records:,} leaf records the "
+                                  "tree header counts were read before it")
             return
         if records != tree.leaf_records:
-            self._salvage_catalog(f"the catalog's leaf chain holds {records:,} records and its "
-                                  f"header records {tree.leaf_records:,}")
+            self._damaged(f"the catalog's leaf chain holds {records:,} records and its header "
+                          f"records {tree.leaf_records:,}")
+            self.folders_not_read = max(self.folders_not_read, 1)
             return
         if (self.alternate_header is None and self.attributes & HFSP_VOL_UNMOUNTED
                 and (files, folders - 1) != (self.file_count, self.folder_count)):
             self._damaged(f"the catalog holds {files:,} files and {max(folders - 1, 0):,} "
                           f"folders besides the root, and the volume header records "
                           f"{self.file_count:,} and {self.folder_count:,}")
+            self.folders_not_read = max(self.folders_not_read, 1)
         if self.alternate_header is None and self.attributes & HFSP_VOL_UNMOUNTED:
             self._check_allocation(fork_blocks)
 
@@ -8809,6 +8739,7 @@ class HfsPlusWalker:
             if size > blocks * self.block_size:
                 self._damaged(f"catalog id {cnid}: its {label} fork records {size:,} bytes in "
                               f"{blocks:,} blocks, which cannot hold them")
+                self.folders_not_read = max(self.folders_not_read, 1)
         return total
 
     def _check_allocation(self, fork_blocks):
@@ -8834,101 +8765,14 @@ class HfsPlusWalker:
                         counted += sum(struct.unpack_from(">I", data, 4 + 8 * i)[0]
                                        for i in range(min(len(data) // 8, 8)))
         except _HfsNodeDamage as exc:
-            self._damaged(f"{exc}: the volume's allocated blocks could not be accounted for")
+            self._tree_fault(exc, "the volume's allocated blocks could not be accounted for")
             return
         used = self.total_blocks - self.free_blocks
         if counted != used:
             self._damaged(f"the volume header counts {used:,} blocks in use and its forks "
                           f"account for {counted:,}, so a file or attribute record may be "
                           "damaged")
-
-    def _salvage_catalog(self, why):
-        """Rebuild the listing from every catalog leaf that can still be read.
-
-        A folder whose own record is lost keeps its contents: its thread record names it
-        and its parent. One with neither is listed under the root as lost-folder-<id>.
-        A file whose record is lost has lost its extents, so it is named in ``damage``."""
-        if self._salvaged is not None:
-            return
-        tree = self._catalog
-        self._salvaged = by_parent = {}
-        records = tree.salvage(self._cat_sort)
-        ids, threads, files, folders = {}, {}, 0, 0
-        for key, data in records:
-            parent = self._cat_parent(key)
-            if parent is None or len(data) < 2:
-                continue
-            kind = struct.unpack_from(">H", data, 0)[0]
-            if kind in (HFSP_FOLDER, HFSP_FILE) and len(data) >= 12:
-                name, bad = _hfs_key_name(key)
-                child = struct.unpack_from(">I", data, 8)[0]
-                if bad:
-                    self._damaged(f"catalog id {child}: {bad}")
-                if not name:
-                    name = f"catalog-id-{child}"
-                if child in ids:
-                    self._damaged(f"catalog id {child} is named by two records; the second, "
-                                  f"{name!r}, is not listed")
-                    continue
-                ids[child] = data
-                by_parent.setdefault(parent, []).append((name, child, data))
-                self._note_private(parent, key, child)
-                files += kind == HFSP_FILE
-                folders += kind == HFSP_FOLDER
-            elif kind in (HFSP_FOLDER_THREAD, HFSP_FILE_THREAD) and len(data) >= 10:
-                threads[parent] = (kind, struct.unpack_from(">I", data, 4)[0],
-                                   _hfs_name(data, 8, posix=True)[0], data)
-        for cnid, (kind, owner, name, _data) in sorted(threads.items()):
-            if cnid in ids or cnid == HFSP_ROOT:
-                continue
-            if kind == HFSP_FILE_THREAD:
-                self._damaged(f"catalog id {cnid} ({name!r}, in folder {owner}): its file "
-                              "record is lost, and its extents with it")
-                continue
-            # the record of a folder, as the thread gives it: no dates, no owner
-            made = struct.pack(">HHII", HFSP_FOLDER, 0, 0, cnid) + bytes(76)
-            ids[cnid] = made
-            by_parent.setdefault(owner, []).append((name or f"catalog-id-{cnid}", cnid, made))
-            self._damaged(f"catalog id {cnid} ({name!r}): its folder record is lost, so it is "
-                          "listed from its thread record, with no dates")
-        reached, queue = {HFSP_ROOT}, [HFSP_ROOT]
-        while queue:
-            for _n, child, _d in by_parent.get(queue.pop(), ()):
-                if child not in reached:
-                    reached.add(child)
-                    queue.append(child)
-        for parent in sorted(by_parent):
-            if parent in reached or parent == HFSP_ROOT_PARENT:
-                continue
-            made = struct.pack(">HHII", HFSP_FOLDER, 0, 0, parent) + bytes(76)
-            ids[parent] = made
-            by_parent.setdefault(HFSP_ROOT, []).append((f"lost-folder-{parent}", parent, made))
-            self._damaged(f"folder {parent}: neither its record nor its thread can be read, so "
-                          f"what it holds is listed under lost-folder-{parent}")
-            reached.add(parent)
-            queue = [parent]
-            while queue:
-                for _n, child, _d in by_parent.get(queue.pop(), ()):
-                    if child not in reached:
-                        reached.add(child)
-                        queue.append(child)
-        self._salvaged_ids = ids
-        lost = None
-        if tree.unscanned:
-            lost = tree.unscanned
-        elif tree.header_ok and tree.leaf_records and len(records) < tree.leaf_records:
-            lost = (f"{tree.leaf_records - len(records):,} of the {tree.leaf_records:,} leaf "
-                    "records could not be read")
-        elif (not tree.header_ok and self.alternate_header is None
-              and (files < self.file_count or folders - 1 < self.folder_count)):
-            lost = (f"{files:,} files and {max(folders - 1, 0):,} folders could be read of the "
-                    f"{self.file_count:,} and {self.folder_count:,} the volume header records")
-        if lost:
-            self.folders_not_read += max(tree.lost_nodes, 1)
-            self._damaged(f"{why}: {lost}")
-        else:
-            self._damaged(f"{why}: the listing was rebuilt from each node by number, and "
-                          "its records match what the headers count")
+            self.folders_not_read = max(self.folders_not_read, 1)
 
     def _note_private(self, parent, key, child):
         """Remember the two private folders by the name they are stored under."""
@@ -8943,13 +8787,6 @@ class HfsPlusWalker:
     def _children(self, cnid):
         """[(name, child cnid, record)] for one folder, from the catalog."""
         self._check_catalog()
-        if self._salvaged is not None:
-            out = list(self._salvaged.get(cnid, ()))
-            for name, child, data in out:
-                self._cache[child] = data
-                if struct.unpack_from(">H", data, 0)[0] == HFSP_FOLDER:
-                    self._folder_names[child] = (cnid, name)
-            return out
         out = []
         try:
             node = self._catalog.find(cnid, self._cat_parent)
@@ -8979,8 +8816,12 @@ class HfsPlusWalker:
                     self._folder_names[child] = (cnid, name)
                 out.append((name, child, data))
         except _HfsNodeDamage as exc:
-            self._salvage_catalog(str(exc))
-            return self._children(cnid)
+            self._tree_fault(exc)
+            if cnid not in self._cut_folders:
+                self._cut_folders.add(cnid)
+                self.folders_not_read = max(self.folders_not_read, len(self._cut_folders))
+                self._damaged(f"folder {cnid}: {len(out):,} entries were read before {exc}, so "
+                              "the rest of this folder may be missing")
         return out
 
     def _record(self, cnid):
@@ -8990,8 +8831,6 @@ class HfsPlusWalker:
         if got is not None:
             return got
         self._check_catalog()
-        if self._salvaged is not None:
-            return self._salvaged_ids.get(cnid)
         try:
             node = self._catalog.find(cnid, self._cat_parent)
             if node is None:
@@ -9010,8 +8849,7 @@ class HfsPlusWalker:
                         if child_name == name and child == cnid:
                             return rec
         except _HfsNodeDamage as exc:
-            self._salvage_catalog(str(exc))
-            return self._salvaged_ids.get(cnid)
+            self._tree_fault(exc)
         return None
 
     def _private_dir(self):
@@ -9134,33 +8972,21 @@ class HfsPlusWalker:
             file_id, start = struct.unpack_from(">II", key, 2)
             return (file_id, fork_type, start)
 
-        if self._extent_salvage is None:
-            try:
-                node = self._extents.find(want, key_of)
-                if node is None:
-                    return []
-                out = []
-                for key, data in self._extents.walk_from(node):
-                    k = key_of(key)
-                    if k is None or k < want:
-                        continue
-                    if k[1] != fork or k[0] != cnid:
-                        break
-                    out.append((k[2], data))
-                return out
-            except _HfsNodeDamage as exc:
-                self._extent_salvage = {}
-                for key, data in self._extents.salvage(key_of):
-                    k = key_of(key)
-                    if k is not None:
-                        self._extent_salvage.setdefault(k[:2], []).append((k[2], data))
-                for rows in self._extent_salvage.values():
-                    rows.sort(key=lambda r: r[0])
-                self._damaged(f"{exc}: the extents overflow tree was read by node number"
-                              + (f" ({self._extents.unscanned})" if self._extents.unscanned
-                                 else f", and {self._extents.lost_nodes:,} of its nodes "
-                                      "could not be used"))
-        return list(self._extent_salvage.get((cnid, fork), ()))
+        out = []
+        try:
+            node = self._extents.find(want, key_of)
+            if node is None:
+                return []
+            for key, data in self._extents.walk_from(node):
+                k = key_of(key)
+                if k is None or k < want:
+                    continue
+                if k[1] != fork or k[0] != cnid:
+                    break
+                out.append((k[2], data))
+        except _HfsNodeDamage as exc:
+            self._tree_fault(exc)               # what follows is a range with no extents
+        return out
 
     def _overflow(self, cnid, resource=False, first=None):
         """The extents a fork continues into, from the extents overflow tree.
@@ -9243,8 +9069,9 @@ class HfsPlusWalker:
 
     # -- attributes --------------------------------------------------------
     def _attr_records(self, cnid):
-        """[(name, record data)] of one file's attributes tree records, or [] with
-        ``_attrs_lost`` set when the tree is damaged and they may be among the lost."""
+        """[(name, record data)] of one file's attributes tree records. When the lookup
+        meets a damaged node, what it reached is returned and the id goes in ``_attr_cut``,
+        because its other attributes may be among what was lost."""
         if self._attrs is None:
             return []
 
@@ -9253,37 +9080,26 @@ class HfsPlusWalker:
                 return None
             return struct.unpack_from(">I", key, 2)[0]
 
-        if self._attr_salvage is None:
-            try:
-                node = self._attrs.find(cnid, key_of)
-                if node is None:
-                    return []
-                out = []
-                for key, data in self._attrs.walk_from(node):
-                    k = key_of(key)
-                    if k is None or k < cnid:
-                        continue
-                    if k > cnid:
-                        break
-                    # HFSPlusAttrKey with its length word already stripped: pad, file
-                    # id, start block, then the name's length in UTF-16 units at 10 and
-                    # the name itself at 12.
-                    if len(key) >= 12:
-                        out.append((_hfs_name(key, 10)[0], data))
-                return out
-            except _HfsNodeDamage as exc:
-                self._attr_salvage = {}
-                for key, data in self._attrs.salvage(key_of):
-                    k = key_of(key)
-                    if k is not None and len(key) >= 12:
-                        self._attr_salvage.setdefault(k, []).append((_hfs_name(key, 10)[0], data))
-                if self._attrs.unscanned or self._attrs.lost_nodes:
-                    self._attrs_lost = True
-                self._damaged(f"{exc}: the attributes tree was read by node number"
-                              + (f" ({self._attrs.unscanned})" if self._attrs.unscanned
-                                 else f", and {self._attrs.lost_nodes:,} of its nodes could "
-                                      "not be used"))
-        return list(self._attr_salvage.get(cnid, ()))
+        out = []
+        try:
+            node = self._attrs.find(cnid, key_of)
+            if node is None:
+                return []
+            for key, data in self._attrs.walk_from(node):
+                k = key_of(key)
+                if k is None or k < cnid:
+                    continue
+                if k > cnid:
+                    break
+                # HFSPlusAttrKey with its length word already stripped: pad, file
+                # id, start block, then the name's length in UTF-16 units at 10 and
+                # the name itself at 12.
+                if len(key) >= 12:
+                    out.append((_hfs_name(key, 10)[0], data))
+        except _HfsNodeDamage as exc:
+            self._tree_fault(exc)
+            self._attr_cut.add(cnid)
+        return out
 
     def _xattr(self, cnid, name):
         """One extended attribute's bytes, or None. Only the inline form is
@@ -9582,7 +9398,7 @@ class HfsPlusWalker:
         if blob:
             yield from self._read_compressed(target, rec, blob)
             return
-        if len(rec) >= 42 and rec[41] & UF_COMPRESSED and self._attrs_lost:
+        if len(rec) >= 42 and rec[41] & UF_COMPRESSED and target in self._attr_cut:
             raise HfsUnreadable("the file is flagged compressed and the attributes tree that "
                                 "holds its compression record is damaged")
         fork_size, extents = self._fork(target, rec)
@@ -35833,6 +35649,24 @@ def _hfs_reader_checks():
     def body(w, node):
         return b"".join(w.read_file(node, None))
 
+    def lost(w):
+        return getattr(w, "folders_not_read", 0)
+
+    def note(w):
+        return getattr(w, "volume_note", None) or ""
+
+    def identified(fh, size):
+        try:
+            return identify_hfsplus(fh, 0, size)
+        except TypeError:                            # a reader that takes no region size
+            return identify_hfsplus(fh, 0)
+
+    def opened(fh, size):
+        try:
+            return HfsPlusWalker(fh, 0, size)
+        except TypeError:
+            return HfsPlusWalker(fh, 0)
+
     def export(img):
         w = walker(img)
         ents = collect(w, w.root)
@@ -35936,7 +35770,7 @@ def _hfs_reader_checks():
             w = walker(v.image())
             paths = {p for p, _n, _s, _m in collect(w, w.root)}
             first = {"l1/one.txt", "l1/two.txt"} <= paths
-            return first and "l4/one.txt" not in paths and "later name" in (w.volume_note or "")
+            return first and "l4/one.txt" not in paths and "later name" in note(w)
         finally:
             globals()["HFSP_LINK_REPEAT_LIMIT"] = kept
     row("HFS+: repeated directory link contents stop at a limit, the first name kept whole",
@@ -35958,32 +35792,38 @@ def _hfs_reader_checks():
 
     def journal_recorded():
         w = journal_note(12288)
-        note = w.volume_note or ""
-        return ("not cleanly unmounted" in note and "12,288 bytes" in note
-                and "not replayed" in note and "newer data" in note and w.note == note)
+        said = note(w)
+        return ("not cleanly unmounted" in said and "12,288 bytes" in said
+                and "not replayed" in said and "newer data" in said
+                and getattr(w, "note", None) == said)
     row("HFS+: a pending journal is recorded with its size and is not replayed", journal_recorded)
 
     def journal_empty():
-        note = journal_note(0).volume_note or ""
-        return "not cleanly unmounted" in note and "nothing pending" in note
+        said = note(journal_note(0))
+        return "not cleanly unmounted" in said and "nothing pending" in said
     row("HFS+: an unclean volume whose journal holds nothing says so", journal_empty)
 
     def damaged_leaf():
         v = _HfsTestVolume(4096)
         names = many(v)
+        # created last, so its contents sort after the leaf this damages, and named so its
+        # own record sorts before it
+        early = v.folder(HFSP_ROOT, "aaa")
+        v.file(early, "after.txt", b"past the damage")
         img = v.image()
-        leaves = len(v.nodes["catalog"]) - 2
-        hit = leaves // 2
+        hit = (len(v.nodes["catalog"]) - 2) // 2
         at = v.node_at("catalog", hit)
-        lost = {n for n, _k in walker(img).listdir(HFSP_ROOT)}
+        before = {n for n, _k in walker(img).listdir(HFSP_ROOT)}
         img[at:at + block] = bytes(block)
         w = walker(img)
-        got = {n for n, _c in w.listdir(HFSP_ROOT)}
-        after = sum(1 for n in names if n in got)
-        return (leaves >= 3 and 0 < len(lost - got) < 120 and after > 450
-                and "file0599.txt" in got and w.folders_not_read >= 1 and w.damage)
-    row("HFS+: a zeroed catalog leaf loses only its own records, and the loss is recorded",
-        damaged_leaf)
+        kids = dict(w.listdir(HFSP_ROOT))
+        kept = [n for n in names if n in kids]
+        inside = dict(w.listdir(kids["aaa"])) if "aaa" in kids else {}
+        return (0 < len(kept) < len(names) and set(kids) < before
+                and "after.txt" in inside and body(w, inside["after.txt"]) == b"past the damage"
+                and lost(w) >= 1 and any("may be missing" in d for d in w.damage))
+    row("HFS+: a zeroed catalog leaf stops that folder with a record, and a folder past it "
+        "is still read", damaged_leaf)
 
     def zeroed_sector():
         v = _HfsTestVolume(4096)
@@ -35995,48 +35835,20 @@ def _hfs_reader_checks():
         img[at + 1536:at + 2048] = bytes(512)
         w = walker(img)
         got = {n for n, _c in w.listdir(HFSP_ROOT)}
-        return got < before and w.folders_not_read >= 1 and w.damage
+        return got < before and lost(w) >= 1 and w.damage
     row("HFS+: one zeroed sector inside a catalog leaf is recorded as a loss", zeroed_sector)
 
     def damaged_header():
         v = _HfsTestVolume(4096)
-        names = many(v)
+        many(v)
         img = v.image()
         at = v.node_at("catalog", 0)
         img[at:at + block] = bytes(block)
         w = walker(img)
-        got = {n for n, _c in w.listdir(HFSP_ROOT)}
-        return set(names) <= got and w.damage and not w.folders_not_read
-    row("HFS+: a zeroed catalog header node still lists every record, by node number",
-        damaged_header)
-
-    def header_unproven():
-        v = _HfsTestVolume(4096)
-        many(v, 100)
-        v.attributes = _HT_UNMOUNTED          # no record that free nodes were zeroed
-        img = v.image()
-        at = v.node_at("catalog", 0)
-        img[at:at + block] = bytes(block)
-        w = walker(img)
-        return w.listdir(HFSP_ROOT) == [] and w.folders_not_read >= 1 and any(
-            "cannot be told" in d for d in w.damage)
-    row("HFS+: with its map lost and free nodes not known to be zeroed, a catalog is refused "
-        "and recorded rather than scanned", header_unproven)
-
-    def lost_parent():
-        v = _HfsTestVolume(4096)
-        keep = v.folder(HFSP_ROOT, "kept")
-        for i in range(300):
-            v.file(keep, f"child{i:03}.txt", b"c")
-        img = v.image()
-        at = v.node_at("catalog", 1)           # the first leaf: the folder's record and thread
-        img[at:at + block] = bytes(block)
-        w = walker(img)
-        got = tree(w)
-        return (w.folders_not_read >= 1 and any("/child" in p for p in got)
-                and any(p.startswith(("kept/", f"lost-folder-{keep}/")) for p in got))
-    row("HFS+: a folder whose record is lost keeps what it holds, in its place or under "
-        "lost-folder-<id>", lost_parent)
+        return w.listdir(HFSP_ROOT) == [] and lost(w) >= 1 and any(
+            "header node" in d for d in w.damage)
+    row("HFS+: a zeroed catalog header node is recorded as a loss, not read as an empty "
+        "volume", damaged_header)
 
     def count_check():
         v = _HfsTestVolume()
@@ -36044,7 +35856,7 @@ def _hfs_reader_checks():
         v.files += 5
         w = walker(v.image())
         w.listdir(HFSP_ROOT)
-        return any("volume header records" in d for d in w.damage)
+        return lost(w) >= 1 and any("volume header records" in d for d in w.damage)
     row("HFS+: catalog totals that differ from the volume header are recorded", count_check)
 
     def tail_of_last_record():
@@ -36056,7 +35868,7 @@ def _hfs_reader_checks():
         img[at + 88:at + 248] = bytes(160)       # both forks, as a zeroed sector would leave them
         w = walker(img)
         w.listdir(HFSP_ROOT)
-        return any("blocks in use" in d for d in w.damage)
+        return lost(w) >= 1 and any("blocks in use" in d for d in w.damage)
     row("HFS+: a file record zeroed past its key, last in its node, is caught by the "
         "volume's block count", tail_of_last_record)
 
@@ -36181,11 +35993,11 @@ def _hfs_reader_checks():
         img = v.image()
         img[HFSP_VH_OFF:HFSP_VH_OFF + 512] = bytes(512)
         fh = io.BytesIO(bytes(img))
-        kind = identify_hfsplus(fh, 0, len(img))
-        w = HfsPlusWalker(fh, 0, len(img))
-        return (kind is not None and body(w, cnid) == b"survives"
-                and any("alternate" in d for d in w.damage)
-                and "not cleanly" not in (w.volume_note or ""))
+        if identified(fh, len(img)) is None:
+            return False
+        w = opened(fh, len(img))
+        return (body(w, cnid) == b"survives" and any("alternate" in d for d in w.damage)
+                and "not cleanly" not in note(w))
     row("HFS+: a damaged primary header falls back to the alternate and says so", alternate)
 
     def alternate_needs_its_end():
@@ -36194,8 +36006,8 @@ def _hfs_reader_checks():
         img = v.image()
         img[HFSP_VH_OFF:HFSP_VH_OFF + 512] = bytes(512)
         grown = bytes(img) + bytes(block)
-        return (identify_hfsplus(io.BytesIO(bytes(img)), 0, len(img)) is not None
-                and identify_hfsplus(io.BytesIO(grown), 0, len(grown)) is None)
+        return (identified(io.BytesIO(bytes(img)), len(img)) is not None
+                and identified(io.BytesIO(grown), len(grown)) is None)
     row("HFS+: an alternate header counts only at the end of the volume it describes",
         alternate_needs_its_end)
 
@@ -36227,14 +36039,14 @@ def _hfs_reader_checks():
             struct.pack_into(">I", img, at, max(mid - 2, 1))
         w = walker(img)
         kids = w.listdir(HFSP_ROOT)
-        return len(kids) == len({c for _n, c in kids}) and w.damage
+        return len(kids) == len({c for _n, c in kids}) and lost(w) >= 1 and w.damage
     row("HFS+: a leaf linked to itself ends the listing and is recorded", lambda: chain("self"))
     row("HFS+: a cycle in the leaf chain lists nothing twice and is recorded",
         lambda: chain("cycle"))
 
     def short_index():
         v = _HfsTestVolume(4096)
-        names = many(v)
+        many(v)
         img = v.image()
         root = len(v.nodes["catalog"]) - 1
         at = v.node_at("catalog", root)
@@ -36242,8 +36054,8 @@ def _hfs_reader_checks():
         second = struct.unpack_from(">H", img, at + block - 4)[0]
         struct.pack_into(">H", img, at + first, second - first - 2)
         w = walker(img)
-        return set(names) <= {n for n, _c in w.listdir(HFSP_ROOT)} and w.damage
-    row("HFS+: one short index record does not stop the listing", short_index)
+        return w.listdir(HFSP_ROOT) == [] and lost(w) >= 1 and w.damage
+    row("HFS+: one short index record is recorded and does not stop the run", short_index)
 
     def apm_image(entry_type=b"Apple_partition_map"):
         v = _HfsTestVolume(256)
@@ -36268,16 +36080,16 @@ def _hfs_reader_checks():
         fh = io.BytesIO(disk)
         regions = partition_regions(fh, len(disk))[0]
         hits = [r for r in regions if r[1] == 64 * 512]
-        w = HfsPlusWalker(fh, 64 * 512, hits[0][2]) if hits else None
-        return (len(hits) == 1 and hits[0][2] == 256 * block
-                and identify_hfsplus(fh, 64 * 512) is not None and body(w, cnid) == b"partitioned")
-    row("HFS+: a volume in an Apple Partition Map is found at its entry's offset", apm_found)
-
-    def apm_refused():
-        disk, _c = apm_image(b"NotAMapEntry")
-        return (parse_apm(io.BytesIO(disk)) == []
-                and parse_apm(io.BytesIO(b"PM" + bytes(4096))) == [])
-    row("HFS+: bytes that only look like a partition map are not read as one", apm_refused)
+        if len(hits) != 1 or hits[0][2] != 256 * block:
+            return False
+        w = HfsPlusWalker(fh, 64 * 512)
+        fake = apm_image(b"NotAMapEntry")[0]
+        for other in (fake, b"PM" + bytes(1 << 16)):
+            if any(r[1] == 64 * 512 for r in partition_regions(io.BytesIO(other), len(other))[0]):
+                return False
+        return identify_hfsplus(fh, 64 * 512) is not None and body(w, cnid) == b"partitioned"
+    row("HFS+: a volume in an Apple Partition Map is found at its entry's offset, and bytes "
+        "that only look like a map are not read as one", apm_found)
 
     def streams():
         v = _HfsTestVolume()
@@ -36333,8 +36145,30 @@ def _hfs_reader_checks():
     row("HFS+: NAMED_STREAM rows are counted apart and are not failures", counted_table)
 
     def stream_row_survives():
-        rows = [("a", "v/a", "NAMED_STREAM", "d", 1), ("b", "v/b", "SHORT", "d", 1)]
-        return _zip_rows_without(rows, {"v/a", "v/b"}) == [("a", "", "NAMED_STREAM", "d", 1)]
+        v = _HfsTestVolume()
+        for name in ("a.txt", "b.txt"):
+            v.xattr(v.file(HFSP_ROOT, name, b"x" * 200), "user.k", b"1")
+        w = walker(v.image())
+        ents = collect(w, w.root)
+        issues, log = [], []
+        real = globals()["_zip_room"]
+        globals()["_zip_room"] = lambda zf, wanted: wanted if len(zf.filelist) <= 1 else 0
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                zf = _zip_create(os.path.join(tmp, "o.zip"))
+                try:
+                    extract_to_zip(zf, w, "v", ents, log, issues=issues)
+                finally:
+                    globals()["_zip_room"] = real
+                    try:
+                        _zip_close(zf)
+                    except Exception:                # pylint: disable=broad-except
+                        pass
+        finally:
+            globals()["_zip_room"] = real
+        taken = {r[0] for r in issues if r[2] == "FAILED"}
+        rows = {r[0]: r for r in issues if r[2] == "NAMED_STREAM"}
+        return taken and all(p in rows and rows[p][1] == "" for p in taken)
     row("HFS+: a stream row outlives its member being taken back out of a full zip",
         stream_row_survives)
 
@@ -36443,8 +36277,9 @@ def _hfs_reader_checks():
         w = walker(v.image())
         tree(w)
         body(w, a)
-        return not w.damage and w.folders_not_read == 0 and w.volume_note is None
-    row("HFS+: a clean volume records no damage and no note", clean_silent)
+        return not w.damage and lost(w) == 0 and not note(w)
+    row("HFS+: a clean volume records no damage and no note (a control: it holds on v1.87 too)",
+        clean_silent)
     return out
 
 

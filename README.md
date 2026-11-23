@@ -1211,11 +1211,11 @@ A pending journal is recorded and not replayed. When a volume was not cleanly un
 its `note` says so and gives the bytes of transactions the journal holds: newer data may
 exist there, and the listing shows the blocks as stored.
 
-Damage is recorded in `damage_first`. A catalog node that fails its checks does not end a
-listing: the leaves still readable are read by node number, using the tree's own map so a
-freed node's old records are not listed as live, and what could not be read counts in
-`folders_not_read` and makes the exit status 1. A folder whose record is lost is listed
-from its thread record, with no dates, or as `lost-folder-<id>` when that is lost too. A
+Damage is recorded in `damage_first`. A B-tree node that fails its checks is never read as
+the end of a folder. The walk keeps what it reached, and `folders_not_read` and exit status
+1 say the folder stopped there. Nothing is rebuilt from raw nodes, so entries past a damaged
+catalog leaf in the same folder are not listed, and a damaged root or header node leaves the
+volume unlisted, with that record. A
 fork's extents each stay at their own file offset: a range that cannot be read is zeros,
 the file is named `SHORT`, and its row says which blocks. A primary volume header that is
 not valid is replaced by the alternate at the end of the volume, and the record says so.
