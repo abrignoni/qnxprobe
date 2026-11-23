@@ -3222,7 +3222,13 @@ class ExfatWalker:
         if clus < 2:
             return b""
         if not contig or not size:
-            return self._read(clus, 0, contig)
+            out = self._read(clus, 0, contig)
+            if live and not contig and size and out and len(out) < size:
+                self._folder_part_read(clus, f"its recorded size of {size:,} bytes is more than "
+                                             f"the {len(out):,} bytes its FAT chain and this "
+                                             f"image hold, so any files recorded after them "
+                                             f"are not listed")
+            return out
         cb = self.cluster_bytes
         count, stop = self._folder_run(clus, size, live)
         out = self._clusters(clus, count)
@@ -3460,13 +3466,21 @@ class ExfatWalker:
         out = bytearray()
         seen = set()
         c = clus
-        while 0x2 <= c < 0xFFFFFFF7 and c not in seen:
+        while self._chain_goes_on(c) and c not in seen:
             seen.add(c)
-            out += read_at(self.fh, self._cluster_off(c), self.cluster_bytes)
-            if size and len(out) >= size:
+            part = read_at(self.fh, self._cluster_off(c), self.cluster_bytes)
+            out += part
+            # bytes after a gap would read as the ones that belong there
+            if len(part) < self.cluster_bytes or (size and len(out) >= size):
                 break
             c = self._fat_next(c)
         return bytes(out[:size]) if size else bytes(out)
+
+    def _chain_goes_on(self, clus):
+        """True for a FAT value naming a data cluster of this volume. A count of 0 in the
+        boot sector says nothing, so it bounds nothing."""
+        return 0x2 <= clus < 0xFFFFFFF7 and (not self.cluster_count
+                                             or clus < self.cluster_count + 2)
 
     def inode(self, node):
         return node
@@ -4215,7 +4229,7 @@ class ExfatWalker:
         have = 0
         seen = set()
         c = clus
-        while 0x2 <= c < 0xFFFFFFF7 and c not in seen:
+        while self._chain_goes_on(c) and c not in seen:
             seen.add(c)
             have += 1
             if have >= need:
@@ -31994,6 +32008,37 @@ def _exfat_nofatchain_checks():
         return ({e.name for e in listed(free)[0].deleted_files()} == {"OLD", "ONE.TXT", "TWO.TXT"}
                 and {e.name for e in listed(taken)[0].deleted_files()} == {"OLD", "ONE.TXT"})
 
+    def chained(fat, data):
+        """A walker over a small volume: 8 clusters of 512 bytes, the FAT from ``fat``."""
+        table = bytearray(b"\xff" * 512)
+        for c, n in fat.items():
+            struct.pack_into("<I", table, c * 4, n)
+        w = ExfatWalker.__new__(ExfatWalker)
+        w.fh, w.fat_start, w.heap_start = io.BytesIO(bytes(table) + data), 0, 512
+        w.cluster_bytes, w.cluster_count, w.root_clus = 512, 8, 1
+        w.damage, w.folders_not_read, w._not_read, w._folder_names = [], 0, set(), {}
+        return w
+
+    def chain_stops_at_short_read():
+        data = b"".join(bytes([0x41 + n]) * 512 for n in range(8))
+        cut = chained({2: 9, 9: 3, 3: 0xFFFFFFFF}, data[:7 * 512 + 100])
+        return cut._read(2, 1536, False) == data[:512] + data[7 * 512:7 * 512 + 100]
+
+    def chain_stops_at_volume_end():
+        data = b"".join(bytes([0x41 + n]) * 512 for n in range(8)) + b"Z" * 512
+        w = chained({2: 10}, data)
+        return (w._read(2, 1024, False) == data[:512]
+                and w.chain_shortfall((2, 1024, False, False)) == (1, 2))
+
+    def chained_folder_short_of_size():
+        data = bytes(8 * 512)
+        short = chained({2: 0xFFFFFFFF}, data)
+        whole = chained({2: 3, 3: 0xFFFFFFFF}, data)
+        return (len(short._folder_bytes((2, 1536, True, False))) == 512
+                and short.folders_not_read == 1 and "FAT chain" in short.damage[0]
+                and len(whole._folder_bytes((2, 1024, True, False))) == 1024
+                and not whole.damage and not whole.folders_not_read)
+
     def deleted_length_past_volume():
         gone = _exfat_entry_set("HUGE.BIN", 20, 1 << 56, in_use=False)
         w, _names = listed(_exfat_run_image(b"".join(sets[:42]) + filler * 2 + gone))
@@ -32126,6 +32171,12 @@ def _exfat_nofatchain_checks():
              "allocated again", ran(deleted_folder_reused)),
             ("a deleted exFAT entry whose length runs past the volume is listed as not "
              "recoverable", ran(deleted_length_past_volume)),
+            ("an exFAT chain stops at the first short read, so later clusters are not spliced "
+             "in", ran(chain_stops_at_short_read)),
+            ("an exFAT chain stops at a link past the volume and is reported as short",
+             ran(chain_stops_at_volume_end)),
+            ("a FAT-chained exFAT folder shorter than its recorded size is recorded",
+             ran(chained_folder_short_of_size)),
             ("an exFAT folder size that is not a whole number of clusters is read to the end "
              "of its last cluster and recorded", ran(size_not_whole_clusters)),
             ("an exFAT folder size too large stops at another entry's first cluster, even one "
