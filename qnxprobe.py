@@ -8296,8 +8296,8 @@ class _HfsTree:
         self.key_compare = head[14 + 33] if len(head) > 47 else 0
         # TN1150 "B-Trees": node 0 is the header node, and a node is 512 to 32,768 bytes,
         # a power of two
-        self.header_ok = (head[8] == HFSP_HEADER and 512 <= node_size <= 32768
-                          and not node_size & (node_size - 1))
+        self.header_ok = (head[8] == HFSP_HEADER and not node_size & (node_size - 1)
+                          and (not node_size or 512 <= node_size <= 32768))
 
     def _raw(self, offset, count):
         """Bytes at a byte offset within the tree's fork, zeros where the fork has no block
@@ -8439,9 +8439,12 @@ class _HfsTree:
 
         None means the tree holds no leaf. A tree that is allocated but empty says
         root 0, depth 0, and node 0 is its own header: every HFS+ volume with no
-        extended attributes and no fragmented file has that shape. A node on the way
-        down that fails its checks raises _HfsNodeDamage.
+        extended attributes and no fragmented file has that shape. A damaged header node
+        does not say that, so it raises _HfsNodeDamage, as does a node on the way down
+        that fails its checks.
         """
+        if not self.header_ok:
+            raise _HfsNodeDamage(self, 0, "the tree's header node is not valid")
         if not self.root:
             return None
         node_no, above, seen = self.root, None, set()
@@ -8637,6 +8640,9 @@ class HfsPlusWalker:
             self._attrs = _HfsTree(self, *_hfs_fork(vh, 352), "attributes")
         except (ValueError, struct.error):
             self._attrs = None                 # a volume with no attributes tree
+        for tree in (self._extents, self._attrs):
+            if tree is not None and not tree.header_ok:
+                self._damaged(f"the {tree.name} tree's header node is not valid")
         self.catalog_node_size = self._catalog.node_size
         self.catalog_depth = self._catalog.depth
         self._cache = {}
@@ -8814,6 +8820,9 @@ class HfsPlusWalker:
         counted = fork_blocks + sum(struct.unpack_from(">I", self._vh, off + 12)[0]
                                     for off in (112, 192, 272, 352, 432))
         counted += -(-1536 // self.block_size) + -(-1024 // self.block_size)
+        if not self._extents.header_ok or (self._attrs is not None
+                                           and not self._attrs.header_ok):
+            return                              # already recorded when the walker opened
         try:
             if self._attrs is not None and self._attrs.first_leaf:
                 for _key, data in self._attrs.walk_from(self._attrs.first_leaf):
@@ -36126,6 +36135,31 @@ def _hfs_reader_checks():
                 and got[16 * block:] == want[16 * block:] and w2.damage)
     row("HFS+: a lost overflow record leaves a gap and every later block in place",
         lost_overflow)
+
+    def tree_header_lost():
+        v, _a, b = fragmented()
+        img = v.image()
+        at = v.node_at("extents", 0)
+        img[at:at + 512] = bytes(512)
+        w, tally, issues, _z = export(img)
+        told = [r[3] for r in issues if r[2] == "SHORT" and r[0] == "b.bin"]
+        return (tally[4] >= 1 and told and "past its end" not in told[0]
+                and any("extents overflow tree's header" in d for d in w.damage))
+    row("HFS+: a zeroed extents header node is recorded, and is not read as an empty tree",
+        tree_header_lost)
+
+    def attr_header_lost():
+        v = _HfsTestVolume()
+        keep = v.file(HFSP_ROOT, "c.txt", b"", owner_flags=UF_COMPRESSED)
+        v.xattr(keep, HFSP_DECMPFS, DECMPFS_MAGIC + struct.pack("<IQ", 1, 5) + b"hello")
+        img = v.image()
+        at = v.node_at("attributes", 0)
+        img[at:at + 512] = bytes(512)
+        w, tally, issues, _z = export(img)
+        return (tally[3] == 1 and any(r[2] == "FAILED" and r[0] == "c.txt" for r in issues)
+                and any("attributes tree's header" in d for d in w.damage))
+    row("HFS+: with the attributes header lost, a compressed file fails rather than "
+        "exporting empty", attr_header_lost)
 
     def compressed_attr_lost():
         v = _HfsTestVolume()
