@@ -546,7 +546,7 @@ the image. A request for the recorded size or more returns what it did before.
 What the reader found goes in the walker's `damage` list, which an export writes to
 `volumes.json` as `damage_recorded` and `damage_first`. A record states what was found.
 `folders_not_read` and exit 1 mean something was lost or could not be read: a folder not
-read to its end, or clusters in use that no live file or folder reaches.
+read to its end, or clusters no live chain reaches that hold folder entries.
 
 - **A chain ends at any table value that is not a cluster of the volume:** a free entry,
   the bad-cluster mark, or a link past the last cluster. A file read also ends at the first
@@ -557,13 +557,17 @@ read to its end, or clusters in use that no live file or folder reaches.
   chain that stops before the folder's end marker is recorded, with what another FAT copy
   holds at that link, including an end-of-chain mark where another copy still holds a link.
   That link is not followed.
-- **Clusters nothing reaches count as lost.** A sector lost from a folder can take its last
-  entries and leave nothing odd behind, but the files they named stay allocated. So the
-  clusters the FAT marks in use that no live chain reaches are counted, whole chains
-  claimed and the bad-cluster mark left out, and any such cluster sets exit 1. An unclean
-  eject can leave these too (`chkdsk` turns them into `FOUND.000`), so a card with lost
-  chains exits 1 with nothing else wrong. None of the 59 clean known-data and corpus FAT
-  volumes measured has one.
+- **Clusters nothing reaches.** The clusters the FAT marks in use that no live chain
+  reaches are counted, whole chains claimed and the bad-cluster mark left out. When any of
+  them holds folder entries, the files those folders record are not listed, so that is a
+  loss and sets exit 1. Otherwise it is a note giving the clusters and bytes. This is what
+  an interrupted write leaves (`chkdsk` turns them into `FOUND.000`), and the count does not
+  mean that much content was lost: on five Windows FAT32 captures of a large file being
+  written, every folder read, every known file matched, and the lost chains of over 120,000
+  clusters held 2 to 7 MiB of the writer's bytes and zeros. The note mentions the boot
+  sector's state byte when it is set, and any live empty or deleted entry still naming the
+  chain. A lost sector that held only file entries therefore shows as this note with exit
+  0, since nothing in what remains tells it from an interrupted write.
 - **Notes, which change neither the listing nor the exit status.** Slots after an
   end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
   bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
@@ -585,7 +589,9 @@ read to its end, or clusters in use that no live file or folder reaches.
   which OEM code page its short names use, so none is assumed: a byte above `0x7F` shows
   as `%XX` of the stored byte (`0x82` is `%82`), and a first byte of `0x05`, which stands
   for `0xE5`, shows as `%E5`. An unpaired UTF-16 unit in a long name shows the same way, in
-  stored order (U+D800 is `%00%D8`). Two different stored names stay different, and a
+  stored order (U+D800 is `%00%D8`). A NUL ends a long name, as Linux reads it, on live and
+  deleted entries alike; in a short name it shows as `%00`. A `/` stored inside a name shows
+  as `%2F`, so it cannot invent a folder. Two different stored names stay different, and a
   name never holds a surrogate. A literal `%` is not escaped, so a file really named
   `CAF%82.TXT` can match an escaped one, and the duplicate handling keeps both.
 - **Times.** A stored date or time that is not a valid reading, such as month 13 or
@@ -1716,8 +1722,8 @@ survive, so a deleted file comes back with all of them.
 
 What neither keeps is where a fragmented file's later clusters lay: FAT32 zeroes the
 chain on delete, and exFAT keeps a chain only for a file it wrote fragmented in the
-first place. A file whose size would need clusters a live file now holds is reported as
-having existed rather than read. A recovered file says in `assumed_contiguous` whether its
+first place. A file whose size would need clusters now in use is reported as having existed
+rather than read. A recovered file says in `assumed_contiguous` whether its
 layout was taken on the one-run assumption or from a chain the volume still held.
 
 **`recoverable` means nothing on the volume contradicts the file. It does not mean the bytes
@@ -1769,7 +1775,7 @@ matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers t
 bytes from the same entries. The FAT32 fixture has 129,022 clusters and its low words fit
 two clusters each, so at its real size its entries are ambiguous under the rule above: the
 self-test compares the bytes with its recorded size cut in memory to 65,535 clusters. The
-fragmented file whose run crosses a live file is refused by this reader and is the one case
+fragmented file whose run reaches clusters in use is refused by this reader and is the one case
 `icat` will read on the contiguous assumption.
 
 ### exFAT: orphan directory entries

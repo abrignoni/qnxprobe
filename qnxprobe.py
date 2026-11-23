@@ -2738,6 +2738,9 @@ class Fat32Walker:
                 bpb = copy
                 self._record("the boot sector is all zeros, so this volume was read from the "
                              "backup copy of it at sector 6")
+        # The state byte Linux sets while a volume is mounted (FAT_STATE_DIRTY, bit 0, in
+        # include/uapi/linux/msdos_fs.h), at a different offset on FAT32.
+        self._boot_state = bpb[65 if self.FAT_BITS == 32 else 37] if len(bpb) > 65 else 0
         self.bps = struct.unpack_from("<H", bpb, 11)[0]
         self.spc = bpb[13]
         self.reserved = struct.unpack_from("<H", bpb, 14)[0]
@@ -2811,20 +2814,21 @@ class Fat32Walker:
     @property
     def folders_not_read(self):
         """Nonzero when something was lost: a folder could not be read to its end, or
-        clusters in use are reached by no live file or folder (_note_unreached)."""
+        clusters no live chain reaches hold folder entries (_note_unreached)."""
         self._note_unreached()
         return self._folders_not_read
 
     def _note_unreached(self):
         """Once per walker: count the clusters the table in use marks allocated that no
-        live file or folder reaches, and record them as lost.
+        live file or folder reaches. Whole chains are claimed, whatever a file's size needs,
+        the bad-cluster mark is not counted, and the walk has no depth limit.
 
-        A sector lost from a folder can take the folder's last entries with it and leave
-        nothing odd in what remains, but the files those entries named are still allocated.
-        Whole chains are claimed, whatever a file's size needs, and the bad-cluster mark
-        is not counted. The walk has no depth limit. An unclean eject can leave such
-        chains too (what chkdsk turns into FOUND.000). None of the 59 clean known-data and
-        corpus FAT volumes measured holds one."""
+        Only such clusters that hold folder entries count as a loss, because then the files
+        those folders record are not listed. Any others are a note: a real interrupted
+        Windows write left lost chains of over 120,000 clusters with every folder read and
+        every known file intact, and most of those clusters held zeros. A live empty file
+        or a deleted entry in a live folder can still name the chain, and the note says so.
+        """
         if self._unreached_checked:
             return
         self._unreached_checked = True
@@ -2864,23 +2868,61 @@ class Fat32Walker:
         if self.FAT_BITS == 32:
             claim(self.root_clus)
         stack, seen = [self.root], {self.root[0]}
+        walked, empties = [], []
         while stack:
-            for _name, child, _times in self.listdir_records(stack.pop()):
+            node = stack.pop()
+            walked.append(node)
+            for _name, child, _times in self.listdir_records(node):
                 if child[2] or child[1]:
                     claim(child[0])
+                elif child[0] >= 2:
+                    empties.append(child[0])
                 if child[2] and child[0] not in seen:
                     seen.add(child[0])
                     stack.append(child)
-        lost = 0
-        for clus in range(2, last):
+
+        def unreached(clus):
+            if not 2 <= clus < last or reached[clus >> 3] & (1 << (clus & 7)):
+                return False
             val = value(clus)
-            if val and val != bad_mark and not reached[clus >> 3] & (1 << (clus & 7)):
-                lost += 1
-        if lost:
-            self._record(f"{lost:,} cluster(s) the FAT marks in use are reached by no live file "
-                         f"or folder, so what they hold is not listed or exported and the "
-                         f"entry that named them is lost or was never written")
+            return bool(val) and val != bad_mark
+
+        lost = folder_clusters = 0
+        for clus in range(2, last):
+            if not unreached(clus):
+                continue
+            lost += 1
+            # one slot first, since nearly every cluster of a lost file fails on it
+            head = read_at(self.fh, self._cluster_off(clus), 32)
+            if len(head) == 32 and head[0] and _fat_dir_cluster_ok(head):
+                raw = read_at(self.fh, self._cluster_off(clus), self.cluster_bytes)
+                if len(raw) == self.cluster_bytes and _fat_dir_cluster_ok(raw):
+                    folder_clusters += 1
+        if not lost:
+            return
+        named = sum(1 for clus in empties if unreached(clus))
+        for node in walked:
+            for _n, first, _s, _d, _t, unknown, _c in self._deleted_in(node, False):
+                if unknown:
+                    start = first if first >= 2 else first + 0x10000
+                    named += any(unreached(c) for c in range(start, last, 0x10000))
+                else:
+                    named += unreached(first)
+        bytes_held = lost * self.cluster_bytes
+        where = (f"and {named:,} live empty or deleted entries still name them" if named else
+                 "with no entry in a live folder reaching them")
+        state = (f" The boot sector's state byte is {self._boot_state:#04x}: the volume was not "
+                 f"cleanly unmounted." if self._boot_state & 0x01 else "")
+        if folder_clusters:
+            self._record(f"{lost:,} cluster(s) ({bytes_held:,} bytes) are marked in use {where}, "
+                         f"and {folder_clusters:,} of them hold folder entries, so the files "
+                         f"those folders record are not listed.{state}")
             self._folders_not_read = self._folders_not_read or 1
+        else:
+            self._record(f"note: {lost:,} cluster(s) ({bytes_held:,} bytes) are marked in use "
+                         f"{where}. This is what an interrupted write leaves. The count is of "
+                         f"allocated clusters and does not mean that much content was "
+                         f"lost.{state}")
 
     def _record(self, line):
         """Keep one line of damage, once, up to _FAT_DAMAGE_CAP lines."""
@@ -3647,11 +3689,11 @@ class Fat32Walker:
                 ok, reason = False, ("the run its size would need goes past the last "
                                      "cluster of this volume")
             elif self._first_used(first, need) is not None:
-                # a cluster in the assumed run belongs to a live file:
-                # either this file was fragmented or it has since been
-                # overwritten, and either way the run cannot be read as it
-                ok, reason = False, ("the run its size would need crosses a live "
-                                     "file, so it was fragmented or is overwritten")
+                # a cluster in the assumed run is allocated: this file was fragmented,
+                # has since been overwritten, or never had its clusters freed. Which
+                # one is not known, and no live file need hold the cluster.
+                ok, reason = False, ("a cluster of the run its size would need is in use, so "
+                                     "the run cannot be read as this file")
             elif not read_at(self.fh, self._cluster_off(first + need - 1)
                              + (sz - 1) % self.cluster_bytes, 1):
                 ok, reason = False, "the run its size would need goes past the end of the image"
@@ -3965,18 +4007,26 @@ def _fat_short_name(e):
     if nt & 0x10:
         ext = ext.lower()
     base, ext = base.decode("ascii", "qnxprobe-name"), ext.decode("ascii", "qnxprobe-name")
-    base, ext = base.replace("\x00", "%00"), ext.replace("\x00", "%00")
+    base = base.replace("\x00", "%00").replace("/", "%2F")
+    ext = ext.replace("\x00", "%00").replace("/", "%2F")
     return f"{base}.{ext}" if ext else base
 
 
 def _vfat_name(lfn):
     parts = sorted(lfn, key=lambda x: x[0])
     raw = b"".join(chunk for _, chunk in parts)
-    name = raw.decode("utf-16-le", "qnxprobe-name")
-    end = name.find("\uffff")
+    return _fat_long_text(raw.decode("utf-16-le", "qnxprobe-name"))
+
+
+def _fat_long_text(text):
+    """A long name from its decoded characters, the same on the live and deleted paths. A
+    NUL or a 0xFFFF pad unit ends it, as Linux reads one (uni16_to_x8 in fs/fat/dir.c stops
+    at the first NUL), so no NUL is left to escape. A stored "/" becomes %2F, because it
+    would otherwise invent a folder."""
+    end = text.find("\uffff")
     if end != -1:
-        name = name[:end]
-    return name.split("\x00")[0]
+        text = text[:end]
+    return text.split("\x00")[0].replace("/", "%2F")
 
 
 def _fat_merged_spans(spans):
@@ -4096,7 +4146,7 @@ def _fat_deleted_long_name(parts, entry):
         lead = ((lead << 1) | (lead >> 7)) & 0xFF
     text = b"".join(chars for chars, _check in reversed(parts)).decode("utf-16-le",
                                                                        "qnxprobe-name")
-    name = text.split("\uffff")[0].rstrip("\x00").replace("\x00", "%00")
+    name = _fat_long_text(text)
     if not name:
         return None
     start = name.lstrip(" .")[:1]
@@ -38384,8 +38434,8 @@ def _fat_reader_checks():
         clean = Lab(16, 5000, keep=64)
         clean.root([keep, late])
         clean_names, ok = listed(clean)
-        return (names == {"KEEP.BIN"} and gap.folders_not_read == 1
-                and "after the end marker" in damage(gap)
+        return (names == {"KEEP.BIN"} and gap.folders_not_read == 0
+                and "after the end marker" in damage(gap) and "marked in use" in damage(gap)
                 and "KEEP.BIN" in odd_names and "reserved" in damage(ffs)
                 and len(inside) == 14 and "FAT 1 still links" in damage(w)
                 and w.folders_not_read == 1
@@ -38487,6 +38537,9 @@ def _fat_reader_checks():
         lost.root([keep])
         lost.chain([10])
         lost.chain([20, 21])                         # allocated, and no entry names it
+        lost.put(20, b"".join(bytes(s) for s in (    # a folder whose own entry is gone
+            short(b".          ", 0x10, 20), short(b"..         ", 0x10, 0),
+            short(b"INSIDE  BIN", first=40, size=1))))
         one = lost.walker()
         marked = Lab(16, 5000, keep=64)
         marked.root([keep])
@@ -38497,7 +38550,8 @@ def _fat_reader_checks():
         longer.root([keep])
         longer.chain([10, 11, 12])                   # a chain past the size is still reached
         three = longer.walker()
-        return (one.folders_not_read == 1 and "2 cluster(s) the FAT marks in use" in damage(one)
+        return (one.folders_not_read == 1 and "2 cluster(s) (1,024 bytes)" in damage(one)
+                and "hold folder entries" in damage(one)
                 and two.folders_not_read == 0 and not damage(two)
                 and three.folders_not_read == 0 and not damage(three))
 
@@ -38526,17 +38580,75 @@ def _fat_reader_checks():
     def no_nul_in_names():
         import sqlite3
         lab = Lab(16, 5000, keep=64)
-        lab.root([short(b"A\x00B     TXT", first=10, size=1)]
-                 + long_slots("ab\x00cd.txt", b"ABCD    TXT", deleted=True)
-                 + [short(b"\xe5BCD    TXT", first=12, size=1)])
+        lab.root([short(b"A\x00B     TXT", first=10, size=1),
+                  short(b"\xe5B\x00     TXT", first=12, size=1)])
         lab.chain([10])
         w = lab.walker()
         live = list(by_name(w))
         gone = [d.name for d in w.deleted_files()]
         db = sqlite3.connect(":memory:")
         lengths = [db.execute("select length(?)", (n,)).fetchone()[0] for n in live + gone]
-        return (live == ["A%00B.TXT"] and gone == ["ab%00cd.txt"]
+        return (live == ["A%00B.TXT"] and gone == ["_B%00.TXT"]
                 and lengths == [len(n) for n in live + gone])
+
+    def lost_chain_is_a_note():
+        def volume(state):
+            lab = Lab(16, 5000, keep=64)
+            lab.root([short(b"KEEP    BIN", first=10, size=1)])
+            lab.chain([10])
+            lab.chain([20, 21])
+            lab.put(20, data(1024, 3))
+            lab.img[37] = state
+            return lab.walker()
+        dirty, clean = volume(1), volume(0)
+        text = damage(dirty)
+        return (dirty.folders_not_read == 0 and clean.folders_not_read == 0
+                and text.startswith("note: 2 cluster(s) (1,024 bytes) are marked in use")
+                and "interrupted write" in text and "does not mean" in text
+                and "state byte is 0x01" in text and "state byte" not in damage(clean))
+
+    def named_chain_is_not_lost():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"EMPTY   BIN", first=20, size=0),
+                  short(b"\xe5ONE    BIN", first=30, size=512)])
+        lab.chain([20])
+        lab.chain([30])
+        w = lab.walker()
+        text = damage(w)
+        return ("2 live empty or deleted entries still name them" in text
+                and "never written" not in text and "no entry" not in text
+                and w.folders_not_read == 0)
+
+    def in_use_is_not_called_live():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"\xe5ONE    BIN", first=30, size=512)])
+        lab.chain([30])                              # allocated, and no live file holds it
+        got = [d for d in lab.walker().deleted_files()]
+        return (len(got) == 1 and not got[0].recoverable and "in use" in got[0].reason
+                and "live" not in got[0].reason)
+
+    def embedded_nul_reads_the_same():
+        lab = Lab(16, 5000, keep=64)
+        odd = "ab\x00cd.txt"
+        lab.root(long_slots(odd, b"ABCD    TXT") + [short(b"ABCD    TXT", first=10, size=1)]
+                 + long_slots(odd, b"ABCE    TXT", deleted=True)
+                 + [short(b"\xe5BCE    TXT", first=12, size=1)])
+        lab.chain([10])
+        w = lab.walker()
+        return list(by_name(w)) == ["ab"] and [d.name for d in w.deleted_files()] == ["ab"]
+
+    def stored_slash_is_escaped():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"A/B     TXT", first=10, size=1)]
+                 + long_slots("c/d long name.txt", b"CDLONG~1TXT")
+                 + [short(b"CDLONG~1TXT", first=11, size=1)]
+                 + long_slots("e/f long name.txt", b"EFLONG~1TXT", deleted=True)
+                 + [short(b"\xe5FLONG~1TXT", first=12, size=1)])
+        lab.chain([10])
+        lab.chain([11])
+        w = lab.walker()
+        return (set(by_name(w)) == {"A%2FB.TXT", "c%2Fd long name.txt"}
+                and [d.name for d in w.deleted_files()] == ["e%2Ff long name.txt"])
 
     rows = (
         (high_word, "a deleted FAT32 entry with a zero high word on a volume over 65,535 "
@@ -38619,7 +38731,18 @@ def _fat_reader_checks():
                                  "deleted mark, are a note and not a loss"),
         (reserved_bit_is_a_note, "a reserved attribute bit on a listed FAT entry is a note "
                                  "and not a loss"),
-        (no_nul_in_names, "a NUL in a stored FAT name becomes %00 on live and deleted entries"),
+        (no_nul_in_names, "a NUL in a stored FAT short name becomes %00 on live and deleted "
+                          "entries"),
+        (lost_chain_is_a_note, "a lost chain holding no folder entries is a counted note with "
+                               "exit 0, and says so when the boot state byte is set"),
+        (named_chain_is_not_lost, "the record does not call a chain's entry lost while a live "
+                                  "empty or deleted entry still names it"),
+        (in_use_is_not_called_live, "a refused deleted file's reason says its clusters are in "
+                                    "use, and does not claim a live file holds them"),
+        (embedded_nul_reads_the_same, "a NUL in a long name ends it the same way on live and "
+                                      "deleted entries"),
+        (stored_slash_is_escaped, "a / stored inside a FAT name becomes %2F on short, long and "
+                                  "deleted names"),
     )
     out = []
     for check, text in rows:
