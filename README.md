@@ -341,8 +341,10 @@ empty with a damage note.
 
 The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
 says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a
-`note` saying it was read without replaying the journal, so newer committed data may
-exist there. Whether any does is not checked.
+`note` saying how much the journal holds pending: committed transactions, the log blocks
+they take and the block copies they carry, counted from the journal's sequence numbers
+with its checksums not checked. The note also says newer data may exist there and that the
+listing shows the blocks as stored. Whether a pending block changes any file is not checked.
 
 A file flagged encrypted (fscrypt) is exported as stored, so an examiner who later holds
 the keys can still use it. fscrypt zero-pads the last data unit, and ciphertext cut at the

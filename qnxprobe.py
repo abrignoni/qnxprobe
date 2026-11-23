@@ -1524,7 +1524,7 @@ EXT_F = dict(inodes_count=0, blocks_count=4, free_blocks=12, first_data_block=20
              feature_compat=92, feature_incompat=96, uuid=104, volume_name=120,
              last_mounted=136, desc_size=254, mkfs_time=264, kbytes_written=376,
              error_count=404, blocks_per_group=32, rev_level=76, feature_ro_compat=100,
-             first_meta_bg=260, blocks_count_hi=336, backup_bgs=588, creator_os=72)
+             first_meta_bg=260, blocks_count_hi=336, backup_bgs=588, creator_os=72, journal_inum=224)
 EXT_INCOMPAT_EXTENTS  = 0x0040   # ext4.h
 EXT_COMPAT_HAS_JOURNAL = 0x0004  # ext4.h
 EXT_VALID_FS = 0x0001            # ext4.h
@@ -1539,6 +1539,12 @@ EXT_INCOMPAT_64BIT = 0x0080        # ext4.h
 EXT_RO_SPARSE_SUPER = 0x0001       # ext4.h
 EXT_RO_HUGE_FILE = 0x0008          # ext4.h
 EXT_COMPAT_SPARSE_SUPER2 = 0x0200  # ext4.h
+JBD2_MAGIC = 0xC03B3998            # include/linux/jbd2.h, as are the values below
+JBD2_DESCRIPTOR, JBD2_COMMIT, JBD2_SB_V1, JBD2_SB_V2, JBD2_REVOKE = 1, 2, 3, 4, 5
+JBD2_TAG_SAME_UUID, JBD2_TAG_LAST = 2, 8
+JBD2_INCOMPAT_64BIT, JBD2_INCOMPAT_CSUM2, JBD2_INCOMPAT_CSUM3 = 0x2, 0x8, 0x10
+JBD2_INCOMPAT_FAST_COMMIT = 0x20
+JBD2_DEFAULT_FC_BLOCKS = 256
 EXT_OS_HURD = 1                    # ext2_fs.h EXT2_OS_HURD, in s_creator_os
 EXT_MAX_LOG_BLOCK = 6              # EXT4_MAX_BLOCK_LOG_SIZE 16 less EXT4_MIN_BLOCK_LOG_SIZE 10
 EXT4_ENCRYPT_FL = 0x800            # ext4.h
@@ -1854,6 +1860,8 @@ class ExtWalker:
             self.blocks |= _e(sb, "blocks_count_hi") << 32
         self.first_meta_bg = _e(sb, "first_meta_bg")
         self.creator_os = _e(sb, "creator_os")
+        self.journal_inum = _e(sb, "journal_inum")
+        self._journal_text = None
         self.backup_bgs = (_e(sb, "backup_bgs"),
                            int.from_bytes(sb[EXT_F["backup_bgs"] + 4:EXT_F["backup_bgs"] + 8],
                                           "little"))
@@ -1878,16 +1886,16 @@ class ExtWalker:
             notes.append(f"the volume records {human(vol)} but its region is {human(size)}, so "
                          "blocks past the region's end may be missing or belong to what "
                          "follows it")
-        if self.incompat & EXT_INCOMPAT_RECOVER:
-            notes.append("its journal is marked as needing recovery and was not replayed: the "
-                         "volume is read as it is stored, so newer committed data may exist "
-                         "in the journal")
         self._static_notes = notes
 
     @property
     def volume_note(self):
         """What the reader says about the volume as a whole, without the damage, or None."""
         parts = list(self._static_notes)
+        if self.incompat & EXT_INCOMPAT_RECOVER:
+            if self._journal_text is None:
+                self._journal_text = self._journal_pending()
+            parts.append(self._journal_text)
         if self.encrypted_files:
             parts.append(f"{self.encrypted_files:,} file(s) are flagged encrypted (fscrypt) and "
                          "were exported as stored: their content and any encrypted names are "
@@ -1906,6 +1914,108 @@ class ExtWalker:
             parts.append(f"{self.damage_count:,} damaged structure(s) recorded, first: "
                          f"{self.damage[0]}")
         return "; ".join(parts) or None
+
+    def _journal_pending(self):
+        """What the note says of a journal that needs recovery. The log is read and counted
+        the way the first pass of jbd2 recovery walks it (do_one_pass, count_tags and wrap in
+        fs/jbd2/recovery.c; journal_tag_bytes in fs/jbd2/journal.c): from s_start, block by
+        block while the magic and the expected sequence hold, a commit block closing each
+        transaction. Nothing is replayed, and block checksums are not checked, so the count
+        is what the sequence numbers show."""
+        lead = ("it was not cleanly unmounted: its journal is marked as needing recovery and "
+                "was not replayed")
+        stored = "the listing shows the blocks as stored"
+
+        def unknown(why):
+            return (f"{lead}; how much is pending is not known ({why}), so newer data may exist "
+                    f"in the journal and {stored}")
+
+        if not self.journal_inum:
+            return unknown("the journal is on another device")
+        raw = self.inode(self.journal_inum)
+        if raw is None:
+            return unknown("its inode cannot be read")
+        size = struct.unpack_from("<I", raw, 4)[0] | struct.unpack_from("<I", raw, 108)[0] << 32
+        try:
+            runs = self._runs(raw, self.journal_inum, -(-size // self.bs), [])
+        except ExtUnreadable:
+            runs = None
+        if not runs:
+            return unknown("its blocks cannot be mapped")
+        starts = [r[0] for r in runs]
+
+        def log_block(n):
+            i = bisect.bisect_right(starts, n) - 1
+            if i < 0 or runs[i][2] is None or n >= runs[i][0] + runs[i][1]:
+                return b""
+            buf = self._meta(self.base + (runs[i][2] + n - runs[i][0]) * self.bs, self.bs)
+            return buf if len(buf) == self.bs else b""
+
+        sb = log_block(0)
+        if not sb or struct.unpack_from(">I", sb, 0)[0] != JBD2_MAGIC:
+            return unknown("its superblock cannot be read")
+        kind = struct.unpack_from(">I", sb, 4)[0]
+        blocksize, maxlen, first, seq, start = struct.unpack_from(">5I", sb, 12)
+        if kind not in (JBD2_SB_V1, JBD2_SB_V2) or blocksize != self.bs:
+            return unknown("its superblock does not fit this volume")
+        if not start:
+            return (f"{lead}; its superblock records nothing to replay (s_start is 0), and "
+                    f"{stored}")
+        features = struct.unpack_from(">I", sb, 0x28)[0] if kind == JBD2_SB_V2 else 0
+        last = maxlen
+        if features & JBD2_INCOMPAT_FAST_COMMIT:        # that area is at the end of the log
+            last -= struct.unpack_from(">I", sb, 0x54)[0] or JBD2_DEFAULT_FC_BLOCKS
+        if not 0 < first <= start < last:
+            return unknown("its log start is outside the log")
+        if features & JBD2_INCOMPAT_CSUM3:
+            tag_bytes = 16
+        else:
+            tag_bytes = (12 if features & JBD2_INCOMPAT_64BIT else 8)
+            tag_bytes += 2 if features & JBD2_INCOMPAT_CSUM2 else 0
+        room = self.bs - (4 if features & (JBD2_INCOMPAT_CSUM2 | JBD2_INCOMPAT_CSUM3) else 0)
+
+        def tags(buf):
+            count, at = 0, 12
+            while at + tag_bytes <= room:
+                flags = struct.unpack_from(">H", buf, at + 6)[0]
+                count += 1
+                at += tag_bytes + (0 if flags & JBD2_TAG_SAME_UUID else 16)
+                if flags & JBD2_TAG_LAST:
+                    break
+            return count
+
+        commits = blocks = copies = open_blocks = open_copies = 0
+        pos, left, cut = start, last - first, False     # at most one trip around the log
+        while left > 0:
+            buf = log_block(pos)
+            if not buf:
+                cut = True
+                break
+            magic, btype, stamp = struct.unpack_from(">III", buf, 0)
+            if magic != JBD2_MAGIC or stamp != seq or btype not in (
+                    JBD2_DESCRIPTOR, JBD2_COMMIT, JBD2_REVOKE):
+                break
+            step = 1 + (tags(buf) if btype == JBD2_DESCRIPTOR else 0)
+            open_blocks += step
+            open_copies += step - 1
+            left -= step
+            pos += step
+            if pos >= last:
+                pos -= last - first
+            if btype == JBD2_COMMIT:
+                commits += 1
+                blocks += open_blocks
+                copies += open_copies
+                open_blocks = open_copies = 0
+                seq = (seq + 1) & 0xFFFFFFFF
+        told = (f"{lead}; by its sequence numbers (checksums not checked) it holds "
+                f"{commits:,} committed transaction(s) pending, in {blocks:,} log block(s) "
+                f"carrying {copies:,} block copies")
+        if open_blocks:
+            told += f", and {open_blocks:,} more log block(s) with no commit record"
+        if cut:
+            told += f"; the count stops at log block {pos:,}, which cannot be read"
+        return f"{told}. Newer data may exist in the journal, and {stored}"
 
     def _damaged(self, what):
         if what in self._damage_seen:
@@ -29362,13 +29472,47 @@ def _ext_reader_checks():
         return "needs_recovery set" in state and "cleanly unmounted" not in state
 
     def not_replayed():
+        """A log written here: one committed transaction of two blocks, then a descriptor
+        with one block and no commit record, which recovery would not replay."""
+        img = bytearray(recover)
+        w = walker(img)
+        runs = w._runs(w.inode(8))                      # pylint: disable=protected-access
+        phys = runs[0][2]
+        if runs[0][0] or runs[0][1] < 8:                # the blocks written below are in one run
+            return False
+        sb = phys * 4096
+        first = struct.unpack_from(">I", img, sb + 20)[0]
+        struct.pack_into(">I", img, sb + 24, 77)        # s_sequence
+        struct.pack_into(">I", img, sb + 28, first)     # s_start
+        struct.pack_into(">I", img, sb + 0x28, 0)       # no checksum or 64-bit tags
+        def head(n, kind, seq):
+            at = (phys + first + n) * 4096
+            img[at:at + 4096] = bytes(4096)
+            struct.pack_into(">III", img, at, 0xC03B3998, kind, seq)
+            return at
+        at = head(0, 1, 77)
+        struct.pack_into(">IHH", img, at + 12, 500, 0, 0)       # a first tag, then its uuid
+        struct.pack_into(">IHH", img, at + 12 + 8 + 16, 501, 0, 2 | 8)
+        head(3, 2, 77)
+        at = head(4, 1, 78)
+        struct.pack_into(">IHH", img, at + 12, 502, 0, 2 | 8)
+        img[(phys + first + 6) * 4096:(phys + first + 7) * 4096] = bytes(4096)
+        note = walker(img).note or ""
+        return ("not cleanly unmounted" in note and "not replayed" in note
+                and "1 committed transaction(s) pending, in 4 log block(s)" in note
+                and "2 block copies" in note and "2 more log block(s) with no commit record" in note
+                and "Newer data may exist" in note and "blocks as stored" in note)
+
+    def nothing_pending():
         note = walker(recover).note or ""
-        return "not replayed" in note and "may exist" in note
+        return "records nothing to replay" in note and "may exist" not in note
 
     row("ext journal: with needs_recovery set the state line does not say cleanly unmounted",
         state_line)
-    row("ext journal: the volume is recorded as read without replaying its journal",
-        not_replayed)
+    row("ext journal: the note says how much the journal holds pending, read without "
+        "replaying it, and that the listing shows the blocks as stored", not_replayed)
+    row("ext journal: a journal whose superblock records nothing to replay is not said to "
+        "hold newer data", nothing_pending)
 
     # directories, names, times
     def root_block(img):
