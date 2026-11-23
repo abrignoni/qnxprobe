@@ -1524,7 +1524,7 @@ EXT_F = dict(inodes_count=0, blocks_count=4, free_blocks=12, first_data_block=20
              feature_compat=92, feature_incompat=96, uuid=104, volume_name=120,
              last_mounted=136, desc_size=254, mkfs_time=264, kbytes_written=376,
              error_count=404, blocks_per_group=32, rev_level=76, feature_ro_compat=100,
-             first_meta_bg=260, blocks_count_hi=336, backup_bgs=588)
+             first_meta_bg=260, blocks_count_hi=336, backup_bgs=588, creator_os=72)
 EXT_INCOMPAT_EXTENTS  = 0x0040   # ext4.h
 EXT_COMPAT_HAS_JOURNAL = 0x0004  # ext4.h
 EXT_VALID_FS = 0x0001            # ext4.h
@@ -1539,6 +1539,7 @@ EXT_INCOMPAT_64BIT = 0x0080        # ext4.h
 EXT_RO_SPARSE_SUPER = 0x0001       # ext4.h
 EXT_RO_HUGE_FILE = 0x0008          # ext4.h
 EXT_COMPAT_SPARSE_SUPER2 = 0x0200  # ext4.h
+EXT_OS_HURD = 1                    # ext2_fs.h EXT2_OS_HURD, in s_creator_os
 EXT_MAX_LOG_BLOCK = 6              # EXT4_MAX_BLOCK_LOG_SIZE 16 less EXT4_MIN_BLOCK_LOG_SIZE 10
 EXT4_ENCRYPT_FL = 0x800            # ext4.h
 EXT4_HUGE_FILE_FL = 0x40000        # ext4.h; i_blocks counts filesystem blocks
@@ -1852,6 +1853,7 @@ class ExtWalker:
         if is64:
             self.blocks |= _e(sb, "blocks_count_hi") << 32
         self.first_meta_bg = _e(sb, "first_meta_bg")
+        self.creator_os = _e(sb, "creator_os")
         self.backup_bgs = (_e(sb, "backup_bgs"),
                            int.from_bytes(sb[EXT_F["backup_bgs"] + 4:EXT_F["backup_bgs"] + 8],
                                           "little"))
@@ -1867,6 +1869,7 @@ class ExtWalker:
         self._unread = {}                               # (folder, name) -> inode, for unread_entries
         self._encrypted_folders = set()
         self.encrypted_files = 0                        # set by the export from its table
+        self._map_short = {}                            # inode -> why its last read was short
         self._tables = {}
         self._inodes = collections.OrderedDict()
         notes = []
@@ -1891,8 +1894,9 @@ class ExtWalker:
                          "not readable without the keys")
         if self._encrypted_folders:
             parts.append(f"{len(self._encrypted_folders):,} folder(s) carry the encrypted flag: "
-                         "the names in them are shown as stored, with %XX where they do not "
-                         "decode, and are not to be read as the real names")
+                         "the names in them are not to be read as the real names: their "
+                         "stored bytes are shown, with %XX for a byte that does not decode "
+                         "and for a NUL or /")
         return "; ".join(parts) or None
 
     @property
@@ -2020,7 +2024,7 @@ class ExtWalker:
             self._inodes.popitem(last=False)
         return raw
 
-    def _runs(self, raw, num=None, need=None, into=None):
+    def _runs(self, raw, num=None, need=None, lost=None):
         """[(logical block, block count, physical block or None)] in logical order.
 
         A file's content is addressed by logical block; where a run's physical
@@ -2041,88 +2045,124 @@ class ExtWalker:
         written pages came back as 8 KiB, and its bytes in the wrong order.
 
         ``need`` is how many logical blocks the file's size reaches; nothing past
-        it is read or checked. A map that cannot be followed is recorded and raises
-        ExtUnreadable, so a lost range is never handed back as a hole. ``into``,
-        when given, is the list to fill, and keeps what was read before the raise.
+        it is read or checked. What the map cannot give goes in ``lost`` as
+        (first logical block, end, why), and the rest of the map is still returned,
+        so a file keeps every block its map reaches. An entry of (None, count, why)
+        is ``count`` blocks i_blocks charges that the map does not reach, which lie
+        somewhere in its holes. Only an extent root that cannot be read at all raises.
         """
         flags = int.from_bytes(raw[32:36], "little")
         if flags & EXT4_INLINE_DATA_FL:
             return None
-        runs = [] if into is None else into
+        runs = []
+        lost = [] if lost is None else lost
+        limit = need if need is not None else 1 << 32   # ee_block and i_block count in 32 bits
 
-        def bad(what):
-            self._damaged(f"inode {num}: {what}")
-            raise ExtUnreadable(what)
+        def gone(first, end, what):
+            end = min(end, limit)
+            if first >= end:
+                return
+            if lost and lost[-1][0] is not None and lost[-1][1] == first:
+                lost[-1] = (lost[-1][0], end, lost[-1][2])
+            elif len(lost) >= EXT_DAMAGE_CAP and lost[-1][0] is not None:
+                lost[-1] = (lost[-1][0], end, lost[-1][2])   # runs inside it are not counted lost
+            else:
+                lost.append((first, end, what))
 
         if flags & EXT4_EXTENTS_FL:
             seen = set()
 
-            def walk(buf, off, want, where):
+            def walk(buf, off, want, where, lo, hi):
                 magic, ent, most, depth = struct.unpack_from("<HHHH", buf, off)
+                problem = None
                 if magic != 0xF30A:
-                    bad(f"{where} does not hold an extent header")
-                if depth > EXT4_MAX_EXTENT_DEPTH or (want is not None and depth != want):
-                    bad(f"{where} records depth {depth}"
-                        + (f" where {want} belongs" if want is not None else ""))
-                if ent > most or off + 12 + ent * 12 > len(buf):
-                    bad(f"{where} counts {ent:,} entries, more than it holds")
-                end = 0
-                for i in range(ent):
+                    problem = "does not hold an extent header"
+                elif depth > EXT4_MAX_EXTENT_DEPTH or (want is not None and depth != want):
+                    problem = (f"records depth {depth}"
+                               + (f" where {want} belongs" if want is not None else ""))
+                elif ent > most or off + 12 + ent * 12 > len(buf):
+                    problem = f"counts {ent:,} entries, more than it holds"
+                if problem:
+                    if want is None:                    # the root: no map is left to follow
+                        self._damaged(f"inode {num}: {where} {problem}")
+                        raise ExtUnreadable(f"{where} {problem}")
+                    gone(lo, hi, f"{where} {problem}")
+                    return
+                starts = [struct.unpack_from("<I", buf, off + 12 + i * 12)[0] for i in range(ent)]
+                end = lo
+                broken = False
+                for i, lblk in enumerate(starts):
                     o = off + 12 + i * 12
-                    lblk = struct.unpack_from("<I", buf, o)[0]
-                    if lblk < end:
-                        bad(f"{where}: entries overlap at file block {lblk:,}")
-                    if need is not None and lblk >= need:
-                        return
+                    count = 1
                     if depth == 0:
                         raw_len = struct.unpack_from("<H", buf, o + 4)[0]
+                        count = raw_len - 0x8000 if raw_len > 0x8000 else raw_len
+                    if not count or (depth and lblk < end):     # a zeroed or misplaced entry
+                        broken = True
+                        continue
+                    if lblk >= min(limit, hi):
+                        break
+                    if broken:
+                        gone(end, lblk, f"{where}: damaged entries before file block {lblk:,}")
+                        broken = False
+                    if depth == 0:
                         st = (struct.unpack_from("<I", buf, o + 8)[0]
                               | struct.unpack_from("<H", buf, o + 6)[0] << 32)
-                        if raw_len > 0x8000:                   # uninitialized extent
-                            count = raw_len - 0x8000
+                        if raw_len > 0x8000:            # uninitialized extent
                             runs.append((lblk, count, None))
+                        elif not self._on_volume(st):
+                            gone(lblk, lblk + count, f"the extent at file block {lblk:,} starts "
+                                                     f"at block {st:,}, past the end of this "
+                                                     "volume")
+                        elif self.blocks and st + count > self.blocks:
+                            keep = self.blocks - st
+                            runs.append((lblk, keep, st))
+                            gone(lblk + keep, lblk + count,
+                                 f"the extent at file block {lblk:,} reaches block "
+                                 f"{st + count - 1:,}, past the end of this volume")
                         else:
-                            count = raw_len
-                            if count:
-                                if not self._on_volume(st) or (self.blocks
-                                                               and st + count > self.blocks):
-                                    bad(f"the extent at file block {lblk:,} reaches block "
-                                        f"{st + count - 1:,}, past the end of this volume")
-                                runs.append((lblk, count, st))
-                        end = lblk + count
+                            runs.append((lblk, count, st))
+                        end = max(end, lblk + count)    # an overlap is settled after the walk
+                        continue
+                    end = lblk + 1
+                    stop = next((s for s in starts[i + 1:] if s > lblk), hi)
+                    leaf = (struct.unpack_from("<I", buf, o + 4)[0]
+                            | struct.unpack_from("<H", buf, o + 8)[0] << 32)
+                    label = f"extent block {leaf:,} for file block {lblk:,}"
+                    if not self._on_volume(leaf):
+                        gone(lblk, stop, f"{label} is not on this volume")
+                    elif leaf in seen:
+                        gone(lblk, stop, f"{label} is reached twice")
                     else:
-                        leaf = (struct.unpack_from("<I", buf, o + 4)[0]
-                                | struct.unpack_from("<H", buf, o + 8)[0] << 32)
-                        end = lblk + 1
-                        if not self._on_volume(leaf):
-                            bad(f"extent block {leaf:,} for file block {lblk:,} is not on "
-                                "this volume")
-                        if leaf in seen:
-                            bad(f"extent block {leaf:,} is reached twice")
                         seen.add(leaf)
                         child = self._meta(self.base + leaf * self.bs, self.bs)
                         if len(child) < self.bs:
-                            bad(f"extent block {leaf:,} for file block {lblk:,} is past the "
-                                "end of the image")
-                        walk(child, 0, depth - 1,
-                             f"extent block {leaf:,} for file block {lblk:,}")
+                            gone(lblk, stop, f"{label} is past the end of the image")
+                        else:
+                            walk(child, 0, depth - 1, label, lblk, stop)
+                if broken:
+                    gone(end, hi, f"{where}: damaged entries from file block {end:,}")
 
-            walk(raw, 40, None, "the inode's extent root")
+            walk(raw, 40, None, "the inode's extent root", 0, limit)
             runs.sort(key=lambda r: r[0])
-            for a, b in zip(runs, runs[1:]):
-                if a[0] + a[1] > b[0]:
-                    bad(f"two extents map file block {b[0]:,}")
+            if any(a[0] + a[1] > b[0] for a, b in zip(runs, runs[1:])):
+                runs = self._split_contested(runs, gone)
             return runs
 
         per = self.bs // 4                                      # pointers per indirect block
         seen = set()
-        empty = []                                              # indirect blocks with no pointers
+        holes = [False]                                         # a zero pointer below ``need``
 
         def add(lblk, phys):
-            if not phys or (need is not None and lblk >= need):  # a zero pointer is a hole
+            if need is not None and lblk >= need:
+                return
+            if not phys:                                        # a zero pointer is a hole
+                holes[0] = True
                 return
             if not self._on_volume(phys):
-                bad(f"file block {lblk:,} points to block {phys:,}, which is not on this volume")
+                gone(lblk, lblk + 1, f"file block {lblk:,} points to block {phys:,}, which is "
+                                     "not on this volume")
+                return
             if runs and runs[-1][2] is not None:
                 l0, n0, p0 = runs[-1]
                 if l0 + n0 == lblk and p0 + n0 == phys:
@@ -2131,50 +2171,107 @@ class ExtWalker:
             runs.append((lblk, 1, phys))
 
         def indirect(block, level, lbase):
-            if not block or (need is not None and lbase >= need):
+            if need is not None and lbase >= need:
                 return
+            if not block:
+                holes[0] = True
+                return
+            span = per ** (level - 1)                           # logical blocks per pointer
+            stop = lbase + per * span
             if not self._on_volume(block):
-                bad(f"indirect block {block:,} for file block {lbase:,} is not on this volume")
+                gone(lbase, stop, f"indirect block {block:,} for file block {lbase:,} is not "
+                                  "on this volume")
+                return
             if block in seen:
-                bad(f"indirect block {block:,} is reached twice")
+                gone(lbase, stop, f"indirect block {block:,} is reached twice")
+                return
             seen.add(block)
             buf = self._meta(self.base + block * self.bs, self.bs)
             if len(buf) < self.bs:
-                bad(f"indirect block {block:,} for file block {lbase:,} is past the end of "
-                    "the image")
-            span = per ** (level - 1)                           # logical blocks per pointer
-            ptrs = struct.unpack(f"<{per}I", buf)
-            if not any(ptrs):
-                empty.append((block, lbase, lbase + per * span))
+                gone(lbase, stop, f"indirect block {block:,} for file block {lbase:,} is past "
+                                  "the end of the image")
                 return
-            for i, ptr in enumerate(ptrs):
+            for i, ptr in enumerate(struct.unpack(f"<{per}I", buf)):
                 if need is not None and lbase + i * span >= need:
                     break
                 if level == 1:
                     add(lbase + i * span, ptr)
                 elif ptr:
                     indirect(ptr, level - 1, lbase + i * span)
+                else:
+                    holes[0] = True
 
         for i in range(12):
             add(i, struct.unpack_from("<I", raw, 40 + 4 * i)[0])
         indirect(struct.unpack_from("<I", raw, 88)[0], 1, 12)
         indirect(struct.unpack_from("<I", raw, 92)[0], 2, 12 + per)
         indirect(struct.unpack_from("<I", raw, 96)[0], 3, 12 + per + per * per)
-        if empty and need is not None:
-            short = self._blocks_unreached(raw)
-            if short:
-                block, first, end = empty[0]
-                bad(f"indirect block {block:,} holds no pointers, so file blocks {first:,} to "
-                    f"{min(end, need) - 1:,} would read as a hole, and the inode records "
-                    f"{short:,} more block(s) than its map reaches")
+        if holes[0] and need is not None:
+            short = self._blocks_unreached(raw) - sum(b - a for a, b, _w in lost)
+            if short > 0:
+                lost.append((None, short, f"the inode records {short:,} more block(s) than its "
+                                          "map reaches"))
         return runs
+
+    @staticmethod
+    def _split_contested(runs, gone):
+        """Runs with every range two extents both claim taken out and recorded, since
+        neither can be trusted there. What only one extent maps is kept."""
+        marks = sorted({r[0] for r in runs} | {r[0] + r[1] for r in runs})
+        starts = collections.defaultdict(list)
+        for r in runs:
+            starts[r[0]].append(r)
+        active, out = {}, []
+        for x, y in zip(marks, marks[1:]):
+            for r in starts.get(x, ()):
+                active[id(r)] = r
+            for key in [k for k, r in active.items() if r[0] + r[1] <= x]:
+                del active[key]
+            if len(active) == 1:
+                l0, _n, p0 = next(iter(active.values()))
+                out.append((x, y - x, None if p0 is None else p0 + x - l0))
+            elif active:
+                gone(x, y, f"two extents map file block {x:,}")
+        return out
+
+    def _attr_blocks(self, raw):
+        """The blocks i_blocks charges a file for its attributes, as e2fsck counts them
+        (check_blocks, check_ea_in_inode, check_ext_attr and size_to_quota_blocks in
+        e2fsck/pass1.c at v1.47.2): one for an attribute block, and the size in blocks of
+        each value kept in an EA inode, whether its entry is in the inode or that block.
+        e2fsck charges an old Lustre-style EA inode nothing, which takes the value's hash
+        to tell. It is counted here, so such a file can hide a loss and is never refused."""
+        total = 0
+
+        def scan(buf, p):
+            nonlocal total
+            while p + 16 <= len(buf) and struct.unpack_from("<I", buf, p)[0]:
+                nlen, _index, _offs, inum, vsize = struct.unpack_from("<BBHII", buf, p)
+                if inum:
+                    total += -(-vsize // self.bs)
+                p += (16 + nlen + 3) & ~3
+
+        if self.isz > EXT_GOOD_OLD_INODE_SIZE:
+            head = EXT_GOOD_OLD_INODE_SIZE + struct.unpack_from("<H", raw, EXT_GOOD_OLD_INODE_SIZE)[0]
+            if head + 4 <= len(raw) and struct.unpack_from("<I", raw, head)[0] == EXT4_XATTR_MAGIC:
+                scan(raw, head + 4)
+        acl = struct.unpack_from("<I", raw, 104)[0] | struct.unpack_from("<H", raw, 118)[0] << 32
+        if acl:
+            total += 1
+            if self._on_volume(acl):
+                blk = self._meta(self.base + acl * self.bs, self.bs)
+                if len(blk) == self.bs and struct.unpack_from("<I", blk, 0)[0] == EXT4_XATTR_MAGIC:
+                    scan(blk, 32)
+        return total
 
     def _blocks_unreached(self, raw):
         """How many blocks i_blocks charges to a block-mapped file beyond those its map
-        reaches. An indirect block of zeros reads the same as a hole, and this is the one
-        recorded value that tells them apart: i_blocks counts the data and indirect blocks
-        (ext4_inode_blocks, fs/ext4/inode.c), plus the attribute block when i_file_acl
-        names one (fs/ext4/xattr.c)."""
+        reaches. A zeroed pointer reads the same as a hole, and this is the one recorded
+        value that tells them apart: i_blocks counts the data and indirect blocks
+        (ext4_inode_blocks, fs/ext4/inode.c) and what _attr_blocks counts. e2fsck does not
+        compare i_blocks on a volume the Hurd created (pass1.c), so this answers 0 there."""
+        if self.creator_os == EXT_OS_HURD:
+            return 0
         charged = struct.unpack_from("<I", raw, 28)[0]
         if self.ro_compat & EXT_RO_HUGE_FILE:
             charged |= struct.unpack_from("<H", raw, 116)[0] << 32
@@ -2182,9 +2279,7 @@ class ExtWalker:
                 charged //= self.bs // 512
         else:
             charged //= self.bs // 512
-        acl = struct.unpack_from("<I", raw, 104)[0] | struct.unpack_from("<H", raw, 118)[0] << 32
-        if acl:
-            charged -= 1
+        charged -= self._attr_blocks(raw)
         per = self.bs // 4
         todo = [(struct.unpack_from("<I", raw, 40 + 4 * i)[0], 0) for i in range(12)]
         todo += [(struct.unpack_from("<I", raw, 88 + 4 * n)[0], n + 1) for n in range(3)]
@@ -2200,13 +2295,68 @@ class ExtWalker:
                     todo.extend((p, level - 1) for p in struct.unpack(f"<{per}I", buf) if p)
         return max(charged - len(seen), 0)
 
+    def _map_loss(self, runs, lost, size):
+        """(bytes of the file its map did not give, text naming them) from what _runs put
+        in ``lost``. Those bytes read as zeros at their own offsets."""
+        bs = self.bs
+        spans = []
+        for first, end, _why in sorted((x for x in lost if x[0] is not None), key=lambda x: x[0]):
+            if spans and first <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], end)
+            else:
+                spans.append([first, end])
+        marks = sorted((r[0], r[0] + r[1]) for r in runs)
+        starts = [m[0] for m in marks]
+
+        def held(a, b):                                 # bytes of [a, b) a run covers
+            total = 0
+            i = max(bisect.bisect_right(starts, a // bs) - 1, 0)
+            while i < len(marks) and marks[i][0] * bs < b:
+                total += max(0, min(marks[i][1] * bs, b) - max(marks[i][0] * bs, a))
+                i += 1
+            return total
+
+        missing = 0
+        for first, end in spans:
+            a, b = first * bs, min(end * bs, size)
+            if b > a:
+                missing += b - a - held(a, b)
+        parts = []
+        if spans:
+            why = next(x[2] for x in lost if x[0] is not None)
+            parts.append(f"file blocks {spans[0][0]:,} to {spans[-1][1] - 1:,}"
+                         + (f" in {len(spans):,} ranges" if len(spans) > 1 else "")
+                         + f" could not be mapped ({why})")
+        extra = next((x for x in lost if x[0] is None), None)
+        if extra is not None:
+            gaps, at = [], 0
+            for lo, hi in sorted([(r[0], r[0] + r[1]) for r in runs] + [tuple(s) for s in spans]):
+                if lo > at:
+                    gaps.append((at, lo))
+                at = max(at, hi)
+            need = -(-size // bs)
+            if at < need:
+                gaps.append((at, need))
+            room = sum(max(0, min(b * bs, size) - a * bs) for a, b in gaps)
+            maybe = min(extra[1] * bs, room)
+            missing += maybe
+            if gaps:
+                parts.append(f"up to {maybe:,} bytes among its holes (file blocks {gaps[0][0]:,} "
+                             f"to {gaps[-1][1] - 1:,}) may be lost: {extra[2]}")
+        return min(missing, size), "; ".join(parts) + "; those bytes are zeros at their offsets"
+
+    def map_shortfall(self, node):
+        """Why this file's last read came back short of its size because of its map, as
+        text, else None. extract_to_zip() puts it in the SHORT row."""
+        return self._map_short.pop(node, None)
+
     def _inline_bytes(self, raw):
         """(data, found) for a file's or folder's inline data: the 60 bytes of i_block, then
         the value of the system.data attribute in the inode body (ext4_read_inline_data,
         fs/ext4/inline.c), with ``found`` saying whether that attribute is there. The
         header follows i_extra_isize, entries follow it, and a value offset counts from
-        the first entry (IFIRST, fs/ext4/xattr.h). An attribute that names a value outside
-        the inode raises, because the bytes it should hold are not here."""
+        the first entry (IFIRST, fs/ext4/xattr.h). An attribute whose value is not in the
+        inode counts as not found, because the bytes it should hold are not here."""
         out = raw[40:100]
         if self.isz <= EXT_GOOD_OLD_INODE_SIZE:
             return out, False
@@ -2221,8 +2371,7 @@ class ExtWalker:
                 break
             if index == EXT4_XATTR_INDEX_SYSTEM and raw[p + 16:p + 16 + nlen] == b"data":
                 if inum or first + voff + vsize > len(raw):
-                    raise ExtUnreadable(f"its system.data attribute places {vsize:,} bytes "
-                                        "outside the inode")
+                    return out, False
                 return out + raw[first + voff:first + voff + vsize], True
             p += (16 + nlen + 3) & ~3
         return out, False
@@ -2245,7 +2394,8 @@ class ExtWalker:
                                        "were not read")
                 return
             if i and nl:
-                nm = buf[p + 8:p + 8 + nl].decode("utf-8", "qnxprobe-name")
+                nm = (buf[p + 8:p + 8 + nl].decode("utf-8", "qnxprobe-name")
+                      .replace("\x00", "%00").replace("/", "%2F"))
                 if nm not in (".", ".."):
                     out.append((nm, i))
             p += rec
@@ -2264,21 +2414,19 @@ class ExtWalker:
         out = []
         if flags & EXT4_INLINE_DATA_FL:
             # The first four bytes are the parent's inode (EXT4_INLINE_DOTDOT_SIZE)
-            try:
-                data, found = self._inline_bytes(raw)
-                if not found and struct.unpack_from("<I", raw, 4)[0] > len(data):
-                    self._folder_part(num, "its size runs past the 60 bytes in the inode and "
-                                           "its system.data attribute is not there")
-                self._dirents(data, 4, num, "its inline entries", out, False)
-            except ExtUnreadable as exc:
-                self._folder_part(num, str(exc))
+            data, found = self._inline_bytes(raw)
+            if not found and struct.unpack_from("<I", raw, 4)[0] > len(data):
+                self._folder_part(num, "its size runs past the 60 bytes in the inode and "
+                                       "its system.data attribute is not there")
+            self._dirents(data, 4, num, "its inline entries", out, False)
         else:
-            runs = []
+            runs, lost = [], []
             try:
-                self._runs(raw, num, None, runs)
+                runs = self._runs(raw, num, None, lost)
             except ExtUnreadable as exc:
                 self._folder_part(num, str(exc))
-            runs.sort(key=lambda r: r[0])
+            for _first, _end, why in lost:
+                self._folder_part(num, why)
             mapped = 0
             for _lblk, count, phys in runs:             # a run that reads as zeros holds no names
                 if phys is None:
@@ -2301,26 +2449,29 @@ class ExtWalker:
         out.sort()
         for name, ino in out:
             child = self.inode(ino)
-            if child is None:
-                self._folder_part(num, f"entry {name!r} names inode {ino:,}, which cannot be read")
-                self._unread[(num, name)] = ino
+            if child is None or not struct.unpack_from("<H", child, 0)[0]:
+                # A live entry naming mode 0: __ext4_iget refuses such an inode as stale.
+                # Its links count is not read, since one live entry was seen with 0 links.
+                why = "cannot be read" if child is None else "is blank (mode 0)"
+                self._folder_part(num, f"entry {name!r} names inode {ino:,}, which {why}")
+                self._unread[(num, name)] = (ino, why)
             elif struct.unpack_from("<H", child, 0)[0] & S_IFMT == S_IFDIR:
                 self._folder_names[ino] = name
                 self._folder_parents[ino] = num
         return out
 
     def unread_entries(self):
-        """[(path, inode)] of every name a folder holds whose inode could not be read.
-        collect() passes over these, so the export records them from here."""
+        """[(path, inode, why)] of every name a folder holds whose inode cannot be read or
+        is blank. collect() passes over these, so the export records them from here."""
         out = []
-        for (folder, name), ino in self._unread.items():
+        for (folder, name), (ino, why) in self._unread.items():
             parts = [name]
             at, hops = folder, 0
             while at != self.root and at in self._folder_names and hops < 4096:
                 parts.append(self._folder_names[at])
                 at = self._folder_parents.get(at)
                 hops += 1
-            out.append(("/".join(reversed(parts)), ino))
+            out.append(("/".join(reversed(parts)), ino, why))
         return out
 
     def entry(self, num):
@@ -2328,6 +2479,8 @@ class ExtWalker:
         if not raw:
             return None
         mode = struct.unpack_from("<H", raw, 0)[0]
+        if not mode:                                    # recorded by the folder that names it
+            return None
         size = (struct.unpack_from("<I", raw, 4)[0]
                 | struct.unpack_from("<I", raw, 108)[0] << 32)
         stamps = self._stamps(raw)
@@ -2402,22 +2555,46 @@ class ExtWalker:
 
     def valid_data_note(self, node, _held):
         """("ENCRYPTED", detail) for the exceptions table when this inode carries
-        EXT4_ENCRYPT_FL, else None. The stored bytes are exported, so an examiner who later
-        holds the keys can use them. The flag is all this says: nothing is decrypted."""
+        EXT4_ENCRYPT_FL, else None. The flag is all this says: nothing is decrypted."""
         raw = self.inode(node)
-        if raw and struct.unpack_from("<I", raw, 32)[0] & EXT4_ENCRYPT_FL:
-            return ("ENCRYPTED", "the inode is flagged encrypted (fscrypt) and no key is held: "
-                                 "its content was exported as stored and was not decrypted")
-        return None
+        if not raw or not struct.unpack_from("<I", raw, 32)[0] & EXT4_ENCRYPT_FL:
+            return None
+        size = struct.unpack_from("<I", raw, 4)[0] | struct.unpack_from("<I", raw, 108)[0] << 32
+        stored = size
+        if not struct.unpack_from("<I", raw, 32)[0] & EXT4_INLINE_DATA_FL:
+            stored = -(-size // self.bs) * self.bs
+        return ("ENCRYPTED", "the inode is flagged encrypted (fscrypt) and no key is held: its "
+                             f"content was exported as stored and was not decrypted. Its logical "
+                             f"size is {size:,} bytes and the member holds {stored:,}, through "
+                             "the end of the block with the last byte, because fscrypt "
+                             "encrypts whole data units")
+
+    def _short_because(self, num, text):
+        if len(self._map_short) >= EXT_DAMAGE_CAP:
+            self._map_short.clear()
+        self._map_short[num] = text
 
     def read_file(self, num, size):
-        """Yield the file's bytes, exactly ``size`` of them, holes and all. A file flagged
-        encrypted is read the same way, as stored (see valid_data_note)."""
+        """Yield the file's bytes, ``size`` of them, holes and all. What the block map cannot
+        give reads as zeros at its own offset, is counted in EOF_SHORTFALL so the export
+        names the file SHORT, and is said by map_shortfall(). A file flagged encrypted is
+        read as stored and through the end of the block holding its last byte, because
+        fscrypt zero-pads the last data unit (Documentation/filesystems/fscrypt.rst) and
+        ciphertext cut at ``size`` could not be decrypted."""
         raw = self.inode(num)
         if not raw:
             raise ExtUnreadable(f"inode {num} cannot be read")
+        flags = struct.unpack_from("<I", raw, 32)[0]
+        if not size:
+            if (flags & EXT4_EXTENTS_FL and not flags & EXT4_INLINE_DATA_FL
+                    and struct.unpack_from("<H", raw, 40)[0] != 0xF30A):
+                self._damaged(f"inode {num}: a 0-byte file whose extent root does not hold an "
+                              "extent header, so it has no bytes to lose")
+            return
+        need = -(-size // self.bs)
+        lost = []
         try:
-            runs = self._runs(raw, num, -(-size // self.bs))
+            runs = self._runs(raw, num, need, lost)
         except ExtUnreadable as exc:
             raise ExtUnreadable(f"{exc}; none of its {size:,} bytes are exported") from None
         if runs is None:
@@ -2425,20 +2602,26 @@ class ExtWalker:
             # the rest in the system.data extended attribute. Past what the two hold
             # the kernel reads zeros (ext4_read_inline_folio, ext4_readpage_inline). With
             # the attribute gone, what lay past the 60 bytes is not known to be zeros.
-            try:
-                data, found = self._inline_bytes(raw)
-                if size > len(data) and not found:
-                    raise ExtUnreadable("the system.data attribute that holds what follows "
-                                        "the first 60 bytes is not in the inode")
-            except ExtUnreadable as exc:
-                self._damaged(f"inode {num}: {exc}")
-                raise ExtUnreadable(f"{exc}; none of its {size:,} bytes are exported") from None
+            data, found = self._inline_bytes(raw)
             data = data[:size]
+            if size > len(data) and not found:
+                why = ("the system.data attribute that holds what follows the first "
+                       f"{len(data)} bytes is not in the inode")
+                self._damaged(f"inode {num}: {why}")
+                self._short_because(num, f"{why}; the rest is zeros")
+                EOF_SHORTFALL["bytes"] += size - len(data)
             yield data
             for chunk in self._zeros(size - len(data), size - len(data)):
                 yield chunk
             return
-        left = size
+        if lost:
+            for _first, _end, why in lost:
+                self._damaged(f"inode {num}: {why}")
+            missing, told = self._map_loss(runs, lost, size)
+            if missing:
+                self._short_because(num, told)
+                EOF_SHORTFALL["bytes"] += missing
+        left = need * self.bs if flags & EXT4_ENCRYPT_FL else size
         pos = 0                                                 # next logical block to deliver
         for lblk, count, phys in runs:
             if left <= 0:
@@ -13528,6 +13711,19 @@ def _run_shortfall(w, node):
         return None
 
 
+def _map_shortfall(w, node):
+    """Why a file read short because its block map is damaged, as text, else None. Only the
+    ext walker reports this; its lost blocks are counted in EOF_SHORTFALL though they are
+    not past the end of the image."""
+    report = getattr(w, "map_shortfall", None)
+    if report is None:
+        return None
+    try:
+        return report(node)
+    except Exception:                                # pylint: disable=broad-except
+        return None
+
+
 def _valid_data_note(w, node, held):
     """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength, or
     an ext file is flagged encrypted, else None. None for any other walker."""
@@ -14681,7 +14877,10 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 written += got
                 cut = None if past_end else chain_shortfall(w, ino)
                 run = None if past_end or cut else _run_shortfall(w, ino)
-                if cut:
+                lost_map = _map_shortfall(w, ino)
+                if lost_map:
+                    told = f"{got:,} of {size:,} bytes read, {lost_map}"
+                elif cut:
                     told = (f"{got:,} of {size:,} bytes read, its cluster chain ends after "
                             f"{cut[0]:,} of the {cut[1]:,} clusters that size needs")
                 elif run:
@@ -28775,8 +28974,8 @@ def _ext_reader_checks():
 
     class Budget(io.BytesIO):
         """An image that stops a reader which keeps going: a loop in the block map would
-        otherwise run for hours on the build that has it."""
-        left = 20000
+        otherwise run for hours, and fill memory, on the build that has it."""
+        left = 3000
 
         def read(self, *args):
             self.left -= 1
@@ -28807,15 +29006,13 @@ def _ext_reader_checks():
     def read(w, ino, size):
         return b"".join(w.read_file(ino, size))
 
-    def refused(img, path, size, want):
-        """True when reading the file raises ExtUnreadable naming ``want``."""
+    def partial(img, path, size):
+        """(what the read hands back, the reason the walker gives for a short read). Reads
+        through the budget, so a map that loops fails here instead of running on."""
         w = ExtWalker(Budget(bytes(img)), 0)
         ino = next(i for p, i, _s, _m in collect(w, w.root) if p == path)
-        try:
-            read(w, ino, size)
-        except ExtUnreadable as exc:
-            return want in str(exc)
-        return False
+        body = read(w, ino, size)
+        return body, getattr(w, "map_shortfall", lambda _n: None)(ino) or ""
 
     def tree_depth1(img, path):
         """Rewrite a file's extent root into an index over one leaf block, the shape a
@@ -28900,14 +29097,12 @@ def _ext_reader_checks():
         at = inode_at(img, ino)
         img[at + 128 + struct.unpack_from("<H", img, at + 128)[0]] ^= 0xFF      # the header magic
         w = walker(img)
-        try:
-            read(w, ino, 100)
-        except ExtUnreadable as exc:
-            return "system.data" in str(exc) and any("system.data" in d for d in w.damage)
-        return False
+        body = read(w, ino, 100)
+        return (body == bytes(range(60)) + bytes(40) and any("system.data" in d for d in w.damage)
+                and "system.data" in (w.map_shortfall(ino) or ""))
 
-    row("ext inline_data: a file past 60 bytes whose attribute is damaged is refused and "
-        "recorded, not padded with zeros", inline_attr_gone)
+    row("ext inline_data: a file whose attribute is damaged keeps its 60 bytes and is "
+        "recorded as short", inline_attr_gone)
     row("ext meta_bg: every file of a volume whose descriptors fill more than one block "
         "matches the sha256 of its source", lambda: fixture("ext4-metabg"))
 
@@ -28932,22 +29127,67 @@ def _ext_reader_checks():
     row("ext cut image: the export exits 1 and volumes.json records the folder, the damage and "
         "how far the volume reaches past the file", cut_export)
 
-    # the block map
+    # the block map: what survives is kept, at its own offsets
+    many = "dir/many_blocks.bin"
+    many_size = 307217
+    many_known = read(walker(sparse2), number(sparse2, many), many_size)
+
     def leaf_zeroed():
-        img, leaf = tree_depth1(sparse4, "dir/many_blocks.bin")
-        if hashlib.sha256(read(walker(img), number(img, "dir/many_blocks.bin"),
-                               307217)).hexdigest() != known["dir/many_blocks.bin"]:
+        """Two leaves: losing the second keeps every block the first one maps."""
+        img, leaf = tree_depth1(sparse4, many)
+        whole = read(walker(img), number(img, many), many_size)
+        if hashlib.sha256(whole).hexdigest() != known[many]:
             return False                                # the patched tree must read whole first
-        bs = 4096
-        img[leaf * bs:(leaf + 1) * bs] = bytes(bs)
-        return refused(img, "dir/many_blocks.bin", 307217, "extent header")
+        first = bytearray(img[leaf * 4096:(leaf + 1) * 4096])
+        lblk, count, hi, phys = struct.unpack_from("<IHHI", first, 12)
+        if struct.unpack_from("<H", first, 2)[0] != 1 or lblk or count <= 30:
+            return False
+        second = bytearray(4096)
+        struct.pack_into("<HHHH", second, 0, 0xF30A, 1, 340, 0)
+        struct.pack_into("<IHHI", second, 12, 30, count - 30, hi, phys + 30)
+        struct.pack_into("<H", first, 16, 30)
+        other = leaf + 1
+        img[leaf * 4096:(leaf + 1) * 4096] = first
+        img[other * 4096:(other + 1) * 4096] = second
+        at = inode_at(img, number(img, many))
+        struct.pack_into("<H", img, at + 40 + 2, 2)
+        struct.pack_into("<IIH", img, at + 40 + 24, 30, other, 0)
+        if read(walker(img), number(img, many), many_size) != whole:
+            return False
+        img[other * 4096:(other + 1) * 4096] = bytes(4096)
+        body, told = partial(img, many, many_size)
+        return (body[:30 * 4096] == whole[:30 * 4096] and not any(body[30 * 4096:])
+                and len(body) == many_size and "extent header" in told and "file blocks 30" in told)
 
     def indirect_zeroed():
         img = bytearray(sparse2)
-        at = inode_at(img, number(img, "dir/many_blocks.bin"))
+        at = inode_at(img, number(img, many))
         block = u32(img, at + 88)
         img[block * 4096:(block + 1) * 4096] = bytes(4096)
-        return refused(img, "dir/many_blocks.bin", 307217, "more block(s) than its map reaches")
+        body, told = partial(img, many, many_size)
+        return (body[:12 * 4096] == many_known[:12 * 4096] and not any(body[12 * 4096:])
+                and "more block(s) than its map reaches" in told)
+
+    def indirect_part_zeroed():
+        img = bytearray(sparse2)
+        at = inode_at(img, number(img, many))
+        block = u32(img, at + 88)
+        img[block * 4096 + 32 * 4:block * 4096 + 64 * 4] = bytes(32 * 4)      # 32 of its pointers
+        body, told = partial(img, many, many_size)
+        keep = (12 + 32) * 4096
+        return body[:keep] == many_known[:keep] and "more block(s) than its map reaches" in told
+
+    def cut_keeps():
+        at = inode_at(sparse2, number(sparse2, many))
+        block = u32(sparse2, at + 88)
+        got = export(bytes(sparse2[:block * 4096]))
+        if got is None:
+            return None
+        _rc, _rec, rows, crcs = got
+        name = f"{many}.SHORT-{12 * 4096}-of-{many_size}-bytes"
+        want = many_known[:12 * 4096] + bytes(many_size - 12 * 4096)
+        return (crcs.get(name) == (binascii.crc32(want), many_size)
+                and any(r[0] == many and r[2] == "SHORT" and "file blocks 12" in r[3] for r in rows))
 
     def real_hole_kept():
         w = walker(sparse2)
@@ -28955,27 +29195,41 @@ def _ext_reader_checks():
         return (hashlib.sha256(read(w, ino, 3145728)).hexdigest() == known["dir/big_sparse.bin"]
                 and not getattr(w, "damage", []))
 
-    row("ext damage: a zeroed extent leaf is refused, not exported as a file of zeros",
-        leaf_zeroed)
-    row("ext damage: a zeroed indirect block is told from a hole by i_blocks and refused",
-        indirect_zeroed)
-    row("ext damage: a real hole across the block map still reads as zeros, with nothing recorded",
-        real_hole_kept)
+    def ea_inode_charge():
+        """A valid sparse block-mapped file with an empty indirect block and a value in an EA
+        inode, whose blocks i_blocks charges to the file, as e2fsck requires."""
+        img = bytearray(sparse2)
+        path = "hole_middle.bin"
+        ino = number(img, path)
+        at = inode_at(img, ino)
+        body = read(walker(img), ino, 24576) + bytes(65536 - 24576)
+        spare = u32(img, 1024 + 4) - 8
+        img[spare * 4096:(spare + 1) * 4096] = bytes(4096)
+        struct.pack_into("<I", img, at + 4, 65536)
+        struct.pack_into("<I", img, at + 88, spare)     # the empty indirect block
+        struct.pack_into("<I", img, at + 28, u32(img, at + 28) + 2 * 8)  # it, and the value's block
+        head = at + 128 + struct.unpack_from("<H", img, at + 128)[0]
+        struct.pack_into("<I", img, head, 0xEA020000)
+        struct.pack_into("<BBHIII", img, head + 4, 1, 1, 0, 13, 4096, 0)
+        img[head + 20] = 0x61
+        w = walker(img)
+        return read(w, ino, 65536) == body and not w.damage
 
     def past_volume():
         img = bytearray(sparse4)
         at = inode_at(img, number(img, "dir/tiny.txt"))
         struct.pack_into("<I", img, at + 40 + 12 + 8, u32(img, 1024 + 4) + 5)
-        return refused(img, "dir/tiny.txt", 5, "past the end of this volume")
+        body, told = partial(img, "dir/tiny.txt", 5)
+        return body == bytes(5) and "past the end of this volume" in told
 
     def index_loop():
-        img, leaf = tree_depth1(sparse4, "dir/many_blocks.bin")
+        img, leaf = tree_depth1(sparse4, many)
         node = bytearray(4096)
         struct.pack_into("<HHHH", node, 0, 0xF30A, 340, 340, 1)
         for i in range(340):
             struct.pack_into("<IIH", node, 12 + i * 12, i, leaf, 0)
         img[leaf * 4096:(leaf + 1) * 4096] = node
-        return refused(img, "dir/many_blocks.bin", 307217, "depth")
+        return "depth" in partial(img, many, many_size)[1]
 
     def indirect_loop():
         img = bytearray(sparse2)
@@ -28994,14 +29248,71 @@ def _ext_reader_checks():
         phys = u32(img, at + 40 + 12 + 8)
         struct.pack_into("<H", img, at + 40 + 2, 2)
         struct.pack_into("<IHHI", img, at + 40 + 24, 0, 0x8001, 0, phys)
-        return refused(img, "dir/tiny.txt", 5, "overlap")
+        body, told = partial(img, "dir/tiny.txt", 5)
+        return body == bytes(5) and "file block" in told
 
-    row("ext damage: an extent past the end of the volume is refused, and what follows the "
+    def blank_inode(path):
+        img = bytearray(sparse4)
+        ino = (number(img, path) if path != "dir"
+               else next(i for n, i in walker(img).listdir(2) if n == "dir"))
+        at = inode_at(img, ino)
+        img[at:at + 256] = bytes(256)
+        got = export(bytes(img))
+        if got is None:
+            return None
+        rc, rec, rows, _crcs = got
+        return (rc == 1 and rec.get("folders_not_read") == 1 and rec.get("failed") == 1
+                and not rec.get("symlinks_or_special_skipped")
+                and any(r[0] == path and r[2] == "FAILED" and "mode 0" in r[3] for r in rows))
+
+    def empty_bad_root():
+        img = bytearray(sparse4)
+        at = inode_at(img, number(img, "dir/tiny.txt"))
+        struct.pack_into("<I", img, at + 4, 0)
+        img[at + 40:at + 100] = bytes(60)
+        got = export(bytes(img))
+        if got is None:
+            return None
+        rc, rec, _rows, crcs = got
+        return (rc == 0 and crcs.get("dir/tiny.txt") == (0, 0) and not rec.get("failed")
+                and any("0-byte file" in d for d in rec.get("damage_first", [])))
+
+    def journal_record():
+        img = bytearray(sparse4)
+        struct.pack_into("<I", img, 1024 + 96, u32(img, 1024 + 96) | 0x8)
+        struct.pack_into("<I", img, 1024 + 40, 0)
+        got = export(bytes(img))
+        if got is None:
+            return None
+        rc, rec, _rows, _crcs = got
+        return (rc == 0 and rec.get("filesystem") == "jbd2 journal device"
+                and "journal device" in (rec.get("note") or ""))
+
+    row("ext damage: a lost extent leaf costs only the blocks it mapped; the rest keep their "
+        "offsets", leaf_zeroed)
+    row("ext damage: a zeroed indirect block is told from a hole by i_blocks, and the direct "
+        "blocks are kept", indirect_zeroed)
+    row("ext damage: a partly zeroed indirect block is told from a hole by i_blocks",
+        indirect_part_zeroed)
+    row("ext cut image: a file whose indirect block is past the cut is SHORT, with what its "
+        "map reached and the unmapped range recorded", cut_keeps)
+    row("ext damage: a real hole across the block map still reads as zeros, with nothing recorded",
+        real_hole_kept)
+    row("ext: a valid sparse file with a value in an EA inode is not taken for damage",
+        ea_inode_charge)
+    row("ext damage: an extent past the end of the volume is recorded, and what follows the "
         "volume is not exported", past_volume)
     row("ext damage: a self-referencing extent index stops at once", index_loop)
     row("ext damage: a self-referencing triple-indirect block past the file's size is not "
         "followed, and the file reads whole", indirect_loop)
-    row("ext damage: two extents with one logical start are refused by name", same_start)
+    row("ext damage: two extents with one logical start are recorded, not trusted", same_start)
+    row("ext damage: a live entry naming a blank inode is FAILED and its folder not read, not "
+        "a special file", lambda: blank_inode("dir/tiny.txt"))
+    row("ext damage: a folder whose inode is blank is FAILED, not a special file",
+        lambda: blank_inode("dir"))
+    row("ext damage: a 0-byte file with a damaged extent root exports empty, with a note",
+        empty_bad_root)
+    row("ext: a journal device leaves a record in volumes.json", journal_record)
 
     # the superblock and group descriptors
     def one_bad_group():
@@ -29011,7 +29322,7 @@ def _ext_reader_checks():
         struct.pack_into("<I", img, 2 * bs + dsz + 8, 0xFFFFFFFF)        # group 1's inode table
         w = walker(img)
         got = {p for p, _i, _s, _m in collect(w, w.root)}
-        lost = {p for p, _i in w.unread_entries()}
+        lost = {e[0] for e in w.unread_entries()}
         return bool(got) and bool(lost) and not got & lost and w.folders_not_read >= 1
 
     def bad_log_block():
@@ -29093,6 +29404,20 @@ def _ext_reader_checks():
             name.encode("utf-8")                        # what SQLite needs of a name
         return {"%FF", "%E2%82", "dir"} <= set(names) and len(set(names)) == len(names)
 
+    def slash_and_nul():
+        img = bytearray(sparse4)
+        at = root_block(img)
+        p = 0
+        while True:
+            rec, nl = struct.unpack_from("<HB", img, at + p + 4)
+            if nl >= 5:
+                break
+            p += rec
+        img[at + p + 6] = 5
+        img[at + p + 8:at + p + 13] = b"a/b\0c"
+        names = [n for n, _i in walker(img).listdir(2)]
+        return "a%2Fb%00c" in names and not any("/" in n or "\0" in n for n in names)
+
     def signed_time():
         img = load("ext4-times")
         w = walker(img)
@@ -29113,15 +29438,19 @@ def _ext_reader_checks():
         while bytes(img[block + p + 8:block + p + 16]) != b"tiny.txt":
             p += struct.unpack_from("<H", img, block + p + 4)[0]
         img[block + p + 8:block + p + 16] = b"\xfa\xfb\xfc\xfd\xfe\xff\xf0\xf1"
+        phys = w._runs(w.inode(number(sparse4, "dir/tiny.txt")))[0][2]   # pylint: disable=protected-access
+        stored = bytes(img[phys * 4096:(phys + 1) * 4096])
         got = export(bytes(img))
         if got is None:
             return None
         rc, rec, rows, crcs = got
         name = "dir/%FA%FB%FC%FD%FE%FF%F0%F1"
-        marked = [r for r in rows if len(r) > 2 and r[2] == "ENCRYPTED"]
+        marked = [r for r in rows if len(r) > 3 and r[2] == "ENCRYPTED"]
         note = rec.get("note") or ""
-        return (rc == 0 and crcs.get(name) == (binascii.crc32(b"tiny\n"), 5)
-                and [r[0] for r in marked] == [name] and not rec.get("failed")
+        return (rc == 0 and crcs.get(name) == (binascii.crc32(stored), 4096)
+                and stored[:5] == b"tiny\n"
+                and [r[0] for r in marked] == [name] and "logical size is 5 bytes" in marked[0][3]
+                and not rec.get("failed") and not rec.get("short")
                 and (rec.get("exceptions") or {}).get("encrypted") == 1
                 and "1 file(s) are flagged encrypted" in note
                 and "without the keys" in note and "not to be read as the real names" in note
@@ -29145,11 +29474,13 @@ def _ext_reader_checks():
         folder_hole)
     row("ext names: names that are not UTF-8 stay distinct as %XX of their stored bytes, with "
         "no surrogate, and a valid name is unchanged", raw_names)
+    row("ext names: a / or NUL stored inside one name is %2F or %00, so it invents no folder",
+        slash_and_nul)
     row("ext times: the zip date comes from the kernel's reading, so a 1961 mtime is not 2097",
         signed_time)
     row("ext encryption: on a volume with some files flagged, a flagged file is exported as "
-        "stored with an ENCRYPTED row, its name as %XX, a counted note and exit 0 (flag only: "
-        "nothing is decrypted)", encrypted)
+        "stored through the end of its block, with an ENCRYPTED row giving its logical size, "
+        "its name as %XX, a counted note and exit 0 (flag only: nothing is decrypted)", encrypted)
     return out
 
 
@@ -35134,6 +35465,15 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 _say(f"          {line}")
                     except Exception as exc:
                         print(f"        could not walk this filesystem: {exc}")
+                if zf is not None and kind == "jbd2 journal device" and wanted and manifest is not None:
+                    manifest.append({
+                        "volume": _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                                                        (".exceptions.tsv",)),
+                        **image_rec, "lba": b // ss, "offset_bytes": b,
+                        "partition_size_bytes": sz, "filesystem": kind,
+                        "files": 0, "bytes": 0, "symlinks_or_special_skipped": 0,
+                        "failed": 0, "short": 0, "excluded": 0, "note": lines[0],
+                    })
                 if zf is not None and kind and kind.startswith("ext") and wanted:
                     stem = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
                     suffix = sanitize_volume_label(ext_name) if ext_name else ""
@@ -35152,12 +35492,12 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                              issues=issues)
                         # a name whose inode cannot be read never reaches the list above
                         unread, undropped = apply_exclude(
-                            [(p, i, None, None) for p, i in w.unread_entries()], exclude)
+                            [(p, i, None, why) for p, i, why in w.unread_entries()], exclude)
                         dropped += undropped
                         fa += len(unread)
-                        issues.extend((p, "", "FAILED", f"its inode ({i:,}) cannot be read, so "
-                                       "it is not exported, and if it is a folder neither is "
-                                       "anything under it", 1) for p, i, _s, _m in unread)
+                        issues.extend((p, "", "FAILED", f"its inode ({i:,}) {why}, so it is "
+                                       "not exported, and if it is a folder neither is "
+                                       "anything under it", 1) for p, i, _s, why in unread)
                         w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
                         if manifest is not None:
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)

@@ -319,16 +319,25 @@ folder whose data is inline in its inode is read from the inode's 60 bytes and i
 `system.data` attribute. Past what those two hold, a file reads as zeros, as it does in
 the kernel. `meta_bg` volumes are read through the descriptor block of each meta group.
 A stored ext name that is not valid UTF-8 keeps its bytes as `%XX`, so `bad_<0xFF>.bin` is
-`bad_%FF.bin` and two such names stay two names.
+`bad_%FF.bin` and two such names stay two names. A NUL or `/` stored inside one name becomes
+`%00` or `%2F`, so it cannot cut a path or invent a folder.
 
 Damage on an ext volume is recorded, not read around. A folder that cannot be read in
 full (its inode, a block past the end of the image, a record length that cannot be right)
 is counted in `folders_not_read` and named in `damage_first`, and the run exits 1. So is
 a group descriptor that points off the volume, and each name whose inode that costs gets
-a `FAILED` row. A file whose extent tree or indirect blocks cannot be followed is
-`FAILED` with the reason and is not in the zip, because a lost piece of the map reads
-like a hole and would export as zeros. An indirect block of zeros is treated as lost
-only when `i_blocks` records more blocks than the map reaches. Without that it is a hole.
+a `FAILED` row. A live name whose inode is blank (mode 0) is `FAILED` the same way, and is
+never counted as a special file.
+
+A file whose block map is partly lost or past the end of the image keeps every block the
+map still reaches, at its own offset. It is stored under the
+`.SHORT-<here>-of-<size>-bytes` name, what was lost reads as zeros, and its `SHORT` row
+names the file blocks. A zero pointer counts as lost only when `i_blocks` records more
+blocks than the map reaches, counted as e2fsck counts them, values in EA inodes included.
+The row then says how many bytes among the file's holes may be lost. e2fsck does not make
+that comparison on a volume the Hurd created, so neither does this. Only a file whose extent
+root cannot be read at all is `FAILED`. A 0-byte file has nothing to lose, so it exports
+empty with a damage note.
 
 The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
 says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a
@@ -336,11 +345,17 @@ says so instead of calling it cleanly unmounted, and its record in `volumes.json
 exist there. Whether any does is not checked.
 
 A file flagged encrypted (fscrypt) is exported as stored, so an examiner who later holds
-the keys can still use it. Each one gets an `ENCRYPTED` row in the exceptions table, the
-volume's `exceptions` counts them as `encrypted`, and its `note` gives the count. This
-alone does not change the exit status. A flagged folder's names are shown as stored, with
-`%XX` where they do not decode, and are not the real names. Nothing here decrypts anything,
-and the flag is all the self-test proves.
+the keys can still use it. fscrypt zero-pads the last data unit, and ciphertext cut at the
+file's size could not be decrypted, so the member runs through the end of the block holding
+the last byte and can be longer than the file's logical size. Each file gets an `ENCRYPTED`
+row that states that size, the volume's `exceptions` counts them as `encrypted`, and its
+`note` gives the count. This alone does not change the exit status. A flagged folder's names
+are not the real names: their stored bytes are shown, with `%XX` for a byte that does not
+decode and for a NUL or `/`. Nothing here decrypts anything, and the flag is all the
+self-test proves.
+
+An external journal device holds no files. It gets a record in `volumes.json` that says what
+it is.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
