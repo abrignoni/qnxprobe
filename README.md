@@ -541,6 +541,39 @@ it. A size of zero reads nothing. Asked for the first 3 MiB of a 200 MiB file on
 and an exFAT volume macOS wrote, 1.76 read the whole 200 MiB and 1.77 read about 3 MiB of
 the image. A request for the recorded size or more returns what it did before.
 
+## FAT12, FAT16 and FAT32: what a damaged volume reports
+
+What the reader found wrong goes in the walker's `damage` list, which an export writes to
+`volumes.json` as `damage_recorded` and `damage_first`. A folder it could not list in full
+is counted in `folders_not_read`, and the run then exits 1.
+
+- **A chain ends at any table value that is not a cluster of the volume:** a free entry,
+  the bad-cluster mark, or a link past the last cluster. A file read also ends at the first
+  cluster the image does not hold in full, so nothing after a gap lands at the wrong
+  offset. Either way the member is `.SHORT-<got>-of-<size>-bytes`.
+- **A folder is different.** Its entries do not depend on their offset, so a cluster the
+  image lacks is recorded and passed over, and the clusters after it are still listed. A
+  chain that stops before the folder's end marker is recorded, with what another FAT copy
+  holds at that link. That link is not followed.
+- **Recorded and still read:** a cluster two chains hold, a chain longer than its size
+  needs, and two entries that start at one cluster.
+- **Free space.** A cluster is free only when every FAT copy that holds its entry says so,
+  so one copy with a sector lost to zeros cannot turn live files into unallocated space.
+  The count of clusters the copies differ on is in the `--unallocated` output.
+- **Boot sector.** When a FAT32 boot sector is all zeros, the backup at sector 6 is used if
+  it has a usable geometry and a table where it says one is, and the report says so. A
+  FAT32 boot sector that describes no usable layout is named as not read, and nothing is
+  exported from it.
+- **Active table.** With FAT32 mirroring off (`BPB_ExtFlags` bit 7), chains are read from
+  the table that field names. TFAT is left out of this, as described below.
+- **Names.** A long name is used only when its entries are in order and carry the short
+  entry's checksum; otherwise the short name is the one reported. A first byte of `0x05`
+  in a short name reads as `0xE5`. The volume does not say which OEM code page its short
+  names use, so none is assumed: a byte above `0x7F` is kept as a lone surrogate, and in
+  a zip member name it appears as `%XX`, so two different stored names stay different.
+- **Times.** A stored date or time that is not a valid reading is shown with its raw
+  words, not as a blank.
+
 ## FAT16, FAT12 and transaction-safe FAT (TFAT)
 
 Since 1.62. A FAT16 volume is read through `Fat16Walker` and a FAT12 volume through
@@ -1669,9 +1702,26 @@ first place. So a file that occupied one run is recovered exactly, and one whose
 would need clusters that a later file has since taken is reported as having existed
 rather than read, because reading it would splice in bytes that now belong to something
 else. A recovered file says in `assumed_contiguous` whether its layout was taken on the
-one-run assumption or from a chain the volume still held. A deleted directory whose
-first cluster is still free and still parses as a directory is walked into, so a folder
-of photographs deleted whole comes back file by file.
+one-run assumption or from a chain the volume still held. A FAT file is `recoverable` only
+while every cluster of that run is on the volume, in the image and free in every FAT copy.
+
+**A zero high word on a large FAT32 volume.** The Windows driver zeroes the high word of a
+first cluster when it deletes an entry, so on a volume of more than 65,535 clusters a zero
+there does not say where the file began. Such an entry is listed with `first_cluster` 0 and
+is not recoverable, and `reason` keeps the low word. A driver that leaves the word alone
+writes the same zero for a file that really is in the low clusters (the macOS-written
+`fat32-deleted` fixture is one), and the entry cannot tell the two apart, so those files
+are reported as not recoverable too.
+
+**Deleted folders.** A deleted directory whose first cluster is free in every FAT copy and
+still parses as a directory is walked into, and every entry in it counts as deleted, marked
+or not, because the Windows driver was seen leaving some unmarked. Its chain is gone, so it
+is read as one run from its first cluster, and the run stops at a cluster in use or one
+that does not read as folder entries. When that happens before the folder's end marker it
+is recorded. On the Windows-written test volumes the folder's clusters were interleaved
+with its files, so 3 to 15 of each deleted folder's files were listed (of 50 on FAT12 and
+170 on FAT16 and FAT32). A folder that lost its high word is found by its own `.` entry,
+which records its first cluster.
 
 Validated the same way as NTFS. `tools/make_fat_deleted_fixtures.sh` builds a FAT32 and
 an exFAT image, each with a folder of two photographs and one fragmented photograph,
