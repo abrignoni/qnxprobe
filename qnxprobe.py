@@ -34,6 +34,8 @@ import binascii
 import getpass
 import plistlib
 import array
+import unicodedata
+import weakref
 
 # ewfprobe is vendored beside this file (see vendored.json) so an EnCase/EWF
 # .E01 acquisition can be read as an ordinary image. It is optional: without it
@@ -12590,6 +12592,36 @@ def _zip_time(v):
     return (d.year, d.month, d.day, d.hour, d.minute, d.second)
 
 
+def _zip_zero_is_no_time(w, node):
+    """True when this walker's mtime of 0 stands for no time rather than a stored 0.
+    FAT and exFAT answer 0 always (their readings come through collect()). The NTFS,
+    ReFS, HFS+, APFS and F2FS converters answer 0 for unset or out of range. Btrfs
+    answers 0 for a file named by its directory whose inode item is gone."""
+    if isinstance(w, (Fat32Walker, ExfatWalker, NtfsWalker, RefsWalker, HfsPlusWalker,
+                      ApfsWalker, F2fsWalker)):
+        return True
+    if isinstance(w, BtrfsWalker):
+        try:
+            return w.times(node) is None
+        except Exception:                            # pylint: disable=broad-except
+            return True
+    return False
+
+
+def _zip_time_lost(v, w=None, node=None):
+    """The stored time as text when a zip cannot hold it, else None. None also when
+    no time exists (_zip_zero_is_no_time)."""
+    if v is None or (v == 0 and _zip_zero_is_no_time(w, node)):
+        return None
+    try:
+        d = datetime.datetime.fromtimestamp(v, datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return f"{v} (outside any date this reader can show)"
+    if 1980 <= d.year <= 2107:
+        return None
+    return f"{v} ({d.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+
+
 def allocation(w, node):
     """What a volume stores for one file beside the size it records, as a dict,
     or None when the walker cannot say.
@@ -12804,13 +12836,171 @@ def _zip_safe_component(part):
                    if unsafe(c) or c == "%" else c for c in part)
 
 
+_ZIP_NAME_BYTES = 255                   # the longest file name APFS and ext4 take
+
+
+def _zip_shorten(part):
+    """A name that fits in _ZIP_NAME_BYTES of UTF-8. A longer one keeps its start and a
+    last extension of up to 64 bytes around a hash of the whole name, so two long names
+    stay apart."""
+    import hashlib
+    raw = part.encode("utf-8", "surrogatepass")
+    if len(raw) <= _ZIP_NAME_BYTES:
+        return part
+    dot = part.rfind(".")
+    tail = part[dot:] if dot > 0 else ""
+    if len(tail.encode("utf-8", "surrogatepass")) > 64:
+        tail = ""
+    mark = "~" + hashlib.sha256(raw).hexdigest()[:16]
+    room = _ZIP_NAME_BYTES - len(mark) - len(tail.encode("utf-8", "surrogatepass"))
+    stem = part[:len(part) - len(tail)].encode("utf-8", "surrogatepass")[:room]
+    return stem.decode("utf-8", "ignore") + mark + tail
+
+
+def _zip_component(part):
+    """One path component as the zip holds it: made safe, then cut to length."""
+    return _zip_shorten(_zip_safe_component(part))
+
+
 def zip_member_name(volume, path):
     """The zip member name for a file at ``path`` (components joined by '/') in
-    ``volume``: every component made safe by _zip_safe_component, so no member
-    can climb out of the folder it is extracted into, start at a root, or be cut
-    short, whatever names the filesystem stored."""
-    return "/".join([_zip_safe_component(volume)]
-                    + [_zip_safe_component(c) for c in path.split("/")])
+    ``volume``: every component made safe by _zip_safe_component and no longer than
+    _ZIP_NAME_BYTES, so no member can climb out of the folder it is extracted into,
+    start at a root, be cut short, or be refused for its length, whatever names the
+    filesystem stored."""
+    return "/".join([_zip_component(volume)]
+                    + [_zip_component(c) for c in path.split("/")])
+
+
+def _zip_key(name):
+    """A name as it is compared for a clash: Windows and macOS extract to folders
+    that ignore case, and macOS also ignores Unicode normalization, so README and
+    readme, or two spellings of one accented letter, would land on one file. This
+    is Unicode's canonical caseless match. Treating two names as alike costs only a
+    suffix, while missing a pair costs a file."""
+    if name.isascii():
+        return name.lower()
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+class _ZipNames:
+    """Every file and folder name one zip holds or has promised, by _zip_key.
+
+    One of these lives as long as the zip (_zip_names), so volumes from different
+    images are kept apart. Whoever asks first keeps the name as it is; only a later
+    clash gets a suffix. Two folders that differ only in case are no clash, since
+    they merge when extracted and lose nothing."""
+
+    def __init__(self, held=()):
+        self.files = {_zip_key("volumes.json")}
+        self.dirs = set()
+        self.folders = {}               # folder as asked for -> folder as held
+        self.numbers = {}               # suffix stem's key -> last number tried
+        for name in held:
+            parts = name.rstrip("/").split("/")
+            self.dirs.update(_zip_key("/".join(parts[:d])) for d in range(1, len(parts)))
+            (self.dirs if name.endswith("/") else self.files).add(_zip_key(name.rstrip("/")))
+
+    def _taken(self, key):
+        return key in self.files or key in self.dirs
+
+    def volume(self, wanted, sidecars=(), claim=True):
+        """The first of wanted, wanted_2, wanted_3 ... whose folder and sidecar
+        tables are all free, reserved unless ``claim`` is false."""
+        name, n = wanted, 1
+        while True:
+            folder = _zip_key(_zip_component(name))
+            beside = [_zip_key(_zip_component(name + s)) for s in sidecars]
+            if not any(self._taken(k) for k in [folder, *beside]):
+                break
+            n += 1
+            name = f"{wanted}_{n}"
+        if claim:
+            self.dirs.add(folder)
+            self.files.update(beside)
+        return name
+
+    def free(self, stem, later="-{}", first=True, into=None):
+        """``stem`` if free (when ``first``), else stem with ``later`` numbered from
+        2, its last component kept to length. Reserved in ``into``, by default as a
+        file."""
+        into = self.files if into is None else into
+        parent, slash, leaf = stem.rpartition("/")
+        if first:
+            name = parent + slash + _zip_shorten(leaf)
+            if not self._taken(_zip_key(name)):
+                into.add(_zip_key(name))
+                return name
+        count = _zip_key(stem) + "\0" + later
+        n = self.numbers.get(count, 1)
+        while True:
+            n += 1
+            name = parent + slash + _zip_shorten(leaf + later.format(n))
+            if not self._taken(_zip_key(name)):
+                self.numbers[count] = n
+                into.add(_zip_key(name))
+                return name
+
+    def folder(self, path):
+        """The folder ``path`` is held as: itself, unless a file already holds a name
+        along it."""
+        done = self.folders.get(path)
+        if done is not None:
+            return done
+        held = ""
+        asked = ""
+        for part in path.split("/"):
+            asked = f"{asked}/{part}" if asked else part
+            done = self.folders.get(asked)
+            if done is None:
+                done = f"{held}/{part}" if held else part
+                if _zip_key(done) in self.files:
+                    done = self.free(done, ".dup-{}", first=False, into=self.dirs)
+                else:
+                    self.dirs.add(_zip_key(done))
+                self.folders[asked] = done
+            held = done
+        return held
+
+    def assign(self, arcs):
+        """The final name of each member name in ``arcs`` (None stays None). Every
+        folder is reserved first, so a file that clashes with a folder is the one
+        renamed and a whole subtree keeps its path. Then files take their names in
+        order, and the later holders of a name are numbered only once every first
+        holder has its own, so a suffix can never land on a name stored later."""
+        parents = {}
+        for arc in arcs:
+            if arc is not None:
+                parent = arc.rpartition("/")[0]
+                if parent and parent not in parents:
+                    parents[parent] = self.folder(parent)
+        out, later = [], []
+        for arc in arcs:
+            if arc is None:
+                out.append(None)
+                continue
+            parent, _slash, leaf = arc.rpartition("/")
+            name = f"{parents[parent]}/{leaf}" if parent else leaf
+            key = _zip_key(name)
+            if self._taken(key):
+                later.append(len(out))
+            else:
+                self.files.add(key)
+            out.append(name)
+        for index in later:
+            out[index] = self.free(out[index], ".dup-{}", first=False)
+        return out
+
+
+_ZIP_NAMES = weakref.WeakKeyDictionary()
+
+
+def _zip_names(zf):
+    """The _ZipNames of this open zip, begun from what it already holds."""
+    names = _ZIP_NAMES.get(zf)
+    if names is None:
+        names = _ZIP_NAMES[zf] = _ZipNames(zf.namelist())
+    return names
 
 
 def damage_lines(w, limit=5):
@@ -12821,16 +13011,123 @@ def damage_lines(w, limit=5):
     return len(damage), [str(d)[:240] for d in list(damage)[:limit]]
 
 
-def _zip_names_in_use(zf, volume, entries):
-    """Every file and folder name the zip holds or this volume's entries will take."""
-    names = set()
-    for name in [*zf.namelist(), *(zip_member_name(volume, e[0]) for e in entries)]:
-        parts = name.rstrip("/").split("/")
-        names.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
-    return names
+def _zip_undo(zf, info, start, dst):
+    """Take a member whose write failed back out of the zip: end its writer, drop it
+    from the member list, and cut the file back to where the member began. An output
+    that cannot be cut back keeps the bytes, and no member names them."""
+    if dst is not None:
+        try:
+            dst.close()                 # always ends the write; may commit the member
+        except Exception:               # pylint: disable=broad-except
+            pass
+    if zf.filelist and zf.filelist[-1] is info:
+        zf.filelist.pop()
+    if zf.NameToInfo.get(info.filename) is info:
+        del zf.NameToInfo[info.filename]
+    if getattr(zf, "_seekable", False):
+        try:
+            zf.fp.seek(start)
+            zf.fp.truncate()
+            zf.start_dir = start
+            return
+        except (OSError, ValueError):
+            zf.fp.seek(0, 2)
+    zf.start_dir = zf.fp.tell()
 
 
-def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=None):
+def _zip_store(zf, info, source):
+    """Copy the stream ``source`` into a new member. If that fails nothing of it
+    stays in the zip (_zip_undo) and the error is raised to the caller."""
+    import shutil
+    start, dst = zf.start_dir, None
+    try:
+        dst = zf.open(info, "w")
+        shutil.copyfileobj(source, dst)
+        dst.close()
+    except BaseException:
+        _zip_undo(zf, info, start, dst)
+        raise
+
+
+def _zip_store_table(zf, name, header, rows):
+    """A tab-separated table as the member ``name``, through _zip_store, so a table
+    that cannot be written whole is not left in the zip cut short."""
+    import csv
+    import tempfile
+
+    class Encoded:                      # a spool is not a text stream before 3.11
+        @staticmethod
+        def write(text):
+            return spool.write(text.encode("utf-8", "backslashreplace"))
+
+    info = zipfile.ZipInfo(name)
+    info.compress_type = zf.compression
+    with tempfile.SpooledTemporaryFile(max_size=32 << 20) as spool:
+        out = csv.writer(Encoded, delimiter="\t", lineterminator="\n")
+        out.writerow(header)
+        out.writerows(rows)
+        info.file_size = spool.tell()
+        spool.seek(0)
+        _zip_store(zf, info, spool)
+    return name
+
+
+_TIME_ROWS_PER_VALUE = 8        # files named per stored time; the rest are counted
+
+
+def _zip_time_rows(lost):
+    """Exception rows for {stored time as text: [count, [(path, member) ...]]}. Up to
+    _TIME_ROWS_PER_VALUE files are named per value and one row with no path counts the
+    rest, so a volume whose files all carry one time adds a few rows, not one per file."""
+    rows = []
+    for shown, (count, named) in lost.items():
+        detail = f"stored time {shown} is outside what a zip holds; the member shows 1980-01-01"
+        rows.extend((path, member, "TIME_NOT_HELD", detail, 1) for path, member in named)
+        rest = count - len(named)
+        if rest:
+            rows.append(("", "", "TIME_NOT_HELD", f"{rest:,} more files: {detail}", rest))
+    return rows
+
+
+def _zip_record_exceptions(zf, volume, rec, issues, pad="        "):
+    """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
+    and name it in the volume's record with a count per kind. A file that failed,
+    read short, was renamed or lost its time is otherwise not recorded in the zip."""
+    if rec is not None and _zip_component(volume) != volume:
+        rec["zip_folder"] = _zip_component(volume)
+    if not issues:
+        return
+    counts = collections.Counter()
+    for row in issues:
+        counts[row[2]] += row[4]
+    summary = {"failed": counts["FAILED"], "short": counts["SHORT"],
+               "renamed": counts["RENAMED"],
+               "time_not_held": counts["TIME_NOT_HELD"]}
+    name = _zip_component(f"{volume}.exceptions.tsv")
+    try:
+        _zip_store_table(zf, name, ["stored_path", "zip_member", "issue", "detail"],
+                         ([p.replace("\0", "\\x00"), m, i, d] for p, m, i, d, _n in issues))
+    except Exception as exc:                         # pylint: disable=broad-except
+        name = None
+        print(f"{pad}could not write the exceptions table: {_zip_reason(exc)}")
+    if rec is not None:
+        rec["exceptions_table"] = name
+        rec["exceptions"] = summary
+    if name:
+        print(f"{pad}every failed, short or renamed file, and each time a zip cannot "
+              f"hold: {name}")
+
+
+def _zip_reason(exc):
+    """Why a read or a write failed, for text that stays in the zip: an I/O error's
+    message without its file name, which would be a path on the examiner's machine."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return str(exc)
+
+
+def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=None,
+                   issues=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -12853,31 +13150,60 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     given, is filled with {member name: name it was written under} for each file
     whose write finished, so a file that failed has no entry in it.
 
-    Each file is read in full into a spool before anything is written, because
-    zipfile cannot remove a member once it is written. A file whose read raises
-    partway is therefore left out of the zip entirely, counted in failed and
-    logged with the reason; streaming it would have left a member holding only
-    the bytes read so far under the file's real name, which a reader of the zip
-    cannot tell from an ordinary, shorter file. The spool stays in memory up to
-    32 MiB and moves to a temporary file above that, so a larger file is written
-    to disk twice and needs its own size free in the temporary folder.
+    Names are settled by _ZipNames before the first write, across the whole zip and
+    ignoring case and Unicode normalization. The first holder of a name keeps it; a
+    later file that clashes gets .dup-<n>, and a name past 255 bytes of UTF-8 keeps its
+    start and a short last extension around a hash. written_names maps a member name to
+    the name it was really written under.
+
+    Each file is read in full into a spool before anything is written, so a read that
+    raises partway reaches the zip not at all. A write that fails partway (the disk
+    fills, the spool cannot be read back) is taken back out by _zip_undo, so no
+    truncated member stays under the file's real name and a later member still
+    extracts. Either way the file is counted in failed and logged with the reason. The
+    spool stays in memory up to 32 MiB and moves to a
+    temporary file above that, so a larger file is written to disk twice and needs its
+    own size free in the temporary folder.
+
+    issues, when given, is filled with one (stored path, zip member, issue, detail,
+    files counted) per file that failed, read short or was renamed, and for each stored time a zip cannot hold (_zip_time_rows).
     """
-    import shutil
     import tempfile
     total_files = sum(1 for _, _, size, _ in entries if size is not None)
     total_bytes = sum(size for _, _, size, _ in entries if size is not None)
     files = written = skipped = failed = short = 0
-    reserved = None
-    for path, ino, size, mtime in entries:
-        arc = zip_member_name(volume, path)
+    names = _zip_names(zf)
+    arcs = [zip_member_name(volume, e[0]) for e in entries]
+    finals = names.assign([arc if e[2] is not None else None for arc, e in zip(arcs, entries)])
+    folder = _zip_component(volume)
+    lost_times = {}
+
+    def note(path, member, issue, detail):
+        if issues is not None:
+            issues.append((path, member, issue, detail, 1))
+
+    for (path, ino, size, mtime), arc, final in zip(entries, arcs, finals):
         if arc != f"{volume}/{path}":
             log.append(f"        RENAMED {volume}/{path!r} stored as {arc}: the stored name "
                        f"carries characters a zip member cannot hold safely")
         if size is None:
             skipped += 1
             continue
+        if final != arc:
+            log.append(f"        RENAMED {volume}/{path!r} stored as {final}: another file "
+                       f"in the zip holds that name")
+        why = []
+        if final != f"{folder}/{path}":
+            if any(_zip_safe_component(c) != c for c in path.split("/")):
+                why.append("the stored name carries characters a zip member cannot hold safely")
+            if any(len(_zip_safe_component(c).encode("utf-8", "surrogatepass")) > _ZIP_NAME_BYTES
+                   for c in path.split("/")):
+                why.append(f"a name was longer than {_ZIP_NAME_BYTES} bytes")
+            if final != arc:
+                why.append("another file in the zip holds that name")
+        info = None
         try:
-            info = zipfile.ZipInfo(arc, date_time=_zip_time(mtime))
+            info = zipfile.ZipInfo(final, date_time=_zip_time(mtime))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
             got = 0
@@ -12890,22 +13216,16 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 past_end = EOF_SHORTFALL["bytes"] - before
                 got = min(got, max(size - past_end, 0))
                 if got < size:
-                    if reserved is None:
-                        reserved = _zip_names_in_use(zf, volume, entries)
-                    stem = f"{arc}.SHORT-{got}-of-{size}-bytes"
-                    info.filename, retry = stem, 1
-                    while info.filename in reserved:
-                        retry += 1
-                        info.filename = f"{stem}-{retry}"
-                    reserved.add(info.filename)
+                    info.filename = names.free(f"{final}.SHORT-{got}-of-{size}-bytes")
                 # zipfile decides on ZIP64 from this size when the member opens, and
                 # refuses a member that then grows past the limit
                 info.file_size = spool.tell()
                 spool.seek(0)
-                with zf.open(info, "w") as dst:
-                    shutil.copyfileobj(spool, dst)
+                _zip_store(zf, info, spool)
                 if written_names is not None:
                     written_names[arc] = info.filename
+            if why:
+                note(path, info.filename, "RENAMED", "; ".join(why))
             # A walker pads a block the image ends inside with zeros, so the bytes
             # it handed back are not the bytes that were there; the shortfall
             # read_at() tallied while this file was read is.
@@ -12914,20 +13234,30 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 written += got
                 cut = None if past_end else chain_shortfall(w, ino)
                 if cut:
-                    log.append(f"        SHORT {arc}: {got:,} of {size:,} bytes read, "
-                               f"its cluster chain ends after {cut[0]:,} of the "
-                               f"{cut[1]:,} clusters that size needs")
+                    told = (f"{got:,} of {size:,} bytes read, its cluster chain ends after "
+                            f"{cut[0]:,} of the {cut[1]:,} clusters that size needs")
                 else:
-                    log.append(f"        SHORT {arc}: {got:,} of {size:,} bytes are in "
-                               f"the image, the rest lies past its end")
+                    told = (f"{got:,} of {size:,} bytes are in the image, the rest lies past "
+                            f"its end")
+                log.append(f"        SHORT {arc}: {told}")
+                note(path, info.filename, "SHORT", told)
             else:
                 files += 1
                 written += size
+            shown = _zip_time_lost(mtime, w, ino) if issues is not None else None
+            if shown is not None:
+                held = lost_times.setdefault(shown, [0, []])
+                held[0] += 1
+                if len(held[1]) < _TIME_ROWS_PER_VALUE:
+                    held[1].append((path, info.filename))
         except Exception as exc:
             failed += 1
             log.append(f"        could not extract {arc}: {exc}")
+            note(path, "", "FAILED", "; ".join([_zip_reason(exc)] + why))
         if progress is not None:
             progress(volume, files, written, total_files, total_bytes)
+    if issues is not None:
+        issues.extend(_zip_time_rows(lost_times))
     return files, written, skipped, failed, short
 
 
@@ -30226,9 +30556,14 @@ def _logical_members(entries):
         return "/".join(out)
 
     def in_zip(path):
-        # two stored names can escape to one (a:b and a%3Ab), so uniqueness is
-        # decided on the name the zip will hold
-        return "/".join(_zip_safe_component(c) for c in path.split("/"))
+        # two stored names can escape to one (a:b and a%3Ab) or differ only in case
+        # (README and readme), so uniqueness is decided on the name the zip will hold,
+        # compared the way the folder it is extracted into may compare it
+        return _zip_key("/".join(_zip_component(c) for c in path.split("/")))
+
+    def plain(entry):
+        base = joined(entry.names) or "root-entry"
+        return base + ".folder-data" if entry.is_folder else base
 
     taken = set()
     for entry in entries:
@@ -30238,58 +30573,52 @@ def _logical_members(entries):
                 taken.add(in_zip(joined(names[:depth])))
         if entry.is_folder and names:
             taken.add(in_zip(joined(names)))
+    # every first holder takes its name before any suffix is chosen, so a suffix
+    # cannot land on a name stored later in the image
+    first = {}
+    for number, entry in enumerate(entries, 1):
+        if not _folder_without_content(entry) and in_zip(plain(entry)) not in taken:
+            taken.add(in_zip(plain(entry)))
+            first[number] = plain(entry)
     out = []
     for number, entry in enumerate(entries, 1):
         if _folder_without_content(entry):
             continue
-        base = joined(entry.names) or "root-entry"
-        if entry.is_folder:
-            base += ".folder-data"
-        member, retry = base, 1
-        while in_zip(member) in taken:
-            member = f"{base}.entry-{number}" + (f"-{retry}" if retry > 1 else "")
-            retry += 1
-        taken.add(in_zip(member))
+        member = first.get(number)
+        if member is None:
+            base, retry = plain(entry), 1
+            member = base
+            while in_zip(member) in taken:
+                member = f"{base}.entry-{number}" + (f"-{retry}" if retry > 1 else "")
+                retry += 1
+            taken.add(in_zip(member))
         out.append((member, entry))
     return out
 
 
-def _logical_volume_name(path, manifest):
+def _logical_volume_name(path, manifest, names=None):
     """The folder of this image's files in the zip: its name without the extension,
-    numbered when an earlier image of the run already has that folder."""
+    numbered when an earlier volume of the run already has that folder. ``names`` is
+    the zip's _ZipNames; without one the earlier volumes come from ``manifest``. The
+    name is not reserved here: a volume --only leaves out takes no folder."""
     stem = os.path.splitext(os.path.basename(os.path.normpath(path)))[0] or "logical"
-    # compared as the zip will hold them: a:b and a%3Ab escape to one folder, and a
-    # folder must not take the name of another image's entries table
-    def held(volume):
-        return {_zip_safe_component(volume), _zip_safe_component(f"{volume}.entries.tsv")}
-
-    used = {"volumes.json"}             # the zip's record of the run, at its root
-    for rec in manifest or []:
-        if rec.get("volume"):
-            used |= held(rec["volume"])
-    name, n = stem, 1
-    while held(name) & used:
-        n += 1
-        name = f"{stem}_{n}"
-    return name
+    if names is None:
+        names = _ZipNames()
+        for rec in manifest or []:
+            if rec.get("volume"):
+                names.volume(rec["volume"], (".entries.tsv",))
+    return names.volume(stem, (".entries.tsv",), claim=False)
 
 
 def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
                          written_names):
     """<volume>.entries.tsv in the zip: one row per entry, with its path and times
     as the container stores them, since a zip member keeps one time and a name made
-    safe. Returns the member name."""
-    import csv
-    import io as _io
-    name = _zip_safe_component(f"{volume}.entries.tsv")
+    safe. stored_names is the entry's names as a JSON list, because a "/" inside one
+    name and a "/" between two read alike in stored_path. Returns the member name."""
     by_entry = {id(e): m for m, e in members}
-    with zf.open(name, "w") as raw:
-        text = _io.TextIOWrapper(raw, encoding="utf-8", errors="backslashreplace",
-                                 newline="")
-        out = csv.writer(text, delimiter="\t", lineterminator="\n")
-        out.writerow(["zip_member", "stored_path", "kind", "size", "bytes_read", "status",
-                      "hash_check", "md5_as_stored", "sha1_as_stored", "deleted",
-                      "times_as_stored"])
+
+    def rows():
         for entry in entries:
             member = by_entry.get(id(entry))
             got, check = walker.results.get(id(entry), (None, ""))
@@ -30306,14 +30635,18 @@ def _write_logical_table(zf, volume, entries, members, excluded, walker, arcs,
                 status, arc = "SHORT", written_names[arcs[member]]
             else:
                 status, arc = "complete", written_names[arcs[member]]
-            out.writerow([arc, entry.path, "folder" if entry.is_folder else "file",
-                          entry.size, "" if got is None else got, status, check,
-                          entry.md5 or "", entry.sha1 or "",
-                          "yes" if getattr(entry, "is_deleted", False) else "",
-                          json.dumps(entry.times, sort_keys=True)])
-        text.flush()
-        text.detach()
-    return name
+            yield [arc, entry.path, json.dumps(list(entry.names)),
+                   "folder" if entry.is_folder else "file",
+                   entry.size, "" if got is None else got, status, check,
+                   entry.md5 or "", entry.sha1 or "",
+                   "yes" if getattr(entry, "is_deleted", False) else "",
+                   json.dumps(entry.times, sort_keys=True)]
+
+    return _zip_store_table(
+        zf, _zip_component(f"{volume}.entries.tsv"),
+        ["zip_member", "stored_path", "stored_names", "kind", "size", "bytes_read", "status",
+         "hash_check", "md5_as_stored", "sha1_as_stored", "deleted", "times_as_stored"],
+        rows())
 
 
 def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, extract=None,
@@ -30337,10 +30670,13 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
     print("=" * 78)
     print("  It holds copies of files and no disk, so no partition table or filesystem "
           "is read.")
-    volume = _logical_volume_name(path, manifest)
+    zip_names = _zip_names(zf) if zf is not None else None
+    volume = _logical_volume_name(path, manifest, zip_names)
     wanted = only is None or only.lower() in volume.lower()
     if not wanted:
         print(f"  not selected by --only: {volume}")
+    elif zip_names is not None:
+        zip_names.volume(volume, (".entries.tsv",))
     if do_triage:
         print("  --triage ranks volumes, and logical evidence has none.")
     if unallocated and unallocated_log is not None:
@@ -30373,7 +30709,11 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
         # column (libyal/libewf, "Expert Witness Compression Format (EWF).asciidoc")
         rows = [(m, e, e.size, e.times.get("modified" if kind == "AD1" else "wr"))
                 for m, e in members]
-        rows, dropped = apply_exclude(rows, exclude)
+        # --exclude reads the path as stored, not the name made for the zip, whose
+        # .folder-data, .entry-<n> and %2F are this tool's own
+        kept_rows = [r for r in rows if not any(x in r[1].path for x in exclude or ())]
+        dropped = len(rows) - len(kept_rows)
+        rows = kept_rows
         kept = {r[0] for r in rows}
         excluded = {m for m, _e in members if m not in kept}
         log = []
@@ -30415,6 +30755,8 @@ def read_logical_image(image, path, do_list=False, list_depth=2, list_max=400, e
                 "files_without_stored_hash": checks["no stored hash"],
                 "entries_table": table,
             })
+            if _zip_component(volume) != volume:
+                manifest[-1]["zip_folder"] = _zip_component(volume)
     print()
 
 
@@ -30510,6 +30852,378 @@ def _logical_self_check():
                 and (rec["files"], rec["short"], rec["failed"], rec["excluded"],
                      rec["stored_hashes_matched"], rec["stored_hashes_mismatched"])
                 == (10, 1, 1, 1, 1, 1))
+
+
+def _zip_export_checks():
+    """[(label, passed)] for what an export must not do to a file: lose it, hide it,
+    misname it or misdate it. Each case drives extract_to_zip, read_logical_image or
+    main() the way the command line does, on stand-ins and on real FAT12 images."""
+    import contextlib
+    import csv
+    import errno
+    import io as _io
+    import random
+    import shutil
+    import tempfile
+    import unicodedata
+
+    class Walker:
+        """Flat files, [(name, data, mtime, read raises)]."""
+        root = 0
+
+        def __init__(self, files):
+            self.files = files
+
+        def listdir(self, node):
+            return [(f[0], n) for n, f in enumerate(self.files, 1)] if node == 0 else []
+
+        def entry(self, node):
+            if node == 0:
+                return (0o040755, 0, 0)
+            return (0o100644, len(self.files[node - 1][1]), self.files[node - 1][2])
+
+        def read_file(self, node, _size):
+            if self.files[node - 1][3]:
+                raise OSError("unreadable")
+            yield self.files[node - 1][1]
+
+    class Entry:
+        md5, sha1 = None, None
+
+        def __init__(self, names, data=b"", folder=False):
+            self.names, self.data, self.is_folder = names, data, folder
+            self.size, self.times, self.content_collected = len(data), {}, True
+
+        @property
+        def path(self):
+            return "/".join(self.names)
+
+    class Image:
+        format, paths, encryption = "EWF-L01", [], None
+
+        def __init__(self, entries):
+            self.logical_entries = entries
+
+        @staticmethod
+        def open_entry(entry):
+            return _io.BytesIO(entry.data)
+
+    class FullDisk(_io.FileIO):
+        """A real file whose write fails once, past a byte offset, like a full disk."""
+        fail_past = None
+
+        def write(self, data):
+            if self.fail_past is not None and self.tell() + len(data) > self.fail_past:
+                self.fail_past = None
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return super().write(data)
+
+    def fat12(files):
+        """A FAT12 volume holding {8.3 name: bytes under one sector} (or pairs, so a
+        name can repeat), one cluster each."""
+        items = list(files.items()) if isinstance(files, dict) else list(files)
+        boot = bytearray(512)
+        boot[0:3], boot[3:11] = b"\xeb\x3c\x90", b"MSDOS5.0"
+        struct.pack_into("<HBHBHHBH", boot, 11, 512, 1, 1, 2, 32, 256, 0xF8, 2)
+        struct.pack_into("<HHI", boot, 24, 18, 2, 0)
+        boot[38], boot[43:54], boot[54:62] = 0x29, b"NO NAME    ", b"FAT12   "
+        boot[510:512] = b"\x55\xaa"
+        cells = [0xFF8, 0xFFF] + [0xFFF] * len(items)
+        fat = bytearray(1024)
+        for n, cell in enumerate(cells):
+            at = n * 3 // 2
+            old = struct.unpack_from("<H", fat, at)[0]
+            new = (old & 0xF) | (cell << 4) if n & 1 else (old & 0xF000) | cell
+            struct.pack_into("<H", fat, at, new)
+        root, data = bytearray(1024), bytearray(512 * len(items))
+        for n, (name, body) in enumerate(items):
+            stem, _dot, ext = name.partition(".")
+            root[n * 32:n * 32 + 11] = f"{stem:<8}{ext:<3}".encode("ascii")
+            root[n * 32 + 11] = 0x20
+            struct.pack_into("<H", root, n * 32 + 26, n + 2)
+            struct.pack_into("<I", root, n * 32 + 28, len(body))
+            data[n * 512:n * 512 + len(body)] = body
+        image = bytes(boot) + bytes(fat) + bytes(fat) + bytes(root) + bytes(data)
+        return image + b"\0" * (256 * 512 - len(image))
+
+    def direct(files, sizes=None):
+        """Files through extract_to_zip: (zip, tally). Paths may hold folders."""
+        walker = Walker(files)
+        rows = [(f[0], n, (sizes or {}).get(f[0], len(f[1])), f[2])
+                for n, f in enumerate(files, 1)]
+        buf, log = _io.BytesIO(), []
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            tally = extract_to_zip(zf, walker, "vol", rows, log)
+        return zipfile.ZipFile(_io.BytesIO(buf.getvalue())), tally
+
+    def logical(entries, exclude=None):
+        buf, manifest = _io.BytesIO(), []
+        with zipfile.ZipFile(buf, "w") as zf, contextlib.redirect_stdout(_io.StringIO()):
+            read_logical_image(Image(entries), "case.L01", extract="x.zip", zf=zf,
+                               manifest=manifest, exclude=exclude)
+        return zipfile.ZipFile(_io.BytesIO(buf.getvalue())), manifest[0]
+
+    def table(zin, name):
+        text = zin.read(name).decode("utf-8")
+        return list(csv.DictReader(_io.StringIO(text, newline=""), delimiter="\t"))
+
+    def fold(name):
+        return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+    def no_clash(names):
+        """No two members land on one file where case and normalization are ignored,
+        and none lands on a folder another member needs."""
+        keys = [fold(n) for n in names]
+        dirs = {"/".join(k.split("/")[:d]) for k in keys for d in range(1, k.count("/") + 1)}
+        return len(keys) == len(set(keys)) and not dirs & set(keys)
+
+    # mkdtemp and rmtree are replaced in the CI build that keeps this function's
+    # images as fixtures: use a folder of its own, a name that glob does not count,
+    # and remove every file by hand.
+    parent = tempfile.mkdtemp(prefix="qnxprobe-zip-")
+    work = os.path.join(parent, "zip-export-checks")
+    os.makedirs(work, exist_ok=True)
+
+    def clear():
+        for root, dirs, names in os.walk(work, topdown=False):
+            for name in names:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+
+    def through_main(files, walker=None):
+        """main() over a FAT12 image, with ``walker`` standing in for what it read."""
+        raw = os.path.join(work, "volume.dd")
+        out = os.path.join(work, "volume.zip")
+        with open(raw, "wb") as fh:
+            fh.write(fat12(files))
+        manifest = []
+        real = walker_for
+        try:
+            if walker is not None:
+                globals()["walker_for"] = lambda *_a, **_k: walker
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf, \
+                    contextlib.redirect_stdout(_io.StringIO()):
+                main(raw, extract=out, zf=zf, manifest=manifest)
+        finally:
+            globals()["walker_for"] = real
+        with open(out, "rb") as fh:
+            held = _io.BytesIO(fh.read())
+        os.remove(raw)
+        os.remove(out)
+        return zipfile.ZipFile(held), manifest
+
+    def two_images():
+        one, two = os.path.join(work, "one.dd"), os.path.join(work, "two.dd")
+        out = os.path.join(work, "two.zip")
+        for path, body in ((one, b"first image"), (two, b"second image")):
+            with open(path, "wb") as fh:
+                fh.write(fat12({"EVID.TXT": body}))
+        manifest = []
+        with zipfile.ZipFile(out, "w") as zf, contextlib.redirect_stdout(_io.StringIO()):
+            read_logical_image(Image([Entry(("EVID.TXT",), b"logical")]), "lba0.L01",
+                               extract=out, zf=zf, manifest=manifest)
+            main(one, extract=out, zf=zf, manifest=manifest)
+            main(two, extract=out, zf=zf, manifest=manifest)
+        with zipfile.ZipFile(out) as zin:
+            names = [n for n in zin.namelist() if n.endswith("/EVID.TXT")]
+            bodies = sorted(zin.read(n) for n in names)
+        folders = [r["volume"] for r in manifest]
+        for path in (one, two, out):
+            os.remove(path)
+        return (bodies == [b"first image", b"logical", b"second image"]
+                and len(set(names)) == 3 and len(set(folders)) == 3
+                and {n.split("/")[0] for n in names} == set(folders)
+                and folders[0] == "lba0")
+
+    def duplicates():
+        zin, tally = direct([("A.TXT", b"one", 0, False), ("A.TXT", b"two", 0, False),
+                             ("a:b", b"colon", 0, False), ("a%3Ab", b"percent", 0, False),
+                             ("A.TXT.dup-2", b"stored name", 0, False)])
+        names = zin.namelist()
+        return (len(names) == len(set(names)) == 5 and tally[0] == 5
+                and zin.read("vol/A.TXT") == b"one"
+                and zin.read("vol/A.TXT.dup-2") == b"stored name"
+                and sorted(zin.read(n) for n in names)
+                == [b"colon", b"one", b"percent", b"stored name", b"two"])
+
+    def failed_write():
+        body = random.Random(1987).randbytes(1 << 20)   # does not compress
+        files = [("case/first.txt", b"first", 0, False), ("case/victim.db", body, 0, False),
+                 ("case/after.txt", b"after", 0, False)]
+        walker = Walker(files)
+        rows = [(f[0], n, len(f[1]), 0) for n, f in enumerate(files, 1)]
+
+        def outcome(path, tally):
+            dest = os.path.join(work, "out")
+            with zipfile.ZipFile(path) as zin:
+                names = zin.namelist()
+                clean = zin.testzip() is None
+                zin.extractall(dest)
+            with open(os.path.join(dest, "vol/case/after.txt"), "rb") as fh:
+                after = fh.read()
+            whole = not os.path.exists(os.path.join(dest, "vol/case/victim.db"))
+            for root, dirs, found in os.walk(dest, topdown=False):
+                for name in found:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(dest)
+            os.remove(path)
+            return (clean and whole and after == b"after" and tally[3] == 1 and tally[0] == 2
+                    and names == ["vol/case/first.txt", "vol/case/after.txt"])
+
+        # the disk fills during the write
+        path = os.path.join(work, "full.zip")
+        with FullDisk(path, "w+") as raw:
+            with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as zf:
+                raw.fail_past = 262144
+                tally = extract_to_zip(zf, walker, "vol", rows, [])
+        good = outcome(path, tally)
+
+        # the spool cannot be read back partway through the copy
+        real, calls = shutil.copyfileobj, [0]
+
+        def cut_short(source, target, length=0):
+            if len(body) == source.seek(0, 2):
+                source.seek(0)
+                calls[0] += 1
+                target.write(source.read(262144))
+                raise OSError(errno.EIO, "Input/output error")
+            source.seek(0)
+            real(source, target, length or 65536)
+
+        path = os.path.join(work, "broken.zip")
+        shutil.copyfileobj = cut_short
+        try:
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                tally = extract_to_zip(zf, walker, "vol", rows, [])
+        finally:
+            shutil.copyfileobj = real
+        return outcome(path, tally) and good and calls[0] == 1
+
+    def case_clashes():
+        accent, spelled = "café", "café"
+        zin, tally = direct([("README", b"1", 0, False), ("readme", b"2", 0, False),
+                             ("dir", b"3", 0, False), ("Dir/x", b"4", 0, False),
+                             (accent, b"5", 0, False), (spelled, b"6", 0, False)])
+        names = zin.namelist()
+        members = [m for m, _e in _logical_members([Entry(("Case",), b"a"),
+                                                    Entry(("case",), b"b")])]
+        return (no_clash(names) and tally[0] == 6
+                and sorted(zin.read(n) for n in names) == [b"1", b"2", b"3", b"4", b"5", b"6"]
+                and zin.read("vol/README") == b"1" and zin.read("vol/Dir/x") == b"4"
+                and zin.read(f"vol/{accent}") == b"5" and no_clash(members)
+                and members[0] == "Case"
+                and _logical_volume_name("Case.L01", [{"volume": "case"}]) == "Case_2"
+                and _logical_volume_name("Volumes.json.L01", []) == "Volumes.json_2")
+
+    def long_names():
+        files = [("a" * 300 + ".db", b"long", 0, False),
+                 ("é" * 200, b"accents", 0, False),
+                 ("n" * 250 + ".txt", b"short read", 0, False)]
+        zin, _tally = direct(files, {"n" * 250 + ".txt": 99})
+        dest = os.path.join(work, "long")
+        zin.extractall(dest)
+        on_disk = sorted(f for _r, _d, found in os.walk(dest) for f in found)
+        for name in on_disk:
+            os.remove(os.path.join(dest, "vol", name))
+        os.rmdir(os.path.join(dest, "vol"))
+        os.rmdir(dest)
+        lzin, _rec = logical([Entry(("f" * 254,), b"data", folder=True),
+                              Entry(("f" * 254, "x"), b"child")])
+        row = next(r for r in table(lzin, "case.entries.tsv") if r["kind"] == "folder")
+        fzin, manifest = through_main({"EVID.TXT": b"x"},
+                                      Walker([("g" * 300 + ".db", b"x", 1_600_000_000, False)]))
+        kept = table(fzin, manifest[0]["exceptions_table"])
+        limit = all(len(c.encode("utf-8")) <= 255
+                    for n in zin.namelist() + lzin.namelist() + fzin.namelist()
+                    for c in n.split("/"))
+        return (limit and len(on_disk) == 3 and any(n.endswith(".db") for n in on_disk)
+                and any(".SHORT-" in n for n in on_disk)
+                and row["stored_path"] == "f" * 254 and row["status"] == "complete"
+                and [(r["stored_path"], r["issue"]) for r in kept]
+                == [("g" * 300 + ".db", "RENAMED")] and kept[0]["zip_member"] in fzin.namelist())
+
+    def failures_named():
+        files = [(f"F{n}.TXT", b"x", 1_600_000_000, True) for n in range(7)]
+        files += [("a:b", b"renamed", 1_600_000_000, False)]
+        zin, manifest = through_main({"EVID.TXT": b"x"}, Walker(files))
+        rec = manifest[0]
+        rows = table(zin, rec["exceptions_table"])
+        return (rec["exceptions_table"] == "lba0.exceptions.tsv"
+                and rec["exceptions"]["failed"] == 7 and rec["exceptions"]["renamed"] == 1
+                and {r["stored_path"] for r in rows if r["issue"] == "FAILED"}
+                == {f"F{n}.TXT" for n in range(7)}
+                and any(r["stored_path"] == "a:b" and r["zip_member"] == "lba0/a%3Ab"
+                        and r["issue"] == "RENAMED" for r in rows))
+
+    def times_kept():
+        files = [("FAR.TXT", b"x", 7258118400, False)]
+        files += [(f"Z{n}.TXT", b"x", 0, False) for n in range(500)]
+        zin, manifest = through_main({"EVID.TXT": b"x"}, Walker(files))
+        rec = manifest[0]
+        rows = table(zin, rec["exceptions_table"])
+        far = [r for r in rows if r["stored_path"] == "FAR.TXT"]
+        plain, plain_man = through_main({"EVID.TXT": b"x"})     # FAT's placeholder 0
+        unset = type("Unset", (Walker, NtfsWalker), {})([("N.TXT", b"x", 0, False)])
+        ntfs, ntfs_man = through_main({"EVID.TXT": b"x"}, unset)     # NTFS: 0 is unset
+        return (rec["exceptions"]["time_not_held"] == 501 and len(rows) < 12
+                and "exceptions_table" not in ntfs_man[0] and "lba0/N.TXT" in ntfs.namelist()
+                and len(far) == 1 and "7258118400" in far[0]["detail"]
+                and any("492 more" in r["detail"] for r in rows)
+                and "exceptions_table" not in plain_man[0]
+                and not any(n.endswith(".exceptions.tsv") for n in plain.namelist()))
+
+    def exclude_stored():
+        def build():
+            return [Entry(("a/b",), b"one name"), Entry(("d",), b"folder bytes", folder=True),
+                    Entry(("same",), b"first"), Entry(("same",), b"second")]
+
+        by_path, rec_path = logical(build(), ["a/b"])
+        _word, rec_word = logical(build(), ["folder"])
+        _entry, rec_entry = logical(build(), ["entry"])
+        return (rec_path["excluded"] == 1
+                and "case/a%2Fb" not in by_path.namelist()
+                and rec_word["excluded"] == 0 and rec_entry["excluded"] == 0)
+
+    def name_boundaries():
+        zin, _rec = logical([Entry(("a/b",), b"one name"), Entry(("a",), b"", folder=True),
+                             Entry(("a", "b"), b"two names")])
+        rows = {r["zip_member"]: r for r in table(zin, "case.entries.tsv") if r["zip_member"]}
+        return (json.loads(rows["case/a%2Fb"]["stored_names"]) == ["a/b"]
+                and json.loads(rows["case/a/b"]["stored_names"]) == ["a", "b"]
+                and rows["case/a%2Fb"]["stored_path"] == rows["case/a/b"]["stored_path"])
+
+    out = []
+    for label, check in (
+            ("two images in one zip, and an L01 and a raw image, get separate folders that "
+             "volumes.json names", two_images),
+            ("two files with one name in a volume are both kept, and the first keeps it",
+             duplicates),
+            ("a write that fails partway leaves no truncated member, and the members after "
+             "it extract", failed_write),
+            ("names differing only in case or Unicode form do not land on one file",
+             case_clashes),
+            ("a name past 255 bytes extracts, with its full name in the table", long_names),
+            ("every failed or renamed file of a filesystem volume is named in its "
+             "exceptions table", failures_named),
+            ("a stored time a zip cannot hold is recorded, in few rows when files share it, "
+             "and a walker's 0 for no time is not", times_kept),
+            ("--exclude on logical evidence reads the stored path, not the generated name",
+             exclude_stored),
+            ("the entries table keeps the boundaries between stored names", name_boundaries)):
+        try:
+            out.append((label, bool(check())))
+        except Exception:                            # pylint: disable=broad-except
+            out.append((label, False))
+        clear()
+    try:
+        os.rmdir(work)
+        os.rmdir(parent)
+    except OSError:
+        pass                            # in that CI build the parent holds the fixtures
+    return out
 
 
 def _open_logical(path, passwords=(), private_keys=()):
@@ -31126,7 +31840,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     print(f"        could not walk this filesystem: {exc}")
 
             if zf is not None and base is not None and wanted:
-                vol = name_prefix + (vol_names.get(base) or f"lba{base // ss}")
+                vol = _zip_names(zf).volume(name_prefix + (vol_names.get(base) or f"lba{base // ss}"),
+                                            (".exceptions.tsv",))
                 print(f"\n      EXTRACTING to {extract}  as {vol}/")
                 try:
                     w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
@@ -31134,7 +31849,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     ents, dropped = apply_exclude(ents, exclude)
                     log = []
                     miss = missing_past_end(base, base + total)
-                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
+                    issues = []
+                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
+                                                         issues=issues)
                     if manifest is not None:
                         rsize = next((r[2] for r in sized_regions if r[1] == base), None)
                         manifest.append({
@@ -31148,6 +31865,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             "symlinks_or_special_skipped": sk,
                             "failed": fa, "short": sh, "excluded": dropped,
                         })
+                    _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None else None,
+                                           issues)
                     print(f"        {f_:,} files, {human(wr)}"
                           + (f", {sk:,} symlinks or special files skipped" if sk else "")
                           + (f", {fa:,} FAILED" if fa else "")
@@ -31278,8 +31997,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 if zf is not None and kind and kind.startswith("ext") and wanted:
                     stem = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
                     suffix = sanitize_volume_label(ext_name) if ext_name else ""
-                    vol = (f"{stem}_{suffix}"
-                           if suffix and not stem.endswith(f"_{suffix}") else stem)
+                    vol = _zip_names(zf).volume(f"{stem}_{suffix}"
+                                                if suffix and not stem.endswith(f"_{suffix}")
+                                                else stem, (".exceptions.tsv",))
                     print(f"        EXTRACTING to {extract}  as {vol}/")
                     try:
                         w = ExtWalker(fh, b)
@@ -31287,7 +32007,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         ents, dropped = apply_exclude(ents, exclude)
                         log = []
                         miss = missing_past_end(b)
-                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
+                        issues = []
+                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
+                                                             issues=issues)
                         if manifest is not None:
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)
                             manifest.append({
@@ -31301,6 +32023,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 "symlinks_or_special_skipped": sk,
                                 "failed": fa, "short": sh, "excluded": dropped,
                             })
+                        _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
+                                               else None, issues, " " * 12)
                         print(f"            {f_:,} files, {human(wr)}"
                               + (f", {sk:,} symlinks or special files skipped" if sk else "")
                               + (f", {fa:,} FAILED" if fa else "")
@@ -31332,7 +32056,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         except Exception as exc:
                             print(f"        could not walk this filesystem: {exc}")
                     if zf is not None:
-                        vol = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
+                        vol = _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                                                    (".exceptions.tsv",))
                         print(f"        EXTRACTING to {extract}  as {vol}/")
                         try:
                             w = walker_for(kind, fh, b, sz)
@@ -31340,7 +32065,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             ents, dropped = apply_exclude(ents, exclude)
                             log = []
                             miss = missing_past_end(b)
-                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
+                            issues = []
+                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
+                                                                 issues=issues)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -31350,6 +32077,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                     "symlinks_or_special_skipped": sk,
                                     "failed": fa, "short": sh, "excluded": dropped,
                                 })
+                            _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
+                                                   else None, issues, " " * 12)
                             n_dmg, dmg = damage_lines(w, 50)
                             if n_dmg and manifest is not None:
                                 manifest[-1]["damage_recorded"] = n_dmg
@@ -31393,14 +32122,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             except Exception as exc:
                                 print(f"        could not walk this filesystem: {exc}")
                         if zf is not None:
-                            vol = name_prefix + (vol_names.get(b) or f"lba{b // ss}")
+                            vol = _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                                                        (".exceptions.tsv",))
                             print(f"        EXTRACTING to {extract}  as {vol}/")
                             try:
                                 ents = collect(w, w.root)
                                 ents, dropped = apply_exclude(ents, exclude)
                                 log = []
                                 miss = missing_past_end(b)
-                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
+                                issues = []
+                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
+                                                                     issues=issues)
                                 if manifest is not None:
                                     manifest.append({
                                         "volume": vol, **image_rec,
@@ -31414,6 +32146,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                         "symlinks_or_special_skipped": sk,
                                         "failed": fa, "short": sh, "excluded": dropped,
                                     })
+                                _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
+                                                       else None, issues, " " * 12)
                                 print(f"            {f_:,} files, {human(wr)}"
                                       + (f", {sk:,} symlinks or special files skipped"
                                          if sk else "")
@@ -35019,6 +35753,7 @@ def self_test():
                  _logical_self_check()),
                 ("an entry stored under a file leaves the file its own name",
                  _logical_stream_self_check()),
+                *_zip_export_checks(),
                 ("two images whose names escape alike get separate zip folders",
                  _logical_volume_name("a%3Ab.L01", [{"volume": "a:b"}]) == "a%3Ab_2"
                  and _logical_volume_name("a.entries.tsv.L01", [{"volume": "a"}])
@@ -38183,7 +38918,7 @@ def self_test():
                 pe_man = []
                 pe_buf = io.StringIO()
                 pe_want = {}
-                pe_leaked, pe_ok, pe_bad = [], 0, 0
+                pe_leaked, pe_ok, pe_bad, pe_failed = [], 0, 0, []
                 try:
                     with open(pe_path, "wb") as pe_fh:
                         pe_fh.write(bytes(pe_img))
@@ -38196,10 +38931,16 @@ def self_test():
                                 pe_want[pe_p] = pe_dg
                     with zipfile.ZipFile(pe_zip) as pe_zr:
                         pe_members = {i_.filename: i_ for i_ in pe_zr.infolist()}
-                        # anything but the other files and the manifest: the damaged
-                        # file under its own name, a marker, or a stray
-                        pe_leaked = sorted(set(pe_members) - {"volumes.json"}
+                        # anything but the other files, the manifest and the table
+                        # that names the failed file: the damaged file under its own
+                        # name, a marker, or a stray
+                        pe_leaked = sorted(set(pe_members)
+                                           - {"volumes.json", "lba0.exceptions.tsv"}
                                            - {f"lba0/{p_}" for p_ in pe_want if p_ != pe_target})
+                        pe_table = (pe_zr.read("lba0.exceptions.tsv").decode("utf-8")
+                                    if "lba0.exceptions.tsv" in pe_members else "")
+                        pe_failed = [ln.split("\t")[:3] for ln in pe_table.splitlines()[1:]
+                                     if ln.split("\t")[2:3] == ["FAILED"]]
                         for pe_p, pe_dg in pe_want.items():
                             if pe_p == pe_target:
                                 continue
@@ -38216,6 +38957,7 @@ def self_test():
                 pe_entry = pe_man[0] if pe_man else {}
                 pe_cond = (not pe_leaked and pe_bad == 0 and pe_ok == len(pe_want) - 1
                            and pe_entry.get("failed") == 1
+                           and pe_failed == [[pe_target, "", "FAILED"]]
                            and f"could not extract lba0/{pe_target}" in pe_buf.getvalue()
                            and "is erased flash" in pe_buf.getvalue())
                 pe_detail = (f"{pe_ok} of {len(pe_want) - 1} other files match their source hash, "

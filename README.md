@@ -260,6 +260,13 @@ For a bare image with no vendor export alongside it, that file is the record
 tying every extracted path back to a place on the disk, checkable against
 `mmls` or `fdisk` without trusting the directory names.
 
+Two images in one run can hold a volume at the same LBA, so since 1.87 every volume
+folder is unique across the zip: the first keeps its name and a later one gets `_2`,
+`_3` and so on. `volume` in `volumes.json` is that name, and `zip_folder` is added when
+the folder is spelled differently in the zip. Names are compared ignoring case and
+Unicode normalization, because Windows and macOS extract to folders that ignore one or
+both.
+
 `--triage` ranks the volumes by how much each has been written, using only what the
 probe already read: the qnx6 superblock serial is a commit counter, and ext exposes
 mount count and lifetime kilobytes written. It also samples filenames and says so
@@ -313,9 +320,8 @@ by name, when the rest lives in an extended attribute this does not read.
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
 
-Each file is read in full before anything of it is written to the zip, because a zip
-member cannot be taken back once written. A file whose read raises partway (in the
-self-test, a UBIFS data node that reads as erased flash) is left out of the zip
+Each file is read in full before anything of it is written to the zip. A file whose
+read raises partway (in the self-test, a UBIFS data node that reads as erased flash) is left out of the zip
 entirely: the report counts it as `FAILED` and prints
 `could not extract <path>: <reason>` for the first five on each volume, and
 `volumes.json` counts it under `failed`.
@@ -327,6 +333,26 @@ the end of the image is still stored, under a name ending
 is given on every volume, not only on one the partition table already shows is cut.
 A file larger than 32 MiB is held in a temporary file while it is read, so extraction
 needs that file's size free in the system's temporary folder.
+
+Since 1.87 a write that fails partway (the disk fills, the temporary copy cannot be read
+back) is taken back out of the zip, so no truncated member stays under the file's real
+name and the members after it still extract. The file counts as `FAILED`. `--extract`
+always writes a new regular file, which can be cut back. From Python, an output that cannot
+seek keeps the bytes already written, and no member names them.
+
+Inside a volume the first file to hold a name keeps it. A later file whose name clashes,
+ignoring case and Unicode normalization, gets `.dup-<n>`. A file that clashes with a
+folder is the one renamed, so the folder's files keep their paths. A name longer than 255
+bytes of UTF-8 keeps its start and a short last extension around a hash.
+
+A filesystem volume with anything to record gets `<volume>.exceptions.tsv` beside its
+folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
+`exceptions`. It has one row per file that failed, read short or was renamed
+(`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
+a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
+files are named per stored value and one row with no path counts the rest. A time of 0 is
+not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
+time, and for the last five for a value out of their range too.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -3545,15 +3571,18 @@ A folder can record a size and an MD5 without its content being collected. EnCas
 table says `content not collected`.
 
 The zip holds a folder named for the image and, beside it, `<image>.entries.tsv`, one row
-per entry with its stored path, size, status, the MD5 and SHA-1 it stores, and its times
+per entry with its stored path, its names as a JSON list (`stored_names`, because a `/`
+inside one name and a `/` between two read alike in the path), size, status, the MD5 and SHA-1 it stores, and its times
 as stored. A zip member keeps one time, the file's last written time: an AD1's modified
 record, or the `wr` column of an L01 or Lx01. A zip holds that time to two seconds and
 from 1980 on, so read the table for the exact value and for the other times. Each file
 is checked against the hashes it stores, and `volumes.json` counts the matches, the
 mismatches and the files that store none. A file with a mismatch is still written and is
-named in the run's output. Member names can differ from stored paths in three cases, all
-kept in the table: a repeated path gets `.entry-<n>`, data held by a folder entry gets
-`.folder-data`, and a `/` inside a stored name is written `%2F`.
+named in the run's output. Member names can differ from stored paths in these cases, all
+kept in the table: a repeated path, or one differing only in case or Unicode form, gets
+`.entry-<n>`, data held by a folder entry gets `.folder-data`, a `/` inside a stored name
+is written `%2F`, and a name past 255 bytes is shortened around a hash. `--exclude` reads
+the stored path, not the member name.
 
 This is `ewfprobe.py`, vendored from
 [abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
