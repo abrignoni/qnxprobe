@@ -40098,15 +40098,17 @@ def _qnx6_reader_checks():
     def names():
         import sqlite3                              # pylint: disable=import-outside-toplevel
         img = bytearray(base)
-        for stored, raw in ((b"deep.bin", b"deep\xe9bin"), (b"big.bin", b"big\xe8bin")):
+        # the two stored names differ only in the byte that does not decode
+        for stored, raw in ((b"deep.bin", b"deep\xe9bin"), (b"big.bin", b"deep\xe8bin")):
             p = root_entry(img, stored)
+            img[p + 4] = len(raw)
             img[p + 5:p + 5 + len(raw)] = raw
         v = vols(img)[0]
         listed = [n for n, _i in v["walker"].listdir(1)]
         db = sqlite3.connect(":memory:")
         db.execute("create table t (n text primary key)")
         db.executemany("insert into t values (?)", [(n,) for n in listed])
-        return "deep%E9bin" in listed and "big%E8bin" in listed \
+        return "deep%E9bin" in listed and "deep%E8bin" in listed \
             and db.execute("select count(*) from t").fetchone()[0] == len(listed)
     row("qnx6: a stored name that is not UTF-8 keeps its bytes as %XX, stays distinct and "
         "goes into SQLite", names)
@@ -44780,8 +44782,9 @@ def self_test():
                  not q6_size_problems),
                 ("a qnx6 superblock whose clock was never set is accepted with a note "
                  "when its checksum (crc32_be, checked against zlib and CRC-32/CKSUM) "
-                 "holds, little and big endian, still refused when it does not, and a "
-                 "bad checksum alone is no reason to refuse"
+                 "holds, little and big endian, and still refused when it does not; with "
+                 "a good clock and no copy that passes, the newest failed copy is read "
+                 "and says so"
                  + "".join(f"; {p}" for p in q6_clock_problems),
                  not q6_clock_problems),
                 ("an extended container is not listed as the qnx6 of its own logical "
