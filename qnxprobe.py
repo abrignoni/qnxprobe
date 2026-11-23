@@ -3165,9 +3165,27 @@ def _vfat_name(lfn):
 _EXFAT_DIR_MAX = 256 << 20       # exFAT specification 7.6.5: a directory's largest DataLength
 
 
+class _ExfatFileNode(tuple):
+    """The node of an exFAT file whose ValidDataLength differs from its DataLength: the
+    same four values as any other node, so it unpacks and compares the same, with the
+    stored ValidDataLength in ``valid``. Every other file has a plain tuple."""
+    valid = None
+
+
 class ExfatWalker:
     """List and read files from an exFAT volume, same interface as Fat32Walker.
-    A node is (cluster, size, is_dir, fat_chain_flag)."""
+    A node is (cluster, size, is_dir, fat_chain_flag).
+
+    A file's size is its DataLength. Its ValidDataLength (Stream Extension offset 8,
+    exFAT specification 7.6.5; valid_size in Linux fs/exfat/exfat_raw.h) says how far user
+    data has been written: what the clusters hold past it is undefined and a read there
+    returns zeros, so read_file() never reads those clusters."""
+
+    # read_file() hands back only bytes it read and the zeros past ValidDataLength. It never
+    # pads over a gap, so the bytes it returned are the count of the file that is there. The
+    # EOF_SHORTFALL tally can be larger: it also takes in FAT reads and a decrypting
+    # reader's whole chunk.
+    read_file_never_pads = True
 
     def __init__(self, fh, base):
         self.fh = fh
@@ -3438,11 +3456,12 @@ class ExfatWalker:
     def _cluster_off(self, clus):
         return self.heap_start + (clus - 2) * self.cluster_bytes
 
-    def _run_chunks(self, clus, want):
+    def _run_chunks(self, clus, want, exact=False):
         """The clusters of a NoFatChain run that hold ``want`` bytes, as whole clusters in
         pieces of about 1 MiB. Nothing below cluster 2 and nothing past the volume is read,
         and the run ends at the first read that comes back short, so a damaged length costs
-        no more than the volume or the image holds."""
+        no more than the volume or the image holds. With ``exact`` the last read stops at
+        ``want``, so an image ending in the slack after it is not counted as missing."""
         if clus < 2:
             return
         cb = self.cluster_bytes
@@ -3453,25 +3472,28 @@ class ExfatWalker:
         done = 0
         while done < count:
             k = min(step, count - done)
-            part = read_at(self.fh, self._cluster_off(clus + done), k * cb)
+            n = min(k * cb, want - done * cb) if exact else k * cb
+            part = read_at(self.fh, self._cluster_off(clus + done), n)
             yield part
-            if len(part) < k * cb:
+            if len(part) < n:
                 return
             done += k
 
-    def _read(self, clus, size, contiguous):
+    def _read(self, clus, size, contiguous, exact=False):
+        """``exact``, for a file's bytes, reads no further than ``size``."""
         if contiguous:
-            out = b"".join(self._run_chunks(clus, size if size else self.cluster_bytes))
+            out = b"".join(self._run_chunks(clus, size if size else self.cluster_bytes, exact))
             return out[:size] if size else out
         out = bytearray()
         seen = set()
         c = clus
         while self._chain_goes_on(c) and c not in seen:
             seen.add(c)
-            part = read_at(self.fh, self._cluster_off(c), self.cluster_bytes)
+            n = min(self.cluster_bytes, size - len(out)) if exact else self.cluster_bytes
+            part = read_at(self.fh, self._cluster_off(c), n)
             out += part
             # bytes after a gap would read as the ones that belong there
-            if len(part) < self.cluster_bytes or (size and len(out) >= size):
+            if len(part) < n or (size and len(out) >= size):
                 break
             c = self._fat_next(c)
         return bytes(out[:size]) if size else bytes(out)
@@ -3526,6 +3548,7 @@ class ExfatWalker:
                 name_len = s2[3]
                 first = struct.unpack_from("<I", s2, 20)[0]
                 data_len = struct.unpack_from("<Q", s2, 24)[0]
+                valid_len = struct.unpack_from("<Q", s2, 8)[0]
                 is_dir = bool(raw[i + 4] & 0x10)
                 contiguous = bool(flags & 0x02)
                 # name entries follow, 0xC1, 15 UTF-16 chars each
@@ -3556,8 +3579,18 @@ class ExfatWalker:
                         # are told apart by the folder holding them.
                         self._folder_not_read(f"folder {name!r} in the folder at cluster "
                                               f"{clus:#x}, recording {data_len:,} bytes", first)
+                    child = (first, data_len, is_dir, contiguous)
+                    if not is_dir and valid_len != data_len:
+                        child = _ExfatFileNode(child)
+                        child.valid = valid_len
+                        if live and valid_len > data_len:
+                            self._folder_part_read(clus, f"file {name!r} records a "
+                                                         f"ValidDataLength of {valid_len:,} "
+                                                         f"bytes, more than its DataLength of "
+                                                         f"{data_len:,}, so it is read to its "
+                                                         f"DataLength", count=False)
                     cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
-                    out.append((name, (first, data_len, is_dir, contiguous), {
+                    out.append((name, child, {
                         "modified": _exfat_stamp(mod, raw[i + 21]),
                         "created": _exfat_stamp(cre, raw[i + 20]),
                         "accessed": _exfat_stamp(acc),
@@ -4184,14 +4217,62 @@ class ExfatWalker:
             # must never reach _read() as zero.
             yield b""
             return
-        if contig:                                   # in pieces, so a damaged length is not
-            left = want                              # held in memory while it is read
-            for part in self._run_chunks(clus, want):
+        # Bytes past ValidDataLength are zeros whatever the clusters hold, so they are
+        # not read. A ValidDataLength over DataLength is damage: DataLength stays the limit.
+        valid = getattr(node, "valid", None)
+        real = want if valid is None else min(want, valid)
+        got = 0
+        if real and contig:                          # in pieces, so a damaged length is not
+            left = real                              # held in memory while it is read
+            for part in self._run_chunks(clus, real, exact=True):
                 yield part[:left]
                 left -= min(len(part), left)
+            got = real - left
+        elif real:
+            # _read() stops at real, so only the bytes that hold it are read.
+            part = self._read(clus, real, False, exact=True)
+            got = len(part)
+            yield part
+        if real >= want or got < real:               # all of it, or a gap: no zeros after one
             return
-        # _read() stops at want, so only the clusters that hold it are read.
-        yield self._read(clus, want, contig)
+        left = min(want, self._allocated_bytes(node)) - real
+        while left > 0:                              # a damaged length costs no more than
+            n = min(left, 1 << 20)                   # the file's allocation holds
+            yield bytes(n)
+            left -= n
+
+    def _allocated_bytes(self, node):
+        """How many bytes of a file's DataLength its run or FAT chain covers."""
+        clus, sz, _, contig = node
+        if not contig:
+            cut = self.chain_shortfall(node)
+            return sz if cut is None else min(sz, cut[0] * self.cluster_bytes)
+        if clus < 2:
+            return 0
+        if not self.cluster_count:
+            return sz
+        return min(sz, max(self.cluster_count + 2 - clus, 0) * self.cluster_bytes)
+
+    def valid_data_note(self, node, held):
+        """(issue, detail) for the exceptions table when this file's ValidDataLength
+        differs from its DataLength, else None. ``held`` is the bytes exported."""
+        valid = getattr(node, "valid", None)
+        if valid is None:
+            return None
+        sz = node[1]
+        if valid > sz:
+            return ("VALID_DATA_DAMAGED",
+                    f"its ValidDataLength of {valid:,} bytes is more than its DataLength of "
+                    f"{sz:,} bytes, so it was read to its DataLength")
+        told = f"ValidDataLength {valid:,} of DataLength {sz:,} bytes: "
+        if held > valid:
+            told += (f"its content is exported to byte {valid:,} and the {held - valid:,} "
+                     f"bytes after that are zeros, which is what a read past "
+                     f"ValidDataLength returns")
+        else:
+            told += f"{held:,} bytes of its content are exported, with no zeros after them"
+        return ("PAST_VALID_DATA", told + ". The clusters past ValidDataLength were not read, "
+                                          "so whatever they hold is not in this export")
 
     def run_shortfall(self, node):
         """Why a NoFatChain file's recorded size cannot be read from this volume, as text,
@@ -13011,6 +13092,18 @@ def _run_shortfall(w, node):
         return None
 
 
+def _valid_data_note(w, node, held):
+    """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength,
+    else None. None for any other walker."""
+    report = getattr(w, "valid_data_note", None)
+    if report is None:
+        return None
+    try:
+        return report(node, held)
+    except Exception:                                # pylint: disable=broad-except
+        return None
+
+
 def chain_shortfall(w, node):
     """(clusters in the chain, clusters the recorded size needs) when a FAT32
     or exFAT file's cluster chain ends before its recorded size is covered,
@@ -13901,7 +13994,9 @@ _ZIP_EXCEPTION_COLUMNS = ["stored_path", "zip_member", "issue", "detail"]
 def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False):
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
-    read short, was renamed or lost its time is otherwise not recorded in the zip."""
+    read short, was renamed or lost its time is otherwise not recorded in the zip. The
+    two ValidDataLength counts appear only when not zero and do not change the exit
+    status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -13919,6 +14014,10 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     summary = {"failed": counts["FAILED"], "short": counts["SHORT"],
                "renamed": counts["RENAMED"],
                "time_not_held": counts["TIME_NOT_HELD"]}
+    for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
+                       ("valid_data_damaged", "VALID_DATA_DAMAGED")):
+        if counts[issue]:                            # neither is a failure or a short read
+            summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
     try:
         _zip_store_table(zf, name, _ZIP_EXCEPTION_COLUMNS,
@@ -13932,7 +14031,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     if held is not None and name:
         held["table"] = zf.NameToInfo.get(name)
     if name and not quiet:
-        _say(f"{pad}every failed, short or renamed file, and each time a zip cannot "
+        valid = ", each exFAT file whose ValidDataLength differs from its size" if (
+            counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
+        _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
              f"hold: {name}")
 
 
@@ -14042,7 +14143,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     own size free in the temporary folder.
 
     issues, when given, is filled with one (stored path, zip member, issue, detail,
-    files counted) per file that failed, read short or was renamed, and for each stored time a zip cannot hold (_zip_time_rows).
+    files counted) per file that failed, read short or was renamed, per exFAT file whose
+    ValidDataLength differs from its DataLength, and for each stored time a zip cannot hold (_zip_time_rows).
 
     Once the output reports it is full (_zip_store), no further file is read or added,
     here or in any later volume of this zip: each is counted in failed and recorded.
@@ -14119,7 +14221,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                     got += len(chunk)
                 # Only now, with the whole file read, does anything reach the zip.
                 past_end = EOF_SHORTFALL["bytes"] - before
-                got = min(got, max(size - past_end, 0))
+                if not getattr(w, "read_file_never_pads", False):
+                    got = min(got, max(size - past_end, 0))
                 if got < size:
                     info.filename = names.free(f"{final}.SHORT-{got}-of-{size}-bytes")
                 # zipfile decides on ZIP64 from this size when the member opens, and
@@ -14152,6 +14255,9 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
             else:
                 files += 1
                 written += size
+            valid_note = _valid_data_note(w, ino, min(got, size))
+            if valid_note:
+                note(path, info.filename, *valid_note)
             shown = _zip_time_lost(mtime, w, ino) if issues is not None else None
             if shown is not None:
                 held = lost_times.setdefault(shown, [0, []])
@@ -31864,17 +31970,19 @@ def _logical_self_check():
                 == (10, 1, 1, 1, 1, 1))
 
 
-def _exfat_entry_set(name, first, size, *, is_dir=False, in_use=True):
-    """One exFAT file entry set with NoFatChain set, its checksum from the
-    specification's formula and not from the reader."""
+def _exfat_entry_set(name, first, size, *, is_dir=False, in_use=True, valid=None,
+                     contiguous=True):
+    """One exFAT file entry set, NoFatChain unless ``contiguous`` is false, its checksum
+    from the specification's formula and not from the reader. ``valid`` is the
+    ValidDataLength to store, the same as ``size`` when not given."""
     chars = name.encode("utf-16-le")
     slots = max(1, (len(name) + 14) // 15)
     ent = bytearray(32 * (2 + slots))
     ent[0], ent[1] = 0x85, 1 + slots
     ent[4] = 0x10 if is_dir else 0x20
     struct.pack_into("<I", ent, 12, (22209 << 16) | 24576)
-    ent[32], ent[33], ent[35] = 0xC0, 0x03, len(name)
-    struct.pack_into("<Q", ent, 40, size)
+    ent[32], ent[33], ent[35] = 0xC0, 0x03 if contiguous else 0x01, len(name)
+    struct.pack_into("<Q", ent, 40, size if valid is None else valid)
     struct.pack_into("<I", ent, 52, first)
     struct.pack_into("<Q", ent, 56, size)
     for k in range(slots):
@@ -32143,6 +32251,98 @@ def _exfat_nofatchain_checks():
         tally, held, _issues = exported(bytes(raw))
         return tally[3:] == (0, 1) and any(".SHORT-" in n for n in held)
 
+    class ChunkedReads(StopsReading):
+        """Reads through read_at in 64 KiB chunks, as a decrypting reader does, so the tally
+        also counts the part of a chunk past the image's end that no file asked for."""
+
+        def read(self, *args):
+            at = self.tell()
+            read_at(_io.BytesIO(self.getvalue()), at - at % 65536, 65536)
+            self.seek(at)
+            return super().read(*args)
+
+    def exported_bytes(raw, reader=StopsReading):
+        w = ExfatWalker(reader(raw), 0)
+        buf, log, issues, rec = _io.BytesIO(), [], [], {}
+        with zipfile.ZipFile(buf, "w") as zf:
+            tally = extract_to_zip(zf, w, "v", collect(w, w.root), log, issues=issues)
+            _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+        with zipfile.ZipFile(_io.BytesIO(buf.getvalue())) as zin:
+            held = {n: zin.read(n) for n in zin.namelist() if not n.endswith(".tsv")}
+        return tally, held, issues, rec, w
+
+    def valid_data_length():
+        """Files whose ValidDataLength stops short of DataLength, over clusters holding
+        another file's bytes. Those bytes must not reach the export."""
+        stale = b"STALE---" * 512
+        real = b"R" * 4096
+        extra = (_exfat_entry_set("run.bin", 10, 12288, valid=5000)
+                 + _exfat_entry_set("chain.bin", 14, 12288, valid=5000, contiguous=False)
+                 + _exfat_entry_set("none.bin", 20, 5000, valid=0)
+                 + _exfat_entry_set("over.bin", 23, 100, valid=9000)
+                 + _exfat_entry_set("equal.bin", 25, 5000)
+                 + _exfat_entry_set("cut.bin", 27, 12288, valid=100, contiguous=False))
+        tail = b"R" * 904 + stale[904:]
+        plant = {10: real, 11: tail, 12: stale, 14: real, 15: tail, 16: stale, 17: stale,
+                 20: stale, 21: stale, 23: b"O" * 4096, 25: real, 26: b"R" * 904 + stale[904:],
+                 27: b"R" * 100 + stale[100:]}
+        raw = bytearray(_exfat_run_image(b"", clusters=1, root_extra=extra, plant=plant))
+        for clus, nxt in ((14, 15), (15, 17), (17, 0xFFFFFFFF), (27, 0xFFFFFFFF)):
+            struct.pack_into("<I", raw, 4 * 512 + clus * 4, nxt)
+        tally, held, issues, rec, w = exported_bytes(bytes(raw))
+        want = b"R" * 5000 + bytes(12288 - 5000)
+        rows = {(i[1], i[2]): i[3] for i in issues}
+        nodes = {e[0]: e[1] for e in collect(w, w.root)}
+        cut = "v/cut.bin.SHORT-4096-of-12288-bytes"
+        return (held.get("v/run.bin") == want and held.get("v/chain.bin") == want
+                and held.get("v/none.bin") == bytes(5000)
+                and held.get("v/over.bin") == b"O" * 100
+                and held.get("v/equal.bin") == b"R" * 5000
+                and held.get(cut) == b"R" * 100 + bytes(3996)
+                and not any(b"STALE" in body for body in held.values())
+                and tally[0] == 5 and tally[3:] == (0, 1)
+                and all(len(n) == 4 for n in nodes.values())
+                and "5,000" in rows.get(("v/run.bin", "PAST_VALID_DATA"), "")
+                and "12,288" in rows.get(("v/chain.bin", "PAST_VALID_DATA"), "")
+                and ("v/none.bin", "PAST_VALID_DATA") in rows
+                and (cut, "PAST_VALID_DATA") in rows
+                and "chain ends after 1" in rows.get((cut, "SHORT"), "")
+                and "9,000" in rows.get(("v/over.bin", "VALID_DATA_DAMAGED"), "")
+                and not any(k[0] == "v/equal.bin" for k in rows)
+                and rec["exceptions"].get("past_valid_data") == 4
+                and rec["exceptions"].get("valid_data_damaged") == 1
+                and any("over.bin" in d for d in w.damage) and not w.folders_not_read)
+
+    def cut_file_counts():
+        """A file an image ends inside: the name, the count, the table and the member
+        all give the bytes of the file that are there, and a file the image holds whole
+        is whole however much of its last cluster is missing."""
+        at = lambda clus: 8 * 512 + (clus - 2) * 4096
+        body = bytes(range(256)) * 20
+        results = []
+        for contiguous, reader in ((True, StopsReading), (False, StopsReading),
+                                   (True, ChunkedReads), (False, ChunkedReads)):
+            for size, into, want in ((5000, 500, 4596), (5000, 1000, 5000), (100, 50, 50)):
+                last = 10 + (size - 1) // 4096
+                extra = _exfat_entry_set("f.bin", 10, size, contiguous=contiguous)
+                raw = bytearray(_exfat_run_image(b"", clusters=1, root_extra=extra,
+                                                 plant={10: body[:4096], 11: body[4096:]}))
+                if not contiguous:
+                    for clus in range(10, last + 1):
+                        struct.pack_into("<I", raw, 4 * 512 + clus * 4,
+                                         clus + 1 if clus < last else 0xFFFFFFFF)
+                tally, held, issues, _rec, _w = exported_bytes(bytes(raw[:at(last) + into]),
+                                                               reader)
+                name = ("v/f.bin" if want == size else f"v/f.bin.SHORT-{want}-of-{size}-bytes")
+                shorts = [i for i in issues if i[2] == "SHORT"]
+                results.append(
+                    held.get(name) == body[:want] and tally[1] == want
+                    and tally[4] == (want < size) and tally[0] == (want == size)
+                    and len(shorts) == (want < size)
+                    and all(i[1] == name and i[3].startswith(f"{want:,} of {size:,} bytes")
+                            for i in shorts))
+        return len(results) == 12 and all(results)
+
     def ran(check):
         try:
             return check()
@@ -32194,7 +32394,13 @@ def _exfat_nofatchain_checks():
             ("a damaged NoFatChain file length stops at the volume's end and the file is "
              "exported as SHORT with the reason", ran(damaged_length_off_volume)),
             ("a damaged NoFatChain file length stops at the image's end and the file is "
-             "exported as SHORT", ran(damaged_length_off_image))]
+             "exported as SHORT", ran(damaged_length_off_image)),
+            ("an exFAT file exports its bytes to ValidDataLength and zeros to DataLength, "
+             "never the clusters' old content, and each such file is recorded",
+             ran(valid_data_length)),
+            ("an exFAT file an image ends inside has one byte count in its name, tally, "
+             "table and member, and a file the image holds whole is not SHORT",
+             ran(cut_file_counts))]
 
 
 def _zip_directory_bound_checks():
