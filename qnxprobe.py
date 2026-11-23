@@ -190,6 +190,21 @@ def report_generations(copies, sized_regions, how_of):
     return order, gens
 
 
+import codecs                        # pylint: disable=wrong-import-position,wrong-import-order
+
+
+def _escape_name_bytes(error):
+    """Codec error handler for stored names: a stretch that does not decode becomes %XX
+    of its stored bytes. A name is then always text that SQLite, a file path and a
+    report accept, which a surrogate is not."""
+    if not isinstance(error, UnicodeDecodeError):
+        raise error
+    return "".join(f"%{b:02X}" for b in error.object[error.start:error.end]), error.end
+
+
+codecs.register_error("qnxprobe-name", _escape_name_bytes)
+
+
 # read_at() is the only path from a walker to the image, so a short answer from
 # it is the one signal that a read reached past the end of the file. The walkers
 # pad a short block with zeros, which is right for a sector an acquisition could
@@ -3145,9 +3160,16 @@ class Fat32Walker:
             sz = struct.unpack_from("<I", e, 28)[0]
             is_dir = bool(attr & 0x10)
             # Windows zeroes the high word when it deletes an entry, so on a volume with
-            # clusters above 65,535 a zero there says nothing about where the file was.
-            unknown = (self.FAT_BITS == 32 and marked and not hi and lo >= 2
-                       and self.cluster_count > 0xFFFF)
+            # clusters above 65,535 a zero there does not say where the file was. The low
+            # word still does when only one cluster number with it fits the volume.
+            unknown = False
+            if (self.FAT_BITS == 32 and marked and not hi and self.cluster_count > 0xFFFF
+                    and (lo >= 2 or (sz and not is_dir))):
+                only = self._only_cluster(lo)
+                if only is None:
+                    unknown = True
+                else:
+                    first = only
             cut = False
             if marked:
                 got = _fat_deleted_long_name([(c, s) for o, c, s in lfn if o == 0xE5], e)
@@ -3254,10 +3276,11 @@ class Fat32Walker:
         cluster since handed to a live file means the assumption is already
         false, and the file is reported as having existed rather than read.
 
-        On a volume of more than 65,535 clusters a deleted entry whose high word
-        is zero is listed with a ``first_cluster`` of 0 and is not recoverable:
-        the Windows driver zeroes that word on delete, so the entry no longer says
-        where the file began.
+        On a volume of more than 65,535 clusters the Windows driver's zeroed high
+        word leaves only the low word. When exactly one cluster number with that low
+        word fits the volume, that is the first cluster. Otherwise the entry is listed
+        with a ``first_cluster`` of 0, is not recoverable, and ``reason`` says the first
+        cluster is ambiguous.
 
         Live directories are walked to find deleted files inside them, and a
         deleted directory whose first cluster is free in every copy and still
@@ -3277,9 +3300,9 @@ class Fat32Walker:
             """The folder's records, and a (node, depth, in_deleted) for each folder to
             go into, in the order the walk reaches them."""
             for name, first, sz, is_dir, times, unknown, cut in self._deleted_in(node, in_deleted):
-                lost = (f"its first cluster is not known: this volume has more than 65,535 "
+                lost = (f"its first cluster is ambiguous: this volume has more than 65,535 "
                         f"clusters and the entry's high word is zero, as a Windows delete "
-                        f"leaves it, so only the low word {first:#x} is left")
+                        f"leaves it, and the low word {first:#x} does not identify one cluster")
                 if is_dir:
                     if unknown:
                         # a folder records its own first cluster in its "." entry
@@ -3356,6 +3379,15 @@ class Fat32Walker:
         """A FAT directory opens with its "." and ".." entries."""
         raw = read_at(self.fh, self._cluster_off(clus), 64)
         return len(raw) == 64 and raw[:11] == b".          " and raw[32:43] == b"..         "
+
+    def _only_cluster(self, low):
+        """The cluster a low word must mean when its high word is gone, or None. The
+        candidates are low + k * 65536 within clusters 2 to count + 1, and exactly one has
+        to fit. A low word of 0 or 1 is not answered: it can also mean no cluster at all."""
+        top = self.cluster_count + 1
+        if low < 2 or low > top or low + 0x10000 <= top:
+            return None
+        return low
 
     def _folder_by_dot(self, low):
         """The first cluster of a deleted folder whose entry kept only its low word, or
@@ -3606,24 +3638,25 @@ def _fat_short_name(e):
     #
     # A first byte of 0x05 stands for 0xE5, which would otherwise mean deleted
     # (Microsoft's FAT specification; Linux fat_parse_short). Bytes above 0x7F are
-    # in an OEM code page the volume does not name, so none is assumed: each is kept
-    # as its own lone surrogate, the way the other readers keep undecodable name
-    # bytes, and two different stored names stay two names.
+    # in an OEM code page the volume does not name, so none is assumed: each shows
+    # as %XX of the stored byte, and two different stored names stay two names. The
+    # case flags are applied to the stored bytes, so they reach ASCII letters only
+    # and never the hex of an escape.
     nt = e[12]
     stored = b"\xe5" + bytes(e[1:8]) if e[0] == 0x05 else bytes(e[0:8])
-    base = stored.decode("ascii", "surrogateescape").rstrip(" ")
-    ext = bytes(e[8:11]).decode("ascii", "surrogateescape").rstrip(" ")
+    base, ext = stored.rstrip(b" "), bytes(e[8:11]).rstrip(b" ")
     if nt & 0x08:
         base = base.lower()
     if nt & 0x10:
         ext = ext.lower()
+    base, ext = base.decode("ascii", "qnxprobe-name"), ext.decode("ascii", "qnxprobe-name")
     return f"{base}.{ext}" if ext else base
 
 
 def _vfat_name(lfn):
     parts = sorted(lfn, key=lambda x: x[0])
     raw = b"".join(chunk for _, chunk in parts)
-    name = raw.decode("utf-16-le", "replace")
+    name = raw.decode("utf-16-le", "qnxprobe-name")
     end = name.find("\uffff")
     if end != -1:
         name = name[:end]
@@ -3699,7 +3732,8 @@ def _fat_deleted_long_name(parts, entry):
     for byte in reversed(bytes(entry[1:11])):
         lead = (lead - byte) & 0xFF
         lead = ((lead << 1) | (lead >> 7)) & 0xFF
-    text = b"".join(chars for chars, _check in reversed(parts)).decode("utf-16-le", "replace")
+    text = b"".join(chars for chars, _check in reversed(parts)).decode("utf-16-le",
+                                                                       "qnxprobe-name")
     name = text.split("\uffff")[0].rstrip("\x00")
     if not name:
         return None
@@ -35245,9 +35279,9 @@ def _fat_deleted_check(image_gz, listing, walker_cls):
     a listed name is also matched with that character replaced by "_".
     Returns (matched, expected, missing, different).
 
-    The FAT32 fixture has 129,022 clusters, and on a volume over 65,535 a deleted
-    entry with a zero high word does not say where its file began, so at that size
-    none of its files is recoverable (_fat_reader_checks holds that). What this
+    The FAT32 fixture has 129,022 clusters, and its deleted entries have a zero high
+    word and low words that fit two clusters each, so at that size none of its files
+    is recoverable (_fat_reader_checks holds that). What this
     compares is the read, so the FAT32 volume's recorded size is cut in memory to
     65,535 clusters, which still covers every file in it.
     """
@@ -37558,7 +37592,7 @@ def _fat_reader_checks():
         total = 0
         for byte in alias:
             total = (((total & 1) << 7) + (total >> 1) + byte) & 0xFF
-        units = name.encode("utf-16-le")
+        units = name.encode("utf-16-le", "surrogatepass")
         if len(units) % 26:
             units += b"\x00\x00"
             units += b"\xff\xff" * ((26 - len(units) % 26) % 26 // 2)
@@ -37591,8 +37625,16 @@ def _fat_reader_checks():
         big.root([gone]), small.root([gone])
         one = [d for d in big.walker().deleted_files() if not d.is_dir]
         two = [d for d in small.walker().deleted_files() if not d.is_dir]
+        # 5,000 + 65,536 is past the last cluster of 70,000, so 5,000 is the only fit
+        proved = Lab(32, 70000, keep=5010)
+        proved.root([short(b"\xe5NLY    BIN", first=5000, size=4)])
+        proved.put(5000, b"ONLY")
+        w = proved.walker()
+        three = [d for d in w.deleted_files() if not d.is_dir]
         return (len(one) == 1 and not one[0].recoverable and one[0].first_cluster == 0
-                and "not known" in one[0].reason and len(two) == 1 and two[0].recoverable)
+                and "ambiguous" in one[0].reason and len(two) == 1 and two[0].recoverable
+                and len(three) == 1 and three[0].recoverable and three[0].first_cluster == 5000
+                and b"".join(w.read_deleted(three[0])) == b"ONLY")
 
     def fixture_high_word():
         """The macOS-written FAT32 fixture at its real size: 129,022 clusters."""
@@ -37722,14 +37764,33 @@ def _fat_reader_checks():
         return names == {"a good long name.txt", "OTHERONE.TXT"}
 
     def oem_short_names():
-        def one(raw):
-            return _fat_short_name(bytes(short(raw)))
+        import sqlite3
+
+        def one(raw, nt=0):
+            e = short(raw)
+            e[12] = nt
+            return _fat_short_name(bytes(e))
         a, b, c = one(b"CAF\x82    TXT"), one(b"CAF\x8a    TXT"), one(b"\x05BC     TXT")
-        safe = {_zip_safe_component(a), _zip_safe_component(b)}
-        return (a != b and len(safe) == 2 and not any(0xD800 <= ord(ch) <= 0xDFFF
-                                                      for name in safe for ch in name)
-                and a.encode("ascii", "surrogateescape") == b"CAF\x82.TXT"
-                and c.encode("ascii", "surrogateescape") == b"\xe5BC.TXT")
+        lower = one(b"CAF\x8a    TXT", 0x18)      # the case flags leave the hex alone
+        lab = Lab(16, 5000, keep=64)
+        odd = "a\ud800b long name.txt"
+        lab.root(long_slots(odd, b"AB~1    TXT") + [short(b"AB~1    TXT", first=10, size=1)]
+                 + long_slots(odd, b"AC~1    TXT", deleted=True)
+                 + [short(b"\xe5C~1    TXT", first=12, size=1)]
+                 + [short(b"\xe5AF\x82    TXT", first=14, size=1)])
+        w = lab.walker()
+        live = list(by_name(w))
+        gone = sorted(d.name for d in w.deleted_files())
+        names = [a, b, c, lower] + live + gone
+        db = sqlite3.connect(":memory:")
+        db.execute("create table t (n text)")
+        db.executemany("insert into t values (?)", [(n,) for n in names])
+        stored = {row[0] for row in db.execute("select n from t")}
+        return ((a, b, c, lower) == ("CAF%82.TXT", "CAF%8A.TXT", "%E5BC.TXT", "caf%8A.txt")
+                and live == ["a%00%D8b long name.txt"]
+                and gone == ["_AF%82.TXT", "a%00%D8b long name.txt"]
+                and {a, b} <= stored and len({a, b}) == 2
+                and {_zip_safe_component(a), _zip_safe_component(b)} == {a, b})
 
     def no_first_cluster():
         lab = Lab(16, 5000, keep=64)
@@ -37804,10 +37865,10 @@ def _fat_reader_checks():
 
     rows = (
         (high_word, "a deleted FAT32 entry with a zero high word on a volume over 65,535 "
-                    "clusters is listed, with its first cluster not known, and not recoverable"),
-        (fixture_high_word, "on the FAT32 fixture at its real size, over 65,535 clusters, "
-                            "deleted entries with a zero high word are listed and not "
-                            "recoverable"),
+                    "clusters is recoverable only when one cluster with its low word fits, "
+                    "and otherwise is listed as ambiguous"),
+        (fixture_high_word, "on the FAT32 fixture at its real size, deleted entries whose "
+                            "low word fits two clusters are listed and not recoverable"),
         (deleted_folder, "every entry in a deleted FAT folder is listed as deleted across its "
                          "run of clusters, and one whose clusters are in use is not recoverable"),
         (stop_at_gap, "a FAT file read stops at the first cluster the image does not hold in "
@@ -37826,8 +37887,9 @@ def _fat_reader_checks():
                      "folders on one cluster are recorded"),
         (long_name_checksum, "a long name whose checksum is not its short entry's is dropped "
                              "for the short name, and a valid one is kept"),
-        (oem_short_names, "OEM bytes in an 8.3 name stay distinct without assuming a code "
-                          "page, 0x05 reads as 0xE5, and the zip layer holds both names"),
+        (oem_short_names, "a stored FAT name that does not decode shows its bytes as %XX on "
+                          "live and deleted entries, stays distinct, and SQLite and the zip "
+                          "layer take it"),
         (no_first_cluster, "a FAT file with a size and no first cluster reads nothing, and "
                            "a folder with none does not read as the root"),
         (reads_in_pieces, "read_file() on FAT hands a large file back in pieces of at most "
