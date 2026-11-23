@@ -4474,13 +4474,40 @@ def ntfs_time(v):
     return sec if -12219292800 < sec < 253402300799 else 0
 
 
+NTFS_MAX_FILETIME = (253402300800 + NTFS_EPOCH_DELTA) * 10_000_000  # the tick after year 9999
+
+
 def _ntfs_instant(v):
     """A FILETIME from an NTFS record as Unix seconds, 0 when it is unset or no date can
-    show it. The same as ntfs_time() except that the last second of year 9999 is a date."""
-    if not v:
+    show it. The same as ntfs_time() except that the last second of year 9999 is a date.
+    The bound is on the stored ticks, since a float cannot hold the last of them."""
+    if not v or v >= NTFS_MAX_FILETIME:
         return 0
-    sec = v / 10_000_000 - NTFS_EPOCH_DELTA
-    return sec if -12219292800 < sec < 253402300800 else 0
+    return min(v / 10_000_000 - NTFS_EPOCH_DELTA, 253402300800.0 - 2 ** -15)
+
+
+def _ntfs_time_text(raw):
+    """A stored FILETIME as text, to the tick and with no float in the way."""
+    if not raw:
+        return "not set"
+    if raw >= NTFS_MAX_FILETIME:
+        return f"FILETIME {raw} (outside any date this reader can show)"
+    whole, ticks = divmod(raw, 10_000_000)
+    when = datetime.datetime(1601, 1, 1) + datetime.timedelta(seconds=whole)
+    return f"{when:%Y-%m-%d %H:%M:%S}.{ticks:07d} UTC"
+
+
+def _ntfs_text(raw):
+    """Stored UTF-16 text. NTFS keeps 16-bit units with no pairing rule, so an unpaired
+    surrogate is real: it is kept as %XX of its stored bytes, and a NUL as %00, so two
+    values stay two and the result is usable in a path or in SQLite."""
+    return raw.decode("utf-16-le", "qnxprobe-name").replace("\x00", "%00")
+
+
+def _ntfs_name(raw):
+    """One stored name component: _ntfs_text, and a / inside it as %2F, since it would
+    otherwise invent a folder the volume does not record."""
+    return _ntfs_text(raw).replace("/", "%2F")
 
 
 def _ntfs_sectors_per_cluster(raw):
@@ -4523,9 +4550,7 @@ def _ntfs_file_names(attrs):
         end = 0x42 + nlen * 2
         if end > len(v):
             continue                        # the record does not hold the name it declares
-        # An NTFS name is 16-bit units with no pairing rule, so an unpaired surrogate is
-        # a real name. It is kept as %XX of its stored bytes, so two names stay two.
-        name = v[0x42:end].decode("utf-16-le", "qnxprobe-name")
+        name = _ntfs_name(v[0x42:end])
         if not name or name in (".", ".."):
             continue
         out.append((ref, name))
@@ -4577,6 +4602,23 @@ def _ntfs_fixup(buf, name):
         end = (i + 1) * NTFS_USA_STRIDE
         if bytes(out[end - 2:end]) != usn:
             return None                 # a sector that was not written with the rest
+        out[end - 2:end] = buf[off + 2 + i * 2: off + 4 + i * 2]
+    return bytes(out)
+
+
+def _ntfs_fixup_torn(buf, name):
+    """The record with its update sequence put back although a stride does not carry the
+    stamp, or None when the array does not fit. Linux does the same: ntfs_fix_post_read
+    replaces every stride and reports the mismatch, and mi_read keeps the record
+    (fs/ntfs3/fsntfs.c, record.c:139-142 at adc218676eef)."""
+    if len(buf) < 8 or buf[0:4] != name:
+        return None
+    off, count = struct.unpack_from("<HH", buf, 4)
+    if count < 2 or off + count * 2 > len(buf) or (count - 1) * NTFS_USA_STRIDE != len(buf):
+        return None
+    out = bytearray(buf)
+    for i in range(count - 1):
+        end = (i + 1) * NTFS_USA_STRIDE
         out[end - 2:end] = buf[off + 2 + i * 2: off + 4 + i * 2]
     return bytes(out)
 
@@ -4738,6 +4780,7 @@ class NtfsWalker:
                                                  # extension record that could not be read
         self._by_parent = None                   # parent record -> names, read on first need
         self._mft0 = None                        # record 0 as $MFTMirr holds it, when used
+        self._mft_list_lost = False              # $MFT's own attribute list could not be read
         self._records = {}                       # record number -> attributes
         self._alloc_bitmap = None                # $Bitmap bytes, read on first need
         self._mft_runs = None
@@ -4814,7 +4857,8 @@ class NtfsWalker:
         sector names. Every other record is then found through them. When record 0 does
         not hold, the copy in $MFTMirr is used, and that is recorded."""
         off = self.base + self.mft_lcn * self.cluster
-        raw = _ntfs_fixup(read_at(self.fh, off, self.rec_size), NTFS_FILE)
+        first = read_at(self.fh, off, self.rec_size)
+        raw = _ntfs_fixup(first, NTFS_FILE)
         attrs = self._parse_attrs(raw, follow_list=False) if raw else []
         pieces = self._unnamed_data_pieces(attrs)
         if not pieces and self.mftmirr_lcn:
@@ -4825,7 +4869,9 @@ class NtfsWalker:
                     and any(name == "$MFT" for _ref, name in _ntfs_file_names(held))):
                 raw, attrs, self._mft0 = copy, held, copy
                 pieces = self._unnamed_data_pieces(held)
-                self._damaged("$MFT record 0 fails its check, so it was read from $MFTMirr")
+                self._damaged("$MFT record 0 lies past the end of the image, so it was read "
+                              "from $MFTMirr" if len(first) < self.rec_size else
+                              "$MFT record 0 fails its check, so it was read from $MFTMirr")
         if raw is None:
             raise ValueError("the MFT's own record is unreadable")
         if not pieces:
@@ -4855,8 +4901,13 @@ class NtfsWalker:
         listed = next((a for a in attrs if a.type == NTFS_ATTRIBUTE_LIST), None)
         if listed is None:
             return self._runs_in_vcn_order(have)
+        gaps = []
         data = listed.value if listed.resident else self._read_runs(
-            listed.runs, min(listed.data_size, NTFS_MAX_ATTRIBUTE_LIST))
+            listed.runs, min(listed.data_size, NTFS_MAX_ATTRIBUTE_LIST), gaps=gaps)
+        if gaps:
+            self._mft_list_lost = True
+            self._damaged("$MFT: its attribute list could not be read in full, so the runs it "
+                          "names are not known")
         wanted, pos = [], 0
         while pos + 26 <= len(data):        # type, length, name length, name offset, VCN, ref
             type_, rec_len = struct.unpack_from("<IH", data, pos)
@@ -4890,18 +4941,49 @@ class NtfsWalker:
         mft = self._data_attr(0)
         if not isinstance(end, int) or mft is None or not mft.data_size:
             return
-        room, pos, lost = end - self.base, 0, 0
+        room, pos, lost, unmapped = end - self.base, 0, 0, 0
         for lcn, count in mft.runs:
             span = count * self.cluster
             used = min(span, max(mft.data_size - pos, 0))
-            if lcn is not None:
+            if lcn is None:
+                unmapped += used
+            else:
                 lost += used - max(0, min(used, room - lcn * self.cluster))
             pos += span
-        if lost:
+        unmapped += max(mft.data_size - pos, 0)
+        if lost or unmapped:
             total = mft.data_size // self.rec_size
             past = min(total, -(-lost // self.rec_size))
-            self._damaged(f"$MFT: {past:,} of {total:,} records lie past the end of the image, "
-                          "so whatever they held is not listed")
+            gone = min(total, -(-unmapped // self.rec_size))
+            parts = []
+            if past:
+                parts.append(f"{past:,} of {total:,} records lie past the end of the image")
+            if gone:
+                parts.append(f"{gone:,} of {total:,} records are in runs that could not be read")
+            self._count_folder("$MFT", f"$MFT: {' and '.join(parts)}, so whatever they held is "
+                                       "not listed")
+
+    def _count_folder(self, key, line):
+        """Record a loss from the tree, once per ``key``. It is counted in
+        folders_not_read, which is what makes the run's exit status 1."""
+        self._damaged(line)
+        if key not in self._folders_counted:
+            self._folders_counted.add(key)
+            self.folders_not_read += 1
+
+    def _note_torn(self, num, parsed):
+        """Record an in-use record whose update sequence does not hold. A folder's is
+        counted too: what it lists can no longer be taken as whole."""
+        torn = self._torn.get(num)
+        if torn is None:
+            return
+        line = (f"MFT record {num} fails its update sequence check and was read as it stands"
+                if parsed else f"MFT record {num} fails its update sequence check and does "
+                               "not parse, so it was not read")
+        if torn[0] & NTFS_MFT_IS_DIR:
+            self._count_folder(num, line)
+        else:
+            self._damaged(line)
 
     def _record_raw(self, num):
         """One MFT record with its fixup applied, or None. An in-use record that fails
@@ -4917,14 +4999,19 @@ class NtfsWalker:
             flags = struct.unpack_from("<H", raw, 0x16)[0]
             if flags & NTFS_MFT_IN_USE:
                 self._torn[num] = (flags, struct.unpack_from("<H", raw, 0x10)[0])
+                fixed = _ntfs_fixup_torn(raw, NTFS_FILE)
         return fixed
 
     def _record(self, num):
-        """The attributes of one MFT record, cached."""
+        """The attributes of one MFT record, cached. An in-use record that fails its
+        fixup is read as it stands when it still names itself, and is recorded."""
         got = self._records.get(num)
         if got is None:
             fixed = self._record_raw(num)
             got = self._parse_attrs(fixed, self_ref=num) if fixed else []
+            if num in self._torn and not any(
+                    a.type in (NTFS_STANDARD_INFORMATION, NTFS_FILE_NAME) for a in got):
+                got = []
             self._records[num] = got
         return got
 
@@ -4973,7 +5060,7 @@ class NtfsWalker:
         if name_len:
             end = pos + name_off + name_len * 2
             if end <= pos + length:
-                name = raw[pos + name_off:end].decode("utf-16-le", "qnxprobe-name")
+                name = _ntfs_name(raw[pos + name_off:end])
         attr = _NtfsAttr(type_, name, flags, not nonres)
         if not nonres:
             vlen, voff = struct.unpack_from("<IH", raw, pos + 16)
@@ -5006,8 +5093,14 @@ class NtfsWalker:
         for a in attrs:
             if a.type != NTFS_ATTRIBUTE_LIST:
                 continue
+            gaps = []
             data = a.value if a.resident else self._read_runs(
-                a.runs, min(a.data_size, NTFS_MAX_ATTRIBUTE_LIST))
+                a.runs, min(a.data_size, NTFS_MAX_ATTRIBUTE_LIST), gaps=gaps)
+            if gaps and self_ref:                # record 0 says so in _mft_run_list
+                self._damaged(f"record {self_ref}: its attribute list could not be read in "
+                              "full, so attributes it names may be missing")
+                self._ext_lost.setdefault(self_ref, set()).update(
+                    (NTFS_DATA, NTFS_INDEX_ROOT, NTFS_INDEX_ALLOCATION))
             pos = 0
             while pos + 26 <= len(data):
                 rec_len = struct.unpack_from("<H", data, pos + 4)[0]
@@ -5042,12 +5135,14 @@ class NtfsWalker:
         resident = [a for a in parts if a.resident]
         if resident:
             return resident[0]
-        return self._joined(NTFS_DATA, name, parts)
+        return self._joined(NTFS_DATA, name, parts, num)
 
-    def _joined(self, type_, name, parts):
+    def _joined(self, type_, name, parts, num=None):
         """One attribute from the pieces it was split into over several records. A VCN no
         piece holds is kept as a hole so later pieces stay at their offsets, and
-        ``incomplete`` says what is missing: reading it as zeros would be a guess."""
+        ``incomplete`` says what is missing: reading it as zeros would be a guess. An
+        allocated size past the runs with no record lost is a disagreement, recorded,
+        and the bytes the runs hold are still read."""
         parts.sort(key=lambda a: a.start_vcn)
         head = parts[0]
         joined = _NtfsAttr(type_, name, head.flags, False)
@@ -5068,9 +5163,15 @@ class NtfsWalker:
             joined.runs.extend(a.runs)
             vcn = max(vcn, a.start_vcn + sum(count for _lcn, count in a.runs))
         if not joined.incomplete and not joined.runs_bad and vcn * self.cluster < joined.alloc_size:
-            joined.incomplete = (f"its extents end at cluster {vcn:,} of the "
-                                 f"{joined.alloc_size // self.cluster:,} it allocates, and the "
-                                 "record holding the rest could not be read")
+            if num == 0 and self._mft_list_lost:
+                pass                                 # _note_mft_past_end counts what this loses
+            elif type_ in self._ext_lost.get(num, ()):
+                joined.incomplete = (f"its extents end at cluster {vcn:,} of the "
+                                     f"{joined.alloc_size // self.cluster:,} it allocates, and "
+                                     "the record holding the rest could not be read")
+            else:
+                self._damaged(f"record {num}: attribute {type_:#x} records {joined.alloc_size:,} "
+                              f"bytes allocated and its run list covers {vcn * self.cluster:,}")
         return joined
 
     def _index_allocation(self, num):
@@ -5082,7 +5183,7 @@ class NtfsWalker:
                  if a.type == NTFS_INDEX_ALLOCATION and a.name == "$I30" and not a.resident]
         if not parts:
             return None
-        return self._joined(NTFS_INDEX_ALLOCATION, "$I30", parts)
+        return self._joined(NTFS_INDEX_ALLOCATION, "$I30", parts, num)
 
     def _cluster_in_use(self, lcn):
         """True when this cluster is marked allocated in $Bitmap. The bitmap is
@@ -5099,11 +5200,15 @@ class NtfsWalker:
         return bool(bits[byte] & (1 << (lcn & 7)))
 
     def _read_bitmap(self, size):
-        """$Bitmap's bytes. A set bit is a cluster in use, so a part that could not be read
-        is set: reading it as zeros would report clusters as free with nothing known."""
+        """$Bitmap's bytes, never more than the volume's clusters need, whatever size the
+        record states. A set bit is a cluster in use, so a part that could not be read, or
+        that lies past the bitmap's initialized size, is set: reading it as zeros would
+        report clusters as free with nothing known."""
         attr = self._data_attr(NTFS_BITMAP)
         if attr is None:
             return b""
+        if self.total_clusters:
+            size = min(size, (self.total_clusters + 7) // 8)
         if attr.resident:
             return bytes(attr.value[:size])
         if attr.incomplete or attr.runs_bad:
@@ -5115,7 +5220,8 @@ class NtfsWalker:
         out = bytearray(self._read_runs(attr.runs, real, 0, pad=0xFF, gaps=gaps))
         lost = sum(n for _at, n in gaps) + real - len(out)
         out += b"\xff" * (real - len(out))
-        out += bytes(size - len(out))       # past the initialized size reads as zero
+        lost += size - len(out)
+        out += b"\xff" * (size - len(out))
         if lost:
             self._damaged(f"$Bitmap: {lost:,} bytes could not be read, so the clusters they "
                           "cover are treated as in use")
@@ -5158,10 +5264,11 @@ class NtfsWalker:
         whose data was **resident**, small enough to live inside the record and
         so never occupying a cluster a carver could find.
 
-        Each result carries ``recoverable``: True when the bytes are still there
-        (resident always; non-resident only while every cluster it used is still
-        free), False when they have been reused, in which case the record is
-        reported as evidence the file existed rather than its content offered.
+        Each result carries ``recoverable``: True for a resident file, and for a
+        non-resident one while every cluster it used is free and its initialized size
+        is not 0. False otherwise, in which case the record is reported as evidence the
+        file existed rather than its content offered. A cluster reused and freed again
+        looks like one never reused, so recovered bytes are a candidate, not a proven copy.
         ``$ATTRIBUTE_LIST`` is not followed (see ``_parse_deleted``), so a file
         whose attributes overflowed its record is reported not recoverable rather
         than reconstructed from records that may now belong elsewhere.
@@ -5190,7 +5297,7 @@ class NtfsWalker:
                 if a.type == NTFS_FILE_NAME and a.resident and len(a.value) > 0x42:
                     nlen, ns = a.value[0x40], a.value[0x41]
                     parent = struct.unpack_from("<Q", a.value, 0)[0] & 0xFFFFFFFFFFFF
-                    nm = a.value[0x42:0x42 + nlen * 2].decode("utf-16-le", "qnxprobe-name")
+                    nm = _ntfs_name(a.value[0x42:0x42 + nlen * 2])
                     names.append((ns, nm, parent))
             if not names:
                 continue                            # nothing names it
@@ -5219,10 +5326,17 @@ class NtfsWalker:
                 reason, ok = "encrypted", False
             elif has_list:
                 reason, ok = "attributes overflowed the record", False
+            elif data.runs_bad:
+                reason, ok = "its run list does not decode", False
+            elif size and not data.init_size:
+                reason, ok = "its initialized size is 0, so it records no valid content", False
             else:
                 for lcn, run in data.runs:
                     if lcn is None:
                         continue                    # a sparse run holds no data to lose
+                    if lcn < 0 or (self.total_clusters and lcn + run > self.total_clusters):
+                        reason, ok = "a run lies outside the volume", False
+                        break
                     if any(self._cluster_in_use(lcn + i) for i in range(run)):
                         reason, ok = "clusters reused by a later file", False
                         break
@@ -5230,9 +5344,9 @@ class NtfsWalker:
                                   created, modified, accessed, has_list, data)
 
     def read_deleted(self, entry, size=None):
-        """Yield the content of a recoverable deleted file. Refuses one whose
-        clusters have been reused, so overwritten data is never presented as the
-        file. Reading is otherwise the same as for a live file."""
+        """Yield the content of a recoverable deleted file. Refuses one the volume shows
+        was reused or holds no valid content. Reading is otherwise the same as for a
+        live file."""
         if not entry.recoverable or entry._data is None:
             raise NtfsUnreadable(
                 f"deleted file {entry.name!r} is not recoverable: {entry.reason}")
@@ -5248,7 +5362,7 @@ class NtfsWalker:
         when the record cannot be read. An empty string means the volume has none."""
         for a in self._record(3):
             if a.type == 0x60 and a.resident:
-                return a.value.decode("utf-16-le", "qnxprobe-name")
+                return _ntfs_text(a.value)      # a label, not a path component
         return "" if self._record(3) else None
 
     def _flags(self, num):
@@ -5285,17 +5399,20 @@ class NtfsWalker:
             torn = self._torn.get(num)
             if torn is None:
                 return None
-            self._damaged(f"MFT record {num} fails its update sequence check, so it was not "
-                          "read")
-            # A folder's children name it as their parent, so they can still be listed.
-            return (S_IFDIR | 0o755, 0, 0) if torn[0] & NTFS_MFT_IS_DIR else None
+            self._note_torn(num, False)
+            # A folder's children name it as their parent, so they can still be listed. A
+            # file is kept as an entry so its path is recorded when its read is refused.
+            return (S_IFDIR | 0o755, 0, 0) if torn[0] & NTFS_MFT_IS_DIR else (0o100644, 0, 0)
+        self._note_torn(num, True)
         is_dir = bool(self._flags(num) & NTFS_MFT_IS_DIR)
         mtime = _ntfs_std_times(attrs)[1]
         data = None if is_dir else self._data_attr(num)
         size = 0 if data is None else (len(data.value) if data.resident else data.data_size)
         if not size:
             target = self._link_target(num)
-            if target is not None:
+            # A link holding a named stream keeps its file or folder kind. Callers that
+            # walk a tree take streams only from those, and the stream is content.
+            if target is not None and not self.streams(num):
                 return (S_IFLNK | 0o777, len(target.encode("utf-8")), mtime)
         if is_dir:
             return (S_IFDIR | 0o755, 0, mtime)
@@ -5322,12 +5439,54 @@ class NtfsWalker:
         text = data[names:]
         for off, length in ((show_off, show_len), (sub_off, sub_len)):
             if length and not length & 1 and off + length <= len(text):
-                return text[off:off + length].decode("utf-16-le", "qnxprobe-name")
+                return _ntfs_text(text[off:off + length])   # a path, so its / stay
         return ""
 
     def readlink(self, num):
         """The target of a symbolic link or junction as stored, "" for any other record."""
         return self._link_target(num) or ""
+
+    def is_kept_link(self, num):
+        """True for a folder-kind entry that is really a link: see entry()."""
+        return self._link_target(num) is not None
+
+    def export_notes(self, num):
+        """[(issue, detail)] an export records for this entry beside any member: a link's
+        kind, stored target and times, and a record read in spite of a failed fixup."""
+        attrs = self._record(num)
+        out = []
+        if num in self._torn and attrs:
+            out.append(("RECORD_TORN", f"MFT record {num} failed its update sequence check, so "
+                                       "one of its 512-byte strides was not written with the "
+                                       "rest. It was read as it stands"))
+        target = self._link_target(num)
+        if target is not None:
+            kind = ("junction" if self.reparse(num)[0] == IO_REPARSE_TAG_MOUNT_POINT else
+                    "directory symlink" if self._flags(num) & NTFS_MFT_IS_DIR else "file symlink")
+            stored = (0, 0, 0)
+            for a in attrs:
+                if a.type == NTFS_STANDARD_INFORMATION and a.resident and len(a.value) >= 32:
+                    stored = (struct.unpack_from("<Q", a.value, 0)[0],
+                              struct.unpack_from("<Q", a.value, 8)[0],
+                              struct.unpack_from("<Q", a.value, 24)[0])
+                    break
+            out.append(("LINK", f"{kind}; stored target: {target or '(none held)'}; created "
+                                f"{_ntfs_time_text(stored[0])}; modified "
+                                f"{_ntfs_time_text(stored[1])}; accessed "
+                                f"{_ntfs_time_text(stored[2])}"))
+        return out
+
+    def short_reason(self, num):
+        """How many of a file's clusters lie outside this volume, as text, else None."""
+        rec, name = (num.record, num.name) if isinstance(num, NtfsStreamRef) else (num, "")
+        data = self._data_attr(rec, name)
+        if data is None or data.resident or not self.total_clusters:
+            return None
+        outside = 0
+        for lcn, count in data.runs:
+            if lcn is not None:
+                outside += count if lcn < 0 else max(0, lcn + count - max(lcn, self.total_clusters))
+        return f"{outside:,} of its clusters lie outside this volume" if outside else None
 
     def run_shortfall(self, num):
         """Why a file's recorded size is more than its run list covers, as text, else None.
@@ -5350,9 +5509,9 @@ class NtfsWalker:
                 raw = struct.unpack_from("<Q", a.value, 8)[0]
                 if not raw or _ntfs_instant(raw):
                     return None
-                if raw == NTFS_EPOCH_DELTA * 10_000_000:
-                    return f"FILETIME {raw} (1970-01-01 00:00:00 UTC)"
-                return f"FILETIME {raw} (outside any date this reader can show)"
+                if raw >= NTFS_MAX_FILETIME:
+                    return _ntfs_time_text(raw)
+                return f"FILETIME {raw} ({_ntfs_time_text(raw)})"
         return None
 
     def stamps(self, num):
@@ -5605,12 +5764,17 @@ class NtfsWalker:
                     continue                        # an extension record, not a file
                 fixed = rec if num == 0 and self._mft0 is not None \
                     else _ntfs_fixup(rec, NTFS_FILE)
-                if not fixed:
+                torn = not fixed
+                if torn:
                     self._torn[num] = (flags, struct.unpack_from("<H", rec, 0x10)[0])
-                    self._damaged(f"MFT record {num} fails its update sequence check, so it "
-                                  "was not read")
-                    continue
-                attrs = self._parse_attrs(fixed, self_ref=num)
+                    fixed = _ntfs_fixup_torn(rec, NTFS_FILE)
+                attrs = self._parse_attrs(fixed, self_ref=num) if fixed else []
+                if torn:
+                    if not _ntfs_file_names(attrs):
+                        self._records[num] = []
+                        self._note_torn(num, False)
+                        continue
+                    self._note_torn(num, True)
                 if not attrs:
                     continue
                 self._records[num] = attrs
@@ -5863,14 +6027,16 @@ class NtfsWalker:
         for a in attrs:
             if a.type == NTFS_INDEX_ROOT and a.name == "$I30":
                 root = a
-        torn = not attrs and num in self._torn
+        torn = num in self._torn
+        root_lost = num == NTFS_ROOT and not attrs
         index_lost = bool(self._ext_lost.get(num, set()) & {NTFS_INDEX_ROOT, NTFS_INDEX_ALLOCATION})
-        if root is None and not torn and not index_lost:
+        if root is None and not torn and not index_lost and not root_lost:
             return out
         alloc = self._index_allocation(num)
+        bad_entries = 0
         # $INDEX_ROOT: a small header, then the index header at 0x10
         if root is not None and len(root.value) >= 0x20:
-            self._index_entries(root.value, 0x10, out, seen)
+            bad_entries += self._index_entries(root.value, 0x10, out, seen, num)
         lost = 0
         if alloc is not None and alloc.runs:
             step = self.idx_size
@@ -5880,24 +6046,40 @@ class NtfsWalker:
             for index, off in enumerate(range(0, total, step)):
                 raw = self._read_runs(alloc.runs, step, off)
                 block = _ntfs_fixup(raw, NTFS_INDX)
+                used = (in_use is None or index >> 3 >= len(in_use)
+                        or bool(in_use[index >> 3] & (1 << (index & 7))))
                 if block and len(block) >= 0x28:
-                    self._index_entries(block, 0x18, out, seen)
-                elif (raw[:4] == NTFS_INDX if in_use is None else
-                      index >> 3 >= len(in_use) or in_use[index >> 3] & (1 << (index & 7))):
+                    # A block the index has freed can hold anything past its live entries.
+                    bad_entries += self._index_entries(block, 0x18, out, seen,
+                                                       num if used else None)
+                elif raw[:4] == NTFS_INDX if in_use is None else used:
                     lost += 1
         if alloc is not None and (alloc.runs_bad or alloc.incomplete):
             lost += 1
-        if torn or lost or index_lost:
-            what = ("its record fails its check" if torn else
+        if torn or lost or index_lost or root_lost or bad_entries:
+            what = ("its record cannot be read" if root_lost else
+                    "its record fails its check" if torn else
                     "an extension record holding its index could not be read" if index_lost
-                    else f"{lost:,} index block(s) could not be read")
-            self._damaged(f"directory record {num}: {what}, so it is listed from the records "
-                          "that name it as their parent")
-            if num not in self._folders_counted:
-                self._folders_counted.add(num)
-                self.folders_not_read += 1
+                    else f"{lost:,} index block(s) could not be read" if lost
+                    else f"{bad_entries:,} index entries have a length that cannot be right")
+            self._count_folder(num, f"directory record {num}: {what}, so it is also listed from "
+                                    "the records that name it as their parent")
             self._add_children_by_parent(num, out, seen)
         return out
+
+    @staticmethod
+    def _next_index_entry(buf, pos, end, owner):
+        """The next offset, in 8-byte steps, that holds a whole file name entry for the
+        directory ``owner``, or None. Its key has to name that directory as its parent."""
+        while pos + 0x52 <= end:
+            elen, klen = struct.unpack_from("<HH", buf, pos + 8)
+            if (0x52 <= elen and not elen % 8 and pos + elen <= end
+                    and 0x42 <= klen <= elen - 0x10
+                    and struct.unpack_from("<Q", buf, pos + 0x10)[0] & 0xFFFFFFFFFFFF == owner
+                    and buf[pos + 0x51] <= 3 and 0x52 + buf[pos + 0x50] * 2 <= elen):
+                return pos
+            pos += 8
+        return None
 
     def _index_bitmap(self, num):
         """The $BITMAP of a directory's index, one bit per index block, set when in use,
@@ -5908,7 +6090,7 @@ class NtfsWalker:
             return None
         if any(a.resident for a in parts):
             return next(a for a in parts if a.resident).value
-        joined = self._joined(NTFS_INDEX_BITMAP, "$I30", parts)
+        joined = self._joined(NTFS_INDEX_BITMAP, "$I30", parts, num)
         return self._read_runs(joined.runs, min(joined.data_size, NTFS_MAX_ATTRIBUTE_LIST),
                                pad=0xFF)
 
@@ -5956,18 +6138,27 @@ class NtfsWalker:
                     out.setdefault(ref & 0xFFFFFFFFFFFF, []).append((name, num, ref >> 48))
         return out
 
-    def _index_entries(self, buf, header_off, out, seen):
-        """Append the entries of one index header. Entry offsets are relative to
-        the header, not to the record, which is why the caller passes its offset."""
+    def _index_entries(self, buf, header_off, out, seen, owner=None):
+        """Append the entries of one index header, and return how many had a length that
+        cannot be right. Entry offsets are relative to the header, not to the record,
+        which is why the caller passes its offset. With ``owner``, the directory this
+        index belongs to, the walk picks up again at the next whole entry after a bad one."""
         if header_off + 16 > len(buf):
-            return
+            return 0
         first, total = struct.unpack_from("<II", buf, header_off)
         pos = header_off + first
         end = min(header_off + total, len(buf))
+        bad = 0
         while pos + 0x52 <= end:
             ref, elen, klen, eflags = struct.unpack_from("<QHHH", buf, pos)
             if elen < 0x10 or pos + elen > end:
-                break
+                if owner is None:
+                    break
+                bad += 1
+                pos = self._next_index_entry(buf, pos + 8, end, owner)
+                if pos is None:
+                    break
+                continue
             if eflags & 0x02:                       # the last entry holds no name
                 break
             rec = ref & 0xFFFFFFFFFFFF
@@ -5978,7 +6169,7 @@ class NtfsWalker:
                 nstart = pos + 0x52
                 nend = nstart + name_len * 2
                 if nend <= pos + elen:
-                    name = buf[nstart:nend].decode("utf-16-le", "qnxprobe-name")
+                    name = _ntfs_name(buf[nstart:nend])
                     # Namespace 2 is the 8.3 name of a file that also has a long
                     # one, indexed beside it. Reporting both would list every such
                     # file twice under two names. The root's index also carries an
@@ -5997,6 +6188,7 @@ class NtfsWalker:
                         seen.add((rec, name))
                         out.append((name, rec))
             pos += elen
+        return bad
 
     def read_file(self, num, size):
         if isinstance(num, NtfsStreamRef):
@@ -6006,6 +6198,9 @@ class NtfsWalker:
         if data is None:
             if NTFS_DATA in self._ext_lost.get(num, ()):
                 raise NtfsUnreadable("its data is in an extension record that could not be read")
+            if num in self._torn:
+                raise NtfsUnreadable("its MFT record fails its update sequence check and no "
+                                     "data attribute could be read from it")
             return
         if data.resident:
             yield data.value[:size] if size else data.value
@@ -6127,7 +6322,9 @@ class NtfsWalker:
 
     def _refuse_unusable(self, data):
         """Raise NtfsUnreadable when an attribute's runs cannot say where its bytes are:
-        they do not decode, a piece of them is missing, or one leaves the volume."""
+        they do not decode, a piece of them is missing, or together they store more
+        clusters than the volume has. One run outside the volume is not refused: the
+        reads stop at the volume's end and that run reads as zeros, at its own offset."""
         if data.resident:
             return
         if data.runs_bad:
@@ -6135,12 +6332,10 @@ class NtfsWalker:
                                  "is not known")
         if data.incomplete:
             raise NtfsUnreadable(data.incomplete)
-        if not self.total_clusters:
-            return
-        for lcn, count in data.runs:
-            if lcn is not None and (lcn < 0 or lcn + count > self.total_clusters):
-                raise NtfsUnreadable(f"its run of {count:,} clusters at cluster {lcn:,} is "
-                                     f"outside this volume of {self.total_clusters:,} clusters")
+        stored = sum(count for lcn, count in data.runs if lcn is not None)
+        if self.total_clusters and stored > self.total_clusters:
+            raise NtfsUnreadable(f"its runs store {stored:,} clusters and this volume has "
+                                 f"{self.total_clusters:,}")
 
     def _note_gaps(self, owner, gaps):
         """Record the ranges of a file that were not in the image and read as zeros."""
@@ -6157,7 +6352,7 @@ class NtfsWalker:
         more = len(merged) - NTFS_GAPS_PER_FILE
         self._damaged(f"{owner or 'a file'}: {sum(n for _a, n in merged):,} bytes at offsets "
                       f"{shown}" + (f" and {more:,} more ranges" if more > 0 else "")
-                      + " are not in the image and read as zeros")
+                      + " are not in the image or on this volume and read as zeros")
 
     def _read_nonresident(self, data, want, start=0, owner=None):
         """Yield ``want`` bytes of a non-resident attribute from byte ``start``.
@@ -6201,7 +6396,9 @@ class NtfsWalker:
 
         A unit whose stored clusters are not all in the image is not inflated. It
         reads as zeros, and what it would have held is what EOF_SHORTFALL counts,
-        so a caller's byte count is in file bytes and not in stored ones."""
+        so a caller's byte count is in file bytes and not in stored ones. Past the
+        initialized size a unit reads as zeros, as it does in Linux (fs/ntfs3/frecord.c
+        ni_read_frame at adc218676eef)."""
         unit = (1 << data.comp_unit) * self.cluster
         vcn_per_unit = 1 << data.comp_unit
         produced = 0
@@ -6217,7 +6414,9 @@ class NtfsWalker:
             if produced >= want:
                 break
             before = EOF_SHORTFALL["bytes"]
-            raw, whole = self._unit_bytes(table, first, vcn_per_unit)
+            unit_at = first * self.cluster
+            raw, whole = ((None, True) if unit_at >= data.init_size
+                          else self._unit_bytes(table, first, vcn_per_unit))
             if raw is None or not whole:          # wholly sparse, or cut by the image's end
                 out = b"\x00" * unit
             elif len(raw) >= unit:
@@ -6229,11 +6428,14 @@ class NtfsWalker:
                     raise NtfsUnreadable(
                         f"the compression unit at cluster {first} of the file does "
                         f"not decode: {exc}") from None
+            if unit_at + len(out) > data.init_size > unit_at:
+                out = out[:data.init_size - unit_at] + bytes(unit_at + len(out) - data.init_size)
             if drop:
                 out, drop = out[drop:], 0
             take = min(len(out), want - produced)
             if raw is not None and not whole:
-                EOF_SHORTFALL["bytes"] = before + take
+                EOF_SHORTFALL["bytes"] = before + min(take, max(data.init_size
+                                                                - (start + produced), 0))
                 gaps.append((start + produced, take))
             yield out[:take]
             produced += take
@@ -13571,6 +13773,30 @@ def chain_shortfall(w, node):
         return None
 
 
+def _walker_notes(w, node):
+    """[(issue, detail)] a walker asks an export to record for this entry (NTFS: a link and
+    a record read in spite of a failed fixup), else []."""
+    report = getattr(w, "export_notes", None)
+    if report is None:
+        return []
+    try:
+        return report(node)
+    except Exception:                                # pylint: disable=broad-except
+        return []
+
+
+def _short_reason(w, node):
+    """Why part of a file reads short though the image holds that offset, as text, else
+    None. None for a walker that has no such case."""
+    report = getattr(w, "short_reason", None)
+    if report is None:
+        return None
+    try:
+        return report(node)
+    except Exception:                                # pylint: disable=broad-except
+        return None
+
+
 def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
     """Every regular file under this inode, as (path, inode, size, mtime).
 
@@ -13600,6 +13826,8 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
             if kept:
                 times[path] = kept
         if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
+            if getattr(w, "is_kept_link", None) is not None and w.is_kept_link(ino):
+                out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
             collect(w, ino, path, depth + 1, seen, out, times)
         elif (mode & 0o170000) == 0o100000:          # regular files only
             out.append((path, ino, size, mtime))
@@ -14463,8 +14691,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                "renamed": counts["RENAMED"],
                "time_not_held": counts["TIME_NOT_HELD"]}
     for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
-                       ("valid_data_damaged", "VALID_DATA_DAMAGED")):
-        if counts[issue]:                            # neither is a failure or a short read
+                       ("valid_data_damaged", "VALID_DATA_DAMAGED"),
+                       ("links", "LINK"), ("records_torn", "RECORD_TORN")):
+        if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
     try:
@@ -14481,8 +14710,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     if name and not quiet:
         valid = ", each exFAT file whose ValidDataLength differs from its size" if (
             counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
-        _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
-             f"hold: {name}")
+        links = ", each link with its stored target" if counts["LINK"] else ""
+        _say(f"{pad}every failed, short or renamed file{valid}{links}, and each time a zip "
+             f"cannot hold: {name}")
 
 
 _ZIP_VOLUMES_HELD = 8           # finished volumes whose last files can still be taken back
@@ -14638,6 +14868,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
         if arc != f"{folder}/{path}":
             log.append(f"        RENAMED {volume}/{path!r} stored as {arc}: "
                        + "; ".join(name_reasons(path)))
+        for issue, detail in _walker_notes(w, ino):
+            note(path, "", issue, detail)
         if size is None:
             skipped += 1
             continue
@@ -14690,7 +14922,10 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 written += got
                 cut = None if past_end else chain_shortfall(w, ino)
                 run = None if past_end or cut else _run_shortfall(w, ino)
-                if cut:
+                outside = _short_reason(w, ino) if past_end else None
+                if outside:
+                    told = f"{got:,} of {size:,} bytes read, {outside}"
+                elif cut:
                     told = (f"{got:,} of {size:,} bytes read, its cluster chain ends after "
                             f"{cut[0]:,} of the {cut[1]:,} clusters that size needs")
                 elif run:
@@ -36611,7 +36846,15 @@ def _ntfs_reader_fix_checks(image_gz):
     def usa_count():
         img = bytearray(clean)
         struct.pack_into("<H", img, at(names["small.txt"]) + 6, 2)
-        return walker(img).entry(names["small.txt"]) is None
+        w = walker(img)
+        ent = w.entry(names["small.txt"])
+        if ent is None:
+            return True
+        try:
+            b"".join(w.read_file(names["small.txt"], ent[1]))
+        except NtfsUnreadable:
+            return True
+        return False
     row("an NTFS record whose update sequence count does not fit its length is refused",
         usa_count)
 
@@ -36888,9 +37131,16 @@ def _ntfs_reader_fix_checks(image_gz):
 
     def past_volume():
         total = ref.total_sectors * ref.bps // cluster
-        w, num = odd_file(nonresident(NTFS_DATA, "", 0, 0, [(total, 1)], cluster, cluster))
-        return refused(w, num, cluster)
-    row("a run outside the volume is refused", past_volume)
+        size = 2 * cluster
+        w, num = odd_file(nonresident(NTFS_DATA, "", 0, 1, [(600, 1), (total, 1)], size, size))
+        got = b"".join(w.read_file(num, size))
+        short = short_row(odd_file(nonresident(NTFS_DATA, "", 0, 1, [(600, 1), (total, 1)],
+                                               size, size))[0], "odd", num, size)
+        return (got[:cluster] == clean[600 * cluster:601 * cluster] and got[cluster:] == bytes(cluster)
+                and len(short) == 1 and short[0][3].startswith(f"{cluster:,} of {size:,} bytes")
+                and "outside this volume" in short[0][3])
+    row("one run outside the volume reads as zeros at its offset, the rest is kept, and the "
+        "file is SHORT", past_volume)
 
     def bad_pairs():
         w, num = odd_file(nonresident(NTFS_DATA, "", 0, 0, [], cluster, cluster,
@@ -36983,6 +37233,243 @@ def _ntfs_reader_fix_checks(image_gz):
         put(img, NTFS_BITMAP, with_attrs(rec, attrs))
         return not walker(img).free_extents()
     row("clusters whose $Bitmap could not be read are not reported free", bitmap_lost)
+
+    def field_patch(img, node, type_, offset, value):
+        rec = plain(img, node)
+        raw = next(a for t, a in attrs_of(rec) if t == type_)
+        struct.pack_into("<Q", rec, bytes(rec).find(raw) + offset, value)
+        put(img, node, rec)
+
+    def named_stream(units):
+        label = b"".join(struct.pack("<H", u) for u in units)
+        attr = bytearray((0x18 + len(label) + 8 + 7) & ~7)
+        struct.pack_into("<II", attr, 0, NTFS_DATA, len(attr))
+        attr[9] = len(units)
+        struct.pack_into("<H", attr, 10, 0x18)
+        struct.pack_into("<IH", attr, 16, 8, 0x18 + len(label))
+        attr[0x18:0x18 + len(label)] = label
+        return (NTFS_DATA, bytes(attr))
+
+    def link_point(tag, goal):
+        text = goal.encode("utf-16-le")
+        head = (struct.pack("<HHHHI", 0, len(text), 0, len(text), 0) if tag == 0xA000000C
+                else struct.pack("<HHHH", 0, len(text), 0, len(text)))
+        return (0xC0, resident(0xC0, struct.pack("<IHH", tag, len(head + text), 0) + head + text))
+
+    def cut_before_mft():
+        img = bytearray(clean)
+        img[2 * cluster:2 * cluster + 4 * rec_size] = clean[at(0):at(0) + 4 * rec_size]
+        struct.pack_into("<Q", img, 56, 2)
+        w = walker(img[:mft_map[0][0] * cluster])
+        collect(w, w.root)
+        said = damage(w)
+        return (_volumes_not_read([{"folders_not_read": w.folders_not_read}]) == 1
+                and "lies past the end" in said and "record 0 fails" not in said)
+    row("an image cut before $MFT is recorded as loss, and record 0 is not called torn",
+        cut_before_mft)
+
+    def cut_inside_mft():
+        # One cluster short of the end of $MFT: every folder is still readable, and only
+        # the last few records are gone.
+        w = walker(clean[:(max(l + c for l, c in mft_map if l is not None) - 1) * cluster])
+        collect(w, w.root)
+        return _volumes_not_read([{"folders_not_read": w.folders_not_read}]) == 1
+    row("an image cut inside $MFT is recorded as loss", cut_inside_mft)
+
+    def listing_torn_dir():
+        img = bytearray(clean)
+        img[at(names["frag"]) + 1022:at(names["frag"]) + 1024] = b"\xEE\xEE"
+        return "frag/target.bin" in {p for p, *_r in walker(img).listing()}
+    row("listing() keeps the subtree under a torn directory record", listing_torn_dir)
+
+    def listing_unparsed_dir():
+        img = bytearray(clean)
+        tear(img, at(names["frag"]))
+        struct.pack_into("<H", img, at(names["frag"]) + 0x14, 0x3F0)
+        w = walker(img)
+        list(w.listing())
+        return w.folders_not_read == 1
+    row("listing() counts a directory whose torn record does not parse", listing_unparsed_dir)
+
+    def deleted_case(change):
+        gone = next(e for e in ref.deleted_files() if not e.resident and e.recoverable and e.size)
+        img = bytearray(clean)
+        change(img, gone.record)
+        return next(e for e in walker(img).deleted_files() if e.record == gone.record)
+
+    def deleted_no_init():
+        got = deleted_case(lambda img, n: field_patch(img, n, NTFS_DATA, 56, 0))
+        return not got.recoverable and "initialized size is 0" in got.reason
+    row("a deleted file with initialized size 0 is not recoverable, with the reason",
+        deleted_no_init)
+
+    def deleted_bad_runs():
+        def change(img, num):
+            rec = plain(img, num)
+            raw = next(a for t, a in attrs_of(rec) if t == NTFS_DATA)
+            at_runs = bytes(rec).find(raw) + struct.unpack_from("<H", raw, 32)[0]
+            rec[at_runs] = 0x48
+            rec[at_runs + 1:bytes(rec).find(raw) + len(raw)] = b"\xff" * (
+                len(raw) - struct.unpack_from("<H", raw, 32)[0] - 1)
+            put(img, num, rec)
+        got = deleted_case(change)
+        return not got.recoverable and "does not decode" in got.reason
+    row("a deleted file whose run list does not decode is not recoverable", deleted_bad_runs)
+
+    def alloc_flip():
+        node = names["frag/target.bin"]
+        size = ref.entry(node)[1]
+        img = bytearray(clean)
+        data = ref._data_attr(node)              # pylint: disable=protected-access
+        field_patch(img, node, NTFS_DATA, 40, data.alloc_size | 1 << 34)
+        w = walker(img)
+        return (b"".join(w.read_file(node, size)) == b"".join(ref.read_file(node, size))
+                and "bytes allocated" in damage(w))
+    row("a flipped bit in allocated size keeps the file and records the disagreement", alloc_flip)
+
+    def bad_index_entry():
+        node = names["many"]
+        alloc = ref._index_allocation(node)      # pylint: disable=protected-access
+        lcn = alloc.runs[0][0]
+        for block in range(alloc.data_size // ref.idx_size):
+            at_block = (lcn + block * ref.idx_size // cluster) * cluster
+            raw = bytearray(clean[at_block:at_block + ref.idx_size])
+            off, count = struct.unpack_from("<HH", raw, 4)
+            for i in range(count - 1):
+                raw[(i + 1) * 512 - 2:(i + 1) * 512] = raw[off + 2 + i * 2:off + 4 + i * 2]
+            first, used = struct.unpack_from("<II", raw, 0x18)
+            pos, spots = 0x18 + first, []
+            while pos + 0x52 < 0x18 + used and not struct.unpack_from("<H", raw, pos + 12)[0] & 2:
+                spots.append(pos)
+                pos += struct.unpack_from("<H", raw, pos + 8)[0]
+            spot = next((p for p in spots[2:-2] if (p + 8) % 512 < 508), None)
+            if spot is None:
+                continue
+            img = bytearray(clean)
+            img[at_block + spot + 8:at_block + spot + 10] = b"\x00\x00"
+            w = walker(img)
+            return (sorted(w.listdir(node)) == sorted(ref.listdir(node))
+                    and w.folders_not_read == 1 and "index entries" in damage(w))
+        return False
+    row("a bad index entry length is recorded and the rest of the block is kept", bad_index_entry)
+
+    def torn_file(unparsed):
+        img = bytearray(clean)
+        node = names["small.txt"]
+        size = ref.entry(node)[1]
+        img[at(node) + 1022:at(node) + 1024] = b"\xEE\xEE"
+        if unparsed:
+            struct.pack_into("<H", img, at(node) + 0x14, 0x3F0)
+        w = walker(img)
+        ent = w.entry(node)
+        out = zipfile.ZipFile(io.BytesIO(), "w")
+        issues = []
+        extract_to_zip(out, w, "v", [("small.txt", node, ent[1], ent[2])], [], issues=issues)
+        got = out.read("v/small.txt") if "v/small.txt" in out.namelist() else None
+        out.close()
+        kinds = {r[0]: r[2] for r in issues}
+        if unparsed:
+            return any(r[0] == "small.txt" and r[2] == "FAILED" for r in issues)
+        return (got == b"".join(ref.read_file(node, size)) and kinds.get("small.txt") == "RECORD_TORN"
+                and "update sequence" in damage(w))
+
+    row("a torn file record that parses is exported and recorded by path",
+        lambda: torn_file(False))
+    row("a torn file record that does not parse is a failed file, by path",
+        lambda: torn_file(True))
+
+    def bitmap_size():
+        import tracemalloc
+        img = bytearray(clean)
+        old = ref._data_attr(NTFS_BITMAP)        # pylint: disable=protected-access
+        field_patch(img, NTFS_BITMAP, NTFS_DATA, 48, old.data_size | 1 << 26)
+        w = walker(img)
+        tracemalloc.start()
+        try:
+            got = w.free_extents()
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        return peak < 8 << 20 and got == ref.free_extents()
+    row("a flipped high bit in $Bitmap's size does not allocate it", bitmap_size)
+
+    def link_table():
+        img = bytearray(clean)
+        goal = "C:\\target\\file.txt"
+        put(img, spare[0], fresh([0x61], NTFS_ROOT, [link_point(0xA000000C, goal)]))
+        put(img, spare[1], fresh([0x62], NTFS_ROOT, [link_point(0xA000000C, goal)], is_dir=True))
+        put(img, spare[2], fresh([0x63], NTFS_ROOT, [link_point(0xA0000003, goal)], is_dir=True))
+        w = walker(img)
+        out = zipfile.ZipFile(io.BytesIO(), "w")
+        issues = []
+        extract_to_zip(out, w, "v", [("a", spare[0], None, 0), ("b", spare[1], None, 0),
+                                     ("c", spare[2], None, 0)], [], issues=issues)
+        out.close()
+        got = {r[0]: r[3] for r in issues if r[2] == "LINK"}
+        when = (datetime.datetime(1601, 1, 1) + datetime.timedelta(seconds=13200000000)
+                ).strftime("%Y-%m-%d %H:%M:%S") + ".0000000 UTC"
+        return (sorted(got) == ["a", "b", "c"] and got["a"].startswith("file symlink;")
+                and got["b"].startswith("directory symlink;") and got["c"].startswith("junction;")
+                and all(goal in d and f"created {when}" in d and f"modified {when}" in d
+                        and f"accessed {when}" in d for d in got.values()))
+    row("every link gets an exceptions row with its stored target and times", link_table)
+
+    def link_streams():
+        img = bytearray(clean)
+        goal = "C:\\target"
+        put(img, spare[0], fresh([0x61], NTFS_ROOT, [link_point(0xA000000C, goal),
+                                                     named_stream([0x73])]))
+        put(img, spare[1], fresh([0x62], NTFS_ROOT, [link_point(0xA0000003, goal),
+                                                     named_stream([0x74])], is_dir=True))
+
+        class Indexed(NtfsWalker):
+            """The fixture's root index does not name the two records built here."""
+
+            def listdir(self, num):
+                got = super().listdir(num)
+                return got + [("a", spare[0]), ("b", spare[1])] if num == NTFS_ROOT else got
+
+        w = Indexed(io.BytesIO(bytes(img)), 0)
+        listed = {e[0] for e in w.listing(streams=True)}
+        held = {e[0]: e[2] for e in collect(w, w.root) if e[1] in spare[:2]}
+        return ({"a:s", "b:t"} <= listed and w.entry(spare[0])[0] & S_IFMT == 0o100000
+                and w.entry(spare[1])[0] & S_IFMT == S_IFDIR and held.get("a") == 0
+                and "b" in held and held["b"] is None and getattr(w, "readlink", str)(spare[1]) == goal)
+    row("a link holding a named stream stays reachable as a file or folder", link_streams)
+
+    def epoch_ticks():
+        _w, _node, held = stored_time(116444736000000005)
+        return len(held) == 1 and "1970-01-01 00:00:00.0000005 UTC" in held[0]
+    row("a FILETIME a few ticks past the Unix epoch is shown as that date", epoch_ticks)
+
+    def nul_and_slash():
+        img = bytearray(clean)
+        goal = "../up/file"
+        put(img, spare[0], fresh([0x61, 0, 0x62], NTFS_ROOT))
+        put(img, spare[1], fresh([0x61, 0x2F, 0x62], NTFS_ROOT, [named_stream([0x73, 0x2F])]))
+        put(img, spare[2], fresh([0x6C], NTFS_ROOT, [link_point(0xA000000C, goal)]))
+        w = walker(img)
+        got = sorted(p for p, node, *_r in w.listing() if node in spare[:2])
+        return (got == ["a%00b", "a%2Fb"] and [n for n, _s in w.named_streams(spare[1])] == ["s%2F"]
+                and getattr(w, "readlink", str)(spare[2]) == goal)
+    row("a NUL or a / stored in one name is escaped, and a link target keeps its /", nul_and_slash)
+
+    def compressed_init():
+        node = names["comp/text.bin"]
+        size = ref.entry(node)[1]
+        img = bytearray(clean)
+        field_patch(img, node, NTFS_DATA, 56, 8192)
+        got = b"".join(walker(img).read_file(node, size))
+        want = b"".join(ref.read_file(node, size))
+        return got[:8192] == want[:8192] and got[8192:] == bytes(size - 8192) and any(want[8192:])
+    row("a compressed file reads as zeros past its initialized size", compressed_init)
+
+    def bitmap_init():
+        img = bytearray(clean)
+        field_patch(img, NTFS_BITMAP, NTFS_DATA, 56, 0)
+        w = walker(img)
+        return not w.free_extents() and "$Bitmap" in damage(w)
+    row("a $Bitmap with initialized size 0 is not reported as free space", bitmap_init)
     return rows
 
 

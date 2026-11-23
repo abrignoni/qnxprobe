@@ -370,7 +370,10 @@ A filesystem volume with anything to record gets `<volume>.exceptions.tsv` besid
 folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 `exceptions`. It has one row per file that failed, read short or was renamed
 (`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
-a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
+a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. On NTFS it
+also has a `LINK` row per symbolic link and junction and a `RECORD_TORN` row per file read
+from a record that failed its update sequence check, counted as `links` and
+`records_torn`. Neither changes the exit status. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+, APFS or F2FS, whose readers use 0 for no
 time, and for ReFS, HFS+, APFS and F2FS for a value out of their range too. An NTFS
@@ -1381,9 +1384,15 @@ the created, modified and accessed instants a file's `$STANDARD_INFORMATION` hol
 `entry()` carries only the modified one, which is what a listing needs.
 
 Symbolic links and junctions are listed as links, with `readlink()` giving the target as
-stored, and are not followed. An extraction writes no member for them and counts them in
-`symlinks_or_special_skipped`, as it does on every other filesystem. A link used to come
-out as an empty file, or not at all when it pointed at a folder.
+stored, and are not followed. An extraction counts them in `symlinks_or_special_skipped`
+and gives each a `LINK` row in the exceptions table with its path, kind, stored target and
+three times. A link that holds a named stream keeps the file or folder kind it has on
+disk, so a caller that takes streams from files and folders still reaches the stream; a
+file link of that kind also keeps its empty member.
+
+A stored name is kept as text that a path or SQLite accepts: an unpaired UTF-16 unit
+becomes `%XX` of its stored bytes (`%00%D8` for U+D800), a NUL becomes `%00`, and a `/`
+inside one name becomes `%2F`. A link target is a path, so its `/` stay.
 
 The update sequence protects every 512 bytes of a record on any sector size, so a volume
 on a 4096-byte-sector disk reads like any other, and a record whose sequence count does
@@ -1393,19 +1402,26 @@ read. An `$MFT` too fragmented for its own record is followed through its
 
 When a volume is damaged or cut short, the export says what is missing:
 
-- A run past the end of the image stays at its own offset as zeros, so nothing after it
-  moves. The member is named `.SHORT-<here>-of-<size>-bytes`, and the missing ranges are
-  in `damage_first`. A compressed unit that is not all there is not inflated, and the
-  count is in file bytes.
-- A file is refused, and recorded as failed, when its run list does not decode, a run
-  leaves the volume, or an extension record holding some of its extents cannot be read.
+- A run past the end of the image, or outside the volume, stays at its own offset as
+  zeros, so nothing after it moves. The member is named `.SHORT-<here>-of-<size>-bytes`,
+  and the missing ranges are in `damage_first`. A compressed unit that is not all there
+  is not inflated, and the count is in file bytes.
+- A file is refused, and recorded as failed, when its run list does not decode, its runs
+  store more clusters than the volume has, or an extension record holding some of its
+  extents cannot be read.
 - A recorded size past the run list is read up to where the runs end and named `.SHORT`,
-  with the reason in the exceptions table.
-- A directory whose record or index block cannot be read is listed from the records that
-  name it as their parent, and is counted in `folders_not_read`, which makes the exit
-  status 1.
-- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut through `$MFT` says how
-  many records lie past its end. Clusters whose `$Bitmap` could not be read count as in
+  with the reason in the exceptions table. An allocated size that disagrees with the run
+  list is recorded in `damage_first`, and the file is read from its runs.
+- A record that fails its update sequence check is read as it stands when it still
+  parses, as Linux reads it, and is recorded. A file's record that does not parse is a
+  failed file, named by its path.
+- A directory whose record, index block or index entry cannot be read is also listed from
+  the records that name it as their parent, and is counted in `folders_not_read`, which
+  makes the exit status 1. `listing()` keeps the subtree under a torn directory record,
+  and counts the directory when its record does not parse.
+- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut before or through `$MFT`
+  says how many records lie past its end and exits 1. `$Bitmap` is never read past what
+  the volume's clusters need, and clusters whose bitmap could not be read count as in
   use, so `free_extents()` does not report them free.
 
 Deleted files are recovered separately, from the MFT rather than the directory index.
@@ -1414,9 +1430,10 @@ file: its name, size, dates, and whether the content can still be read. A file w
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
 could find. A non-resident file is recoverable only while every cluster it used is still
-free; once a later file has taken one, `read_deleted()` refuses it rather than hand back
-bytes that now belong to something else, so overwritten data is never presented as the
-file. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
+free and its initialized size is not 0; once a live file has taken a cluster,
+`read_deleted()` refuses it rather than hand back that file's bytes. A cluster that was
+reused and freed again looks the same as one never reused, so a recovered file's bytes
+are a candidate, not a proven copy. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
 records that may since have been reused, so a file whose attributes overflowed its record
 is reported as having existed rather than reconstructed from whatever now lives there.
 
