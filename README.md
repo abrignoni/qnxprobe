@@ -379,9 +379,9 @@ Since 1.68 a member's name is made safe before it is written: a stored name of `
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
 backslash, colon or control character are written escaped as `%XX`, so no member can
 land outside the folder it is extracted into, start at a root, or be cut short by a
-NUL. Since 1.87 a `?` or `*` is escaped the same way: one such name, as a file or a folder,
-made `Expand-Archive` in Windows PowerShell 5.1.26100 stop with an error and leave none of
-the zip's files. A name that is only a Windows device name (`NUL`, `CON`, `PRN`, `AUX`, `COM1` to
+NUL. Since 1.87 a `?`, `*`, `<`, `>`, `|` or `"` is escaped the same way: one such name, as
+a file or a folder, made `Expand-Archive` in Windows PowerShell 5.1.26100 leave none of the
+zip's files. A name that is only a Windows device name (`NUL`, `CON`, `PRN`, `AUX`, `COM1` to
 `COM9`, `LPT1` to `LPT9`, in any case, with or without trailing dots or spaces) has its
 first letter escaped, so `nul` is held as `%6Eul`. A name with an extension, such as
 `aux.c`, is not changed. Ordinary names are kept exactly as stored. Each renamed member is logged as

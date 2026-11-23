@@ -12934,9 +12934,9 @@ class ProgressEmitter:
 
 # Characters a zip member name must not carry as they are: a backslash or a colon
 # that an extracting tool on Windows reads as a separator or a stream, control
-# characters (NUL ends the name early in some tools), and ? and *, which stop Windows
-# PowerShell 5.1's Expand-Archive and leave none of the zip's files.
-_ZIP_UNSAFE = set(range(0x20)) | {0x7F, ord("\\"), ord(":"), ord("?"), ord("*")}
+# characters (NUL ends the name early in some tools), and ? * < > | and ", any one of
+# which makes Windows PowerShell 5.1's Expand-Archive leave none of the zip's files.
+_ZIP_UNSAFE = set(range(0x20)) | {0x7F} | {ord(c) for c in '\\:?*<>|"'}
 
 # Names Windows keeps for devices. Extracting a file under one can write to the device
 # and leave no file and no error, with or without trailing dots and spaces, which
@@ -32628,17 +32628,19 @@ def _zip_export_checks():
         lrows = {r["stored_path"]: r for r in table(lzin, "case.entries.tsv")}
         return (no_clash([on_windows(n) for n in names]) and len(names) == len(stored)
                 and sorted(zin.read(n) for n in names) == sorted(n.encode() for n in stored)
-                and all(f"lba0/{n}" in names for n in ("a_", "b.", "c ", "d<", "dir/x",
+                and all(f"lba0/{n}" in names for n in ("a_", "b.", "c ", "d_", "dir/x",
                                                        "aux.c", "con.txt"))
                 and zin.read("lba0/a%3F") == b"a?" and zin.read("lba0/alone%3F") == b"alone?"
+                and zin.read("lba0/d%3C") == b"d<" and zin.read("lba0/d%3E") == b"d>"
+                and zin.read("lba0/d_") == b"d_"
                 and zin.read("lba0/dir%2E%2E%2E/x") == b"dir.../x"
                 and zin.read("lba0/%6Eul") == b"nul" and zin.read("lba0/%4EUL.") == b"NUL."
                 and all(rows[n]["issue"] == "RENAMED" and rows[n]["zip_member"] in names
-                        for n in ("a?", "alone?", "b", "c", "d>", "d_", "dir.../x", "nul",
+                        for n in ("a?", "alone?", "b", "c", "d<", "d>", "dir.../x", "nul",
                                   "NUL."))
                 and "device name" in rows["nul"]["detail"]
                 and "characters" not in rows["nul"]["detail"]
-                and not {"a_", "aux.c", "con.txt"} & set(rows)
+                and not {"a_", "d_", "aux.c", "con.txt"} & set(rows)
                 and no_clash([on_windows(n) for n in lzin.namelist()])
                 and lzin.read(lrows["a_"]["zip_member"]) == b"2"
                 and lzin.read("case/%6Eul") == b"3" and lrows["nul"]["zip_member"] == "case/%6Eul")
