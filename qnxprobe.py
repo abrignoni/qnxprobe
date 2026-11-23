@@ -37900,6 +37900,27 @@ def _f2fs_reader_checks():
                     and got[:at] == before[:at] and got[at + BS:] == before[at + BS:])
         return with_edits(full, [(first * BS, bytes(node)), (free_block * BS, mark)], check)
 
+    def node_offsets():
+        """The log places a direct node by its offset (gc.c f2fs_start_bidx_of_node) and a
+        read finds it by logical block (node.c get_node_path). The two must agree at every
+        level of the tree, including the ones no fixture file is large enough to reach."""
+        w = walker(free_v)
+        ino = w.inode(sorted(files(w).values())[0][0])
+        n, apb, nids = ino["addrs_in_inode"], ino["apb"], w.addrs_per_block
+        ind = apb * nids
+        spots = [n, n + apb - 1, n + apb, n + 2 * apb - 1]
+        for base in (n + 2 * apb, n + 2 * apb + ind):
+            spots += [base + m * apb + k for m in (0, 1, 7, nids - 1) for k in (0, 1, apb - 1)]
+        base = n + 2 * apb + 2 * ind
+        spots += [base + top * ind + mid * apb + k for top in (0, 1, 7, nids - 1)
+                  for mid in (0, 1, 7, nids - 1) for k in (0, 1, apb - 1)]
+        for logical in spots:
+            ofs = w._node_path(ino, logical)[2][-1]      # pylint: disable=protected-access
+            start = w._start_bidx(ofs, n, apb, nids)     # pylint: disable=protected-access
+            if not start <= logical < start + apb or not w._is_dnode(ofs):  # pylint: disable=protected-access
+                return False
+        return True
+
     def encrypted():
         w0 = walker(free_v)
         path, (nid, size) = next((p, v) for p, v in sorted(files(w0).items())
@@ -37957,6 +37978,8 @@ def _f2fs_reader_checks():
     row("F2FS roll-forward: a chain cut after 5 nodes applies those 5", log_cut)
     row("F2FS roll-forward: a looped chain applies nothing and is recorded", log_loop)
     row("F2FS roll-forward: a log inode recreating a held inode stops recovery", log_existing_inode)
+    row("F2FS roll-forward: a direct node's offset and its logical blocks agree at every tree "
+        "level", node_offsets)
     row("F2FS roll-forward: a crafted direct node in the log changes the one block it moves",
         log_direct_node)
     row("F2FS encryption: a flagged file is exported as stored to the end of its block, with "

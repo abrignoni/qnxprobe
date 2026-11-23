@@ -2294,7 +2294,12 @@ its checksum when the checkpoint's flags say so. Anything the kernel would stop 
 leaves the checkpoint's state in place and is recorded. The image is never written, and each
 file that takes anything from the log has a `ROLL_FORWARD` row in the exceptions table.
 Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
-files match the kernel's read-back hashes, where 1.87 listed 1.
+files match the kernel's read-back hashes, where 1.87 listed 1. The log on that volume holds
+inode nodes only, so replay of a direct node has been run on a crafted log and not on one the
+kernel wrote. One step of the kernel's is not done: when the log gives a file a block the
+checkpoint still marks in use, the kernel takes it from the earlier owner through the
+segment summary. This reader records that in `damage_first` and leaves the earlier owner as
+it was, so that block can then appear in both files.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
@@ -3879,11 +3884,20 @@ struct f2fs_super_block, f2fs_checkpoint, f2fs_inode, node_footer,
   f2fs_dir_entry, f2fs_dentry_block, f2fs_nat_entry
                                   include/linux/f2fs_fs.h
 current_nat_addr, get_node_path   fs/f2fs/node.{h,c}
+f2fs_sanity_check_node_footer     fs/f2fs/node.c
 validate_checkpoint               fs/f2fs/checkpoint.c
-sanity_check_raw_super            fs/f2fs/super.c
+sanity_check_raw_super, sanity_check_area_boundary, max_file_blocks
+                                  fs/f2fs/super.c
 read_normal_summaries             fs/f2fs/segment.c   (the NAT journal)
 do_read_inode                     fs/f2fs/inode.c
 f2fs_fill_dentries                fs/f2fs/dir.c
+f2fs_recover_fsync_data, find_fsync_dnodes, recover_data, do_recover_data,
+  recover_dentry                  fs/f2fs/recovery.c
+f2fs_recover_inline_data          fs/f2fs/inline.c
+f2fs_start_bidx_of_node           fs/f2fs/gc.c
+f2fs_decompress_cluster, __f2fs_cluster_blocks
+                                  fs/f2fs/compress.c
+f2fs_read_multi_pages             fs/f2fs/data.c
 ```
 
 The inode's address count, the direct/indirect node layout and the NAT block
