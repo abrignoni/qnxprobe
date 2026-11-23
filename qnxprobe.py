@@ -3244,10 +3244,16 @@ class F2fsWalker:
                 L += 1
                 continue
             bmsize = self._dentry_geom(self.bs)[1]
-            if not any(buf[:bmsize]):
-                # dir.c f2fs_delete_entry punches a block when its last entry goes
-                self._folder_part(nid, f"block {L:,} of the folder (block {addr:,}) holds no "
-                                       "entries, which a folder block in use does not")
+            if not any(buf):
+                # A folder block is written with an entry in it, and a delete clears only
+                # the bitmap (dir.c), so a block of zeros is not one the folder code wrote.
+                self._folder_part(nid, f"block {L:,} of the folder (block {addr:,}) is all "
+                                       "zeros, so whatever it listed is lost")
+            elif not any(buf[:bmsize]):
+                # f2fs_delete_entry punches a block when its last entry goes, and keeps it
+                # if that fails, so this alone does not show that anything was lost.
+                self._damaged(f"folder node {nid:,}: block {L:,} (block {addr:,}) has no entry "
+                              "marked in use")
             out.extend(self._parse_dentry(buf, 0, self.bs, nid))
             L += 1
         return out
