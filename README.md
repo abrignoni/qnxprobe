@@ -554,7 +554,11 @@ is counted in `folders_not_read`, and the run then exits 1.
 - **A folder is different.** Its entries do not depend on their offset, so a cluster the
   image lacks is recorded and passed over, and the clusters after it are still listed. A
   chain that stops before the folder's end marker is recorded, with what another FAT copy
-  holds at that link. That link is not followed.
+  holds at that link, including an end-of-chain mark where another copy still holds a link.
+  That link is not followed.
+- **A lost sector in a folder is recorded.** The FAT specification says every entry after
+  one whose first byte is `0x00` is free, so a nonzero first byte past it is recorded, as
+  is an in-use entry with a reserved attribute bit set. The listing itself does not change.
 - **Recorded and still read:** a cluster two chains hold, a chain longer than its size
   needs, and two entries that start at one cluster.
 - **Free space.** A cluster is free only when every FAT copy that holds its entry says so,
@@ -582,9 +586,10 @@ is counted in `folders_not_read`, and the run then exits 1.
 
 Since 1.62. A FAT16 volume is read through `Fat16Walker` and a FAT12 volume through
 `Fat12Walker`, with the same listing, reading, `deleted_files()`, `free_extents()` and
-`chain_shortfall()` calls as FAT32. Either is recognised by a `FAT16   ` or `FAT12   ` type
-string at offset 54 of the boot sector, the `0x55AA` signature, and a BPB a cluster count
-can be computed from. Which of the two it is comes from that count and not from the
+`chain_shortfall()` calls as FAT32. Either is recognised by a `FAT16   `, `FAT12   ` or
+generic `FAT     ` type string at offset 54 of the boot sector (Microsoft's specification
+lists the generic one and FatFs writes it), the `0x55AA` signature, and a BPB a cluster
+count can be computed from. Which of the two it is comes from that count and not from the
 string, because Microsoft's FAT specification types a volume by its count of clusters and
 nothing else: fewer than 4,085 is FAT12, and 4,085 to 65,524 is FAT16. A volume whose
 string and count disagree is read by its count, and the report says both.
@@ -1709,11 +1714,16 @@ else. A recovered file says in `assumed_contiguous` whether its layout was taken
 one-run assumption or from a chain the volume still held. A FAT file is `recoverable` only
 while every cluster of that run is on the volume, in the image, free in every FAT copy that
 counts, and claimed by no other deleted entry. When two deleted entries' runs overlap, the
-volume does not record which wrote last, so both are listed and neither is read.
+volume does not record which wrote last, so both are listed and neither is read. A run
+is claimed only up to its first cluster in use, and a deleted folder claims only clusters
+that were read as its entries. When the other entry has the same first cluster and size,
+`reason` names it: a rename or move then delete leaves that, and so can a same-size
+replacement, so the two are not treated as one file.
 
 **A zero high word on a large FAT32 volume.** The Windows driver zeroes the high word of a
-first cluster when it marks an entry deleted, so on a volume of more than 65,535 clusters a
-zero there does not by itself say where the file began. This rule is for entries marked
+first cluster when it marks an entry deleted, so on a volume with a cluster numbered
+`0x10000` or above (65,535 clusters or more, since numbering starts at 2) a zero there does
+not by itself say where the file began. This rule is for entries marked
 deleted: an unmarked child of a deleted folder never went through a delete and keeps its
 stored high word. The candidates are the low word plus a multiple of 65,536, within
 clusters 2 to the last, so a low word of 0 or 1 starts at 65,536 or 65,537. When exactly one
@@ -1727,8 +1737,8 @@ so those files are reported as ambiguous too when their low word fits a second c
 **Deleted folders.** A deleted directory whose first cluster is free in every FAT copy and
 still parses as a directory is walked into, and every entry in it counts as deleted, marked
 or not, because the Windows driver was seen leaving some unmarked. Its chain is gone, so it
-is read as one run from its first cluster, and the run stops at a cluster in use or one
-that does not read as folder entries. An end marker counts only as a slot of 32 zero bytes,
+is read as one run from its first cluster, and the run stops at a cluster in use, at the
+first cluster of another folder, or at one that does not read as folder entries. An end marker counts only as a slot of 32 zero bytes,
 because MP4 and HEIC data also open with zeros. Reading less than the folder's recorded
 size, or stopping before an end marker, is recorded. On the Windows-written test volumes the folder's clusters were interleaved
 with its files, so 3 to 15 of each deleted folder's files were listed (of 50 on FAT12 and
