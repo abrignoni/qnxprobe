@@ -2195,18 +2195,19 @@ class ExtWalker:
         return max(charged - len(seen), 0)
 
     def _inline_bytes(self, raw):
-        """A file's or folder's inline data: the 60 bytes of i_block, then the value of the
-        system.data attribute in the inode body (ext4_read_inline_data, fs/ext4/inline.c).
-        The header follows i_extra_isize, entries follow it, and a value offset counts
-        from the first entry (IFIRST, fs/ext4/xattr.h). An attribute that names a value
-        outside the inode raises, because the bytes it should hold are not here."""
+        """(data, found) for a file's or folder's inline data: the 60 bytes of i_block, then
+        the value of the system.data attribute in the inode body (ext4_read_inline_data,
+        fs/ext4/inline.c), with ``found`` saying whether that attribute is there. The
+        header follows i_extra_isize, entries follow it, and a value offset counts from
+        the first entry (IFIRST, fs/ext4/xattr.h). An attribute that names a value outside
+        the inode raises, because the bytes it should hold are not here."""
         out = raw[40:100]
         if self.isz <= EXT_GOOD_OLD_INODE_SIZE:
-            return out
+            return out, False
         extra = struct.unpack_from("<H", raw, EXT_GOOD_OLD_INODE_SIZE)[0]
         head = EXT_GOOD_OLD_INODE_SIZE + extra
         if head + 4 > len(raw) or struct.unpack_from("<I", raw, head)[0] != EXT4_XATTR_MAGIC:
-            return out
+            return out, False
         first = p = head + 4
         while p + 16 <= len(raw):
             nlen, index, voff, inum, vsize = struct.unpack_from("<BBHII", raw, p)
@@ -2216,9 +2217,9 @@ class ExtWalker:
                 if inum or first + voff + vsize > len(raw):
                     raise ExtUnreadable(f"its system.data attribute places {vsize:,} bytes "
                                         "outside the inode")
-                return out + raw[first + voff:first + voff + vsize]
+                return out + raw[first + voff:first + voff + vsize], True
             p += (16 + nlen + 3) & ~3
-        return out
+        return out, False
 
     def _dirents(self, buf, start, num, where, out, big_block):
         """Add a directory block's names to ``out``. A record length that cannot be right
@@ -2258,7 +2259,11 @@ class ExtWalker:
         if flags & EXT4_INLINE_DATA_FL:
             # The first four bytes are the parent's inode (EXT4_INLINE_DOTDOT_SIZE)
             try:
-                self._dirents(self._inline_bytes(raw), 4, num, "its inline entries", out, False)
+                data, found = self._inline_bytes(raw)
+                if not found and struct.unpack_from("<I", raw, 4)[0] > len(data):
+                    self._folder_part(num, "its size runs past the 60 bytes in the inode and "
+                                           "its system.data attribute is not there")
+                self._dirents(data, 4, num, "its inline entries", out, False)
             except ExtUnreadable as exc:
                 self._folder_part(num, str(exc))
         else:
@@ -2278,10 +2283,15 @@ class ExtWalker:
                     if len(buf) < self.bs:
                         self._folder_part(num, f"block {b:,} is past the end of the image")
                     self._dirents(buf, 0, num, f"block {b:,}", out, self.bs >= 65536)
+            # The kernel steps over a hole in a folder (ext4_readdir, fs/ext4/dir.c), so a
+            # short map is damage only when i_blocks says the map lost something.
             want = -(-struct.unpack_from("<I", raw, 4)[0] // self.bs)
-            if mapped < want:
-                self._folder_part(num, f"its size needs {want:,} blocks and its map reaches "
-                                       f"{mapped:,}")
+            if mapped < want and not flags & EXT4_EXTENTS_FL:
+                short = self._blocks_unreached(raw)
+                if short:
+                    self._folder_part(num, f"its map reaches {mapped:,} of the {want:,} blocks "
+                                           f"its size spans, and the inode records {short:,} "
+                                           "more block(s) than the map reaches")
         out.sort()
         for name, ino in out:
             child = self.inode(ino)
@@ -2398,8 +2408,17 @@ class ExtWalker:
         if runs is None:
             # Inline data keeps the first 60 bytes in the inode's block field and
             # the rest in the system.data extended attribute. Past what the two hold
-            # the kernel reads zeros (ext4_read_inline_folio, ext4_readpage_inline).
-            data = self._inline_bytes(raw)[:size]
+            # the kernel reads zeros (ext4_read_inline_folio, ext4_readpage_inline). With
+            # the attribute gone, what lay past the 60 bytes is not known to be zeros.
+            try:
+                data, found = self._inline_bytes(raw)
+                if size > len(data) and not found:
+                    raise ExtUnreadable("the system.data attribute that holds what follows "
+                                        "the first 60 bytes is not in the inode")
+            except ExtUnreadable as exc:
+                self._damaged(f"inode {num}: {exc}")
+                raise ExtUnreadable(f"{exc}; none of its {size:,} bytes are exported") from None
+            data = data[:size]
             yield data
             for chunk in self._zeros(size - len(data), size - len(data)):
                 yield chunk
@@ -28855,6 +28874,21 @@ def _ext_reader_checks():
     row("ext inline_data: a 100-byte file reads whole, its tail from the system.data attribute",
         inline_tail)
     row("ext inline_data: every file matches the sha256 of its source", lambda: fixture("ext4-inline"))
+
+    def inline_attr_gone():
+        img = load("ext4-inline")
+        ino = number(img, "over60.bin")
+        at = inode_at(img, ino)
+        img[at + 128 + struct.unpack_from("<H", img, at + 128)[0]] ^= 0xFF      # the header magic
+        w = walker(img)
+        try:
+            read(w, ino, 100)
+        except ExtUnreadable as exc:
+            return "system.data" in str(exc) and any("system.data" in d for d in w.damage)
+        return False
+
+    row("ext inline_data: a file past 60 bytes whose attribute is damaged is refused and "
+        "recorded, not padded with zeros", inline_attr_gone)
     row("ext meta_bg: every file of a volume whose descriptors fill more than one block "
         "matches the sha256 of its source", lambda: fixture("ext4-metabg"))
 
@@ -29065,8 +29099,18 @@ def _ext_reader_checks():
         w = walker(img)
         return next(i for n, i in w.listdir(2) if n == name)
 
+    def folder_hole():
+        img = bytearray(sparse2)
+        ino = next(i for n, i in walker(img).listdir(2) if n == "dir")
+        struct.pack_into("<I", img, inode_at(img, ino) + 4, 2 * 4096)   # one block, sized for two
+        w = walker(img)
+        names = [n for n, _i in w.listdir(ino)]
+        return "tiny.txt" in names and not getattr(w, "damage", [])
+
     row("ext damage: a record length of 0 inside a folder is recorded with where it is",
         bad_rec_len)
+    row("ext: a hole in a folder is stepped over as the kernel does, with nothing recorded",
+        folder_hole)
     row("ext names: names that are not UTF-8 stay distinct as %XX of their stored bytes, with "
         "no surrogate, and a valid name is unchanged", raw_names)
     row("ext times: the zip date comes from the kernel's reading, so a 1961 mtime is not 2097",
