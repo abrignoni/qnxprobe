@@ -8280,8 +8280,7 @@ class _HfsTree:
     def __init__(self, vol, size, extents, name):
         self.vol, self.size, self.extents, self.name = vol, size, extents, name
         # the shortest key a record of this tree can have (TN1150: HFSPlusCatalogKey,
-        # HFSPlusExtentKey, HFSPlusAttrKey), so a sector of zeros inside a node is not
-        # read as records with empty keys
+        # HFSPlusExtentKey, HFSPlusAttrKey)
         self.min_key = {"catalog": 6, "extents overflow": 10, "attributes": 12}.get(name, 0)
         head = self._raw(0, 512)
         if len(head) < 120:
@@ -8571,6 +8570,7 @@ class HfsPlusWalker:
         self._tree_faults = set()              # (tree, node) already recorded
         self._attr_cut = set()                 # ids whose attribute lookup met a damaged node
         self._provenance = None                # (files holding it, whether the count is whole)
+        self._block_note = None                # _check_allocation(), when the two differ
         self._folder_names = {}                # folder id -> (parent id, name), for stream_rows
         self._link_vnodes = {}                 # node past the base -> (id, open folders, repeat, shut)
         self._link_keys = {}
@@ -8673,6 +8673,8 @@ class HfsPlusWalker:
             parts.append(f"{len(self._links_held):,} later name(s) of directory hard links "
                          f"list nothing, past {HFSP_LINK_REPEAT_LIMIT:,} entries of repeated "
                          "contents; each such folder is listed in full under its first name")
+        if self._block_note:
+            parts.append(self._block_note)
         if self._provenance and self._provenance[0]:
             count, whole = self._provenance
             parts.append(f"{'' if whole else 'at least '}{count:,} file(s) hold the "
@@ -8735,8 +8737,7 @@ class HfsPlusWalker:
 
     def _check_forks(self, rec):
         """The blocks a file record's two forks hold, recording a fork whose size its
-        blocks cannot contain. One bad sector can end inside a record that is last in its
-        node, where no other check of the node sees it."""
+        blocks cannot contain."""
         cnid = struct.unpack_from(">I", rec, 8)[0]
         total = 0
         for off, label in ((88, "data"), (168, "resource")):
@@ -8752,8 +8753,9 @@ class HfsPlusWalker:
         """Compare the blocks the volume header counts as used with those its forks account
         for: the files', the attributes', the special files', the bad block file's, and the
         reserved blocks at each end (TN1150: the first 1536 bytes and the last 1024). They
-        were equal on all 19 volumes macOS wrote for this reader's known data, so a
-        difference on a cleanly unmounted volume means a record no longer says what it did."""
+        were equal on all 19 volumes macOS wrote for this reader's known data. No other
+        writer was measured, so a difference is stated in ``note`` and is not called
+        damage and does not change the exit status."""
         counted = fork_blocks + sum(struct.unpack_from(">I", self._vh, off + 12)[0]
                                     for off in (112, 192, 272, 352, 432))
         counted += -(-1536 // self.block_size) + -(-1024 // self.block_size)
@@ -8775,10 +8777,8 @@ class HfsPlusWalker:
             return
         used = self.total_blocks - self.free_blocks
         if counted != used:
-            self._damaged(f"the volume header counts {used:,} blocks in use and its forks "
-                          f"account for {counted:,}, so a file or attribute record may be "
-                          "damaged")
-            self.folders_not_read = max(self.folders_not_read, 1)
+            self._block_note = (f"the volume header counts {used:,} blocks in use and its "
+                                f"forks and reserved blocks account for {counted:,}")
 
     def _note_private(self, parent, key, child):
         """Remember the two private folders by the name they are stored under."""
@@ -35869,7 +35869,8 @@ def _hfs_reader_checks():
         w = walker(img)
         got = {n for n, _c in w.listdir(HFSP_ROOT)}
         return got < before and lost(w) >= 1 and w.damage
-    row("HFS+: one zeroed sector inside a catalog leaf is recorded as a loss", zeroed_sector)
+    row("HFS+: a catalog leaf with this 512-byte stretch zeroed fails its checks and is "
+        "recorded", zeroed_sector)
 
     def damaged_header():
         v = _HfsTestVolume(4096)
@@ -35901,9 +35902,9 @@ def _hfs_reader_checks():
         img[at + 88:at + 248] = bytes(160)       # both forks, as a zeroed sector would leave them
         w = walker(img)
         w.listdir(HFSP_ROOT)
-        return lost(w) >= 1 and any("blocks in use" in d for d in w.damage)
-    row("HFS+: a file record zeroed past its key, last in its node, is caught by the "
-        "volume's block count", tail_of_last_record)
+        return "blocks in use" in note(w) and not lost(w)
+    row("HFS+: blocks in use that the forks do not account for are stated in the note",
+        tail_of_last_record)
 
     def attr_size_sector():
         v = _HfsTestVolume()

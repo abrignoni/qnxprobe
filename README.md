@@ -1217,7 +1217,8 @@ Damage is recorded in `damage_first`. A B-tree node that fails its checks is nev
 the end of a folder. The walk keeps what it reached, and `folders_not_read` and exit status
 1 say the folder stopped there. Nothing is rebuilt from raw nodes, so entries past a damaged
 catalog leaf in the same folder are not listed, and a damaged root or header node leaves the
-volume unlisted, with that record. A
+volume unlisted, with that record. A node that is damaged but still passes these checks is
+read as stored, so this is not a general detector of damaged sectors. A
 fork's extents each stay at their own file offset: a range that cannot be read is zeros,
 the file is named `SHORT`, and its row says which blocks. A primary volume header that is
 not valid is replaced by the alternate at the end of the volume, and the record says so.
