@@ -543,9 +543,10 @@ the image. A request for the recorded size or more returns what it did before.
 
 ## FAT12, FAT16 and FAT32: what a damaged volume reports
 
-What the reader found wrong goes in the walker's `damage` list, which an export writes to
-`volumes.json` as `damage_recorded` and `damage_first`. A folder it could not list in full
-is counted in `folders_not_read`, and the run then exits 1.
+What the reader found goes in the walker's `damage` list, which an export writes to
+`volumes.json` as `damage_recorded` and `damage_first`. A record states what was found.
+`folders_not_read` and exit 1 mean something was lost or could not be read: a folder not
+read to its end, or clusters in use that no live file or folder reaches.
 
 - **A chain ends at any table value that is not a cluster of the volume:** a free entry,
   the bad-cluster mark, or a link past the last cluster. A file read also ends at the first
@@ -556,9 +557,17 @@ is counted in `folders_not_read`, and the run then exits 1.
   chain that stops before the folder's end marker is recorded, with what another FAT copy
   holds at that link, including an end-of-chain mark where another copy still holds a link.
   That link is not followed.
-- **A lost sector in a folder is recorded.** The FAT specification says every entry after
-  one whose first byte is `0x00` is free, so a nonzero first byte past it is recorded, as
-  is an in-use entry with a reserved attribute bit set. The listing itself does not change.
+- **Clusters nothing reaches count as lost.** A sector lost from a folder can take its last
+  entries and leave nothing odd behind, but the files they named stay allocated. So the
+  clusters the FAT marks in use that no live chain reaches are counted, whole chains
+  claimed and the bad-cluster mark left out, and any such cluster sets exit 1. An unclean
+  eject can leave these too (`chkdsk` turns them into `FOUND.000`), so a card with lost
+  chains exits 1 with nothing else wrong. None of the 59 clean known-data and corpus FAT
+  volumes measured has one.
+- **Notes, which change neither the listing nor the exit status.** Slots after an
+  end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
+  bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
+  they do not show that anything was lost.
 - **Recorded and still read:** a cluster two chains hold, a chain longer than its size
   needs, and two entries that start at one cluster.
 - **Free space.** A cluster is free only when every FAT copy that holds its entry says so,
@@ -1707,13 +1716,21 @@ survive, so a deleted file comes back with all of them.
 
 What neither keeps is where a fragmented file's later clusters lay: FAT32 zeroes the
 chain on delete, and exFAT keeps a chain only for a file it wrote fragmented in the
-first place. So a file that occupied one run is recovered exactly, and one whose size
-would need clusters that a later file has since taken is reported as having existed
-rather than read, because reading it would splice in bytes that now belong to something
-else. A recovered file says in `assumed_contiguous` whether its layout was taken on the
-one-run assumption or from a chain the volume still held. A FAT file is `recoverable` only
-while every cluster of that run is on the volume, in the image, free in every FAT copy that
-counts, and claimed by no other deleted entry. When two deleted entries' runs overlap, the
+first place. A file whose size would need clusters a live file now holds is reported as
+having existed rather than read. A recovered file says in `assumed_contiguous` whether its
+layout was taken on the one-run assumption or from a chain the volume still held.
+
+**`recoverable` means nothing on the volume contradicts the file. It does not mean the bytes
+are the file's.** FAT and exFAT cannot prove that a free cluster still holds a deleted file.
+A later file can reuse the clusters and then be deleted with its directory slot overwritten,
+and nothing on the volume records that, so a recoverable file can read as another file's
+content, or as a splice of several when it was fragmented. Measured on Windows-written
+FAT16 volumes, one such file returned exactly another file's bytes and a 10-cluster one held
+5 clusters of other files. Every recoverable entry therefore has `content_unverified` True,
+and what `read_deleted()` returns for it is a candidate to check.
+
+A FAT file is `recoverable` when every cluster of that run is on the volume, in the image,
+free in every FAT copy that counts, and claimed by no other surviving deleted entry. When two deleted entries' runs overlap, the
 volume does not record which wrote last, so both are listed and neither is read. A run
 is claimed only up to its first cluster in use, and a deleted folder claims only clusters
 that were read as its entries. When the other entry has the same first cluster and size,
@@ -1751,10 +1768,9 @@ created and then deleted; the self-test recovers them from the directory entries
 matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers the same
 bytes from the same entries. The FAT32 fixture has 129,022 clusters and its low words fit
 two clusters each, so at its real size its entries are ambiguous under the rule above: the
-self-test compares the bytes with its recorded size cut in memory to 65,535 clusters. The fragmented file that lands across reused space is
-refused by this reader and is the one case `icat` will read on the contiguous
-assumption; refusing it is the deliberate choice not to present bytes the entry cannot
-vouch for.
+self-test compares the bytes with its recorded size cut in memory to 65,535 clusters. The
+fragmented file whose run crosses a live file is refused by this reader and is the one case
+`icat` will read on the contiguous assumption.
 
 ### exFAT: orphan directory entries
 

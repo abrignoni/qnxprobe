@@ -2620,9 +2620,16 @@ class F2fsWalker:
 class FatDeletedFile:
     """One deleted FAT32, FAT16, FAT12 or exFAT directory entry that still describes a file.
 
-    ``recoverable`` says whether the content can be read back: the entry keeps
-    its first cluster and size, so the data is readable while those clusters
-    are still free. ``assumed_contiguous`` is True when the chain that said
+    ``recoverable`` means nothing on the volume contradicts the file: its first
+    cluster is known, every cluster its read touches is free, and no surviving
+    entry claims them. It does not mean the bytes are the file's. FAT and exFAT
+    cannot prove that a free cluster still holds a deleted file: a later file can
+    reuse the clusters and then be deleted with its directory slot overwritten, and
+    nothing on the volume records that. So every recoverable entry has
+    ``content_unverified`` True, and what read_deleted() returns for it is a
+    candidate that can be another file's content.
+
+    ``assumed_contiguous`` is True when the chain that said
     where the rest of the file lay is gone (FAT32 zeroes it on delete; exFAT
     keeps one only for a fragmented file) and the read assumes the file was
     laid out in one run, which is how a driver writes a fresh file onto a
@@ -2632,7 +2639,7 @@ class FatDeletedFile:
 
     __slots__ = ("name", "parent", "is_dir", "size", "first_cluster",
                  "recoverable", "reason", "assumed_contiguous", "times",
-                 "in_deleted_dir", "_node")
+                 "in_deleted_dir", "content_unverified", "_node")
 
     def __init__(self, name, parent, is_dir, size, first_cluster, recoverable,
                  reason, assumed_contiguous, times, in_deleted_dir, node):
@@ -2641,10 +2648,12 @@ class FatDeletedFile:
         self.recoverable, self.reason = recoverable, reason
         self.assumed_contiguous, self.times = assumed_contiguous, times
         self.in_deleted_dir = in_deleted_dir
+        self.content_unverified = bool(recoverable)
         self._node = node
 
     def __repr__(self):
-        state = "recoverable" if self.recoverable else f"not recoverable ({self.reason})"
+        state = ("recoverable, content unverified" if self.recoverable
+                 else f"not recoverable ({self.reason})")
         extra = ", contiguity assumed" if self.assumed_contiguous else ""
         return (f"FatDeletedFile(name={self.name!r}, size={self.size}, "
                 f"cluster={self.first_cluster}, {state}{extra})")
@@ -2709,8 +2718,9 @@ class Fat32Walker:
     def __init__(self, fh, base):
         self.fh = fh
         self.base = base
-        self.damage = []
-        self.folders_not_read = 0
+        self._damage = []
+        self._folders_not_read = 0
+        self._unreached_checked = False
         self.free_space_note = None                  # free_extents() sets it, for the record
         self._damage_seen = set()
         self._folders_short = set()
@@ -2791,12 +2801,93 @@ class Fat32Walker:
                         self._record(f"BPB_ExtFlags names FAT {active} as the active table and "
                                      f"the volume has {self.nfats}, so FAT 0 was read")
 
+    @property
+    def damage(self):
+        """What was found while reading, for damage_lines(). Asking for it also runs the
+        one check of the whole volume (_note_unreached)."""
+        self._note_unreached()
+        return self._damage
+
+    @property
+    def folders_not_read(self):
+        """Nonzero when something was lost: a folder could not be read to its end, or
+        clusters in use are reached by no live file or folder (_note_unreached)."""
+        self._note_unreached()
+        return self._folders_not_read
+
+    def _note_unreached(self):
+        """Once per walker: count the clusters the table in use marks allocated that no
+        live file or folder reaches, and record them as lost.
+
+        A sector lost from a folder can take the folder's last entries with it and leave
+        nothing odd in what remains, but the files those entries named are still allocated.
+        Whole chains are claimed, whatever a file's size needs, and the bad-cluster mark
+        is not counted. The walk has no depth limit. An unclean eject can leave such
+        chains too (what chkdsk turns into FOUND.000). None of the 59 clean known-data and
+        corpus FAT volumes measured holds one."""
+        if self._unreached_checked:
+            return
+        self._unreached_checked = True
+        if self._unusable or not self.cluster_count or not self.cluster_bytes:
+            return
+        last = self.cluster_count + 2
+        width, _fmt, mask, eoc, code = _FAT_ENTRY[self.FAT_BITS]
+        bad_mark = eoc - 1
+        reached = bytearray(last // 8 + 1)
+        held = {"at": -1, "words": None}
+
+        def value(clus):
+            """A table entry through one cached block, since chains run mostly in order."""
+            if width is None:
+                if held["words"] is None:
+                    held["words"] = read_at(self.fh, self.fat_start, last + last // 2 + 2)
+                off = clus + clus // 2
+                return _fat12_entry(held["words"][off:off + 2], clus & 1)
+            block = clus // FAT_SCAN_ENTRIES
+            if block != held["at"]:
+                raw = read_at(self.fh, self.fat_start + block * FAT_SCAN_ENTRIES * width,
+                              FAT_SCAN_ENTRIES * width)
+                words = array.array(code)
+                words.frombytes(raw[:len(raw) // width * width])
+                if sys.byteorder != "little":
+                    words.byteswap()
+                held["at"], held["words"] = block, words
+            at = clus - block * FAT_SCAN_ENTRIES
+            return held["words"][at] & mask if at < len(held["words"]) else None
+
+        def claim(first):
+            cur = first
+            while cur is not None and 2 <= cur < last and not reached[cur >> 3] & (1 << (cur & 7)):
+                reached[cur >> 3] |= 1 << (cur & 7)
+                cur = value(cur)
+
+        if self.FAT_BITS == 32:
+            claim(self.root_clus)
+        stack, seen = [self.root], {self.root[0]}
+        while stack:
+            for _name, child, _times in self.listdir_records(stack.pop()):
+                if child[2] or child[1]:
+                    claim(child[0])
+                if child[2] and child[0] not in seen:
+                    seen.add(child[0])
+                    stack.append(child)
+        lost = 0
+        for clus in range(2, last):
+            val = value(clus)
+            if val and val != bad_mark and not reached[clus >> 3] & (1 << (clus & 7)):
+                lost += 1
+        if lost:
+            self._record(f"{lost:,} cluster(s) the FAT marks in use are reached by no live file "
+                         f"or folder, so what they hold is not listed or exported and the "
+                         f"entry that named them is lost or was never written")
+            self._folders_not_read = self._folders_not_read or 1
+
     def _record(self, line):
         """Keep one line of damage, once, up to _FAT_DAMAGE_CAP lines."""
-        if line in self._damage_seen or len(self.damage) > _FAT_DAMAGE_CAP:
+        if line in self._damage_seen or len(self._damage) > _FAT_DAMAGE_CAP:
             return
         self._damage_seen.add(line)
-        self.damage.append(line if len(self.damage) < _FAT_DAMAGE_CAP
+        self._damage.append(line if len(self._damage) < _FAT_DAMAGE_CAP
                            else "further damage records were not kept")
 
     def _folder_lost(self, first, detail):
@@ -2806,7 +2897,7 @@ class Fat32Walker:
                 f"folder {name!r}" if name is not None else "a folder")
         if first not in self._folders_short:
             self._folders_short.add(first)
-            self.folders_not_read += 1
+            self._folders_not_read += 1
         self._record(f"{what} at cluster {first:#x}: {detail}")
 
     def _fat_value(self, clus, start=None):
@@ -2959,33 +3050,39 @@ class Fat32Walker:
         return bytes(out)
 
     def _check_slots(self, clus, raw):
-        """Record what a lost sector leaves in a folder. Nothing here changes what is listed.
+        """Note what a folder holds past its end marker and any reserved attribute bits.
+        These are notes: they change neither what is listed nor the exit status, because
+        Linux commit 6a2875517c77 reports media whose trailing slots were never zeroed,
+        with nothing lost. A real loss shows in _note_unreached.
 
         Microsoft's FAT specification says every entry after one whose first byte is 0x00
-        is free, so a nonzero first byte past it means the listing stopped at damage (an
-        imager writes zeros for a sector it could not read). The two top attribute bits
-        are reserved, so an in-use entry with either set is not what it reads as."""
+        is free. A slot there with the 0xE5 mark is free too, and is counted apart from one
+        holding other data. The two top attribute bits are reserved."""
         if clus in self._slots_checked:
             return
         self._slots_checked.add(clus)
         end = None
-        after = bad = 0
+        after = marked = bad = 0
         for i in range(0, len(raw) - 31, 32):
             if end is None:
                 if raw[i] == 0:
                     end = i
                 elif raw[i] != 0xE5 and raw[i + 11] & 0xC0:
                     bad += 1
+            elif raw[i] == 0xE5:
+                marked += 1
             elif raw[i]:
                 after += 1
-        if after:
-            self._folder_lost(clus, f"{after:,} slot(s) after the end marker at byte {end:,} "
-                                    f"are not free, so any files recorded in them are not "
-                                    f"listed")
+        name = self._folder_names.get(clus)
+        what = ("the root folder" if clus == self.root[0] else
+                f"folder {name!r}" if name is not None else "a folder")
+        if after or marked:
+            self._record(f"note: {what} at cluster {clus:#x}: after the end marker at byte "
+                         f"{end:,}, {after:,} slot(s) hold data and {marked:,} carry the "
+                         f"deleted mark; they are not listed")
         if bad:
-            self._folder_lost(clus, f"{bad:,} slot(s) hold an attribute byte with its reserved "
-                                    f"bits set, so what they record may not be listed "
-                                    f"correctly")
+            self._record(f"note: {what} at cluster {clus:#x}: {bad:,} slot(s) hold an attribute "
+                         f"byte with its reserved bits set")
 
     def free_extents(self, min_bytes=0):
         """[(byte offset, length)] for the runs of space the volume says are free.
@@ -3467,12 +3564,19 @@ class Fat32Walker:
         second cluster onward lay are zeroed. Reading a file longer than one
         cluster therefore assumes it was written in one run, and the result
         says so in ``assumed_contiguous``, because the volume cannot confirm it.
-        A file is ``recoverable`` only while every cluster that read would
-        touch is on the volume, in the image, free in every FAT copy that counts
-        and claimed by no other deleted entry; a cluster since handed to a live
-        file means the assumption is already false, and two deleted entries on one
-        cluster cannot both hold it. The volume does not record which of them wrote
-        last, so neither is read, and both are listed with the reason.
+        A file is ``recoverable`` when nothing on the volume contradicts it: every
+        cluster that read would touch is on the volume, in the image, free in every
+        FAT copy that counts and claimed by no other surviving deleted entry. A
+        cluster since handed to a live file contradicts the assumption, and two
+        deleted entries on one cluster cannot both hold it. The volume does not record
+        which of them wrote last, so neither is read, and both are listed with the
+        reason.
+
+        That is not proof of the bytes. A later file can reuse the clusters and then
+        be deleted with its slot overwritten, leaving nothing to contradict the
+        earlier entry, so a recoverable file can read as another file's content, or
+        as a splice of several when it was fragmented. Every recoverable entry says so
+        with ``content_unverified``.
 
         On a volume with a cluster numbered 0x10000 or above (65,535 clusters or more)
         the Windows driver's zeroed high word leaves only the low word of an entry marked deleted. The candidates are
@@ -3603,10 +3707,11 @@ class Fat32Walker:
         return hits[0] if len(hits) == 1 else None
 
     def read_deleted(self, entry, size=None):
-        """The content of a recoverable deleted file, read from its first
-        cluster on for its recorded size, in pieces, ending at the first read
-        that comes back short. Refuses one whose clusters have been reused, so
-        overwritten bytes are never presented as the file."""
+        """The candidate content of a recoverable deleted file, read from its
+        first cluster on for its recorded size, in pieces, ending at the first read
+        that comes back short. Refuses an entry the volume contradicts. A reuse the
+        volume records nowhere cannot be refused, so the bytes returned can be
+        another file's (``content_unverified``)."""
         if not entry.recoverable or entry._node is None:
             raise NtfsUnreadable(
                 f"deleted file {entry.name!r} is not recoverable: {entry.reason}")
@@ -3860,6 +3965,7 @@ def _fat_short_name(e):
     if nt & 0x10:
         ext = ext.lower()
     base, ext = base.decode("ascii", "qnxprobe-name"), ext.decode("ascii", "qnxprobe-name")
+    base, ext = base.replace("\x00", "%00"), ext.replace("\x00", "%00")
     return f"{base}.{ext}" if ext else base
 
 
@@ -3990,7 +4096,7 @@ def _fat_deleted_long_name(parts, entry):
         lead = ((lead << 1) | (lead >> 7)) & 0xFF
     text = b"".join(chars for chars, _check in reversed(parts)).decode("utf-16-le",
                                                                        "qnxprobe-name")
-    name = text.split("\uffff")[0].rstrip("\x00")
+    name = text.split("\uffff")[0].rstrip("\x00").replace("\x00", "%00")
     if not name:
         return None
     start = name.lstrip(" .")[:1]
@@ -38259,6 +38365,8 @@ def _fat_reader_checks():
         late = short(b"LATE    BIN", first=11, size=1)
         lab = Lab(16, 5000, keep=64)
         lab.root([keep, bytes(32), late])            # a sector lost to zeros in the middle
+        lab.chain([10])
+        lab.chain([11])                              # the file past the gap is still allocated
         names, gap = listed(lab)
         odd = Lab(16, 5000, keep=64)
         odd.root([keep, b"\xff" * 32])               # a sector of 0xFF
@@ -38363,6 +38471,73 @@ def _fat_reader_checks():
                 and "'after rename.bin'" in one.reason and "'before rename.bin'" in two.reason
                 and "same first cluster and size" in one.reason)
 
+    def recoverable_is_labelled():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"\xe5REE    BIN", first=10, size=4),
+                  short(b"\xe5SED    BIN", first=20, size=4)])
+        lab.chain([20])
+        got = {d.name: d for d in lab.walker().deleted_files()}
+        return (got["_REE.BIN"].recoverable and got["_REE.BIN"].content_unverified is True
+                and not got["_SED.BIN"].recoverable
+                and got["_SED.BIN"].content_unverified is False)
+
+    def unreached_clusters_are_lost():
+        keep = short(b"KEEP    BIN", first=10, size=1)
+        lost = Lab(16, 5000, keep=64)
+        lost.root([keep])
+        lost.chain([10])
+        lost.chain([20, 21])                         # allocated, and no entry names it
+        one = lost.walker()
+        marked = Lab(16, 5000, keep=64)
+        marked.root([keep])
+        marked.chain([10])
+        marked.link(30, 0xFFF7)                      # the bad-cluster mark is not a loss
+        two = marked.walker()
+        longer = Lab(16, 5000, keep=64)
+        longer.root([keep])
+        longer.chain([10, 11, 12])                   # a chain past the size is still reached
+        three = longer.walker()
+        return (one.folders_not_read == 1 and "2 cluster(s) the FAT marks in use" in damage(one)
+                and two.folders_not_read == 0 and not damage(two)
+                and three.folders_not_read == 0 and not damage(three))
+
+    def after_marker_is_a_note():
+        keep = short(b"KEEP    BIN", first=10, size=1)
+        for slot in (short(b"STALE   BIN", first=40, size=1),
+                     short(b"\xe5TALE   BIN", first=40, size=1)):
+            lab = Lab(16, 5000, keep=64)
+            lab.root([keep, bytes(32), slot])
+            lab.chain([10])
+            w = lab.walker()
+            if set(by_name(w)) != {"KEEP.BIN"} or w.folders_not_read != 0:
+                return False
+            if "note:" not in damage(w) or "after the end marker" not in damage(w):
+                return False
+        return True
+
+    def reserved_bit_is_a_note():
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"ODD     BIN", 0x60, 10, 1)])
+        lab.chain([10])
+        w = lab.walker()
+        return ("ODD.BIN" in by_name(w) and w.folders_not_read == 0
+                and "note:" in damage(w) and "reserved" in damage(w))
+
+    def no_nul_in_names():
+        import sqlite3
+        lab = Lab(16, 5000, keep=64)
+        lab.root([short(b"A\x00B     TXT", first=10, size=1)]
+                 + long_slots("ab\x00cd.txt", b"ABCD    TXT", deleted=True)
+                 + [short(b"\xe5BCD    TXT", first=12, size=1)])
+        lab.chain([10])
+        w = lab.walker()
+        live = list(by_name(w))
+        gone = [d.name for d in w.deleted_files()]
+        db = sqlite3.connect(":memory:")
+        lengths = [db.execute("select length(?)", (n,)).fetchone()[0] for n in live + gone]
+        return (live == ["A%00B.TXT"] and gone == ["ab%00cd.txt"]
+                and lengths == [len(n) for n in live + gone])
+
     rows = (
         (high_word, "a deleted FAT32 entry with a zero high word on a volume over 65,535 "
                     "clusters is recoverable only when one cluster with its low word fits, "
@@ -38435,6 +38610,16 @@ def _fat_reader_checks():
                                  "clusters, whose last cluster is 0x10000"),
         (twin_is_named, "deleted entries on one first cluster and size are refused and each "
                         "reason names the other"),
+        (recoverable_is_labelled, "a recoverable deleted FAT file carries content_unverified, "
+                                  "and a refused one does not"),
+        (unreached_clusters_are_lost, "FAT clusters in use that no live chain reaches are "
+                                      "recorded as lost, leaving out the bad-cluster mark and "
+                                      "the rest of a chain longer than its size"),
+        (after_marker_is_a_note, "slots after a FAT folder's end marker, with data or the "
+                                 "deleted mark, are a note and not a loss"),
+        (reserved_bit_is_a_note, "a reserved attribute bit on a listed FAT entry is a note "
+                                 "and not a loss"),
+        (no_nul_in_names, "a NUL in a stored FAT name becomes %00 on live and deleted entries"),
     )
     out = []
     for check, text in rows:
