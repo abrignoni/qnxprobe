@@ -2243,8 +2243,8 @@ class ExtWalker:
         ``need`` is how many logical blocks the file's size reaches; nothing past
         it is read or checked. What the map cannot give goes in ``lost`` as
         (first logical block, end, why), and the rest of the map is still returned. An
-        entry in a sector that holds a bad entry is not trusted, since noise can look valid,
-        and goes in ``lost`` too. An entry of (None, count, why)
+        entry in a sector that holds a bad entry is not followed, since a damaged entry can
+        look valid, and goes in ``lost`` too. An entry of (None, count, why)
         is ``count`` blocks i_blocks charges that the map does not reach, which lie
         somewhere in its holes. Only an extent root that cannot be read at all raises.
         """
@@ -2317,8 +2317,8 @@ class ExtWalker:
                 bad = {x[0] for x in items if x[0] not in chain}
                 untrusted = set(bad)
                 if want is not None and bad:
-                    # One bad sector: every entry touching a sector that holds a bad entry is
-                    # read as damaged too, since a noise entry can look valid.
+                    # Every entry touching a sector that holds a bad entry is left out too,
+                    # since a damaged entry beside it can still look valid.
                     spans = [((off + 12 + i * 12) // 512, (off + 12 + i * 12 + 11) // 512)
                              for i in bad]
                     sectors = {a for a, b in spans if a == b}   # a bad entry inside one sector
@@ -2425,7 +2425,7 @@ class ExtWalker:
             for i, ptr in enumerate(ptrs):
                 if need is not None and lbase + i * span >= need:
                     break
-                if i * 4 // 512 in sick:                # one bad sector: none of it is trusted
+                if i * 4 // 512 in sick:                # a sector with a bad pointer is left out
                     gone(lbase + i * span, lbase + (i + 1) * span,
                          f"indirect block {block:,} holds pointers that are not on this volume")
                     continue
@@ -2664,7 +2664,7 @@ class ExtWalker:
         (ext4_rec_len_from_disk), though neither writes it (ext4_rec_len_to_disk stores
         65535). So a 0 there is an empty block only when no valid entry follows it, and never
         in a folder's first block, which always opens with "." (ext4_init_dirblock, namei.c).
-        An empty later block is noted, since any names a lost sector held there are gone.
+        An empty later block is noted, since whatever names it held are not there to read.
         Below 64 KiB a zero is not a length any writer stores, and is what a zeroed sector
         leaves."""
         p = start
@@ -2678,7 +2678,7 @@ class ExtWalker:
                                            "bytes were not read")
                     return
                 self._damaged(f"folder inode {num}: {where} opens with record length 0 and "
-                              "holds no entries; any names a lost sector held there are gone")
+                              "holds no entries, so any names it held cannot be read")
             if big_block:
                 rec = (self.bs if rec in (0, 65535) else (rec & 65532) | ((rec & 3) << 16))
             nl = buf[p + 6]
@@ -29798,8 +29798,8 @@ def _ext_reader_checks():
         read(cut, ino, many_size)
         return EOF_SHORTFALL["bytes"] - before == many_size % 4096
 
-    row("ext damage: one bad sector in an extent leaf costs the entries it touches, keeps the "
-        "ones after it at their offsets, and the count is true", leaf_bad_sector)
+    row("ext damage: an extent leaf whose second sector is 0xFF loses the entries in it, keeps "
+        "the ones after it at their offsets, and the count is true", leaf_bad_sector)
     row("ext: a sealed extent block whose checksum fails is recorded", leaf_checksum)
     row("ext damage: an inode of 0xFF is FAILED and its folder not read, not a special file",
         noise_mode)
