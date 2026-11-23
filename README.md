@@ -335,7 +335,7 @@ exist there. Whether any does is not checked.
 
 A file flagged encrypted (fscrypt) is `FAILED` and its content is not read. A flagged
 folder's names are listed as stored, not decrypted, and the `note` counts those folders.
-This was tested on the flag alone, with no real fscrypt ciphertext.
+The self-test proves this on the flag alone, and nothing here decrypts anything.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
