@@ -778,7 +778,11 @@ always walk the same one. The rules are the Linux driver's (`fs/qnx6/inode.c`, v
   say where the volume starts. It is recorded as a volume not read, and so is a first
   superblock that kept its magic with no valid copy found, on a region nothing else claims.
 - The image has to reach the end of the second superblock's area. If it does not, the
-  volume is marked INCOMPLETE and the run says a newer generation may be lost.
+  volume is marked INCOMPLETE, the run says a newer generation may be lost, and it exits 1.
+- The Linux driver refuses a volume unless both superblocks pass. This reader goes on with
+  the one that survives, because it may be all there is. It records that the other area
+  holds no valid copy, that an older generation may have been read and newer data may
+  exist, and it exits 1.
 - With no boot block the data area starts at 0x1000 (lines 335-341 and 374-375). Above 4096
   bytes per block no source says where it starts, so such a volume is not read. This layout
   is checked on fixtures only: no real volume without a boot block is at hand.
@@ -795,11 +799,11 @@ read is a fixture written from that same struct.
 **Block pointers.** Only ~0 means unused. A stored 0 is block 0, which real volumes use. On
 the nine vehicle volumes at hand, a stored 0 appears only as a top-level Bitmap pointer (on
 six of them), no pointer block is all zeros, and every slot past a tree's size is ~0. Each
-slot is judged on its own, so a bad sector in a pointer block costs only the slots it
-covers. One block cannot be stored twice, so when a pointer block holds 0 in more than one
-slot, those zero slots are refused and the rest are followed. Pointers past the volume's
-block count, more than 5 levels, and a pointer back to its own pointer block are refused
-the same way.
+slot is judged on its own and zeros are counted per 512-byte sector, the unit an imager
+zero-fills. A 0 is followed as block 0 only when it is alone in its sector and no other
+sector holds a lone 0 inside the tree's size, because one block cannot be stored twice.
+Pointers past the volume's block count, more than 5 levels, and a pointer back to its own
+pointer block are refused the same way.
 
 **Sparse files.** QNX documents that fs-qnx6 [creates sparse files by default since
 7.1](https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.user_guide/topic/fsystems_QNX6_filesystem.html),
@@ -824,6 +828,15 @@ Metadata that cannot be read goes into the walker's `damage` list and `volumes.j
 the run exit 1. A long name that cannot be read becomes `long-name-damaged-inode-<n>-block-<b>`,
 an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a name is
 written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`, and a stored NUL as `%00`.
+A long name that fails the checksum in its directory entry is kept and recorded.
+
+A directory block of zeros holds no entries and raises nothing, so after a walk the distinct
+inodes reached are compared with the superblock's count of inodes in use (`sb_num_inodes`
+minus `sb_free_inodes`). A shortfall is recorded with both numbers and the run exits 1. The
+two were equal on all 19 superblock generations of the nine vehicle volumes and the
+QNX-written test image, which include hard links. An inode whose format bits are not a type
+QNX defines (`sys/stat.h`, including `S_IFNAM`) is recorded as damage and not counted as a
+special file.
 
 ## QNX6 free space
 
