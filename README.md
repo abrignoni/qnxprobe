@@ -1442,17 +1442,22 @@ data was **resident**, small enough to sit inside the MFT record, is always reco
 this way, and it is the only route to one, because it never occupied a cluster a carver
 could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
 used as free, its initialized size is not 0, the image holds every cluster its read
-fetches, and no other record claims one of those clusters. The clusters a read fetches
-stop at the initialized size, except that a compressed file is fetched in whole units, so
-every stored cluster of a unit that starts below that size counts. A deleted record claims
-those clusters and the clusters of its named streams inside their own initialized sizes. A
-record in use claims all of its stored clusters. When a file's read meets another record's
-claim the file is refused, because the volume does not record which wrote last: a later
+fetches, and no other record claims one of those clusters. A zero-length non-resident file
+whose initialized size is 0 is still listed as recoverable, and reading it yields no bytes.
+An attribute claims what a read of it would fetch. That stops at the attribute's
+initialized size, except that a compressed attribute is fetched in whole units, so every
+stored cluster of a unit that starts below that size counts, and a claimed cluster can
+start at or past that size. A deleted record claims this for its unnamed stream, its named
+streams and any other non-resident attribute it holds, such as a deleted folder's index or
+a non-resident attribute list. An attribute with an initialized size of 0 claims nothing.
+A record in use claims all of its stored clusters. When a file's read meets another
+record's claim the file is refused, because the volume does not record which wrote last: a later
 log sequence number shows a later update of the record, not of its data. A claim that
 touches only a file's named stream does not refuse its unnamed stream. The `reason` names
 the record the file shares the most with (a live record first), how many of the clusters
 its read uses are shared with that record, and how many other records also share. A
-reuse by a file whose own record has since been overwritten leaves no trace, so a recovered
+recoverable compressed file can still fail to decode when it is read, and the read then
+raises `NtfsUnreadable`. A reuse by a file whose own record has since been overwritten leaves no trace, so a recovered
 file's bytes are still a candidate, not a proven copy. A deleted file the overlay filter
 compressed, or a cloud placeholder, is reported as not recoverable, since its content is
 not in its unnamed stream. `$ATTRIBUTE_LIST` is not followed for a deleted record, because

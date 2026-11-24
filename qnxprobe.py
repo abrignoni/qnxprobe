@@ -5363,8 +5363,10 @@ class NtfsWalker:
 
     def _claim_runs(self, attr):
         """[(lcn, clusters)] a deleted record's attribute claims: what a read of it would
-        fetch, so nothing past its own initialized size. A piece that does not start at VCN
-        0 holds no sizes of its own, so all of its stored runs count."""
+        fetch (_read_set). For a compressed attribute that is every stored cluster of each
+        unit that starts below its initialized size, so a claimed cluster can start at or
+        past that size. A piece that does not start at VCN 0 holds no sizes of its own, so
+        all of its stored runs count."""
         if attr.start_vcn:
             return [(lcn, count) for lcn, count in attr.runs if lcn is not None and count]
         return self._read_set(attr, max(attr.data_size, attr.init_size))
@@ -5373,11 +5375,13 @@ class NtfsWalker:
         """{record: reason} for deleted records whose own read would use a cluster another
         record claims.
 
-        A deleted record claims what a read of its unnamed stream fetches (_read_set), the
-        clusters of its named streams inside their own initialized sizes, and likewise for
-        any other non-resident attribute it holds, such as a deleted folder's index. A
-        stream with an initialized size of 0 claims nothing. A record in use claims every
-        stored cluster. When a record's read meets another's claim it is not offered: the
+        A deleted record claims what a read of each of its non-resident attributes would
+        fetch (_claim_runs): its unnamed stream, its named streams, and any other one it
+        holds, such as a deleted folder's index or a non-resident attribute list. That
+        stops at each attribute's initialized size, except that a compressed attribute is
+        fetched in whole units, so every stored cluster of a unit that starts below that
+        size counts. An attribute with an initialized size of 0 claims nothing. A record
+        in use claims every stored cluster. When a record's read meets another's claim it is not offered: the
         volume does not record which wrote last, and the log sequence number shows the last
         update of a record, not of its data. A claim on a file's named stream alone does
         not refuse its unnamed stream. Memory is one bit per cluster plus the runs of the
@@ -5560,9 +5564,13 @@ class NtfsWalker:
         Each result carries ``recoverable``: True for a resident file, and for a
         non-resident one while every cluster it used is free, its initialized size is
         not 0, the image holds every cluster its read fetches (_read_set), and no other
-        record claims one of those clusters. A refused record names the record it shares
-        the most with, how many clusters of its read that is, and how many other records
-        share with it, because the volume does not record which wrote last. A claim on a
+        record claims one of those clusters. A zero-length non-resident file with an
+        initialized size of 0 is still recoverable, and reading it yields no bytes. A
+        refused record names a live record it shares clusters with when there is one, and
+        otherwise the deleted record it shares the most with, then how many clusters of
+        its read that is and how many other records share with it, because the volume does
+        not record which wrote last. A recoverable compressed file can still fail to
+        decode, and its read then raises NtfsUnreadable. A claim on a
         file's named stream alone does not refuse its unnamed stream. False otherwise, in which case the record is reported
         as evidence the file existed rather than its content offered. A reuse by a file
         whose own record has since been overwritten leaves no trace, so recovered bytes
