@@ -1463,10 +1463,11 @@ def qnx6_select(fh, base, copies):
         layout = "boot"
     elif rels & {0, 0xE00}:
         layout = "noboot"
-    elif read_at(fh, base, 3) != QNX6_BOOT_JMP and bs <= 0x1000 and off - base == 0x1000 + total:
-        layout = "noboot"           # the first copy is gone and this one sits where a
-    else:                           # volume with no boot block keeps its second
-        layout = "boot"
+    elif (read_at(fh, base, 3) != QNX6_BOOT_JMP and bs <= 0x1000
+          and rels & {0x1000 + total, 0x1000 + total + 0xE00}):
+        layout = "noboot"           # the first copy is gone and a copy sits in either slot
+    else:                           # of the area where a volume with no boot block keeps its
+        layout = "boot"             # second
     second = (qnx6_data_start(bs) if layout == "boot" else 0x1000) + total
     good = [c[0] - base for c in mine if c[2]["checksum_ok"]]
     first_ok = any(rel in QNX6_FIRST_SLOTS for rel in good)
@@ -40358,6 +40359,19 @@ def _qnx6_reader_checks():
         v = vols(noboot)[0]
         return "serial 11," in v["detail"] and files(v["walker"]) == want
     row("qnx6: a volume with no boot block reads from 0x1000 (fs/qnx6/inode.c)", no_boot)
+
+    def no_boot_second_slot():
+        img = bytearray(noboot)                     # newer copy in the second area's other slot
+        s2 = second - 0x2000
+        older = bytes(img[0:512])
+        img[s2 + 0xE00:s2 + 0xE00 + 512] = bytes(img[s2:s2 + 512])
+        img[s2:s2 + 512] = older
+        img[0:512] = bytes(512)                     # the first copy lost
+        v = vols(img)[0]
+        return ("serial 11," in v["detail"] and files(v["walker"]) == want
+                and not any("past the end" in d for d in walker_damage(v)))
+    row("qnx6: a volume with no boot block whose newest copy is in the second area's other "
+        "slot still reads from 0x1000", no_boot_second_slot)
 
     def as_mmi():
         img = bytearray(noboot)
