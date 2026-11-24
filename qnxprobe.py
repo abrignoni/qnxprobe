@@ -6986,11 +6986,12 @@ def _apfs_copy_ok(copy, at):
 
 
 def _apfs_copies_left(fh, base, size=None):
-    """The blocks holding valid checkpoint superblocks in a region whose block 0 has no
-    APFS magic: every block of the first stretch, then a sample, then the whole
-    descriptor area of the first copy met. Empty when there are none."""
+    """The blocks holding valid checkpoint superblocks in a region whose block 0 holds
+    other bytes and no APFS magic: every block of the first stretch, then a sample, then
+    the whole descriptor area of the first copy met. Empty when there are none, and for
+    an all-zero block 0, which _apfs_head() reads from a copy instead."""
     head = read_at(fh, base, 4096)
-    if len(head) < 4096 or head[32:36] == APFS_NX_MAGIC:
+    if len(head) < 4096 or head[32:36] == APFS_NX_MAGIC or not any(head):
         return []
     found = _apfs_copy_in(fh, base, 1, APFS_NX_PROBE_BLOCKS)
     if found is None:
@@ -7052,10 +7053,11 @@ def _apfs_head(fh, base):
     (None, None) when nothing here is an APFS container.
 
     A block 0 that passes its checksum is used as it always was, so a clean container
-    reads the same checkpoint. One that keeps the magic and fails its checksum is replaced
-    by a valid copy from the checkpoint descriptor area, and _newest_checkpoint() then
-    takes the newest from that copy's area. So is a block with no magic, but only in a
-    partition the GPT types as APFS. Anywhere else such a region may hold the leftover of
+    reads the same checkpoint. One that keeps the magic and fails its checksum, or an
+    all-zero one (what an imager writes for an unreadable sector), is replaced by a valid
+    copy from the checkpoint descriptor area, and _newest_checkpoint() then takes the
+    newest from that copy's area. A block with other bytes and no magic is treated this
+    way only in a partition the GPT types as APFS. Anywhere else it may be the leftover of
     an old container behind another filesystem, so it is not read from a copy, and
     _apfs_remnant_note() records what is there instead."""
     head = read_at(fh, base, 4096)
@@ -7072,9 +7074,11 @@ def _apfs_head(fh, base):
         blocks = struct.unpack_from("<I", head, 104)[0]
         if 0 < blocks <= 1 << 16:
             found = _apfs_copy_in(fh, base, struct.unpack_from("<Q", head, 112)[0], blocks)
-    typed = _apfs_typed_partition(fh, base) if not magic else None
-    if not magic and not typed:
-        return None, None
+    typed = None
+    if not magic and any(head):
+        typed = _apfs_typed_partition(fh, base)
+        if not typed:
+            return None, None
     found = found or _apfs_copy_in(fh, base, 1, APFS_NX_PROBE_BLOCKS)
     if found is None and (_apfs_typed_partition(fh, base) if typed is None else typed):
         found = _apfs_copy_in(fh, base, 1, APFS_NX_PROBE_TYPED_BLOCKS)
@@ -29221,6 +29225,32 @@ def _apfs_reader_checks():
         lines = identify_fs(_io.BytesIO(bytes(1 << 20)), 0, 1 << 20)[1]
         return not any("checkpoint copies" in line for line in lines)
 
+    def zero_block_bare():
+        """An all-zero block 0 with no partition table: every file reads from a copy, and a
+        live filesystem whose first block is zero is still read as that filesystem."""
+        base = walker(clean)
+        raw = bytes(bs) + clean[bs:]
+        if identify_fs(_io.BytesIO(raw), 0, len(raw))[0] != "apfs":
+            return False
+        w = walker(raw)
+        got = listed(w)
+        if (w.xid != base.xid or set(got) != set(full)
+                or not any("block 0" in str(d) for d in w.damage)):
+            return False
+        for path, entry in sorted(full.items()):
+            if entry[2] is not None and (b"".join(w.read_file(got[path][1], got[path][2]))
+                                         != b"".join(base.read_file(entry[1], entry[2]))):
+                return False
+        source = os.path.join(here, "btrfs-live.img.gz")
+        if not os.path.isfile(source):
+            return True
+        with gzip.open(source, "rb") as handle:
+            live = handle.read()
+        if any(live[:bs]) or identify_fs(_io.BytesIO(live), 0, len(live))[0] != "btrfs":
+            return False
+        behind = live[:bs] + clean[bs:16 * bs] + live[16 * bs:]
+        return identify_fs(_io.BytesIO(behind), 0, len(behind))[0] == "btrfs"
+
     def skipped_checkpoint():
         """Block 0 older than the newest checkpoint, whose superblock is then lost."""
         w = walker(clean)
@@ -29332,6 +29362,8 @@ def _apfs_reader_checks():
         ("an APFS volume name is read to the length the format holds", long_volume_name),
         ("a bare APFS container with one bad first sector gets a record naming its "
          "checkpoint copies, and is not read from them", bare_first_sector),
+        ("a bare APFS container with an all-zero block 0 reads every file from a checkpoint "
+         "copy", zero_block_bare),
         ("a lost newest APFS checkpoint superblock is recorded with the transaction skipped "
          "and the one read", skipped_checkpoint),
         ("an APFS file storing a time of exactly 0 gets a row for its 1980 member date",

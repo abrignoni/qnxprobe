@@ -990,18 +990,21 @@ written as an empty file.
 
 A block 0 that keeps its magic and fails its checksum is replaced by a valid superblock
 copy from the checkpoint descriptor area, found through what block 0 still says or in the
-64 blocks after it. A block 0 with no magic (zero, 0xFF or other bytes) is read the same
-way in a partition the GPT types as APFS, up to 1 GiB in, once no other filesystem has
-claimed the partition. If no valid copy is found there, the partition still gets a record
-with `extract_error` and exits 1.
+64 blocks after it. An all-zero block 0 is read from a copy in those 64 blocks too, once no
+other filesystem has claimed the region. A block 0 with other bytes and no magic is read
+from a copy only in a partition the GPT types as APFS. In such a partition the search goes
+up to 1 GiB in, and if no valid copy is found the partition still gets a record with
+`extract_error` and exits 1.
 
-Without that GPT type a region with no magic is not read as APFS, because it could be an
-old container left behind a filesystem this tool does not identify. If no filesystem claims
-it and it holds valid checkpoint copies, it gets a record that names the blocks, says the
-region was not read, and says it may be a damaged container or a leftover from an earlier
-one. Copies are looked for in the first 64 blocks and then on a sample of blocks up to
-1 GiB in, so a small descriptor area far from the start can be missed. A block 0 that
-passes its checksum is used exactly as before.
+Without that GPT type, a region whose block 0 holds other bytes and no magic is not read as
+APFS, because it could be an old container left behind a filesystem this tool does not
+identify. If no filesystem claims it and it holds valid checkpoint copies, it gets a record
+that names the blocks, says the region was not read, and says it may be a damaged container
+or a leftover from an earlier one. Copies are looked for in the first 64 blocks and then on
+a sample of blocks up to 1 GiB in, so a small descriptor area far from the start can be
+missed. A region with no GPT type, an all-zero block 0 and a descriptor area past the first
+64 blocks is not recognized and gets no such record. A block 0 that passes its checksum is
+used exactly as before.
 
 If the descriptor area holds a later transaction than the newest superblock that passes
 its checksum, the older checkpoint is read, as it should be after an interrupted write,
