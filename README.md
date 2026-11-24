@@ -581,8 +581,8 @@ on a volume whose boot state byte is clear (see below).
   empty or deleted entry still names the chain.
 
   This count sees only allocated clusters, so it does not detect damage to a folder in
-  general. On Windows-written FAT16 and FAT32 volumes, zeroing a folder's last sector when
-  it held only an empty long-named file lost that file with exit 0 and no record.
+  general. On Windows-written FAT16 and FAT32 volumes, zeroing the last used sector of a
+  folder of 121 empty long-named files listed 120 of them, with exit 0 and no record.
 - **Notes, which change neither the listing nor the exit status.** Slots after an
   end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
   bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
