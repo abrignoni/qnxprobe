@@ -26113,13 +26113,13 @@ def walker_for(kind, fh, base, size=None):
         return _cached_walker(fh, base, size, kind, lambda: Jffs2Walker(fh, base, size))
     if kind in ("yaffs1", "yaffs2"):
         return _cached_walker(fh, base, size, kind, lambda: YaffsWalker(fh, base, size))
-    room = CFG_STORE_MAX if size is None else size
     if kind == "nvram":
-        st = nvram_store(fh, base, room)
+        st = nvram_store(fh, base, CFG_STORE_MAX if size is None else size)
         return ConfigStoreWalker(fh, base, st[0], "nvram.bin") if st else None
     if kind == "uboot-env":
-        st = uboot_env_store(fh, base, room)
-        return ConfigStoreWalker(fh, base, st[0], "uboot-env.bin") if st else None
+        st = uboot_env_store(fh, base, UBOOT_ENV_MAX if size is None else size)
+        return (ConfigStoreWalker(fh, base, st[0], "uboot-env.bin", uboot_env_note(st))
+                if st else None)
     return None
 
 
@@ -39444,15 +39444,33 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # Neither has a directory, so each is given as a volume holding one file, the
 # store's bytes as they sit on the chip, for a consumer to parse. Both are
 # accepted only on a CRC-32 that holds over the store, and a store's size is the
-# one its CRC holds for, tried in 4 KiB steps up to CFG_STORE_MAX.
+# one its CRC holds for: a libnvram store's is tried in 4 KiB steps up to
+# CFG_STORE_MAX, a U-Boot environment's at the sizes in UBOOT_ENV_SIZES.
 #
 # U-Boot's environment layout, env_t in include/env_internal.h at v2024.01
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86):
-# a little-endian CRC-32, a flags byte only when the board keeps a redundant copy
+# a CRC-32, a flags byte only when the board keeps a redundant copy
 # (ENV_HEADER_SIZE, lines 59-61), then CONFIG_ENV_SIZE less that header of
 # NUL-separated name=value strings ending in an empty one. env_import() checks
 # crc32(0, data, ENV_SIZE) before it reads them
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310).
+# The CRC is a uint32_t in the byte order of the CPU U-Boot runs on, and
+# mkenvimage writes either order (-b,
+# https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/tools/mkenvimage.c#L257-L258),
+# so the stored value is accepted read either way and the order that held is
+# reported.
+#
+# CONFIG_ENV_SIZE is the board's choice. The 1,266 configs/*_defconfig files of
+# that tree set it in 856, to 19 values: 0x80, 0x190, 0x800, 0x1000, 0x2000,
+# 0x2800, 0x3000, 0x4000, 0x4200, 0x8000, 0x10000, 0x18000, 0x20000, 0x21000,
+# 0x30000, 0x40000, 0x80000, 0x100000 and 0x2a00000, and env/Kconfig gives a
+# board that sets none 0x1f000 or one of those. All but 0x80 and 0x190 are
+# multiples of 512 bytes, and those above 0x4200 are multiples of 4 KiB.
+# UBOOT_ENV_SIZES is 0x80, 0x190, every multiple of 512 bytes up to 64 KiB and
+# every multiple of 4 KiB from there up to 1 MiB. That covers each value above
+# but 0x2a00000 (one file, total_compute_defconfig): every candidate offset is
+# read and summed up to the largest size tried, and 42 MiB per candidate is
+# not spent on one board file. An environment of any other size is not found.
 #
 # Belkin libnvram store, env_image_gemtek in Belkin's own libnvram source (its
 # header carries Belkin's copyright), as found in a public copy of the WeMo firmware
@@ -39462,26 +39480,34 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # 16-byte header (lines 853-874); the count and end of data are written after it,
 # from the index of strings (lines 420-450 and 1165-1178).
 # ---------------------------------------------------------------------------
-CFG_STORE_MAX = 256 << 10         # the largest store size tried
+CFG_STORE_MAX = 256 << 10         # the largest libnvram store size tried
+UBOOT_ENV_MAX = 1 << 20           # the largest U-Boot environment size tried
+UBOOT_ENV_SIZES = ((0x80, 0x190) + tuple(range(512, 64 << 10, 512))
+                   + tuple(range(64 << 10, UBOOT_ENV_MAX + 1, 4096)))
 CFG_KINDS = ("nvram", "uboot-env")
 NVRM_MAGIC = b"NVRM"
 NVRM_HEADER = 16
 _CFG_NAME = re.compile(rb"[A-Za-z0-9_.:+-]{1,64}=")   # what a store's first string opens with
 
 
-def _cfg_crc_size(fh, base, start, crc, room):
-    """The smallest size, a multiple of 4 KiB and at most room and CFG_STORE_MAX,
-    for which the CRC-32 of the bytes from base + start to base + size is crc,
-    or None. One read and one pass, whatever the number of sizes tried."""
-    buf = read_at(fh, base, max(0, min(room, CFG_STORE_MAX)))
+def _cfg_crc_size(fh, base, start, crcs, room, sizes=None):
+    """(size, crc) for the smallest size, among sizes (ascending; the multiples
+    of 4 KiB up to CFG_STORE_MAX when not given) and at most room, for which the
+    CRC-32 of the bytes from base + start to base + size is one of crcs, or None.
+    One read and one pass, whatever the number of sizes tried."""
+    if sizes is None:
+        sizes = range(FLASH_ALIGN, CFG_STORE_MAX + 1, FLASH_ALIGN)
+    buf = memoryview(read_at(fh, base, max(0, min(room, sizes[-1]))))
     c, done = 0, start
-    for size in range(FLASH_ALIGN, len(buf) + 1, FLASH_ALIGN):
+    for size in sizes:
+        if size > len(buf):
+            break
         if size <= start:
             continue
         c = binascii.crc32(buf[done:size], c)
         done = size
-        if c == crc:
-            return size
+        if c in crcs:
+            return size, c
     return None
 
 
@@ -39509,30 +39535,48 @@ def nvram_store(fh, base, room):
     if len(head) < NVRM_HEADER or head[:4] != NVRM_MAGIC:
         return None
     crc, count, eod = struct.unpack_from("<III", head, 4)
-    size = _cfg_crc_size(fh, base, NVRM_HEADER, crc, room)
-    if size is None:
+    hit = _cfg_crc_size(fh, base, NVRM_HEADER, (crc,), room)
+    if hit is None:
         return None
-    return size, count, eod
+    return hit[0], count, eod
 
 
 def uboot_env_store(fh, base, room):
-    """(size, header, flags) for a U-Boot environment at base whose CRC-32 holds
-    and whose strings end inside it, else None. header is 4 for a single copy and
-    5 for one of a redundant pair, whose flags byte is returned (else None)."""
+    """(size, header, flags, order) for a U-Boot environment at base whose CRC-32
+    holds and whose strings end inside it, else None. header is 4 for a single
+    copy and 5 for one of a redundant pair, whose flags byte is returned as
+    stored (else None). order is the byte order the stored CRC held in,
+    "little-endian" or "big-endian", or "either byte order" for a value that
+    reads the same both ways. The size is one of UBOOT_ENV_SIZES."""
     head = read_at(fh, base, 5 + 65)
     if len(head) < 8:
         return None
-    crc = struct.unpack_from("<I", head)[0]
+    le, be = struct.unpack_from("<I", head)[0], struct.unpack_from(">I", head)[0]
     for hdr in (4, 5):
         if not _CFG_NAME.match(head, hdr):
             continue
-        size = _cfg_crc_size(fh, base, hdr, crc, room)
-        if size is None:
+        hit = _cfg_crc_size(fh, base, hdr, (le, be), room, UBOOT_ENV_SIZES)
+        if hit is None:
             continue
+        size, crc = hit
         strings, ended = cfg_strings(read_at(fh, base + hdr, size - hdr))
         if ended and strings:
-            return size, hdr, (head[4] if hdr == 5 else None)
+            order = ("either byte order" if le == be else
+                     "little-endian" if crc == le else "big-endian")
+            return size, hdr, (head[4] if hdr == 5 else None), order
     return None
+
+
+def uboot_env_note(store):
+    """The note for a volume that is one copy of a redundant pair: its flags byte
+    as stored, which U-Boot compares between the two copies to choose one
+    (env_check_redund in env/common.c). The choice is not made here: it needs
+    both copies, and each copy is a volume of its own. None for a single copy."""
+    _size, hdr, flags, _order = store
+    if hdr != 5:
+        return None
+    return (f"the redundant-copy layout, a 5-byte header: flags byte {flags} as stored; "
+            "which copy U-Boot would use is not worked out")
 
 
 def _erased_after(fh, start, end):
@@ -39571,25 +39615,27 @@ def identify_uboot_env(fh, base, size):
     st = uboot_env_store(fh, base, size)
     if not st or not _erased_after(fh, base + st[0], base + size):
         return None
-    n, hdr, flags = st
+    n, hdr, flags, order = st
     strings, _ = cfg_strings(read_at(fh, base + hdr, n - hdr))
     layout = ("a 4-byte header, the single-copy layout" if hdr == 4 else
               f"a 5-byte header, the redundant-copy layout (flags byte {flags})")
     return "uboot-env", [
-        "format       U-Boot's environment layout (env_t), CRC-32 holds; the layout "
-        "does not say which program wrote the store",
+        "format       U-Boot's environment layout (env_t), CRC-32 holds with the stored "
+        f"value read as {order}; the layout does not say which program wrote the store",
         f"store        {human(n)}, {layout}, {len(strings)} name=value strings",
         "file         uboot-env.bin, the store's bytes as held on flash"]
 
 
 class ConfigStoreWalker:
     """A configuration store as a volume holding one file: the store's bytes, as
-    held on flash, under name. It records no time, so none is reported."""
+    held on flash, under name. It records no time, so none is reported.
+    volume_note is what an export's volumes.json says about the store, or None."""
     root = 1
     _FILE = 2
 
-    def __init__(self, fh, base, size, name):
+    def __init__(self, fh, base, size, name, volume_note=None):
         self.fh, self.base, self.size, self.name = fh, base, size, name
+        self.volume_note = volume_note
 
     def listdir(self, node):
         return [(self.name, self._FILE)] if node == self.root else []
@@ -39672,7 +39718,9 @@ def flash_regions(fh, size):
       NVRM      a Belkin libnvram store whose CRC-32 holds (nvram_store); its
                 extent is the size that CRC holds for
       U-Boot    an environment whose first string opens with a name and "="
-                and whose CRC-32 holds (uboot_env_store); its extent likewise
+                and whose CRC-32 holds, stored in either byte order, at one of
+                the sizes in UBOOT_ENV_SIZES (uboot_env_store); its extent
+                likewise
       EFS       a QNX F3S partition, found by its boot record wherever in the
                 partition wear levelling left it and placed by the record's
                 unit_index (efs_partitions); its extent is the unit count the
@@ -44291,7 +44339,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, (F2fsWalker, HfsPlusWalker)) and w.volume_note:
+                            if isinstance(w, (F2fsWalker, HfsPlusWalker, ConfigStoreWalker)) and w.volume_note:
                                 if manifest is not None:
                                     manifest[-1]["note"] = w.volume_note
                                 _say(f"            NOTE {w.volume_note}")
@@ -57187,7 +57235,7 @@ def self_test():
             ccond = (got == want and jentries == 310 + 3
                      and reads == {0x10000: ("uboot-env.bin", e1), 0x14000: ("uboot-env.bin", e2),
                                    nv_at: ("nvram.bin", nv)}
-                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2)) == (len(e2), 5, 3))
+                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2))[:3] == (len(e2), 5, 3))
             if not ccond:
                 ok = False
             print(f"  [{'PASS' if ccond else 'FAIL'}] a flash dump's U-Boot environments and "
@@ -57231,6 +57279,123 @@ def self_test():
             print(f"  [{'PASS' if wcond else 'FAIL'}] and an environment that is the whole file "
                   f"is that file ({alone}), while one that only begins a larger file leaves "
                   f"the rest to be searched ({lead_kinds})")
+
+        # A U-Boot environment's CRC is a uint32_t in the byte order of the CPU
+        # U-Boot runs on (env_t), mkenvimage -b writes it big-endian, and its size
+        # is the board's CONFIG_ENV_SIZE. Built here from made-up strings on
+        # erased flash, each store at a 4 KiB boundary. The first image holds a
+        # little-endian store and two big-endian ones, one of each layout:
+        # volumes() must find the three and the description must name the order
+        # that held. The second holds a store at sizes the 4 KiB steps up to
+        # 256 KiB never reached (128 and 400 bytes, 512 bytes, 6 KiB, 0x4200,
+        # 512 KiB and 1 MiB), at one they did (0x21000) and, as controls, at
+        # three sizes that are not tried (off the 512-byte steps, off the 4 KiB
+        # steps above 64 KiB, and over 1 MiB), which must not be claimed. The
+        # sizes are written out here and not taken from UBOOT_ENV_SIZES, which
+        # they check. The third is exported for real: a redundant-layout store's
+        # volumes.json record must carry its flags byte as stored and name no
+        # copy as the one in use, and a single-copy store's record must carry no
+        # note.
+        def _uenv(strings, size, hdr=4, flags=1, order="<"):
+            data = (b"\x00".join(strings) + b"\x00\x00").ljust(size - hdr, b"\x00")
+            return (struct.pack(order + "I", binascii.crc32(data))
+                    + (bytes([flags]) if hdr == 5 else b"") + data)
+
+        def _uflash(stores, size):
+            chip = bytearray(b"\xff" * size)
+            for at, blob in stores:
+                chip[at:at + len(blob)] = blob
+            return bytes(chip)
+
+        def _ufound(chip):
+            return [(v["base"], v["kind"], v["size"])
+                    for v in volumes(io.BytesIO(chip), len(chip))]
+
+        ustr = [b"bootdelay=2", b"baudrate=115200", b"example_addr=192.0.2.7"]
+        o_le, o_be = _uenv(ustr, 0x1000), _uenv(ustr, 0x1000, order=">")
+        o_red = _uenv(ustr, 0x2000, hdr=5, flags=9, order=">")
+        o_chip = _uflash([(0x1000, o_le), (0x3000, o_be), (0x5000, o_red)], 0x10000)
+        o_got = _ufound(o_chip)
+        o_said = [" ".join(identify_fs(io.BytesIO(o_chip), b, n)[1]) for b, _k, n in o_got]
+        uo_cond = (o_got == [(0x1000, "uboot-env", 0x1000), (0x3000, "uboot-env", 0x1000),
+                             (0x5000, "uboot-env", 0x2000)]
+                   and ["read as little-endian" in s for s in o_said] == [True, False, False]
+                   and ["read as big-endian" in s for s in o_said] == [False, True, True]
+                   and "flags byte 9" in o_said[2]
+                   and _ufound(o_be) == [(0, "uboot-env", 0x1000)])
+        if not uo_cond:
+            ok = False
+        print(f"  [{'PASS' if uo_cond else 'FAIL'}] a U-Boot environment whose CRC-32 is stored "
+              f"big-endian is found in both layouts, alone and in a flash dump, and its "
+              f"description names the byte order that held "
+              f"({', '.join(f'{b:#x} {human(n)}' for b, _k, n in o_got)})")
+
+        s_at, s_stores, s_want = 0x1000, [], []
+        s_tried = (0x80, 0x190, 0x200, 0x1800, 0x4200, 0x21000, 0x80000, 0x100000)
+        for s_size in s_tried + (0x1900, 0x11200, 0x101000):
+            s_blob = _uenv(ustr[:2] + [b"example_size=%d" % s_size], s_size,
+                           hdr=5 if s_size in (0x1800, 0x80000) else 4)
+            s_stores.append((s_at, s_blob))
+            if s_size in s_tried:
+                s_want.append((s_at, "uboot-env", s_size))
+            s_at += -(-s_size // 4096) * 4096 + 4096
+        s_chip = _uflash(s_stores, s_at)
+        s_vols = volumes(io.BytesIO(s_chip), len(s_chip))
+        s_got = [(v["base"], v["kind"], v["size"]) for v in s_vols]
+        s_read = {v["base"]: b"".join(v["walker"].read_file(n, v["walker"].entry(n)[1]))
+                  for v in s_vols if v.get("walker") and v["kind"] == "uboot-env"
+                  for _f, n in v["walker"].listdir(v["walker"].root)}
+        us_cond = (len(s_want) == 8 and s_got == s_want
+                   and s_read == {at: blob for at, blob in s_stores if len(blob) in s_tried})
+        if not us_cond:
+            ok = False
+        print(f"  [{'PASS' if us_cond else 'FAIL'}] U-Boot environments of 128 and 400 bytes, "
+              f"sizes off the 4 KiB steps and sizes over 256 KiB up to 1 MiB are found and "
+              f"read back byte for byte, and three sizes that are not tried (0x1900, 0x11200, "
+              f"0x101000) are not claimed "
+              f"({', '.join(f'{n:#x}' for _b, _k, n in s_got)})")
+
+        if getattr(sys, "frozen", False):
+            print("  [SKIP] a redundant-layout U-Boot environment's flags byte is in its "
+                  "volumes.json record: a packaged build does not run an export here")
+        else:
+            import subprocess as _sp
+            n_chip = _uflash([(0x1000, _uenv(ustr, 0x1000, hdr=5, flags=7)),
+                              (0x3000, _uenv(ustr, 0x1000, hdr=5, flags=8, order=">")),
+                              (0x5000, o_le)], 0x8000)
+            n_stem = os.path.join(d, f"uboot-env-check-{uuid.uuid4().hex}")
+            n_recs, n_rc = [], None
+            try:
+                with open(n_stem + ".dd", "wb") as n_fh:
+                    n_fh.write(n_chip)
+                n_rc = _sp.run([sys.executable, "-B", os.path.abspath(__file__), n_stem + ".dd",
+                                "--extract", n_stem + ".zip"], stdin=_sp.DEVNULL,
+                               stdout=_sp.PIPE, stderr=_sp.PIPE, timeout=240,
+                               check=False).returncode
+                with zipfile.ZipFile(n_stem + ".zip") as n_zip:
+                    n_recs = json.loads(n_zip.read("volumes.json"))["volumes"]
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, _sp.SubprocessError):
+                pass
+            finally:
+                for n_left in (n_stem + ".dd", n_stem + ".zip"):
+                    try:
+                        os.remove(n_left)
+                    except OSError:
+                        pass
+            n_notes = [r.get("note") for r in n_recs]
+            un_cond = (n_rc == 0
+                       and [r.get("offset_bytes") for r in n_recs] == [0x1000, 0x3000, 0x5000]
+                       and n_notes[2:] == [None]
+                       and "flags byte 7 as stored" in (n_notes[0] or "")
+                       and "flags byte 8 as stored" in (n_notes[1] or "")
+                       and not any("active" in (n or "") or "in use" in (n or "")
+                                   for n in n_notes))
+            if not un_cond:
+                ok = False
+            print(f"  [{'PASS' if un_cond else 'FAIL'}] an export's volumes.json record of a "
+                  f"redundant-layout U-Boot environment carries its flags byte as stored and "
+                  f"names no copy as the one in use, and a single-copy one carries no note "
+                  f"({len(n_recs)} records, exit {n_rc})")
 
         # An eMMC image from an embedded device can hold ext filesystems with no
         # partition table in front of them. Built here: 1.25 MiB of random bytes,
