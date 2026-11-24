@@ -253,7 +253,11 @@ The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
 (files that could not be read, which are not in the zip) and, on a
-volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
+volume that does, `extends_past_image_by_bytes`. `note` is what the reader says about the
+volume as a whole, when it says anything. Besides F2FS's notes, the committed fixtures
+give these: an XFS dirty log, a Btrfs log tree, default subvolume or one device of two,
+ReFS log records that follow the newest checkpoint, an APFS volume left locked, and zstd
+data on a Python without zstd. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -3602,7 +3606,10 @@ Linux servers, NAS units and storage appliances. `--list`, `--extract` and
 superblock is verified: the `XFSB` magic, a geometry that holds as the kernel requires it,
 and on v5 a superblock CRC that holds. A v4 superblock has no CRC, so its root inode must
 also read as a directory. A superblock that fails any of these is not claimed, and the
-other filesystems get their turn at the region.
+other filesystems get their turn at the region. One case is claimed on the superblock
+alone: a v4 volume whose root inode lies past the end of the image or of its region. The
+superblock is whole and states the volume's size, so this is a cut XFS volume, and it is
+named and recorded as one (see below).
 
 What it reads:
 
@@ -3619,6 +3626,14 @@ What it reads:
 - directories in all five forms: shortform (in the inode), block, leaf, node, and node or
   leaf with a B+tree extent map, with and without the file type byte (`ftype`), and
   directory blocks larger than the filesystem block;
+- names as UTF-8. A stretch of a stored name that is not UTF-8 is kept as `%XX` of its
+  bytes (a stored `0x80` is `%80`), and a NUL or a `/` inside one name as `%00` or `%2F`,
+  so no name holds a surrogate. A literal `%` is not escaped, so a file really named
+  `caf%E9.txt` and one stored as `caf`, `0xE9`, `.txt` read alike: both are listed, each
+  with its own inode, the one really named that first. An extraction keeps both: that
+  one under the name, the other as `.dup-2` with a `RENAMED` row whose stored path reads
+  the same, so the row alone does not say which bytes were stored. A symlink target is a
+  path, so its bytes that are not UTF-8 become `%XX` and its `/` stay as they are;
 - symbolic links held inline and in blocks of their own; hard links, which list as one
   inode under each name; FIFOs, listed and not extracted (device nodes the same way, by
   the source: making one needs root, and none was made);
@@ -3664,14 +3679,37 @@ What fails is not used, and is counted:
 
 The count and the first damaged structure appear in the volume's note.
 
+**A cut volume.** Each inode, directory block, extent B+tree block or symlink block that
+lies past the end is recorded with what follows from it (an inode: what a folder names by
+it is not listed) and counted in `folders_not_read`, so the extraction exits 1. A cut
+that takes none of them still records the missing end in the note and exits 0. A volume
+cut just after its superblock has one record, that the root folder cannot be read and
+none of its files are listed, and exits 1. Measured on `xfs-v4` (5,319 files): cut 4 KiB
+short, all 5,319 files are exported and the run exits 0; cut in half, 4,611 are exported,
+8 inodes past the cut are recorded and counted, and the run exits 1; cut after its first
+sector, no file is exported and the run exits 1. File data past the end, with its inode
+still there, is the `.SHORT` case above and is not counted in `folders_not_read`; no cut
+tried here produced one.
+
+An export writes the note to `volumes.json` as `note`, without the damage sentence, which
+it writes as `damage_recorded` and `damage_first`: a missing end, a dirty log, the
+needsrepair flag, a realtime section.
+
 **The log is not replayed.** Whether it is clean is decided the way `xfs_db` and
 `xfs_logprint` decide it (libxlog `xlog_is_dirty`): find the log's head by the cycle
 numbers stamped in it, and its tail from the last record before the head. A dirty log is
 reported in the volume's lines and its note, and the volume is read as it is stored: what
-was still only in the log is not there. The head is found by the kernel's first pass only;
-its later passes step back over a write torn at the moment of a crash, which this does
-not, so on such a log the head named here can be later than the kernel's. An external log
-is reported as such, its state not known.
+was still only in the log is not there. The note says so in those terms: files and
+content written since the log's tail (the first log record whose changes are not all in
+place) may be missing, or older than the device would show after a mount, with the tail,
+the head and how many 512-byte log blocks lie between them. An export writes it to
+`volumes.json` as `note`. A dirty log alone does not change the exit status. On
+`xfs-dirty`, `xfs_logprint` shows 21 inode items in the log (the 20 files added and their
+folder); the reader lists that folder empty, and the export exits 0 and carries the
+note. The head is found by the kernel's first pass only; its later passes step back over
+a write torn at the moment of a crash, which this does not, so on such a log the head
+named here can be later than the kernel's. An external log is reported as such, its state
+not known.
 
 ### What is refused, and why
 
@@ -3745,6 +3783,14 @@ the superblock; remote symlink headers naming another offset, length, owner or b
 one mapped to 2,000 blocks; a volume cut to half its size, and one in a region shorter
 than the image; and a v4 superblock pasted onto a region with no XFS root inode behind it.
 Each of these checks was shown to fail when the line of the reader it guards was changed.
+
+Four more rows cover names and what an export records, and each fails on the reader as it
+was before them: a shortform directory rewritten in memory to hold a name with a byte
+that is not UTF-8, the name that byte reads as, a `/` and a NUL, with a symlink target
+given such a byte (Linux 6.18 refuses a `/` or a NUL in a name, `xfs_dir2_namecheck` in
+fs/xfs/libxfs/xfs_dir2.c, so those two only show the escape); and, through a real
+`--extract`, the dirty log's note in `volumes.json`, and `xfs-v4` cut after its
+superblock, cut in half and cut 4 KiB short.
 
 The layout is sourced from xfsprogs v6.18.0 (commit
 8b892adad226bb9fef4009c4cba4dbc25b70b011); no xfsprogs code was copied, as xfsprogs is
