@@ -38147,10 +38147,13 @@ def _f2fs_reader_checks():
         a real --extract."""
         if getattr(sys, "frozen", False):
             return None
+        # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+        # each export names its own files and removes them itself.
         work = tempfile.mkdtemp(prefix="qnxprobe-f2fs-")
+        stem = os.path.join(work, f"f2fs-check-{uuid.uuid4().hex}")
+        raw, out = stem + ".img", stem + ".zip"
         undo = img.apply(edits)
         try:
-            raw, out = os.path.join(work, "v.img"), os.path.join(work, "o.zip")
             limit = img.size if end is None else end
             with open(raw, "wb") as fh:
                 fh.write(img.raw[:limit])
@@ -38171,6 +38174,11 @@ def _f2fs_reader_checks():
             return done.returncode, rec, rows, members
         finally:
             img.restore(undo)
+            for leftover in (raw, out):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
             shutil.rmtree(work, ignore_errors=True)
 
     out = []
