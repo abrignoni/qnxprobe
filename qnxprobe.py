@@ -36710,6 +36710,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 sized_regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
                 vol_names[first * ss] = volume_name(idx, first, name)
 
+        # What a partition table lists, as distinct from the regions added below
+        # (the whole image, a flash filesystem, LUKS data, a logical volume).
+        table_labels = {lab for lab, _st, _rs in sized_regions}
+
         # No partition table at all (a whole-disk filesystem, or a bare region
         # such as an ETFS flash dump) means no regions were recorded. Treat the
         # whole image as one region so it still reaches identify_fs and the
@@ -36796,9 +36800,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 print(f"    {label:<28} {where}")
             print("    A raw image split into numbered segments (.001, .002, ...) has to be")
             print("    joined before it is read; its first segment alone looks like this.")
-            print("    Each volume above is marked INCOMPLETE below, and a file on it that")
-            print("    reaches past the end is counted SHORT and stored under a name that")
-            print("    says how much of it is here, not as an extracted file.")
+
+        marked_incomplete = []
+
+        def mark_incomplete(miss, pad):
+            """Say a volume being extracted reaches past the end of the file."""
+            marked_incomplete.append(miss)
+            print(f"{pad}INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
 
         def missing_past_end(base, declared_end=None):
             """Bytes of the volume at base that lie past the end of the file."""
@@ -37054,7 +37062,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     for line in dmg[:5]:
                         _say(f"        DAMAGE {line}")
                     if miss:
-                        print(f"        INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                        mark_incomplete(miss, " " * 8)
                 except Exception as exc:
                     _say(f"        could not extract this filesystem: {exc}")
                     _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=base // ss,
@@ -37076,7 +37084,33 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                   if lab not in vols and lab not in protective]
         if others:
             print("  WHAT IS IN THE OTHER PARTITIONS")
+            past_end_recorded = set()    # a hybrid MBR and GPT can list one start twice
             for lab, b, sz in others:
+                if lab in table_labels and b >= size:
+                    # Nothing of it can be identified or walked, so it would leave no
+                    # record and the run would read as complete.
+                    gone = (f"none of this partition is in the image: the partition table "
+                            f"lists it at byte {b:,} and the image ends at byte {size:,}")
+                    if lab in containers:
+                        gone += ("; it is an extended partition, so the logical partitions "
+                                 "inside it cannot be listed")
+                    # the kind volumes() gives it, which --check-discovery compares
+                    print(f"    {lab}   {human(sz)}   ->  "
+                          + ("extended partition container" if lab in containers
+                             else "not recognised"))
+                    print(f"        {gone}")
+                    print()
+                    if (zf is not None and b not in past_end_recorded
+                            and (only is None or only.lower() in lab.lower())):
+                        past_end_recorded.add(b)
+                        vol = _zip_names(zf).volume(
+                            name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                            (".exceptions.tsv",))
+                        _zip_volume_not_read(zf, manifest, vol, image_rec, ValueError(gone),
+                                             lba=b // ss, offset_bytes=b,
+                                             partition_size_bytes=sz, filesystem=None,
+                                             extends_past_image_by_bytes=sz)
+                    continue
                 if lab in containers:
                     print(f"    {lab}   {human(sz)}   ->  extended partition "
                           f"container, holds the logical volumes below")
@@ -37255,7 +37289,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         for line in log[:5]:
                             _say(line)
                         if miss:
-                            print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                            mark_incomplete(miss, " " * 12)
                     except Exception as exc:
                         _say(f"        could not extract: {exc}")
                         _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
@@ -37337,7 +37371,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             for line in dmg[:5]:
                                 _say(f"            DAMAGE {line}")
                             if miss:
-                                print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                                mark_incomplete(miss, " " * 12)
                         except Exception as exc:
                             _say(f"        could not extract: {exc}")
                             _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
@@ -37417,7 +37451,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 for line in log[:5]:
                                     _say(line)
                                 if miss:
-                                    print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                                    mark_incomplete(miss, " " * 12)
                             except Exception as exc:
                                 _say(f"        could not extract: {exc}")
                                 _zip_volume_not_read(zf, manifest, vol, image_rec, exc,
@@ -37425,6 +37459,12 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                      partition_size_bytes=sz,
                                                      filesystem="qnx_ifs")
                 print()
+
+        if marked_incomplete:
+            print("  A volume marked INCOMPLETE above reaches past the end of the file. A file")
+            print("  on it that reaches past the end is counted SHORT and stored under a name")
+            print("  that says how much of it is here, not as an extracted file.")
+            print()
 
         if rejected:
             print(f"  rejected (magic present, fields inconsistent):")
@@ -43071,6 +43111,47 @@ def self_test():
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+        # A disk cut after its first partition: the second is listed by the table
+        # and none of it is in the file. It gets a record and counts as not read,
+        # and the first exports as it does alone. The image is removed when the
+        # row ends, because the build workflow counts the images left in this folder.
+        p2_lba = 2048 + -(-len(q4) // SECTOR)
+        cut_disk = bytearray(p2_lba * SECTOR)
+        for slot, (first, count) in enumerate(((2048, p2_lba - 2048), (p2_lba, 64))):
+            ent = bytearray(16)
+            ent[4] = 0x4d
+            struct.pack_into("<II", ent, 8, first, count)
+            cut_disk[446 + slot * 16:462 + slot * 16] = ent
+        cut_disk[510:512] = b"\x55\xaa"
+        cut_disk[2048 * SECTOR:2048 * SECTOR + len(q4)] = q4
+        p2_path = os.path.join(d, "second_partition_cut.img")
+        p2_man, p2_buf = [], io.StringIO()
+        p2_zip = io.BytesIO()
+        try:
+            with open(p2_path, "wb") as out:
+                out.write(cut_disk)
+            with zipfile.ZipFile(p2_zip, "w") as zf, contextlib.redirect_stdout(p2_buf):
+                main(p2_path, extract="x.zip", zf=zf, manifest=p2_man)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(p2_path)
+        p2_rec = p2_man[1] if len(p2_man) == 2 else {}
+        cond = (len(p2_man) == 2 and p2_man[0].get("files") == 4
+                and p2_man[0].get("short") == 0 and not p2_man[0].get("extract_error")
+                and _volumes_not_read(p2_man) == 1
+                and p2_rec.get("offset_bytes") == p2_lba * SECTOR
+                and p2_rec.get("extends_past_image_by_bytes") == 64 * SECTOR
+                and p2_rec.get("files") == 0
+                and (p2_rec.get("extract_error") or "").startswith(
+                    "none of this partition is in the image: the partition table lists it "
+                    f"at byte {p2_lba * SECTOR:,} and the image ends at byte {len(cut_disk):,}")
+                and "INCOMPLETE" not in p2_buf.getvalue())
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a partition that begins past the end of a cut "
+              f"disk gets a record, counts as not read, and no volume is said to be marked "
+              f"INCOMPLETE")
 
         # A split image, joined by the reader. FTK Imager and its peers write a
         # raw image as numbered segments, and since 1.13 a run on any one of

@@ -4390,7 +4390,10 @@ above are in this README only for now.)
   the partitions that reach past the end, marks each affected volume `INCOMPLETE` in
   the report and in `volumes.json` (`extends_past_image_by_bytes`), and stores a file
   whose blocks lie past the cut under a name ending `.SHORT-<here>-of-<size>-bytes`,
-  counted as `short` rather than as extracted.
+  counted as `short` rather than as extracted. A partition the table lists that begins
+  at or past the end of the image holds nothing to read: with `--extract` it gets a
+  `volumes.json` record whose `extract_error` gives the listed offset and where the
+  image ends, and the run exits 1.
 - **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
   a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
   sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
