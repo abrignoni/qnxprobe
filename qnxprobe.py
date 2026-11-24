@@ -47704,7 +47704,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             issues = []
                             f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
                                                                  issues=issues)
-                            if hasattr(w, "unread_entries"):
+                            # YAFFS and JFFS2 list their own unread names below
+                            if isinstance(w, (F2fsWalker, UbiWalker, UbifsWalker)):
                                 if isinstance(w, F2fsWalker):
                                     w.check_reached()
                                 # a name whose inode cannot be read never reaches the list above
