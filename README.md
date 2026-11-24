@@ -331,13 +331,17 @@ and the run exits 1. So is a group descriptor that points off the volume, and ea
 whose inode that costs gets a `FAILED` row. A live name whose inode is blank (mode 0), has
 a mode that is none of the seven file types, or fails its checksum on a `metadata_csum`
 volume is `FAILED` the same way, and is never counted as a special file. A regular file
-whose size is past the largest the volume's block size and features allow (`ext4_max_size`
-for extents, `ext4_max_bitmap_size` for block maps) is `FAILED` with that size in its row.
+whose size is past what e2fsck accepts for that volume is `FAILED` with that size in its row
+(`e2fsck/pass1.c` in e2fsprogs 1.47.2). With extents the limit is 2^(32 + block bits) - 1
+bytes, 16 TiB at 4 KiB blocks. With a block map it is what the direct and three indirect
+levels address, about 4 TiB at 4 KiB blocks. A size below that limit is exported at full
+length, so a damaged size can still produce a very large run of zeros.
 
 A file whose block map is partly lost or past the end of the image keeps the blocks of
 every map entry it can follow, at their own offsets. An extent entry that fails the map's
-checks is not followed, and neither are the others in its 512-byte sector. Entries outside
-that sector are kept. On `metadata_csum` volumes an extent block that fails its checksum is
+checks is not followed. Inside an extent block, neither are the others in its 512-byte
+sector, and entries outside that sector are kept. In the extent root in the inode, only the
+bad entry is left out. On `metadata_csum` volumes an extent block that fails its checksum is
 recorded. The file is stored under the
 `.SHORT-<here>-of-<size>-bytes` name, what was lost reads as zeros, and its `SHORT` row
 names the file blocks. A zero pointer counts as lost only when `i_blocks` records more
@@ -356,9 +360,9 @@ Limits:
   does not change the exit status.
 - Without `metadata_csum`, a damaged inode or map entry that still forms valid values reads
   as valid. An inode whose type disagrees with its folder entry is recorded.
-- A stored size below the filesystem's maximum is treated as a real sparse file. On a volume
-  without `metadata_csum`, a damaged size there is exported as zeros up to that size, which
-  can run to terabytes.
+- A stored size below e2fsck's limit is treated as a real sparse file. On a volume without
+  `metadata_csum`, a damaged size there is exported as zeros up to that size, which can run
+  to terabytes.
 
 The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
 says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a

@@ -1949,30 +1949,17 @@ class ExtWalker:
         return why
 
     def _max_file_size(self, flags):
-        """The largest i_size this volume's block size and features allow: ext4_max_size for
-        an extent-mapped file, ext4_max_bitmap_size for a block-mapped one (fs/ext4/super.c)."""
-        bits = 10 + self.bs.bit_length() - 11
-        huge = bool(self.ro_compat & EXT_RO_HUGE_FILE)
-        lfs = (1 << 63) - 1                             # MAX_LFS_FILESIZE on a 64-bit kernel
-        if flags & EXT4_EXTENTS_FL:
-            upper = lfs if huge else (((1 << 32) - 1) >> (bits - 9)) << bits
-            return min(((1 << 32) - 1) << bits, upper)
+        """The largest i_size e2fsck accepts for a regular file on this volume (check_blocks,
+        bad_size 4 and 6, and ext2_max_sizes in e2fsck_pass1, e2fsck/pass1.c at e2fsprogs
+        v1.47.2). An extent-mapped file on a volume with the extents feature is limited by
+        its 32-bit logical block number, to 2^(32 + block bits) - 1. Any other file is limited
+        by what twelve direct pointers and three levels of indirect blocks address. The
+        huge_file feature does not enter into either."""
+        bits = self.bs.bit_length() - 1
+        if flags & EXT4_EXTENTS_FL and self.incompat & EXT_INCOMPAT_EXTENTS:
+            return (1 << (32 + bits)) - 1
         ppb = 1 << (bits - 2)
-        upper = (1 << 48) - 1 if huge else ((1 << 32) - 1) >> (bits - 9)
-        res = 12 + ppb + ppb * ppb + ppb * ppb * ppb
-        meta = 1 + (1 + ppb) + (1 + ppb + ppb * ppb)
-        if res + meta > upper:
-            res = upper
-            upper -= 12 + ppb
-            meta = 1
-            if upper < ppb * ppb:
-                meta += 1 + -(-upper // ppb)
-            else:
-                meta += 1 + ppb
-                upper -= ppb * ppb
-                meta += 1 + -(-upper // ppb) + -(-upper // (ppb * ppb))
-            res -= meta
-        return min(res << bits, lfs)
+        return (12 + ppb + ppb * ppb + ppb * ppb * ppb) << bits
 
     @property
     def volume_note(self):
@@ -2242,9 +2229,10 @@ class ExtWalker:
 
         ``need`` is how many logical blocks the file's size reaches; nothing past
         it is read or checked. What the map cannot give goes in ``lost`` as
-        (first logical block, end, why), and the rest of the map is still returned. An
-        entry in a sector that holds a bad entry is not followed, since a damaged entry can
-        look valid, and goes in ``lost`` too. An entry of (None, count, why)
+        (first logical block, end, why), and the rest of the map is still returned. Inside
+        an extent block or an indirect block, an entry in a sector that holds a bad entry is
+        not followed either, since a damaged entry can look valid, and goes in ``lost`` too.
+        In the extent root in the inode only the bad entry itself is left out. An entry of (None, count, why)
         is ``count`` blocks i_blocks charges that the map does not reach, which lie
         somewhere in its holes. Only an extent root that cannot be read at all raises.
         """
@@ -2907,8 +2895,8 @@ class ExtWalker:
             return
         largest = self._max_file_size(flags)
         if size > largest:
-            why = (f"its recorded size of {size:,} bytes is past the largest this filesystem "
-                   f"allows ({largest:,})")
+            why = (f"its recorded size of {size:,} bytes is past the largest e2fsck accepts "
+                   f"for this volume and file ({largest:,})")
             self._damaged(f"inode {num}: {why}")
             raise ExtUnreadable(f"{why}; none of it is exported")
         need = -(-size // self.bs)
@@ -29735,17 +29723,30 @@ def _ext_reader_checks():
                         for e in w.unread_entries()))
 
     def huge_size():
-        """A size past ext4_max_size is refused at once; a sparse size at it is not."""
-        img = bytearray(sparse4)
-        ino = number(img, "dir/tiny.txt")
-        w = walker(img)
-        largest = ((1 << 32) - 1) << 12
-        refused = False
-        try:
-            next(w.read_file(ino, largest + 1))
-        except ExtUnreadable as exc:
-            refused = f"{largest + 1:,}" in str(exc)
-        return refused and len(next(walker(img).read_file(ino, largest))) > 0
+        """The sizes e2fsck accepts (bad_size 4 and 6, e2fsck/pass1.c at v1.47.2), asked of
+        read_file for its first block only, so nothing of that length is ever produced. A
+        3 TiB sparse file is valid with no huge_file feature, on either kind of map."""
+        def first(img, path, size):
+            w = walker(img)
+            return next(w.read_file(number(img, path), size), b"")
+
+        def refused(img, path, size):
+            try:
+                first(img, path, size)
+            except ExtUnreadable as exc:
+                return f"{size:,}" in str(exc)
+            return False
+
+        extents = bytearray(sparse4)                    # the same volume without huge_file
+        struct.pack_into("<I", extents, 1024 + 100, u32(extents, 1024 + 100) & ~0x8)
+        mapped = (12 + 1024 + 1024 ** 2 + 1024 ** 3) * 4096
+        tiny = "dir/tiny.txt"
+        return (not u32(sparse2, 1024 + 100) & 0x8
+                and first(extents, tiny, 3 << 40)[:5] == b"tiny\n"
+                and first(sparse2, tiny, 3 << 40)[:5] == b"tiny\n"
+                and first(extents, tiny, (1 << 44) - 1)[:5] == b"tiny\n"
+                and first(sparse2, tiny, mapped)[:5] == b"tiny\n"
+                and refused(extents, tiny, 1 << 44) and refused(sparse2, tiny, mapped + 1))
 
     def backup_superblock():
         """A two-group 1 KiB volume with its primary superblock zeroed, against the same
@@ -29808,8 +29809,8 @@ def _ext_reader_checks():
     row("ext damage: an inode of 0xFF is FAILED and its folder not read, not a special file",
         noise_mode)
     row("ext: an inode whose checksum fails is FAILED, though its type is valid", inode_checksum)
-    row("ext damage: a size past ext4_max_size is refused with no zeros streamed, and a sparse "
-        "size at the maximum is not", huge_size)
+    row("ext: a 3 TiB sparse size reads on a volume without huge_file, a size at e2fsck's limit "
+        "reads, and one past it is refused with no zeros streamed", huge_size)
     row("ext: a region whose primary superblock is gone and that holds a valid backup gets a "
         "record, with the exit status unchanged, and no backup means no record",
         backup_superblock)
