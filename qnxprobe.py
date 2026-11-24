@@ -12527,6 +12527,12 @@ def lz4_block_decompress(src, limit=None):
 # on, so a listing that comes back empty says why wherever the volume is shown.
 SQUASHFS_NO_ZSTD_NOTE = ("zstd compressed; this Python has no zstd (3.14 adds it), so "
                          "the listing may be short and no file can be read")
+# The same for xz and the legacy lzma format (the lzma module) and for gzip
+# (zlib). Both are in the standard library, lzma since 3.3, and both are left
+# out when Python is built without the C library behind them.
+SQUASHFS_NO_MODULE_NOTE = ("{0} compressed; this Python has no {1} module (the standard "
+                           "library carries it unless Python was built without {2}), so "
+                           "the listing may be short and no file can be read")
 
 
 def _zstd_module():
@@ -12574,6 +12580,7 @@ def zstd_decompress(src):
 # ---------------------------------------------------------------------------
 SQUASHFS_MAGIC = 0x73717368
 SQFS_METADATA_SIZE = 8192
+SQFS_DAMAGE_KEPT = 1000                 # entries kept in a walker's damage list
 SQFS_INVALID_FRAG = 0xFFFFFFFF
 SQFS_COMP = {1: "gzip", 2: "lzma", 3: "lzo", 4: "xz", 5: "lz4", 6: "zstd"}
 SQFS_TYPE_MODE = {1: S_IFDIR, 2: S_IFREG, 3: S_IFLNK, 4: 0o060000, 5: 0o020000,
@@ -12590,6 +12597,36 @@ class SquashfsUnreadable(Exception):
     says which and why."""
 
 
+# What a read of SquashFS metadata raises when it cannot give the bytes back.
+_SQFS_READ_ERRORS = (SquashfsUnreadable, DecompressError, struct.error)
+# The standard library module each compressor is decoded with, and the C library
+# a Python build needs for it. LZO (3) and LZ4 (5) are decoded by this file's own
+# code and zstd (6) is asked for through _zstd_module().
+_SQFS_MODULE = {1: ("zlib", "zlib"), 2: ("lzma", "liblzma"), 4: ("lzma", "liblzma")}
+
+
+def _sqfs_absent_module(comp):
+    """(module, C library) when the standard library module that decodes
+    compression id ``comp`` is not in this Python, else None."""
+    module, library = _SQFS_MODULE.get(comp, (None, None))
+    if module is None:
+        return None
+    try:
+        __import__(module)
+    except ImportError:
+        return module, library
+    return None
+
+
+def _sqfs_no_decompressor(comp):
+    """Why this Python cannot decompress SquashFS compression id ``comp``, as
+    text that names the module and which Python has it, else None."""
+    if comp == 6:
+        return None if _zstd_module() is not None else SQUASHFS_NO_ZSTD_NOTE
+    absent = _sqfs_absent_module(comp)
+    return SQUASHFS_NO_MODULE_NOTE.format(SQFS_COMP[comp], *absent) if absent else None
+
+
 def _sqfs_decompress(comp, data, limit):
     """Turn one compressed SquashFS block back into its bytes. The wrappers are
     fs/squashfs/{zlib,xz,lzo,lz4,zstd}_wrapper.c: gzip is a zlib stream with its
@@ -12600,36 +12637,54 @@ def _sqfs_decompress(comp, data, limit):
     the header's 8-byte size field with the real size; its own decoder puts the
     "unknown" value (all 0xFF) back before decoding and keeps that many bytes
     (squashfs-tools/lzma_xz_wrapper.c lzma_compress and lzma_uncompress, at
-    708c59ae), and so does this."""
-    import lzma, zlib
+    708c59ae), and so does this.
+
+    Each module is imported where its compressor is met, so a Python built
+    without one still reads the volumes that do not use it, and a volume that
+    does says which module is absent instead of stopping the run."""
+    if comp == 3:
+        return lzo1x_decompress(data, limit)
+    if comp == 5:
+        return lz4_block_decompress(data, limit)
+    if comp == 6:
+        return zstd_decompress(data)
+    if comp not in _SQFS_MODULE:
+        raise DecompressError(f"compression id {comp} is not one SquashFS defines")
     try:
         if comp == 1:
-            return zlib.decompress(data)
-        if comp == 4:
-            return lzma.decompress(data, format=lzma.FORMAT_XZ)
-        if comp == 2:
+            import zlib
+            try:
+                return zlib.decompress(data)
+            except zlib.error as exc:
+                raise DecompressError(f"gzip: {exc}") from None
+        import lzma
+        try:
+            if comp == 4:
+                return lzma.decompress(data, format=lzma.FORMAT_XZ)
             if len(data) < 13:
                 raise DecompressError("lzma block shorter than its header")
             want = struct.unpack_from("<I", data, 5)[0]
             out = lzma.decompress(data[:5] + b"\xff" * 8 + data[13:],
                                   format=lzma.FORMAT_ALONE)
             return out[:want]
-        if comp == 3:
-            return lzo1x_decompress(data, limit)
-        if comp == 5:
-            return lz4_block_decompress(data, limit)
-        if comp == 6:
-            return zstd_decompress(data)
-    except (zlib.error, lzma.LZMAError) as exc:
-        raise DecompressError(f"{SQFS_COMP.get(comp)}: {exc}") from None
-    raise DecompressError(f"compression id {comp} is not one SquashFS defines")
+        except lzma.LZMAError as exc:
+            raise DecompressError(f"{SQFS_COMP[comp]}: {exc}") from None
+    except ImportError:
+        module, library = _SQFS_MODULE[comp]
+        raise DecompressError(f"{SQFS_COMP[comp]} needs the standard library's {module} "
+                              f"module (in a Python built with {library}); this Python "
+                              "does not carry it") from None
 
 
 class SquashfsWalker:
     """List and read a SquashFS 4.0 image. A node is an inode reference (the
     metadata block's offset in the inode table, shifted left 16, plus the byte
     offset inside it), which is what a directory entry records, so a hard link
-    is one node reached by two names."""
+    is one node reached by two names.
+
+    What could not be read is recorded in ``damage`` (see damage_lines), the
+    first 1,000 entries of it, and ``folders_not_read`` counts the folders whose
+    inode or listing could not be read in full. Nothing is recovered."""
 
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
@@ -12652,12 +12707,43 @@ class SquashfsWalker:
         self._meta = {}
         self._ids = None
         self._frag_index = None
+        self._frag_error = None
+        self.damage, self._damage_seen = [], set()
+        self.folders_not_read, self._not_read = 0, set()
+        self._folder_names, self._folder_parents = {}, {}
         # Many small files share one fragment block, so the last few blocks are
         # kept decompressed, as the kernel's fragment cache does (super.c,
         # SQUASHFS_CACHED_FRAGMENTS).
         self._frags = collections.OrderedDict()
 
     root = property(lambda self: self.root_ref)
+
+    # -- what could not be read ----------------------------------------------
+    def _damaged(self, what):
+        if what not in self._damage_seen and len(self.damage) < SQFS_DAMAGE_KEPT:
+            self._damage_seen.add(what)
+            self.damage.append(what)
+
+    def _folder_path(self, ref):
+        """A folder's path from the names it was listed under, "" for the root."""
+        parts, hops = [], 0
+        while ref != self.root_ref and ref in self._folder_names and hops < 4096:
+            parts.append(self._folder_names[ref])
+            ref = self._folder_parents.get(ref)
+            hops += 1
+        return "/".join(reversed(parts))
+
+    def _folder_part(self, ref, found):
+        """Record a folder that was not listed in full, counted once per folder.
+        damage_lines() keeps 240 characters of a line, so the folder's path goes last."""
+        if ref == self.root_ref:
+            self._damaged(f"the root folder {found}")
+        else:
+            self._damaged(f"a folder {found}: "
+                          f"{self._folder_path(ref) or f'inode reference {ref:#x}'}")
+        if ref not in self._not_read:
+            self._not_read.add(ref)
+            self.folders_not_read += 1
 
     # -- metadata ----------------------------------------------------------
     def _meta_block(self, pos):
@@ -12719,7 +12805,15 @@ class SquashfsWalker:
     def _fragment(self, index):
         """(start, stored_size_word) for a fragment table entry."""
         if self._frag_index is None:
-            self._frag_index = self._table(self.frag_table, self.fragments, 16)
+            if self._frag_error is None:
+                try:
+                    self._frag_index = self._table(self.frag_table, self.fragments, 16)
+                except _SQFS_READ_ERRORS as exc:
+                    self._frag_error = f"the fragment table could not be read ({exc})"
+                    self._damaged(f"{self._frag_error}, so no file that ends in a shared "
+                                  "fragment can be read to its end")
+            if self._frag_index is None:
+                raise SquashfsUnreadable(self._frag_error)
         if index >= self.fragments:
             raise SquashfsUnreadable(f"fragment {index} is beyond the table")
         start, size = struct.unpack_from("<QI", self._frag_index, index * 16)
@@ -12781,7 +12875,7 @@ class SquashfsWalker:
     def entry(self, ref):
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS:
             return None
         return ino["mode"], ino["size"], ino["mtime"]
 
@@ -12796,20 +12890,23 @@ class SquashfsWalker:
         """Why this volume cannot be read on this Python, or None. listdir()
         answers an empty list when its directory table cannot be decompressed,
         so volumes() carries this beside the volume to say why."""
-        if self.comp == 6 and _zstd_module() is None:
-            return SQUASHFS_NO_ZSTD_NOTE
-        return None
+        return _sqfs_no_decompressor(self.comp)
 
     def listdir(self, ref):
+        """[(name, node)] for a folder. A folder that cannot be read, or can be
+        read only in part, answers what was read and is recorded in ``damage``
+        and counted in ``folders_not_read``."""
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS as exc:
+            self._folder_part(ref, f"could not be read ({exc}), so nothing in it is listed "
+                                   "or exported")
             return []
         if ino["type"] not in (1, 8):
             return []
         out = []
         pos, off = self.dir_table + ino["dir_start"], ino["dir_off"]
-        left = ino["size"] - 3                       # "." and ".." are not stored
+        total = left = ino["size"] - 3               # "." and ".." are not stored
         try:
             while left > 0:
                 hdr, pos, off = self._meta_read(pos, off, 12)
@@ -12819,18 +12916,29 @@ class SquashfsWalker:
                     raise SquashfsUnreadable("directory header counts more than 256")
                 for _ in range(count + 1):
                     ent, pos, off = self._meta_read(pos, off, 8)
-                    ioff, _delta, _dtype, nlen = struct.unpack("<HhHH", ent)
+                    ioff, _delta, dtype, nlen = struct.unpack("<HhHH", ent)
                     if nlen + 1 > 256:
                         raise SquashfsUnreadable("directory entry name over 256 bytes")
                     name, pos, off = self._meta_read(pos, off, nlen + 1)
                     left -= 8 + nlen + 1
                     # the kernel copies the name's bytes and never decodes them
                     # (fs/squashfs/dir.c), so a stretch that is not UTF-8 is %XX
-                    out.append((name.decode("utf-8", "qnxprobe-name")
-                                .replace("\x00", "%00").replace("/", "%2F"),
-                                (start << 16) | ioff))
-        except (SquashfsUnreadable, DecompressError, struct.error):
-            pass                                     # report what was read
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
+                    child = (start << 16) | ioff
+                    out.append((name, child))
+                    if dtype == 1 and child not in self._folder_names:
+                        # the entry's own type field says it is a folder, so a
+                        # record about it can give its path
+                        self._folder_names[child], self._folder_parents[child] = name, ref
+        except _SQFS_READ_ERRORS as exc:             # report what was read
+            if out:
+                self._folder_part(ref, f"was listed in part: {len(out):,} entries were read "
+                                       f"and the last {left:,} of its {total:,} listing bytes "
+                                       f"could not be ({exc}), so entries are missing")
+            else:
+                self._folder_part(ref, f"could not be listed ({exc}), so nothing in it is "
+                                       "listed or exported")
         return out
 
     # -- file data ---------------------------------------------------------
@@ -12925,10 +13033,11 @@ def identify_squashfs(fh, base, size=None):
     if size is not None and w.bytes_used > size:
         lines.append(f"note         the image records {human(w.bytes_used)} but the region "
                      f"holds {human(size)}, so its end is missing")
-    if w.comp == 6 and _zstd_module() is None:
-        lines.append("note         " + SQUASHFS_NO_ZSTD_NOTE)
+    no_module = _sqfs_no_decompressor(w.comp)
+    if no_module:
+        lines.append("note         " + no_module)
     if not root_ok:
-        if w.comp == 6 and _zstd_module() is None:
+        if no_module:
             return "squashfs", lines
         return None
     return "squashfs", lines
@@ -40273,6 +40382,79 @@ def _squashfs_reader_checks():
     row("SquashFS: a stored name that is not UTF-8 comes back with those bytes as %XX and no "
         "surrogate, goes into SQLite, and is the zip member's name; two names that differ in "
         "one such byte stay apart; a symlink's target is read the same way", stored_names)
+
+    def not_read(run, module):
+        """Whether an export recorded its one volume as not read for want of ``module``."""
+        man, members, _said = run
+        rec = man[0] if man else {}
+        first = (rec.get("damage_first") or [""])[0]
+        return (not members and len(man) == 1 and rec.get("filesystem") == "squashfs"
+                and rec.get("files") == 0 and rec.get("folders_not_read") == 1
+                and rec.get("damage_recorded") == 1 and len(first) <= 240
+                and first.startswith("the root folder could not be read") and module in first
+                and _volumes_not_read(man) == 1)
+
+    def whole(run):
+        man, members, _said = run
+        return (len(members) == 612 and len(man) == 1 and man[0]["files"] == 612
+                and not man[0].get("damage_recorded") and not man[0].get("folders_not_read")
+                and not man[0]["failed"] and _volumes_not_read(man) == 0)
+
+    def without_zstd():
+        image = load("squashfs-zstd.img.gz")
+        if image is None:
+            return None
+        names = globals()
+        real = names["_zstd_module"]
+        try:
+            names["_zstd_module"] = lambda: None     # as on a Python older than 3.14
+            absent = export(image)
+        finally:
+            names["_zstd_module"] = real
+        said = (absent[0][0].get("damage_first") or [""])[0] if absent[0] else ""
+        if not (not_read(absent, "zstd") and "3.14" in said):
+            return False
+        return real() is None or whole(export(image))
+    row("SquashFS: a zstd volume on a Python with no zstd module is recorded as not read, "
+        "with a folder not read and a line that names zstd and Python 3.14, and counts for "
+        "the exit status; where zstd is present it reads whole with no record", without_zstd)
+
+    def without_module():
+        images = {c: load(f"squashfs-{c}.img.gz") for c in ("xz", "lzma", "gzip")}
+        if None in images.values():
+            return None
+
+        def absent(module, test):
+            """test() with "import <module>" failing, as on a Python built without it."""
+            held = sys.modules.get(module)
+            sys.modules[module] = None
+            try:
+                return test()
+            finally:
+                if held is None:
+                    del sys.modules[module]
+                else:
+                    sys.modules[module] = held
+
+        def no_lzma():
+            notes = {c: [v.get("note") for v in volumes(io.BytesIO(d), len(d))]
+                     for c, d in images.items()}
+            return {c: export(d) for c, d in images.items()}, notes
+
+        def no_zlib():
+            w = SquashfsWalker(io.BytesIO(images["gzip"]), 0)
+            return (w.listdir(w.root) == [] and w.folders_not_read == 1
+                    and "zlib module" in w.damage[0] and "zlib module" in (w.note or ""))
+
+        runs, notes = absent("lzma", no_lzma)
+        return (not_read(runs["xz"], "lzma module") and not_read(runs["lzma"], "lzma module")
+                and all("lzma module" in (notes[c][0] or "") for c in ("xz", "lzma"))
+                and whole(runs["gzip"]) and notes["gzip"] == [None]
+                and absent("zlib", no_zlib) and whole(export(images["xz"])))
+    row("SquashFS: with Python's lzma module absent, an xz and a legacy lzma volume are each "
+        "recorded as not read by a line and a note that name the module, and a gzip volume "
+        "still reads whole; a gzip volume without zlib is recorded the same way",
+        without_module)
     return out
 
 

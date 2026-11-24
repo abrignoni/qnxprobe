@@ -2537,6 +2537,18 @@ mksquashfs wrote from 20 entries, 10 of them with a path that is not UTF-8
 (`tools/make_squashfs_odd_fixture.sh`): every name matches the source tree's bytes under
 this rule and goes into SQLite, and the 18 files match their hashes.
 
+**A Python without the decompressor.** gzip is read with Python's `zlib` module, xz and
+the legacy lzma format with its `lzma` module, and zstd with `compression.zstd`, which
+Python has from 3.14. LZO and LZ4 are decoded by qnxprobe's own code, so nothing can be
+missing for them. When the running Python does not have the module a volume needs, the
+volume is still identified and its note names the module. mksquashfs compresses the
+metadata as well unless told not to, so the root folder cannot be read: an export records
+that in `volumes.json` as `folders_not_read` and a damage line that names the module,
+writes no file for the volume, and exits 1. A volume that uses another compressor still
+reads. This is tested for zstd on
+Python 3.10 and 3.12, which do not have it, and for `lzma` and `zlib` by making the import
+fail, because every Python at hand was built with both.
+
 ### JFFS2
 
 A log-structured filesystem with no superblock: the filesystem is whatever nodes the
@@ -4507,7 +4519,8 @@ above are in this README only for now.)
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
   the reason as the volume's note, so the report, the window and a LEAPP run log say why
-  it lists nothing. In UBIFS each file whose data
+  it lists nothing, and an export records the volume as not read and exits 1 (see
+  [SquashFS](#squashfs)). In UBIFS each file whose data
   is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
   were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
   JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is
