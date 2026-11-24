@@ -5310,7 +5310,7 @@ class NtfsWalker:
             return f"its runs store {clusters:,} clusters and this volume has " \
                    f"{self.total_clusters:,}"
         if self._room is not None:
-            needed = self._initialized_runs(data)
+            needed = self._read_set(data, size)
             held = self._room // self.cluster
             past = sum(max(0, lcn + run - max(lcn, held)) for lcn, run in needed)
             if past:
@@ -5321,31 +5321,66 @@ class NtfsWalker:
             return f"$Bitmap marks {marked:,} of the {clusters:,} clusters it reads as in use"
         return ""
 
-    def _initialized_runs(self, attr):
-        """[(lcn, clusters)] of an attribute's stored runs inside its initialized size: the
-        clusters a read of it uses. A piece that does not start at VCN 0 holds no sizes of
-        its own, so all of its stored runs count."""
-        if attr.start_vcn:
-            return [(lcn, count) for lcn, count in attr.runs if lcn is not None and count]
-        limit = -(-attr.init_size // self.cluster)
+    def _read_span(self, data, want, start=0):
+        """(where a read of an uncompressed attribute ends, where it stops taking bytes from
+        the runs). Past the second it reads as zeros: that is the initialized size."""
+        end = min(start + want, sum(count for _lcn, count in data.runs) * self.cluster)
+        return end, max(start, min(end, data.init_size)) if data.init_size else start
+
+    def _read_vcns(self, data, want, start=0):
+        """(first VCN, VCN past the last) that a read of ``want`` bytes from ``start`` fetches
+        from the runs. A compressed attribute is fetched in whole units, so this reaches
+        every stored cluster of each unit that starts below the initialized size."""
+        if data.compressed:
+            per = 1 << data.comp_unit
+            unit = per * self.cluster
+            first = (start // unit) * per
+            if want <= 0:
+                return first, first
+            units = -(-(want + start % unit) // unit)
+            below = data.init_size - first * self.cluster
+            valid = -(-below // unit) if below > 0 else 0
+            total = sum(count for _lcn, count in data.runs)
+            return first, max(first, min(first + min(units, valid) * per, total))
+        real = self._read_span(data, want, start)[1]
+        first = start // self.cluster
+        return first, -(-real // self.cluster) if real > start else first
+
+    def _read_set(self, data, want, start=0):
+        """[(lcn, clusters)] of exactly the stored clusters read_deleted() fetches for this
+        attribute. The read path takes its limits from _read_span and _read_vcns too, so
+        this and the read cannot differ."""
+        first, stop = self._read_vcns(data, want, start)
         out, vcn = [], 0
-        for lcn, count in attr.runs:
-            take = min(count, limit - vcn)
-            if take <= 0:
-                break
-            if lcn is not None:
-                out.append((lcn, take))
+        for lcn, count in data.runs:
+            low, high = max(vcn, first), min(vcn + count, stop)
+            if low < high and lcn is not None:
+                out.append((lcn + low - vcn, high - low))
             vcn += count
+            if vcn >= stop:
+                break
         return out
 
-    def _deleted_conflicts(self):
-        """{record: reason} for deleted records whose clusters another record also claims.
+    def _claim_runs(self, attr):
+        """[(lcn, clusters)] a deleted record's attribute claims: what a read of it would
+        fetch, so nothing past its own initialized size. A piece that does not start at VCN
+        0 holds no sizes of its own, so all of its stored runs count."""
+        if attr.start_vcn:
+            return [(lcn, count) for lcn, count in attr.runs if lcn is not None and count]
+        return self._read_set(attr, max(attr.data_size, attr.init_size))
 
-        A deleted record claims the clusters inside its initialized size, so a record with
-        an initialized size of 0 claims none. When two deleted records claim one cluster,
-        neither is offered: the volume does not record which wrote it last. The log sequence
-        number shows the last update of the record, not of its data. A record still in use
-        holds every cluster of its runs. Memory is one bit per cluster plus the runs of the
+    def _deleted_conflicts(self):
+        """{record: reason} for deleted records whose own read would use a cluster another
+        record claims.
+
+        A deleted record claims what a read of its unnamed stream fetches (_read_set), the
+        clusters of its named streams inside their own initialized sizes, and likewise for
+        any other non-resident attribute it holds, such as a deleted folder's index. A
+        stream with an initialized size of 0 claims nothing. A record in use claims every
+        stored cluster. When a record's read meets another's claim it is not offered: the
+        volume does not record which wrote last, and the log sequence number shows the last
+        update of a record, not of its data. A claim on a file's named stream alone does
+        not refuse its unnamed stream. Memory is one bit per cluster plus the runs of the
         records still in play."""
         if self._conflicts is not None:
             return self._conflicts
@@ -5354,8 +5389,8 @@ class NtfsWalker:
         if mft is None or not self.total_clusters:
             return self._conflicts
         count = mft.data_size // self.rec_size
-        claimed = bytearray((self.total_clusters + 7) // 8)
-        spans, sizes, live = [], {}, set()
+        wanted = bytearray((self.total_clusters + 7) // 8)
+        reads, claims, live = {}, {}, set()
         for num in range(count):
             raw = self._record_raw(num)
             parsed = self._parse_deleted(raw) if raw and raw[:4] == NTFS_FILE else None
@@ -5372,14 +5407,14 @@ class NtfsWalker:
             has_list = any(a.type == NTFS_ATTRIBUTE_LIST for a in attrs)
             if self._deleted_blocker(data, attrs, data.data_size, has_list):
                 continue
-            runs = self._initialized_runs(data)
-            if not runs:
+            spans = [(lcn, lcn + run) for lcn, run in self._read_set(data, data.data_size)]
+            if not spans:
                 continue
-            sizes[num] = sum(run for _lcn, run in runs)
-            for lcn, run in runs:
-                spans.append((lcn, lcn + run, num))
-                self._set_bits(claimed, lcn, lcn + run)
-        if not sizes:
+            reads[num] = self._merged_spans(spans)
+            claims[num] = list(reads[num])
+            for lcn, stop in reads[num]:
+                self._set_bits(wanted, lcn, stop)
+        if not reads:
             return self._conflicts
         for num in range(count):
             raw = self._record_raw(num)
@@ -5389,59 +5424,72 @@ class NtfsWalker:
             flags, attrs = parsed
             in_use = bool(flags & NTFS_MFT_IN_USE)
             for a in attrs:
-                if a.resident or (num in sizes and a.type == NTFS_DATA and not a.name):
+                if a.resident or (num in reads and a.type == NTFS_DATA and not a.name):
                     continue
-                runs = (a.runs if in_use else self._initialized_runs(a))
-                for lcn, run in runs:
+                for lcn, run in (a.runs if in_use else self._claim_runs(a)):
                     if lcn is None or lcn < 0 or not run:
                         continue
                     stop = min(lcn + run, self.total_clusters)
-                    if lcn < stop and self._bits_set(claimed, lcn, stop):
-                        spans.append((lcn, stop, num))
+                    if lcn < stop and self._bits_set(wanted, lcn, stop):
+                        claims.setdefault(num, []).append((lcn, stop))
                         if in_use:
                             live.add(num)
-        for num, (shared, other, is_live) in self._shared_clusters(spans, live, sizes).items():
-            self._conflicts[num] = (
-                f"{shared:,} of its {sizes[num]:,} clusters are also mapped by live record {other}"
-                if is_live else
-                f"{shared:,} of its {sizes[num]:,} clusters are also claimed by deleted record "
-                f"{other}, and the volume does not record which wrote last")
+        shared = self._shared_clusters(reads, claims)
+        for num, others in shared.items():
+            total = sum(stop - lcn for lcn, stop in reads[num])
+            # a live record is named first, then whichever shares the most
+            other = min(others, key=lambda o: (o not in live, -others[o], o))
+            text = (f"{others[other]:,} of its {total:,} clusters are also "
+                    + (f"mapped by live record {other}" if other in live
+                       else f"claimed by deleted record {other}"))
+            if len(others) > 1:
+                text += f", {len(others) - 1:,} other record(s) also share clusters with it"
+            if other not in live:
+                text += ", and the volume does not record which wrote last"
+            self._conflicts[num] = text
         return self._conflicts
 
     @staticmethod
-    def _shared_clusters(spans, live, candidates):
-        """{candidate: [clusters shared, the other record, whether that record is live]},
-        from one sweep over the spans in cluster order. A live record is named first."""
+    def _merged_spans(spans):
+        """[(start, stop)] sorted, with overlapping and touching spans joined."""
+        out = []
+        for low, high in sorted(spans):
+            if out and low <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], high))
+            else:
+                out.append((low, high))
+        return out
+
+    def _shared_clusters(self, reads, claims):
+        """{reader: {other record: clusters of the reader's read inside that record's claim}},
+        from one sweep in cluster order. Each record's spans are joined first, so a cluster
+        is counted once per pair however many of its attributes map it."""
         import heapq
-        spans.sort()
-        found, active, ends, index, at = {}, {}, [], 0, 0
-        while index < len(spans) or ends:
+        events = [(low, high, num, True) for num, spans in reads.items() for low, high in spans]
+        events += [(low, high, num, False) for num, spans in claims.items()
+                   for low, high in self._merged_spans(spans)]
+        events.sort()
+        found, reading, claiming, ends, index, at = {}, set(), set(), [], 0, 0
+        while index < len(events) or ends:
             if not ends:
-                at = spans[index][0]
-            while index < len(spans) and spans[index][0] == at:
-                _start, end, owner = spans[index]
-                active[owner] = active.get(owner, 0) + 1
-                heapq.heappush(ends, (end, owner))
+                at = events[index][0]
+            while index < len(events) and events[index][0] == at:
+                _low, high, num, is_read = events[index]
+                (reading if is_read else claiming).add(num)
+                heapq.heappush(ends, (high, num, is_read))
                 index += 1
             upto = ends[0][0]
-            if index < len(spans):
-                upto = min(upto, spans[index][0])
-            if len(active) > 1:
-                holder = min((o for o in active if o in live), default=None)
-                for owner in active:
-                    if owner not in candidates:
-                        continue
-                    other = holder if holder is not None else min(o for o in active if o != owner)
-                    row = found.setdefault(owner, [0, other, holder is not None])
-                    row[0] += upto - at
-                    if holder is not None and not row[2]:
-                        row[1], row[2] = holder, True
+            if index < len(events):
+                upto = min(upto, events[index][0])
+            for reader in reading:
+                for other in claiming:
+                    if other != reader:
+                        row = found.setdefault(reader, {})
+                        row[other] = row.get(other, 0) + upto - at
             at = upto
             while ends and ends[0][0] == at:
-                _end, owner = heapq.heappop(ends)
-                active[owner] -= 1
-                if not active[owner]:
-                    del active[owner]
+                _high, num, is_read = heapq.heappop(ends)
+                (reading if is_read else claiming).discard(num)
         return found
 
     def _read_bitmap(self, size):
@@ -5511,10 +5559,11 @@ class NtfsWalker:
 
         Each result carries ``recoverable``: True for a resident file, and for a
         non-resident one while every cluster it used is free, its initialized size is
-        not 0, the image holds every cluster its read needs, and no live record maps one
-        of them and no other deleted record claims one. Two deleted records that claim one
-        cluster are both refused, each naming the other, because the volume does not
-        record which wrote it last. False otherwise, in which case the record is reported
+        not 0, the image holds every cluster its read fetches (_read_set), and no other
+        record claims one of those clusters. A refused record names the record it shares
+        the most with, how many clusters of its read that is, and how many other records
+        share with it, because the volume does not record which wrote last. A claim on a
+        file's named stream alone does not refuse its unnamed stream. False otherwise, in which case the record is reported
         as evidence the file existed rather than its content offered. A reuse by a file
         whose own record has since been overwritten leaves no trace, so recovered bytes
         are a candidate, not a proven copy. A file the
@@ -6659,8 +6708,7 @@ class NtfsWalker:
         if data.compressed:
             yield from self._read_compressed(data, want, start, owner)
             return
-        end = min(start + want, sum(count for _lcn, count in data.runs) * self.cluster)
-        real = max(start, min(end, data.init_size)) if data.init_size else start
+        end, real = self._read_span(data, want, start)
         pos = start
         gaps = []
         while pos < real:
@@ -6698,12 +6746,13 @@ class NtfsWalker:
         total_vcn = vcn
         drop = start % unit
         gaps = []
+        fetch_to = self._read_vcns(data, want, start)[1]
         for first in range((start // unit) * vcn_per_unit, total_vcn, vcn_per_unit):
             if produced >= want:
                 break
             before = EOF_SHORTFALL["bytes"]
             unit_at = first * self.cluster
-            raw, whole = ((None, True) if unit_at >= data.init_size
+            raw, whole = ((None, True) if first >= fetch_to
                           else self._unit_bytes(table, first, vcn_per_unit))
             if raw is None or not whole:          # wholly sparse, or cut by the image's end
                 out = b"\x00" * unit
@@ -37762,6 +37811,91 @@ def _ntfs_reader_fix_checks(image_gz):
         said = damage(w)
         return f"deleted record {spare[0]}:" in said and "a file:" not in said
     row("a deleted file's missing range is recorded under its own record", deleted_gap_names_owner)
+
+    def compressed_attr(runs, size, init):
+        attr = bytearray(nonresident(NTFS_DATA, "", 0, 15, runs, 16 * cluster, size, init))
+        struct.pack_into("<H", attr, 12, NTFS_ATTR_COMPRESSED)
+        struct.pack_into("<H", attr, 34, 4)
+        return bytes(attr)
+
+    def compressed_unit_claimed():
+        free = quiet(3)
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, compressed_attr(
+            [(free[0], 1), (free[1], 1), (None, 14)], 8192, 100))], 100))
+        put(img, spare[1], free_rec([0x62], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 1, [(free[1], 1), (free[2], 1)], 2 * cluster, 2 * cluster))], 200))
+        got = {e.record: e for e in walker(img).deleted_files()}
+        return (not got[spare[0]].recoverable and not got[spare[1]].recoverable
+                and got[spare[0]].reason.startswith(
+                    f"1 of its 2 clusters are also claimed by deleted record {spare[1]}"))
+    row("every stored cluster of a compressed unit a read fetches counts as its claim",
+        compressed_unit_claimed)
+
+    def read_set_matches_read():
+        node = names["comp/text.bin"]
+        source = next(a for t, a in attrs_of(plain(clean, node)) if t == NTFS_DATA)
+        for init in (100, 70000, ref.entry(node)[1]):
+            attr = bytearray(source)
+            struct.pack_into("<Q", attr, 56, init)
+            img = bytearray(clean)
+            put(img, spare[0], free_rec([0x63], [(NTFS_DATA, bytes(attr))], 100))
+            w = walker(img)
+            got = next(e for e in w.deleted_files() if e.record == spare[0])
+            seen = set()
+            real = w._read_clusters                  # pylint: disable=protected-access
+
+            def spy(lcn, skip, take):
+                if take > 0:
+                    seen.update(range(lcn + skip // cluster,
+                                      lcn + (skip + take - 1) // cluster + 1))
+                return real(lcn, skip, take)
+            w._read_clusters = spy                   # pylint: disable=protected-access
+            got.recoverable = True
+            b"".join(w.read_deleted(got))
+            model = {lcn + i for lcn, n in w._read_set(got._data, got.size)  # pylint: disable=protected-access
+                     for i in range(n)}
+            if not seen or seen != model:
+                return False
+        return True
+    row("the clusters read_deleted fetches are exactly its read set", read_set_matches_read)
+
+    def named_stream_case(stream_init):
+        free = quiet(3)
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [
+            (NTFS_DATA, nonresident(NTFS_DATA, "", 0, 0, [(free[0], 1)], cluster, cluster)),
+            (NTFS_DATA, nonresident(NTFS_DATA, "s", 0, 0, [(free[1], 1)], cluster, cluster,
+                                    stream_init))], 100))
+        put(img, spare[1], free_rec([0x62], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 0, [(free[1], 1)], cluster, cluster))], 200))
+        return {e.record: e for e in walker(img).deleted_files()}
+
+    def named_stream_claims():
+        got = named_stream_case(cluster)
+        none = named_stream_case(0)
+        return (got[spare[0]].recoverable and not got[spare[1]].recoverable
+                and f"deleted record {spare[0]}" in got[spare[1]].reason
+                and none[spare[0]].recoverable and none[spare[1]].recoverable)
+    row("a named stream's claim refuses the other file and not its own unnamed stream",
+        named_stream_claims)
+
+    def reason_counts_one_record():
+        free = quiet(4)
+        size = 3 * cluster
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 2, [(c, 1) for c in free[:3]], size, size))], 100))
+        put(img, spare[1], free_rec([0x62], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 1, [(free[0], 1), (free[1], 1)], 2 * cluster, 2 * cluster))], 200))
+        put(img, spare[2], free_rec([0x63], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 1, [(free[2], 1), (free[3], 1)], 2 * cluster, 2 * cluster))], 300))
+        got = next(e for e in walker(img).deleted_files() if e.record == spare[0])
+        return got.reason == (f"2 of its 3 clusters are also claimed by deleted record {spare[1]}, "
+                              "1 other record(s) also share clusters with it, and the volume "
+                              "does not record which wrote last")
+    row("a refusal counts what it shares with the record it names, and how many others",
+        reason_counts_one_record)
 
     def shared_live():
         got = shared_case(900, 100, live=True)

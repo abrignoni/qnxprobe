@@ -1441,12 +1441,17 @@ file: its name, size, dates, and whether the content can still be read. A file w
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
 could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
-used as free, its initialized size is not 0, the image holds every cluster its read needs,
-and no other record has a claim on those clusters. A deleted record claims the clusters
-inside its initialized size. When two deleted records claim one cluster, both are refused,
-because the volume does not record which wrote it last: a later log sequence number shows
-a later update of the record, not of its data. A deleted record sharing a cluster with a
-live record is refused too. The `reason` gives the count and names the other record. A
+used as free, its initialized size is not 0, the image holds every cluster its read
+fetches, and no other record claims one of those clusters. The clusters a read fetches
+stop at the initialized size, except that a compressed file is fetched in whole units, so
+every stored cluster of a unit that starts below that size counts. A deleted record claims
+those clusters and the clusters of its named streams inside their own initialized sizes. A
+record in use claims all of its stored clusters. When a file's read meets another record's
+claim the file is refused, because the volume does not record which wrote last: a later
+log sequence number shows a later update of the record, not of its data. A claim that
+touches only a file's named stream does not refuse its unnamed stream. The `reason` names
+the record the file shares the most with (a live record first), how many of the clusters
+its read uses are shared with that record, and how many other records also share. A
 reuse by a file whose own record has since been overwritten leaves no trace, so a recovered
 file's bytes are still a candidate, not a proven copy. A deleted file the overlay filter
 compressed, or a cloud placeholder, is reported as not recoverable, since its content is
