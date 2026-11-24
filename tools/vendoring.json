@@ -28,6 +28,8 @@
         {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "stark4n6/Arc2Lite", "manifest": "vendor/vendored.json", "external": true},
+        {"repo": "abrignoni/MLEAPP", "manifest": "mleapp/vendor/vendored.json"},
+        {"repo": "abrignoni/dpapiprobe", "copy": "dpapiprobe/vendor/qnxprobe.py"},
         {"repo": "kalink0/crush-forensics", "copy": "crush/third_party/qnxprobe/qnxprobe.py",
          "external": true}
       ]
@@ -45,6 +47,8 @@
         {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "stark4n6/Arc2Lite", "manifest": "vendor/vendored.json", "external": true},
+        {"repo": "abrignoni/MLEAPP", "manifest": "mleapp/vendor/vendored.json"},
+        {"repo": "abrignoni/dpapiprobe", "copy": "dpapiprobe/vendor/ewfprobe.py"},
         {"repo": "kalink0/crush-forensics", "copy": "crush/third_party/ewfprobe/ewfprobe.py",
          "external": true}
       ]
