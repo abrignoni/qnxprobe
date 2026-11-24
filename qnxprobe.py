@@ -19992,6 +19992,11 @@ def identify_jffs2(fh, base, size=None):
 #     whose data CRC fails
 #   a static volume's LEB holds data_size     drivers/mtd/ubi/attach.c,
 #     bytes; an unmapped LEB reads as 0xFF      drivers/mtd/ubi/eba.c
+#   a static volume with fewer LEBs than its  drivers/mtd/ubi/vtbl.c:593-616
+#     used_ebs is marked corrupted; one with    init_volumes
+#     no LEB at all is taken to be empty
+#   a volume name is name_len bytes with no   drivers/mtd/ubi/vtbl.c:234-247
+#     NUL among them; nothing else is checked   vtbl_check
 #
 # The PEB size is recorded nowhere; it is the distance between EC headers.
 # ---------------------------------------------------------------------------
@@ -20005,6 +20010,15 @@ UBI_CONTAINER = (1 << 63) - 1
 
 class UbiUnreadable(Exception):
     """A UBI structure this reader cannot use; the message says which."""
+
+
+# Every eraseblock of a UBI device opens with an erase counter header, and the volume
+# table is kept twice, in two eraseblocks. A region with one such header and no second
+# one is therefore part of a UBI image, and its eraseblock size cannot be measured.
+UBI_ONE_HEADER = ("an erase counter header whose CRC holds opens it and no second one "
+                  "follows, so at most one eraseblock of a UBI image is here ({size:,} "
+                  "bytes): its eraseblock size is not known, and the volume table and the "
+                  "volumes cannot be read")
 
 
 def _ubi_crc(data):
@@ -20117,7 +20131,12 @@ def ubi_peb_size(fh, base, size):
 
 
 class UbiImage:
-    """The PEB map and volume table of a UBI image at `base`."""
+    """The PEB map and volume table of a UBI image at `base`.
+
+    ``damage`` says what the image could not give and ``lost`` counts the entries of it
+    that mean data is missing (an entry starting "note:" is not one). ``partial`` is the
+    VID header of an eraseblock the data ends inside, when it reads: that eraseblock is
+    not mapped, and its header is kept only for what it records."""
 
     def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
@@ -20127,12 +20146,15 @@ class UbiImage:
         if ec0 is None:
             raise UbiUnreadable("no UBI erase counter header at the start")
         self.vid_off, self.data_off, self.image_seq, _ = ec0
-        self.peb = ubi_peb_size(fh, base, size) or size
+        found = ubi_peb_size(fh, base, size)
+        self.peb_known, self.peb = found is not None, found or size
         if not (0 < self.vid_off < self.peb and 0 < self.data_off < self.peb):
-            raise UbiUnreadable("EC header offsets do not fit the eraseblock")
+            raise UbiUnreadable("EC header offsets do not fit the eraseblock" if found
+                                else UBI_ONE_HEADER.format(size=size))
         self.leb_size = self.peb - self.data_off
         self.npebs = size // self.peb
         self.stats = collections.Counter()
+        self.damage, self.lost, self.partial = [], 0, None
         cands = collections.defaultdict(list)
         for p in range(self.npebs):
             at = base + p * self.peb
@@ -20169,7 +20191,66 @@ class UbiImage:
                 if len(vids) - i - 1:
                     self.stats["an older copy of a block, not the one read"] += len(vids) - i - 1
                 break
+        self._ends_inside(size)
         self.volumes = self._volume_table()
+
+    def _ends_inside(self, size):
+        """Record an eraseblock the data ends inside. Only whole eraseblocks are mapped,
+        so this one is not read; its headers, when they are there, say what it held."""
+        tail = size - self.npebs * self.peb
+        if tail <= 0:
+            return
+        at = self.base + self.npebs * self.peb
+        head = read_at(self.fh, at, min(tail, 64))
+        if not head or head[:4] != UBI_EC_MAGIC[:len(head[:4])]:
+            # Not an eraseblock of UBI: blank flash holds nothing, anything else is noted.
+            blank = True
+            for pos in range(0, tail, 1 << 20):
+                chunk = read_at(self.fh, at + pos, min(1 << 20, tail - pos))
+                if chunk.strip(b"\xff") or not chunk:
+                    blank = False
+                    break
+            if not blank:
+                self.damage.append(f"note: the UBI data is followed by {tail:,} bytes that are not "
+                                   f"a whole eraseblock ({self.peb:,} bytes) and do not open with "
+                                   "a UBI erase counter header; they are not read as UBI")
+            return
+        said = (f"the UBI data ends {tail:,} bytes into an eraseblock of {self.peb:,} bytes, "
+                "which is not read")
+        ec = _ubi_ec(head)
+        if ec is None:
+            self.lost += 1
+            self.damage.append(f"{said}: its erase counter header does not read, so what it "
+                               "held is not known")
+            return
+        if ec[2] != self.image_seq:
+            self.damage.append(f"note: {said}; it carries another image sequence number, so "
+                               "it is not an eraseblock of this UBI image")
+            return
+        raw = read_at(self.fh, at + ec[0], 64) if ec[0] + 64 <= tail else b""
+        vid = _ubi_vid(raw)
+        if vid is None:
+            if raw == b"\xff" * 64:
+                self.damage.append(f"note: {said}; its volume header is blank, as a free "
+                                   "eraseblock's is")
+                return
+            self.lost += 1
+            self.damage.append(f"{said}: its volume header does not read, so what it held is "
+                               "not known")
+            return
+        self.partial = vid
+        what = (f"logical eraseblock {vid['lnum']} of "
+                + ("the volume table" if vid["vol_id"] == UBI_LAYOUT_VOL
+                   else f"volume {vid['vol_id']}"))
+        have = self.map.get((vid["vol_id"], vid["lnum"]))
+        if have is not None and have["sqnum"] > vid["sqnum"]:
+            self.damage.append(f"note: {said}; it holds an older copy of {what}, and the newer "
+                               "copy is the one read")
+            return
+        self.lost += 1
+        self.damage.append(f"{said}: it holds " + (
+            f"the newest copy of {what}, so an older copy is read in its place"
+            if have is not None else f"{what}, so that block is missing from what is read"))
 
     def _data_ok(self, vid):
         data = read_at(self.fh, vid["data_at"], vid["data_size"])
@@ -20194,7 +20275,8 @@ class UbiImage:
                 reserved, align, data_pad, vtype, upd, nlen = struct.unpack_from(">IIIBBH", rec, 0)
                 if not reserved:
                     continue
-                name = rec[16:16 + min(nlen, 127)].decode("utf-8", "replace")
+                name = (rec[16:16 + min(nlen, 127)].decode("utf-8", "qnxprobe-name")
+                        .replace("\x00", "%00").replace("/", "%2F"))
                 vols.append(dict(id=i, name=name, type=vtype, reserved=reserved,
                                  data_pad=data_pad, update_marker=upd,
                                  flags=rec[144]))
@@ -20212,7 +20294,14 @@ class UbiImage:
 
 class UbiVolumeView:
     """One UBI volume read as a flat file: LEB n at n * usable LEB size, an
-    unmapped LEB as 0xFF, a static volume ending where its data ends."""
+    unmapped LEB as 0xFF, a static volume ending where its data ends.
+
+    A static volume records how many LEBs it uses (used_ebs, in every VID header) and
+    its last LEB records where the data ends. When fewer are here than it records, the
+    kernel marks the volume corrupted (vtbl.c init_volumes), and ``short`` is
+    (LEBs here, LEBs recorded, whether the size is recorded): a read then stops at the
+    first LEB that is missing and nothing is put in its place. With the last LEB's
+    header gone the size is the most those LEBs can hold."""
 
     def __init__(self, ubi, vol):
         self.ubi, self.vol = ubi, vol
@@ -20220,10 +20309,15 @@ class UbiVolumeView:
         lebs = {k[1]: v for k, v in ubi.map.items() if k[0] == vol["id"]}
         self.lebs = lebs
         self.name = vol["name"]
-        if vol["type"] == 2 and lebs:
-            used = next(iter(lebs.values()))["used_ebs"]
-            last = lebs.get(used - 1)
+        self.short = None
+        cut = ubi.partial if ubi.partial and ubi.partial["vol_id"] == vol["id"] else None
+        if vol["type"] == 2 and (lebs or cut):
+            used = (next(iter(lebs.values())) if lebs else cut)["used_ebs"]
+            last = lebs.get(used - 1) or (cut if cut and cut["lnum"] == used - 1 else None)
             self.size = (used - 1) * self.leb + (last["data_size"] if last else self.leb)
+            held = sum(1 for n in range(used) if n in lebs)
+            if held < used:
+                self.short = (held, used, last is not None)
         else:
             self.size = ((max(lebs) + 1) if lebs else 0) * self.leb
         self._pos = 0
@@ -20247,6 +20341,8 @@ class UbiVolumeView:
             take = min(self.leb - off, end - pos)
             vid = self.lebs.get(lnum)
             if vid is None:
+                if self.short:
+                    break
                 out += b"\xff" * take
             else:
                 chunk = read_at(self.ubi.fh, vid["data_at"] + off, take)
@@ -20263,7 +20359,14 @@ class UbiWalker:
     SquashFS is walked as that filesystem under the volume's name; any other
     volume (a kernel, a device tree, an environment) is one regular file of
     the volume's bytes. A node carries the volume index in its top bits and
-    the inner filesystem's own node below them."""
+    the inner filesystem's own node below them.
+
+    ``damage`` lists what could not be read, here and in each volume's own
+    filesystem, and ``folders_not_read`` counts the entries of it that mean data is
+    missing: an eraseblock the data ends inside, a dump that ends inside a NAND page,
+    a volume table that does not read, a static volume with fewer eraseblocks than it
+    records, and a volume that opens as a filesystem and could not be read as one.
+    ``unread_entries()`` names the files whose inode a UBIFS volume could not read."""
 
     root = UBI_CONTAINER
 
@@ -20271,6 +20374,7 @@ class UbiWalker:
         if size is None:
             size = image_size(fh) - base
         self.ubi, self.nand = UbiImage(fh, base, size), None
+        self._damage, self._lost = [], 0
         # On a raw NAND dump the spare bytes after each page shift everything
         # past an eraseblock's first page. The EC and VID headers may still read
         # (a VID header in a 512-byte subpage lies inside the first page), but
@@ -20286,12 +20390,47 @@ class UbiWalker:
                 if trial.vtbl_ok:
                     self.ubi, self.nand = trial, (page, spare)
                     break
+        # A dump that ends inside a page is a whole number of pages in no geometry.
+        # Each is tried again over the whole pages that are there, and the part of a
+        # page after them is recorded as not read.
+        if not self.ubi.vtbl_ok:
+            for page, spare in YAFFS_GEOMETRIES:
+                rest = size % (page + spare)
+                if not rest or size < page + spare:
+                    continue
+                view = NandDataView(fh, base, size, page, spare)
+                try:
+                    trial = UbiImage(view, 0, view.size)
+                except UbiUnreadable:
+                    continue
+                if trial.vtbl_ok:
+                    self.ubi, self.nand = trial, (page, spare)
+                    self._lose(f"the dump is not a whole number of NAND pages ({page} data "
+                               f"bytes and {spare} spare bytes each): its last {rest:,} bytes "
+                               "are part of a page and are not read")
+                    break
+        if not self.ubi.peb_known:
+            raise UbiUnreadable(UBI_ONE_HEADER.format(size=size))
+        if not self.ubi.vtbl_ok:
+            self._lose("the UBI volume table does not read, so the volumes' names, types and "
+                       "padding are not known: each volume number with mapped eraseblocks is "
+                       "read as vol<number>, up to its highest mapped eraseblock, with no "
+                       "padding taken off")
         self.inner = []                        # (volume, view, walker or None, note)
         for vol in self.ubi.volumes:
             view = self.ubi.volume_view(vol)
+            if view.short:
+                self._lose(self._short_text(view, True))
+            elif vol["type"] == 2 and not view.lebs:
+                self._damage.append(
+                    f"note: static volume {vol['id']} has no eraseblock here and is listed "
+                    "as an empty file; UBI records a static volume's size only in its "
+                    "eraseblocks, so an empty volume and one whose eraseblocks are missing "
+                    f"look the same: {vol['name']}")
             walker, kind = None, "raw"
             head = view.read(8) if view.size else b""
             view.seek(0)
+            what = ("SquashFS" if head[:4] == b"hsqs" else "UBIFS")
             try:
                 if head[:4] == b"hsqs":
                     walker, kind = SquashfsWalker(view, 0), "squashfs"
@@ -20299,7 +20438,74 @@ class UbiWalker:
                     walker, kind = UbifsWalker(view, 0), "ubifs"
             except Exception as exc:          # a volume that will not open is a file
                 walker, kind = None, f"raw ({type(exc).__name__}: {exc})"
+                self._lose(f"volume {vol['id']} opens as {what} and could not be read as it "
+                           f"({str(exc)[:70]}), so it is exported as one file of its raw bytes "
+                           f"and none of the files in it are listed: {vol['name']}")
             self.inner.append((vol, view, walker, kind))
+        # The volume table alone. ubinize writes a dynamic volume with no data as no
+        # eraseblock at all, and the kernel reads it as empty, so this is a note: an
+        # empty device and one whose volumes' eraseblocks were cut away look the same.
+        if self.ubi.vtbl_ok and self.inner and not any(view.lebs for _v, view, _w, _k
+                                                       in self.inner):
+            self._damage.append(
+                f"note: the volume table lists {len(self.inner):,} volume(s) and no "
+                f"eraseblock of any of them is here, in {self.ubi.npebs:,} eraseblock(s): "
+                "each is listed as an empty file; a volume written with no data and one "
+                "whose eraseblocks are missing look the same")
+
+    def _lose(self, what):
+        """Record something that could not be read, counted in folders_not_read."""
+        self._damage.append(what)
+        self._lost += 1
+
+    @staticmethod
+    def _short_text(view, named):
+        """What a static volume short of its eraseblocks holds, for the volume's record
+        (with its number and name) and for its file's own SHORT row (without)."""
+        held, used, sized = view.short
+        rest = ", so it is read only up to the first one that is missing"
+        if not sized:
+            rest += (f"; the last one records where the data ends, so {view.size:,} bytes is "
+                     "the most it can hold and not a recorded size")
+        if named:
+            return (f"static volume {view.vol['id']} has {held:,} of the {used:,} eraseblocks "
+                    f"it records{rest}: {view.vol['name']}")
+        return f"{held:,} of the {used:,} eraseblocks this static volume records are here{rest}"
+
+    @property
+    def damage(self):
+        out = list(self.ubi.damage) + list(self._damage)
+        for vol, _view, walker, _kind in self.inner:
+            out.extend(f"volume {vol['id']}: {line}"
+                       for line in getattr(walker, "damage", None) or ())
+        return out
+
+    @property
+    def folders_not_read(self):
+        return (self.ubi.lost + self._lost
+                + sum(getattr(walker, "folders_not_read", 0) or 0
+                      for _vol, _view, walker, _kind in self.inner))
+
+    def unread_entries(self):
+        """[(path, inode number)] of every name in a volume's filesystem whose inode could
+        not be read, with the path given the way this walker lists it."""
+        out = []
+        for vol, _view, walker, _kind in self.inner:
+            report = getattr(walker, "unread_entries", None)
+            if report is not None:
+                top = vol["name"] or f"vol{vol['id']}"
+                out.extend((f"{top}/{path}", node) for path, node in report())
+        return out
+
+    def run_shortfall(self, node):
+        """Why a static volume listed as a file read short, as text, else None."""
+        if node == UBI_CONTAINER:
+            return None
+        i, _inner = self._split(node)
+        _vol, view, walker, _kind = self.inner[i]
+        if walker is None and view.short:
+            return self._short_text(view, False)
+        return None
 
     def _split(self, node):
         return node >> UBI_NODE_SHIFT, node & ((1 << UBI_NODE_SHIFT) - 1)
@@ -20380,8 +20586,9 @@ def identify_ubi(fh, base, size=None):
         size = image_size(fh) - base
     try:
         w = UbiWalker(fh, base, size)
-    except UbiUnreadable:
-        return None
+    except UbiUnreadable as exc:
+        # The header's CRC holds, so this is UBI; the export records why it is not read.
+        return "ubi", [f"damaged      {exc}"]
     _remember_walker(fh, base, size, "ubi", w)
     u = w.ubi
     if not u.stats["mapped"]:
@@ -20432,6 +20639,12 @@ def identify_ubi(fh, base, size=None):
 #   data node compression: LZO1X, raw deflate fs/ubifs/compress.c,
 #     (the kernel's "deflate"), zstd            crypto/deflate.c
 #   a missing data block is a hole            fs/ubifs/file.c read_block
+#   an inode's seconds are read as signed     fs/ubifs/super.c:141-145 ubifs_iget
+#     64-bit, so a time before 1970 is held
+#   the log's first LEB always opens with the fs/ubifs/replay.c:1006-1030
+#     commit start node of the current         replay_log_leb, and 1203-1217
+#     commit; the kernel does not mount         ubifs_replay_journal
+#     without it
 # ---------------------------------------------------------------------------
 UBIFS_MAGIC = 0x06101831
 UBIFS_BIT_REPAIR_NOTE = ("bit errors   {n:,} node(s){where} failed their CRC by one flipped bit "
@@ -20481,17 +20694,30 @@ def _ubifs_truncate(blocks, old, new):
         del blocks[blk]
 
 
+def _ubifs_name(raw):
+    """One stored name as text: bytes that are not UTF-8 as %XX, a NUL as %00 and a
+    slash as %2F, so a name is never a surrogate and never invents a folder."""
+    return raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
 class UbifsWalker:
     """List and read a UBIFS volume: the committed index, with the journal
     replayed over it. The volume is a flat file of LEBs (a UBI volume view, or
-    the output of mkfs.ubifs itself); a node is an inode number."""
+    the output of mkfs.ubifs itself); a node is an inode number.
+
+    ``damage`` lists the index nodes and directory entry nodes that did not read and a
+    journal that could not be replayed, and each one counts in ``folders_not_read``,
+    because what an unread index node or an unreplayed journal held is not known: names,
+    inodes and data blocks alike. ``unread_entries()`` names the entries whose inode
+    node could not be read."""
 
     root = 1
 
-    def __init__(self, fh, base):
+    def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
         self.leb_size = 0                      # LEB 0 is read before the size is known
         self.stats = collections.Counter()
+        self.damage, self.folders_not_read = [], 0
         self.bit_repairs = set()               # (lnum, offs) of nodes read with one bit restored
         sb = self._node(0, 0)
         if sb is None or sb[20] != UBIFS_SB_NODE:
@@ -20507,12 +20733,39 @@ class UbifsWalker:
             raise UbifsUnreadable("implausible LEB size")
         self.master = self._master()
         if self.master is None:
-            raise UbifsUnreadable("no master node reads in LEB 1 or 2")
+            total = self.leb_cnt * self.leb_size
+            raise UbifsUnreadable("no master node reads in LEB 1 or 2" + (
+                f": the superblock records {self.leb_cnt:,} eraseblocks of {self.leb_size:,} "
+                f"bytes, and {total - size:,} of those {total:,} bytes lie past the end of "
+                "the image" if size is not None and total > size else ""))
         self.inodes, self.data, self.dents = {}, collections.defaultdict(dict), \
             collections.defaultdict(dict)
         self._walk_index()
         self._replay()
         self._ino_cache = {}
+        lost = self.stats["unreadable index nodes"]
+        if lost:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"{lost:,} index node(s) did not read, so the names, inodes and data blocks "
+                "they index are not known here: files and folders may be missing, and a block "
+                "of a listed file may read as zeros, as a hole does")
+        why = ("holds no node, and the kernel requires the current commit's start node there"
+               if self.stats["log head with no node"] else
+               "does not open with the current commit's start node, which the kernel requires"
+               if self.stats["log does not open with this commit"] else None)
+        if why:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"the journal was not replayed: the log's first eraseblock (LEB "
+                f"{self.master['log_lnum']:,}) {why}, so what was written since the last "
+                "commit is not listed")
+        lost = self.stats["unreadable directory entries"]
+        if lost:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"{lost:,} directory entry node(s) the index points to did not read, so "
+                "those names are not listed and neither is anything under them")
 
     # -- nodes ---------------------------------------------------------------
     def _node(self, lnum, offs, length=None, want=None):
@@ -20651,7 +20904,7 @@ class UbifsWalker:
     def _dent(raw):
         target = struct.unpack_from("<Q", raw, 40)[0]
         dtype, nlen = raw[49], struct.unpack_from("<H", raw, 50)[0]
-        return target, dtype, raw[56:56 + nlen].decode("utf-8", "surrogateescape")
+        return target, dtype, bytes(raw[56:56 + nlen])       # as stored: _ubifs_name() shows it
 
     # -- the journal ---------------------------------------------------------
     def _replay(self):
@@ -20662,6 +20915,8 @@ class UbifsWalker:
         for _ in range(self.log_lebs):
             nodes = self._scan_leb(lnum, 0)
             if not nodes:
+                if cs_sqnum is None:
+                    self.stats["log head with no node"] += 1
                 break
             if cs_sqnum is None:
                 first = nodes[0][1]
@@ -20729,7 +20984,7 @@ class UbifsWalker:
         raw = self._node(loc[0], loc[1], loc[2], UBIFS_INO_NODE) if loc else None
         if raw is None:
             return None
-        size, _at, _ct, mtime = struct.unpack_from("<QQQQ", raw, 48)
+        size, _at, _ct, mtime = struct.unpack_from("<Qqqq", raw, 48)
         nlink, uid, gid, mode, flags, dlen = struct.unpack_from("<IIIIII", raw, 92)
         ino = dict(size=size, mtime=mtime, nlink=nlink, uid=uid, gid=gid, mode=mode,
                    flags=flags, data=raw[160:160 + dlen])
@@ -20744,11 +20999,32 @@ class UbifsWalker:
         return ino["mode"], ino["size"], ino["mtime"]
 
     def listdir(self, inum):
-        return sorted((name, t) for name, (t, _dt) in self.dents.get(inum, {}).items())
+        # two stored names that show as the same text keep the order of their bytes
+        return [(shown, t) for shown, _raw, t in sorted(
+            (_ubifs_name(name), name, t) for name, (t, _dt) in self.dents.get(inum, {}).items())]
+
+    def unread_entries(self):
+        """[(path, inode number)] of every name whose inode node could not be read, or
+        that the index holds no inode for. collect() passes over these, so the export
+        records them from here."""
+        out, stack, seen = [], [(self.root, "", 0)], set()
+        while stack:
+            inum, prefix, depth = stack.pop()
+            if inum in seen or depth > 64:
+                continue
+            seen.add(inum)
+            for name, child in self.listdir(inum):
+                path = f"{prefix}/{name}" if prefix else name
+                ino = self._ino(child)
+                if ino is None:
+                    out.append((path, child))
+                elif ino["mode"] & S_IFMT == S_IFDIR:
+                    stack.append((child, path, depth + 1))
+        return sorted(out)
 
     def readlink(self, inum):
         ino = self._ino(inum)
-        return ino["data"].decode("utf-8", "surrogateescape") if ino else ""
+        return ino["data"].decode("utf-8", "qnxprobe-name") if ino else ""
 
     def read_file(self, inum, size):
         ino = self._ino(inum)
@@ -20805,13 +21081,13 @@ class UbifsWalker:
                     parent = self._key(raw, 24)[0]
                     target, _dtype, name = self._dent(raw)
                     if target and target not in self.inodes:
-                        names[target].append((sq, parent, name))
+                        names[target].append((sq, parent, _ubifs_name(name)))
                     continue
                 inum = struct.unpack_from("<I", raw, 24)[0]
                 if inum in self.inodes:
                     continue
                 if t == UBIFS_INO_NODE:
-                    size, _at, _ct, mtime = struct.unpack_from("<QQQQ", raw, 48)
+                    size, _at, _ct, mtime = struct.unpack_from("<Qqqq", raw, 48)
                     nlink, _uid, _gid, mode, flags = struct.unpack_from("<IIIII", raw, 92)
                     inos[inum].append((sq, nlink, size, mtime, mode, flags))
                 elif t == UBIFS_DATA_NODE:
@@ -20881,12 +21157,22 @@ def identify_ubifs(fh, base, size=None):
     if len(head) < 24 or struct.unpack_from("<I", head, 0)[0] != UBIFS_MAGIC \
             or head[20] != UBIFS_SB_NODE:
         return None
-    try:
-        w = UbifsWalker(fh, base)
-    except UbifsUnreadable:
-        return None
     if size is None:
         size = image_size(fh) - base
+    try:
+        w = UbifsWalker(fh, base, size)
+    except UbifsUnreadable as exc:
+        # A superblock node whose CRC holds, of a volume that reaches past the end of
+        # the region, is a cut UBIFS volume; the export records why it is not read.
+        nlen = struct.unpack_from("<I", head, 16)[0]
+        raw = read_at(fh, base, nlen) if 124 <= nlen <= 1 << 20 else b""
+        if len(raw) < nlen or not raw or _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+            return None
+        leb_size, leb_cnt = struct.unpack_from("<II", raw, 36)
+        if not 4096 <= leb_size <= 16 << 20 or leb_cnt * leb_size <= size:
+            return None
+        return "ubifs", [f"format       {human(leb_size)} LEBs, {leb_cnt:,} in use",
+                         f"damaged      {exc}"]
     _remember_walker(fh, base, size, "ubifs", w)
     return "ubifs", ubifs_lines(w)
 
@@ -20913,7 +21199,7 @@ def ubifs_lines(w):
     if w.flags & UBIFS_FLG_AUTHENTICATION:
         lines.append("note         authenticated volume; hashes are not checked here")
     for k in ("unreadable index nodes", "unreadable directory entries",
-              "log does not open with this commit"):
+              "log does not open with this commit", "log head with no node"):
         if w.stats[k]:
             lines.append(f"damaged      {w.stats[k]:,} {k}")
     if w.bit_repairs:
@@ -27945,7 +28231,7 @@ def walker_for(kind, fh, base, size=None):
     if kind == "btrfs":
         return BtrfsWalker(fh, base)
     if kind == "ubifs":
-        return _cached_walker(fh, base, size, kind, lambda: UbifsWalker(fh, base))
+        return _cached_walker(fh, base, size, kind, lambda: UbifsWalker(fh, base, size))
     if kind == "ubi":
         return _cached_walker(fh, base, size, kind, lambda: UbiWalker(fh, base, size))
     if kind == "jffs2":
@@ -47418,8 +47704,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             issues = []
                             f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
                                                                  issues=issues)
-                            if isinstance(w, F2fsWalker):
-                                w.check_reached()
+                            if hasattr(w, "unread_entries"):
+                                if isinstance(w, F2fsWalker):
+                                    w.check_reached()
                                 # a name whose inode cannot be read never reaches the list above
                                 unread, undropped = apply_exclude(
                                     [(p, i, None, None) for p, i in w.unread_entries()], exclude)
@@ -47429,6 +47716,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                "read, so it is not exported, and if it is a "
                                                "folder neither is anything under it", 1)
                                               for p, i, _s, _m in unread)
+                            if isinstance(w, F2fsWalker):
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
                             elif isinstance(w, YaffsWalker):
                                 # a file under a folder with no header in the image, or
@@ -60904,6 +61192,343 @@ def self_test():
                   f"copy with a bad data CRC is still read, as the kernel attaches it: "
                   f"{sum(1 for v in ub_res.values() if v is None)} of {len(ub_res)} files match "
                   f"({un_lone} such LEB counted)")
+
+        # UBI and UBIFS, on the fixtures mkfs.ubifs, ubinize and the kernel wrote: names
+        # that are not plain UTF-8, a time before 1970, and images cut short. Each case
+        # is made in memory and, where the export is what is checked, written to this
+        # run's folder and removed again. A stored name is changed in place and its
+        # record's CRC recomputed: ubinize writes a volume name with a slash or a byte
+        # that is not UTF-8 as given, and mkfs.ubifs copies a file name's bytes.
+        def ua_export(ua_image, ua_tag):
+            """(manifest, {member: bytes}, exceptions rows) of one image exported the way
+            --extract does it. Both files it writes are removed."""
+            ua_path = os.path.join(d, f"{ua_tag}.dump")
+            ua_zip = os.path.join(d, f"{ua_tag}.zip")
+            ua_man = []
+            try:
+                with open(ua_path, "wb") as ua_fh:
+                    ua_fh.write(bytes(ua_image))
+                with zipfile.ZipFile(ua_zip, "w") as ua_zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(ua_path, extract=ua_zip, zf=ua_zf, manifest=ua_man)
+                with zipfile.ZipFile(ua_zip) as ua_zr:
+                    ua_got = {i_.filename: ua_zr.read(i_) for i_ in ua_zr.infolist()}
+            finally:
+                for ua_rm in (ua_path, ua_zip):
+                    if os.path.exists(ua_rm):
+                        os.remove(ua_rm)
+            ua_rows = [ln.split("\t") for n_, data_ in ua_got.items()
+                       if n_.endswith(".exceptions.tsv")
+                       for ln in data_.decode("utf-8").splitlines()[1:]]
+            return ua_man, ua_got, ua_rows
+
+        def ua_said(ua_obj, ua_text):
+            """True when a walker's damage list, or a manifest record's, holds the text."""
+            ua_lines = (ua_obj.get("damage_first") or [] if isinstance(ua_obj, dict)
+                        else getattr(ua_obj, "damage", None) or [])
+            return any(ua_text in str(line_) for line_ in ua_lines)
+
+        def ua_sqlite(ua_names):
+            """How many of the names SQLite stores as distinct text, or -1 if it refuses one."""
+            import sqlite3                          # pylint: disable=import-outside-toplevel
+            ua_db = sqlite3.connect(":memory:")
+            try:
+                ua_db.execute("create table t (n text primary key)")
+                ua_db.executemany("insert into t values (?)", [(n_,) for n_ in ua_names])
+                return ua_db.execute("select count(*) from t").fetchone()[0]
+            except (sqlite3.Error, UnicodeError):
+                return -1
+            finally:
+                ua_db.close()
+
+        def ua_row(ua_text, ua_check):
+            """One row: the check returns (passed, detail); an exception is a failure."""
+            try:
+                ua_ok, ua_detail = ua_check()
+            except Exception as exc:                 # pylint: disable=broad-except
+                ua_ok, ua_detail = False, f"raised {type(exc).__name__}: {exc}"
+            print(f"  [{'PASS' if ua_ok else 'FAIL'}] {ua_text} ({ua_detail})")
+            return bool(ua_ok)
+
+        ua_fx = {n_: os.path.join(fx, f"{n_}.img.gz")
+                 for n_ in ("ubi-nor", "ubifs-lzo", "ubi-nand-history")}
+        if all(os.path.isfile(p_) for p_ in ua_fx.values()):
+            import gzip                              # pylint: disable=import-outside-toplevel
+            import contextlib                        # pylint: disable=import-outside-toplevel
+            ua_img = {}
+            for n_, p_ in ua_fx.items():
+                with gzip.open(p_, "rb") as gz:
+                    ua_img[n_] = gz.read()
+            ua_nor, ua_bare, ua_hist = (ua_img[n_] for n_ in ua_fx)
+
+            def ua_volume_names():
+                img = bytearray(ua_nor)
+                w0 = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                new = {"rootfs_data": b"caf\xe8", "rootfs": b"data/vol", "kernel": b"caf\xe9"}
+                for lnum in (0, 1):                  # both copies of the volume table
+                    at = w0.ubi.map[(UBI_LAYOUT_VOL, lnum)]["data_at"]
+                    for vol in w0.ubi.volumes:
+                        rec, raw = at + vol["id"] * UBI_VTBL_REC, new[vol["name"]]
+                        struct.pack_into(">H", img, rec + 14, len(raw))
+                        img[rec + 16:rec + 144] = raw.ljust(128, b"\0")
+                        struct.pack_into(">I", img, rec + 168, _ubi_crc(bytes(img[rec:rec + 168])))
+                w1 = UbiWalker(io.BytesIO(bytes(img)), 0, len(img))
+                names = [n_ for n_, _i in w1.listdir(w1.root)]
+                tops = {p_.split("/")[0] for p_, *_x in collect(w1, w1.root)}
+                return (names == ["caf%E8", "data%2Fvol", "caf%E9"] and tops == set(names)
+                        and ua_sqlite(names) == 3
+                        and len(collect(w1, w1.root)) == len(collect(w0, w0.root)) > 400,
+                        f"listed as {names}")
+            if not ua_row("UBI volume names: a slash stored in a name is %2F and a byte that "
+                          "is not UTF-8 is %XX, so no name invents a folder, two names stay "
+                          "distinct and SQLite stores them", ua_volume_names):
+                ok = False
+
+            def ua_patched_ubifs():
+                """The bare UBIFS fixture with two names in one folder changed to differ
+                only in a byte that is not UTF-8, and the first one's file given the
+                time -315619200 (1960-01-01). (image, folder path, the two names as they
+                should list, the file's inode, its bytes). The key's name hash is left as
+                it was: this reader does not use it."""
+                img = bytearray(ua_bare)
+                w0 = UbifsWalker(io.BytesIO(ua_bare), 0)
+                paths = {n_: p_ for p_, n_, *_x in walk_all(w0)}
+                first = UBIFS_LOG_LNUM + w0.log_lebs + w0.lpt_lebs + w0.orph_lebs
+                groups = collections.defaultdict(list)
+                for lnum in range(first, w0.leb_cnt):
+                    # pylint: disable=protected-access
+                    for offs, raw in w0._scan_leb(lnum, 0):
+                        if raw[20] != UBIFS_DENT_NODE:
+                            continue
+                        parent = struct.unpack_from("<I", raw, 24)[0]
+                        target, nlen = struct.unpack_from("<Q", raw, 40)[0], \
+                            struct.unpack_from("<H", raw, 50)[0]
+                        ent = w0.entry(target)
+                        if (parent in paths and ent and ent[0] & S_IFMT == S_IFREG
+                                and ent[1] > 0 and nlen >= 6
+                                and raw[57:56 + nlen].isascii()):
+                            groups[(parent, nlen)].append((lnum * w0.leb_size + offs, raw, target))
+                (parent, _nlen), pair = next((k, v) for k, v in sorted(groups.items())
+                                             if len(v) >= 2)
+                stem = bytes(pair[0][1][57:56 + _nlen])
+                listed = []
+                for (at, raw, _target), lead in zip(pair[:2], (b"\xe9", b"\xe8")):
+                    img[at + 56:at + 56 + _nlen] = lead + stem
+                    struct.pack_into("<I", img, at + 4,
+                                     _ubi_crc(bytes(img[at + 8:at + len(raw)])))
+                    listed.append(f"%{lead[0]:02X}" + stem.decode("ascii"))
+                inum = pair[0][2]
+                lnum, offs, nlen = w0.inodes[inum]
+                at = lnum * w0.leb_size + offs
+                struct.pack_into("<qqq", img, at + 56, -315619200, -315619200, -315619200)
+                struct.pack_into("<I", img, at + 4, _ubi_crc(bytes(img[at + 8:at + nlen])))
+                data = b"".join(w0.read_file(inum, w0.entry(inum)[1]))
+                return bytes(img), paths[parent], listed, inum, data
+
+            ua_case = {}
+
+            def ua_once(key, make):
+                if key not in ua_case:
+                    ua_case[key] = make()
+                return ua_case[key]
+
+            def ua_ubifs_names():
+                img, folder, listed, _inum, data = ua_once("p", ua_patched_ubifs)
+                w1 = UbifsWalker(io.BytesIO(img), 0)
+                names = [p_ for p_, *_x in walk_all(w1)]
+                before = sum(1 for _e in walk_all(UbifsWalker(io.BytesIO(ua_bare), 0)))
+                want = [f"{folder}/{n_}" if folder else n_ for n_ in listed]
+                surrogates = sum(any(0xD800 <= ord(c_) <= 0xDFFF for c_ in p_) for p_ in names)
+                _man, got, rows = ua_once("x", lambda: ua_export(img, "ubifs_names"))
+                return (all(p_ in names for p_ in want) and not surrogates
+                        and ua_sqlite(names) == len(names) == before
+                        and got.get(f"lba0/{want[0]}") == data and f"lba0/{want[1]}" in got
+                        and not any(r_[2] == "RENAMED" for r_ in rows),
+                        f"two names that differ in one stored byte list as {listed}, "
+                        f"{surrogates} names with a surrogate, {len(names)} names")
+            if not ua_row("UBIFS names: a byte that is not UTF-8 is %XX of the stored byte in "
+                          "the listing and in the zip, never a surrogate, and SQLite stores "
+                          "every name", ua_ubifs_names):
+                ok = False
+
+            def ua_ubifs_time():
+                img, folder, listed, inum, _data = ua_once("p", ua_patched_ubifs)
+                w1 = UbifsWalker(io.BytesIO(img), 0)
+                _man, _got, rows = ua_once("x", lambda: ua_export(img, "ubifs_names"))
+                path = f"{folder}/{listed[0]}" if folder else listed[0]
+                told = [r_[3] for r_ in rows if r_[0] == path and r_[2] == "TIME_NOT_HELD"]
+                return (w1.entry(inum)[2] == -315619200 and len(told) == 1
+                        and "stored time -315619200 (1960-01-01 00:00:00 UTC)" in told[0],
+                        f"the walker gives {w1.entry(inum)[2]}, the table says {told}")
+            if not ua_row("UBIFS times: an inode's seconds are read as signed, as the kernel "
+                          "reads them, so a 1960 time keeps its stored value in the walker "
+                          "and in its TIME_NOT_HELD row", ua_ubifs_time):
+                ok = False
+
+            def ua_cut_ubi():
+                whole = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                kernel = b"".join(whole.read_file(dict(whole.listdir(whole.root))["kernel"],
+                                                  150000))
+                man, got, rows = ua_export(ua_nor[:-4096], "ubi_cut_4k")
+                rec = man[0] if man else {}
+                short = [r_ for r_ in rows if r_[2] == "SHORT"]
+                last = (rec.get("folders_not_read", 0) >= 1 and _volumes_not_read(man) == 1
+                        and ua_said(rec, "ends 61,440 bytes into an eraseblock of 65,536 bytes")
+                        and ua_said(rec, "static volume 2 has 2 of the 3 eraseblocks")
+                        and "lba0/kernel" not in got and len(kernel) == 150000
+                        and got.get("lba0/kernel.SHORT-130816-of-150000-bytes") == kernel[:130816]
+                        and len(short) == 1 and "2 of the 3 eraseblocks" in short[0][3]
+                        and sum(1 for n_ in got if n_.startswith("lba0/rootfs")) == 416)
+                # cut between two eraseblocks: the one that records where the data ends is gone
+                even = UbiWalker(io.BytesIO(ua_nor[:-65536]), 0, len(ua_nor) - 65536)
+                node = dict(even.listdir(even.root))["kernel"]
+                size = even.entry(node)[1]
+                bound = (size == 3 * 65408 and ua_said(even, "196,224 bytes is the most it can hold")
+                         and "the most it can hold" in (getattr(even, "run_shortfall",
+                                                                lambda _n: "")(node) or "")
+                         and b"".join(even.read_file(node, size)) == kernel[:130816]
+                         and getattr(even, "folders_not_read", 0) == 1)
+                half = UbiWalker(io.BytesIO(ua_nor[:len(ua_nor) // 2]), 0, len(ua_nor) // 2)
+                halved = (ua_said(half, "ends 32,768 bytes into an eraseblock")
+                          and ua_said(half, "index node(s) did not read")
+                          and ua_said(half, "note: static volume 2 has no eraseblock here")
+                          and getattr(half, "folders_not_read", 0) >= 2)
+                clean = not getattr(whole, "damage", None) and not getattr(
+                    whole, "folders_not_read", 0)
+                return (last and bound and halved and clean,
+                        f"last 4 KiB cut: {rec.get('damage_recorded', 0)} record(s), "
+                        f"{len(short)} SHORT, the volume counted as not read in full: "
+                        f"{_volumes_not_read(man)}; cut before the last eraseblock: size "
+                        f"shown as {size:,}; cut in half: "
+                        f"{len(getattr(half, 'damage', None) or [])} record(s); whole: "
+                        f"{len(getattr(whole, 'damage', None) or [])}")
+            if not ua_row("a UBI image cut short is recorded: the eraseblock the data ends "
+                          "inside, a static volume with fewer eraseblocks than it records "
+                          "exported SHORT at its recorded size with nothing put in the gap, "
+                          "and the UBIFS index that no longer reads", ua_cut_ubi):
+                ok = False
+
+            def ua_table_and_raw():
+                whole = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                img = bytearray(ua_nor)
+                for lnum in (0, 1):                  # both copies fail their first CRC
+                    img[whole.ubi.map[(UBI_LAYOUT_VOL, lnum)]["data_at"] + 168] ^= 0xFF
+                bare = UbiWalker(io.BytesIO(bytes(img)), 0, len(img))
+                no_table = (ua_said(bare, "the UBI volume table does not read")
+                            and getattr(bare, "folders_not_read", 0) >= 1
+                            and [n_ for n_, _i in bare.listdir(bare.root)]
+                            == ["vol0", "vol1", "vol2"])
+                img = bytearray(ua_nor)
+                vol = next(v for v in whole.ubi.volumes if v["name"] == "rootfs_data")
+                for lnum in (1, 2):                  # the two master LEBs read as erased
+                    at = whole.ubi.map[(vol["id"], lnum)]["data_at"]
+                    img[at:at + 4] = b"\xff" * 4
+                man, got, _rows = ua_export(img, "ubi_no_master")
+                rec = man[0] if man else {}
+                raw = (ua_said(rec, "opens as UBIFS and could not be read as it")
+                       and rec.get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                       and "lba0/rootfs_data" in got
+                       and not any(n_.startswith("lba0/rootfs_data/") for n_ in got))
+                return (no_table and raw,
+                        f"no table: {len(getattr(bare, 'damage', None) or [])} record(s); "
+                        f"UBIFS with no master node: {rec.get('damage_recorded', 0)} record(s), "
+                        f"folders_not_read {rec.get('folders_not_read')}")
+            if not ua_row("a UBI volume table that does not read, and a volume that opens as "
+                          "UBIFS and is exported as raw bytes because it cannot be read, are "
+                          "each recorded and counted as not read in full", ua_table_and_raw):
+                ok = False
+
+            def ua_nand_cut():
+                whole = UbiWalker(io.BytesIO(ua_hist), 0, len(ua_hist))
+                want = [(p_, s_) for p_, _n, s_, _m in collect(whole, whole.root)]
+                cut = UbiWalker(io.BytesIO(ua_hist[:-4096]), 0, len(ua_hist) - 4096)
+                got = [(p_, s_) for p_, _n, s_, _m in collect(cut, cut.root)]
+                paged = (cut.nand == (2048, 64) and got == want and len(want) > 10
+                         and ua_said(cut, "not a whole number of NAND pages")
+                         and ua_said(cut, "its last 128 bytes are part of a page")
+                         and getattr(cut, "folders_not_read", 0) == 1)
+                half = UbiWalker(io.BytesIO(ua_hist[:len(ua_hist) // 2]), 0, len(ua_hist) // 2)
+                journal = (ua_said(half, "the journal was not replayed")
+                           and getattr(half, "folders_not_read", 0) == 1)
+                return (paged and journal and not getattr(whole, "damage", None),
+                        f"cut by 4 KiB: read as {cut.nand} pages, {len(got)} of {len(want)} "
+                        f"files listed, {len(getattr(cut, 'damage', None) or [])} record(s); "
+                        f"cut in half: {len(getattr(half, 'damage', None) or [])} record(s)")
+            if not ua_row("a NAND dump of UBI that ends inside a page is read over its whole "
+                          "pages with the rest recorded, and a UBIFS log whose first "
+                          "eraseblock is gone is recorded as a journal not replayed",
+                          ua_nand_cut):
+                ok = False
+
+            def ua_index_and_inode():
+                man, got, _rows = ua_export(ua_bare[:len(ua_bare) // 2], "ubifs_half")
+                cut = man[0] if man else {}
+                half = (cut.get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                        and ua_said(cut, "index node(s) did not read")
+                        and not any(n_.startswith("lba0/") for n_ in got))
+                w0 = UbifsWalker(io.BytesIO(ua_bare), 0)
+                path, inum = next((p_, n_) for p_, n_, mode_, size_, *_x in walk_all(w0)
+                                  if mode_ & S_IFMT == S_IFREG and size_ > 0)
+                img = bytearray(ua_bare)
+                at = w0.inodes[inum][0] * w0.leb_size + w0.inodes[inum][1]
+                img[at:at + 4] = b"\xff" * 4         # the inode node reads as erased flash
+                man, got, rows = ua_export(img, "ubifs_no_inode")
+                rec = man[0] if man else {}
+                failed = [r_ for r_ in rows if r_[2] == "FAILED"]
+                gone = (rec.get("failed") == 1 and _files_not_exported(man) == 1
+                        and len(failed) == 1 and failed[0][0] == path
+                        and f"its inode ({inum:,}) cannot be read" in failed[0][3]
+                        and f"lba0/{path}" not in got
+                        and sum(1 for n_ in got if n_.startswith("lba0/")) == 409)
+                clean = not getattr(w0, "damage", None) and not getattr(w0, "unread_entries",
+                                                                        list)()
+                return (half and gone and clean,
+                        f"cut in half: folders_not_read {cut.get('folders_not_read')}; "
+                        f"one inode node erased: {len(failed)} FAILED row(s), "
+                        f"{rec.get('failed')} counted as failed")
+            if not ua_row("UBIFS: index nodes that do not read are a volume record counted in "
+                          "folders_not_read, and a name whose inode node does not read is a "
+                          "FAILED row, not a file silently left out", ua_index_and_inode):
+                ok = False
+
+            def ua_stubs():
+                """What is left when a file is cut just after its first structure: every
+                piece whose first header still checks is claimed, recorded and counted."""
+                told = []
+                for tag, image, keep, want in (
+                        ("ubifs_sb", ua_bare, 4096, "lie past the end of the image"),
+                        ("ubi_ec", ua_nor, 64, "no second one follows"),
+                        ("ubi_part", ua_nor, 2112, "no second one follows"),
+                        ("ubi_one", ua_nor, 65536, "no second one follows"),
+                        ("ubi_nand_one", ua_hist, 135168, "no second one follows")):
+                    man, got, _rows = ua_export(image[:keep], tag)
+                    rec = man[0] if len(man) == 1 else {}
+                    good = (want in (rec.get("extract_error") or "")
+                            and _volumes_not_read(man) == 1
+                            and not any(n_.startswith("lba0/") for n_ in got))
+                    told.append(f"{keep:,} bytes: {'recorded' if good else 'NOT RECORDED'}")
+                    if not good:
+                        return False, "; ".join(told)
+                man, got, _rows = ua_export(ua_nor[:131072], "ubi_table_only")
+                rec = man[0] if len(man) == 1 else {}
+                table = (ua_said(rec, "note: the volume table lists")
+                         and not rec.get("folders_not_read") and _volumes_not_read(man) == 0
+                         and sorted(len(v_) for n_, v_ in got.items()
+                                    if n_.startswith("lba0/")) == [0, 0, 0])
+                bad = bytearray(ua_nor[:65536])
+                bad[20] ^= 1                         # the header's CRC no longer holds
+                man, got, _rows = ua_export(bad, "ubi_bad_header")
+                refused = not man and not any(n_.startswith("lba0") for n_ in got)
+                return (table and refused,
+                        "; ".join(told) + f"; the volume table alone: "
+                        f"{'a note' if table else 'NOT A NOTE'}; a first header that "
+                        f"fails its CRC: {'not claimed' if refused else 'CLAIMED'}")
+            if not ua_row("a UBI or UBIFS file cut just after its first structure is claimed "
+                          "by the header that still checks and recorded as not read, and one "
+                          "holding only the volume table gets a note that no volume's "
+                          "eraseblock is here",
+                          ua_stubs):
+                ok = False
 
         # Two JFFS2 partitions side by side in a dump with no partition table:
         # both number their inodes from 2, so read as one filesystem a name from
