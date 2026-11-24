@@ -1401,7 +1401,12 @@ not fit its length is refused. Clusters over 64 KiB, up to the 2 MiB Windows for
 read. An `$MFT` too fragmented for its own record is followed through its
 `$ATTRIBUTE_LIST`, and so is a directory index split over several records.
 
-When a volume is damaged or cut short, the export says what is missing:
+An image cut short was tested at three points (the last 4 KiB, halfway, and just after the
+boot region) on 13 volumes Windows wrote: each run lost nothing, or recorded what it lost
+and exited 1. The list below says what the reader does when it meets each state. Those
+paths were run on patched copies of the fixtures, so they are not a claim that damage in
+general is detected: a lost sector over the start of an MFT record, for one, can lose that
+file or folder with no record.
 
 - A run past the end of the image, or outside the volume, stays at its own offset as
   zeros, so nothing after it moves. The member is named `.SHORT-<here>-of-<size>-bytes`,
@@ -1413,13 +1418,15 @@ When a volume is damaged or cut short, the export says what is missing:
 - A recorded size past the run list is read up to where the runs end and named `.SHORT`,
   with the reason in the exceptions table. An allocated size that disagrees with the run
   list is recorded in `damage_first`, and the file is read from its runs.
-- A record that fails its update sequence check is read as it stands when it still
-  parses, as Linux reads it, and is recorded. A file's record that does not parse is a
-  failed file, named by its path.
-- A directory whose record, index block or index entry cannot be read is also listed from
-  the records that name it as their parent, and is counted in `folders_not_read`, which
-  makes the exit status 1. `listing()` keeps the subtree under a torn directory record,
-  and counts the directory when its record does not parse.
+- A record whose header is intact but which fails its update sequence check is read as it
+  stands when it still parses, as Linux reads it, and is recorded. If it does not parse, a
+  file's record is a failed file, named by its path.
+- A directory with such a record, or with an index block or entry that cannot be read, is
+  also listed from the records that name it as their parent, and is counted in
+  `folders_not_read`, which makes the exit status 1. When the stride that differs lies
+  wholly past the record's bytes in use, nothing it holds was affected: the record is
+  noted and neither the count nor the exit status changes. `listing()` keeps the subtree
+  under such a record, and counts the directory when the record does not parse.
 - A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut before or through `$MFT`
   says how many records lie past its end and exits 1. `$Bitmap` is never read past what
   the volume's clusters need, and clusters whose bitmap could not be read count as in
@@ -1431,12 +1438,19 @@ file: its name, size, dates, and whether the content can still be read. A file w
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
 could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
-used as free and its initialized size is not 0. When `$Bitmap` marks any of them in use,
-`read_deleted()` refuses the file and its `reason` gives how many of its clusters are
-marked. A cluster that was reused and freed again looks the same as one never reused, so
-a recovered file's bytes are a candidate, not a proven copy. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
-records that may since have been reused, so a file whose attributes overflowed its record
-is reported as having existed rather than reconstructed from whatever now lives there.
+used as free, its initialized size is not 0, and no other record outranks it on those
+clusters. A cluster is reallocated only after the file holding it was freed, so of two
+records mapping one cluster, the one with the later log sequence number wrote it last: a
+deleted record loses to that one and to any live record, and two records the log cannot
+order are both refused. The `reason` gives the count and names the other record. A reuse
+by a file whose own record has since been overwritten leaves no trace, so a recovered
+file's bytes are still a candidate, not a proven copy. A deleted file the overlay filter
+compressed, or a cloud placeholder, is reported as not recoverable, since its content is
+not in its unnamed stream. `$ATTRIBUTE_LIST` is not followed for a deleted record, because
+it points at other records that may since have been reused, so a file whose attributes
+overflowed its record is reported as having existed rather than reconstructed from
+whatever now lives there, with its size shown as unknown (`None`) when the attribute that
+holds it is in an extension record. A freed extension record is not listed as a file.
 
 Validated two ways. A 16 MiB volume written by `mkntfs` and populated through `ntfs-3g`
 carries a resident file, an empty one, a sparse one, a compressed one, one fragmented

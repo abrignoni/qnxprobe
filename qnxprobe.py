@@ -4625,6 +4625,20 @@ def _ntfs_fixup_torn(buf, name):
     return bytes(out)
 
 
+def _ntfs_torn_past_use(buf):
+    """True when every 512-byte stride that lacks the record's stamp starts at or past the
+    record's bytes in use (header field 0x18), so no attribute lies in it."""
+    if len(buf) < 0x1C:
+        return False
+    off, count = struct.unpack_from("<HH", buf, 4)
+    used = struct.unpack_from("<I", buf, 0x18)[0]
+    if count < 2 or off + count * 2 > len(buf) or (count - 1) * NTFS_USA_STRIDE != len(buf):
+        return False
+    stamp = buf[off:off + 2]
+    return all(buf[(i + 1) * NTFS_USA_STRIDE - 2:(i + 1) * NTFS_USA_STRIDE] == stamp
+               or i * NTFS_USA_STRIDE >= used for i in range(count - 1))
+
+
 def _ntfs_runs(data, offset, cluster_count):
     """Decode a mapping-pair list into [(lcn or None, clusters)], in VCN order.
 
@@ -4703,8 +4717,10 @@ class NtfsDeletedFile:
     """One file whose MFT record is free but still describes it.
 
     ``recoverable`` says whether the content can still be read: a resident file
-    always (its bytes are in the record), a non-resident one only while every
-    cluster it used is still free. ``reason`` names why not, when it is False.
+    (its bytes are in the record), or a non-resident one while nothing on the volume
+    contradicts it (see NtfsWalker.deleted_files). ``reason`` names why not, when it
+    is False. ``size`` and ``resident`` are None when the record's data attribute is in
+    an extension record that was not read, so neither is known.
     """
 
     __slots__ = ("record", "name", "parent", "is_dir", "size", "resident",
@@ -4723,9 +4739,10 @@ class NtfsDeletedFile:
 
     def __repr__(self):
         state = "recoverable" if self.recoverable else f"not recoverable ({self.reason})"
+        where = ("storage unknown" if self.resident is None else
+                 "resident" if self.resident else "non-resident")
         return (f"NtfsDeletedFile(rec={self.record}, name={self.name!r}, "
-                f"size={self.size}, {'resident' if self.resident else 'non-resident'}, "
-                f"{state})")
+                f"size={self.size}, {where}, {state})")
 
 
 class NtfsWalker:
@@ -4784,6 +4801,7 @@ class NtfsWalker:
         self._mft0 = None                        # record 0 as $MFTMirr holds it, when used
         self._mft_list_lost = False              # $MFT's own attribute list could not be read
         self._stream_folders = {}                # path -> a folder collect() saw with streams
+        self._conflicts = None                   # deleted record -> why another outranks it
         self._records = {}                       # record number -> attributes
         self._alloc_bitmap = None                # $Bitmap bytes, read on first need
         self._mft_runs = None
@@ -4976,14 +4994,15 @@ class NtfsWalker:
 
     def _note_torn(self, num, parsed):
         """Record an in-use record whose update sequence does not hold. A folder's is
-        counted too: what it lists can no longer be taken as whole."""
+        counted too, unless the stride that differs lies wholly past the record's bytes
+        in use: then nothing it holds was affected."""
         torn = self._torn.get(num)
         if torn is None:
             return
         line = (f"MFT record {num} fails its update sequence check and was read as it stands"
                 if parsed else f"MFT record {num} fails its update sequence check and does "
                                "not parse, so it was not read")
-        if torn[0] & NTFS_MFT_IS_DIR:
+        if torn[0] & NTFS_MFT_IS_DIR and not (parsed and torn[2]):
             self._count_folder(num, line)
         else:
             self._damaged(line)
@@ -5001,7 +5020,8 @@ class NtfsWalker:
         if fixed is None and len(raw) >= 0x30 and raw[:4] == NTFS_FILE:
             flags = struct.unpack_from("<H", raw, 0x16)[0]
             if flags & NTFS_MFT_IN_USE:
-                self._torn[num] = (flags, struct.unpack_from("<H", raw, 0x10)[0])
+                self._torn[num] = (flags, struct.unpack_from("<H", raw, 0x10)[0],
+                                   _ntfs_torn_past_use(raw))
                 fixed = _ntfs_fixup_torn(raw, NTFS_FILE)
         return fixed
 
@@ -5214,19 +5234,194 @@ class NtfsWalker:
         bits = self._bitmap_bits()
         limit = len(bits) * 8
         end = lcn + count
-        marked = end - max(lcn, limit) if end > limit else 0
-        stop, pos = min(end, limit), lcn
+        return (end - max(lcn, limit) if end > limit else 0) + self._bits_set(bits, lcn,
+                                                                              min(end, limit))
+
+    @staticmethod
+    def _bits_set(bits, pos, stop):
+        """How many bits from ``pos`` up to ``stop`` are set, whole bytes at a time."""
+        found = 0
         while pos < stop and pos & 7:
-            marked += bits[pos >> 3] >> (pos & 7) & 1
+            found += bits[pos >> 3] >> (pos & 7) & 1
             pos += 1
         whole = (stop - pos) >> 3 if stop > pos else 0
         if whole:
-            marked += sum(bits[pos >> 3:(pos >> 3) + whole].translate(NTFS_BITS_SET))
+            found += sum(bits[pos >> 3:(pos >> 3) + whole].translate(NTFS_BITS_SET))
             pos += whole * 8
         while pos < stop:
-            marked += bits[pos >> 3] >> (pos & 7) & 1
+            found += bits[pos >> 3] >> (pos & 7) & 1
             pos += 1
-        return marked
+        return found
+
+    @staticmethod
+    def _set_bits(bits, pos, stop):
+        """Set the bits from ``pos`` up to ``stop``, whole bytes at a time."""
+        while pos < stop and pos & 7:
+            bits[pos >> 3] |= 1 << (pos & 7)
+            pos += 1
+        whole = (stop - pos) >> 3 if stop > pos else 0
+        if whole:
+            bits[pos >> 3:(pos >> 3) + whole] = b"\xff" * whole
+            pos += whole * 8
+        while pos < stop:
+            bits[pos >> 3] |= 1 << (pos & 7)
+            pos += 1
+
+    def _deleted_blocker(self, data, attrs, size, has_list):
+        """Why this deleted record's content cannot be offered, read from the record and
+        $Bitmap alone, as text, or "" when nothing there stands against it."""
+        tag = None
+        for a in attrs:
+            if a.type == NTFS_REPARSE_POINT:
+                head = a.value[:4] if a.resident else self._read_runs(a.runs, 4)
+                if len(head) == 4:
+                    tag = struct.unpack("<I", head)[0]
+                break
+        if tag == IO_REPARSE_TAG_WOF:
+            return "its content is in the overlay filter's compressed stream, which was not read"
+        if tag is not None and tag & IO_REPARSE_TAG_CLOUD_MASK == IO_REPARSE_TAG_CLOUD:
+            info = next((a.value for a in attrs if a.type == NTFS_STANDARD_INFORMATION
+                         and a.resident and len(a.value) >= 0x24), None)
+            bits = struct.unpack_from("<I", info, 0x20)[0] if info else 0
+            if bits & NTFS_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS or (
+                    size and not self._stored(data, self.cluster)):
+                return "it is a cloud provider's placeholder, whose content was not read"
+        if data.resident:
+            return ""
+        if has_list:
+            return "attributes overflowed the record"
+        if data.encrypted:
+            return "encrypted"
+        if data.runs_bad:
+            return "its run list does not decode"
+        if size and not data.init_size:
+            return "its initialized size is 0, so it records no valid content"
+        stored = [(lcn, run) for lcn, run in data.runs if lcn is not None]
+        clusters = sum(run for _lcn, run in stored)  # a sparse run holds no data to lose
+        if any(lcn < 0 or (self.total_clusters and lcn + run > self.total_clusters)
+               for lcn, run in stored):
+            return "a run lies outside the volume"
+        if self.total_clusters and clusters > self.total_clusters:
+            return f"its runs store {clusters:,} clusters and this volume has " \
+                   f"{self.total_clusters:,}"
+        marked = sum(self._clusters_marked(lcn, run) for lcn, run in stored)
+        if marked:
+            return f"$Bitmap marks {marked:,} of the {clusters:,} clusters it reads as in use"
+        return ""
+
+    def _deleted_conflicts(self):
+        """{record: reason} for deleted records whose clusters another record also maps.
+
+        A cluster is only reallocated after the file holding it was freed, so of two
+        records that map it the one with the later log sequence number (the LSN at 0x08
+        of the record header) wrote it last. A deleted record loses to a live record and to
+        one with a later LSN. Equal LSNs, or one of 0, cannot order the two, and neither is
+        offered. Memory is one bit per cluster plus the runs of the records still in play."""
+        if self._conflicts is not None:
+            return self._conflicts
+        self._conflicts = {}
+        mft = self._data_attr(0)
+        if mft is None or not self.total_clusters:
+            return self._conflicts
+        count = mft.data_size // self.rec_size
+        claimed = bytearray((self.total_clusters + 7) // 8)
+        lsns, spans, sizes = {}, [], {}
+        for num in range(count):
+            raw = self._record_raw(num)
+            parsed = self._parse_deleted(raw) if raw and raw[:4] == NTFS_FILE else None
+            if parsed is None:
+                continue
+            flags, attrs = parsed
+            if (flags & (NTFS_MFT_IN_USE | NTFS_MFT_IS_DIR)
+                    or struct.unpack_from("<Q", raw, self._BASE_REF)[0] & 0xFFFFFFFFFFFF
+                    or not any(a.type == NTFS_FILE_NAME for a in attrs)):
+                continue
+            data = next((a for a in attrs if a.type == NTFS_DATA and a.name == ""), None)
+            if data is None or data.resident:
+                continue
+            has_list = any(a.type == NTFS_ATTRIBUTE_LIST for a in attrs)
+            if self._deleted_blocker(data, attrs, data.data_size, has_list):
+                continue
+            runs = [(lcn, run) for lcn, run in data.runs if lcn is not None and run]
+            if not runs:
+                continue
+            lsns[num] = struct.unpack_from("<Q", raw, 8)[0]
+            sizes[num] = sum(run for _lcn, run in runs)
+            for lcn, run in runs:
+                spans.append((lcn, lcn + run, num))
+                self._set_bits(claimed, lcn, lcn + run)
+        if not lsns:
+            return self._conflicts
+        candidates = set(lsns)
+        for num in range(count):
+            raw = self._record_raw(num)
+            parsed = self._parse_deleted(raw) if raw and raw[:4] == NTFS_FILE else None
+            if parsed is None:
+                continue
+            flags, attrs = parsed
+            for a in attrs:
+                if a.resident or (num in candidates and a.type == NTFS_DATA and not a.name):
+                    continue
+                for lcn, run in a.runs:
+                    if lcn is None or lcn < 0 or not run:
+                        continue
+                    stop = min(lcn + run, self.total_clusters)
+                    if lcn < stop and self._bits_set(claimed, lcn, stop):
+                        spans.append((lcn, stop, num))
+                        if num not in lsns:         # None stands for a live record
+                            lsns[num] = None if flags & NTFS_MFT_IN_USE else \
+                                struct.unpack_from("<Q", raw, 8)[0]
+        found = self._shared_clusters(spans, lsns, candidates)
+        for num, (shared, other, kind) in found.items():
+            what = (f"live record {other}" if kind == 0 else
+                    f"record {other}, whose log sequence number is later" if kind == 1 else
+                    f"record {other}, and their log sequence numbers do not order them")
+            self._conflicts[num] = f"{shared:,} of its {sizes[num]:,} clusters are also mapped by {what}"
+        return self._conflicts
+
+    @staticmethod
+    def _shared_clusters(spans, lsns, candidates):
+        """{candidate: [clusters lost, the other record, 0 live, 1 later or 2 unordered]},
+        from one sweep over the spans in cluster order."""
+        import heapq
+        spans.sort()
+        found, active, ends, index, at = {}, {}, [], 0, 0
+        while index < len(spans) or ends:
+            if not ends:
+                at = spans[index][0]
+            while index < len(spans) and spans[index][0] == at:
+                _start, end, owner = spans[index]
+                active[owner] = active.get(owner, 0) + 1
+                heapq.heappush(ends, (end, owner))
+                index += 1
+            upto = ends[0][0]
+            if index < len(spans):
+                upto = min(upto, spans[index][0])
+            if len(active) > 1:
+                live = next((o for o in active if lsns[o] is None), None)
+                if live is not None:
+                    losers = [(o, live, 0) for o in active if o in candidates]
+                else:
+                    best = max(active, key=lambda o: lsns[o])
+                    unordered = (sum(1 for o in active if lsns[o] == lsns[best]) > 1
+                                 or any(not lsns[o] for o in active))
+                    if unordered:
+                        losers = [(o, next(x for x in active if x != o), 2)
+                                  for o in active if o in candidates]
+                    else:
+                        losers = [(o, best, 1) for o in active if o in candidates and o != best]
+                for owner, other, kind in losers:
+                    row = found.setdefault(owner, [0, other, kind])
+                    row[0] += upto - at
+                    if kind < row[2]:
+                        row[1], row[2] = other, kind
+            at = upto
+            while ends and ends[0][0] == at:
+                _end, owner = heapq.heappop(ends)
+                active[owner] -= 1
+                if not active[owner]:
+                    del active[owner]
+        return found
 
     def _read_bitmap(self, size):
         """$Bitmap's bytes, never more than the volume's clusters need, whatever size the
@@ -5294,11 +5489,15 @@ class NtfsWalker:
         so never occupying a cluster a carver could find.
 
         Each result carries ``recoverable``: True for a resident file, and for a
-        non-resident one while every cluster it used is free and its initialized size
-        is not 0. False otherwise, in which case the record is reported as evidence the
-        file existed rather than its content offered. A cluster reused and freed again
-        looks like one never reused, so recovered bytes are a candidate, not a proven copy.
-        ``$ATTRIBUTE_LIST`` is not followed (see ``_parse_deleted``), so a file
+        non-resident one while every cluster it used is free, its initialized size is
+        not 0, and no live record or deleted record with a later log sequence number maps
+        any of them. Two records the log cannot order are both refused. False otherwise,
+        in which case the record is reported as evidence the file existed rather than its
+        content offered. A reuse by a file whose own record has since been overwritten
+        leaves no trace, so recovered bytes are a candidate, not a proven copy. A file the
+        overlay filter compressed, or a cloud placeholder, is not recoverable: its content
+        is not in its unnamed stream. A record naming a base record is part of that file
+        and is not listed. ``$ATTRIBUTE_LIST`` is not followed (see ``_parse_deleted``), so a file
         whose attributes overflowed its record is reported not recoverable rather
         than reconstructed from records that may now belong elsewhere.
 
@@ -5309,6 +5508,7 @@ class NtfsWalker:
         if data_attr is None:
             return
         count = data_attr.data_size // self.rec_size
+        conflicts = self._deleted_conflicts()
         for num in range(count):
             if num < 16 and not include_system:
                 continue                            # 0-15 are the reserved metafiles
@@ -5321,6 +5521,8 @@ class NtfsWalker:
             flags, attrs = parsed
             if flags & NTFS_MFT_IN_USE:
                 continue                            # a live file; the walk lists it
+            if struct.unpack_from("<Q", raw, self._BASE_REF)[0] & 0xFFFFFFFFFFFF:
+                continue                            # an extension record, not a file
             names = []
             for a in attrs:
                 if a.type == NTFS_FILE_NAME and a.resident and len(a.value) > 0x42:
@@ -5338,6 +5540,14 @@ class NtfsWalker:
             has_list = any(a.type == NTFS_ATTRIBUTE_LIST for a in attrs)
             created, modified, accessed = _ntfs_std_times(attrs)
             data = next((a for a in attrs if a.type == NTFS_DATA and a.name == ""), None)
+            if not is_dir and has_list and (data is None or (
+                    not data.resident and data.start_vcn)):
+                # The attribute that holds the size is in an extension record, not read.
+                yield NtfsDeletedFile(num, name, parent, is_dir, None,
+                                      None if data is None else False, False,
+                                      "attributes overflowed the record",
+                                      created, modified, accessed, has_list, data)
+                continue
             if is_dir or data is None:
                 yield NtfsDeletedFile(num, name, parent, is_dir, 0, True, False,
                                       "directory" if is_dir else "no data attribute",
@@ -5346,41 +5556,17 @@ class NtfsWalker:
             size = len(data.value) if data.resident else data.data_size
             if size < min_size:
                 continue
-            if data.resident:
-                yield NtfsDeletedFile(num, name, parent, is_dir, size, True, True, "",
-                                      created, modified, accessed, has_list, data)
-                continue
-            reason, ok = "", True
-            if data.encrypted:
-                reason, ok = "encrypted", False
-            elif has_list:
-                reason, ok = "attributes overflowed the record", False
-            elif data.runs_bad:
-                reason, ok = "its run list does not decode", False
-            elif size and not data.init_size:
-                reason, ok = "its initialized size is 0, so it records no valid content", False
-            else:
-                stored = [(lcn, run) for lcn, run in data.runs if lcn is not None]
-                clusters = sum(run for _lcn, run in stored)  # a sparse run holds no data to lose
-                if any(lcn < 0 or (self.total_clusters and lcn + run > self.total_clusters)
-                       for lcn, run in stored):
-                    reason, ok = "a run lies outside the volume", False
-                elif self.total_clusters and clusters > self.total_clusters:
-                    reason, ok = (f"its runs store {clusters:,} clusters and this volume has "
-                                  f"{self.total_clusters:,}"), False
-                else:
-                    marked = sum(self._clusters_marked(lcn, run) for lcn, run in stored)
-                    if marked:
-                        reason, ok = (f"$Bitmap marks {marked:,} of the {clusters:,} clusters "
-                                      "it reads as in use"), False
-            yield NtfsDeletedFile(num, name, parent, is_dir, size, False, ok, reason,
-                                  created, modified, accessed, has_list, data)
+            reason = self._deleted_blocker(data, attrs, size, has_list)
+            if not reason and not data.resident:
+                reason = conflicts.get(num, "")
+            yield NtfsDeletedFile(num, name, parent, is_dir, size, data.resident, not reason,
+                                  reason, created, modified, accessed, has_list, data)
 
     def read_deleted(self, entry, size=None):
-        """Yield the content of a recoverable deleted file. Refuses one with a cluster
-        $Bitmap marks in use or with no valid content. Free clusters may still have been
-        reused and freed again, so what this yields is a candidate. Reading is otherwise
-        the same as for a live file."""
+        """Yield the content of a recoverable deleted file, and refuse any other: see
+        deleted_files() for what makes one recoverable. What this yields is a candidate,
+        since a reuse whose record is gone leaves no trace. Reading is otherwise the same
+        as for a live file."""
         if not entry.recoverable or entry._data is None:
             raise NtfsUnreadable(
                 f"deleted file {entry.name!r} is not recoverable: {entry.reason}")
@@ -5531,9 +5717,9 @@ class NtfsWalker:
         attrs = self._record(num)
         out = []
         if num in self._torn and attrs:
-            out.append(("RECORD_TORN", f"MFT record {num} failed its update sequence check, so "
-                                       "one of its 512-byte strides was not written with the "
-                                       "rest. It was read as it stands"))
+            out.append(("RECORD_TORN", f"MFT record {num} failed its update sequence check: "
+                                       "a 512-byte stride of it does not end in the record's "
+                                       "stamp. It was read as it stands"))
         target = self._link_target(num)
         if target is not None:
             kind = ("junction" if self.reparse(num)[0] == IO_REPARSE_TAG_MOUNT_POINT else
@@ -5844,7 +6030,8 @@ class NtfsWalker:
                     else _ntfs_fixup(rec, NTFS_FILE)
                 torn = not fixed
                 if torn:
-                    self._torn[num] = (flags, struct.unpack_from("<H", rec, 0x10)[0])
+                    self._torn[num] = (flags, struct.unpack_from("<H", rec, 0x10)[0],
+                                       _ntfs_torn_past_use(rec))
                     fixed = _ntfs_fixup_torn(rec, NTFS_FILE)
                 attrs = self._parse_attrs(fixed, self_ref=num) if fixed else []
                 if torn:
@@ -6105,7 +6292,7 @@ class NtfsWalker:
         for a in attrs:
             if a.type == NTFS_INDEX_ROOT and a.name == "$I30":
                 root = a
-        torn = num in self._torn
+        torn = num in self._torn and not (attrs and self._torn[num][2])
         root_lost = num == NTFS_ROOT and not attrs
         index_lost = bool(self._ext_lost.get(num, set()) & {NTFS_INDEX_ROOT, NTFS_INDEX_ALLOCATION})
         if root is None and not torn and not index_lost and not root_lost:
@@ -35429,15 +35616,19 @@ def _ntfs_deleted_check(image_gz, listing):
             digest, name = line.split("  ", 1)
             want[name] = digest
     w = NtfsWalker(img, 0)
-    have = {e.name: e for e in w.deleted_files() if e.recoverable and not e.is_dir}
+    have = {e.name: e for e in w.deleted_files() if not e.is_dir}
     matched = missing = different = 0
     for name, digest in want.items():
         e = have.get(name)
-        if e is None:
+        if e is None or not (e.recoverable or "do not order" in e.reason):
             missing += 1
             continue
+        # ntfs-3g keeps no log, so every record of this fixture has LSN 0. recording.bin
+        # reuses clusters of files deleted before it, and the two cannot be ordered, so
+        # it is refused. Its bytes are still compared, through the same read path.
         h = hashlib.sha256()
-        for chunk in w.read_deleted(e):
+        for chunk in (w.read_deleted(e) if e.recoverable
+                      else w._read_nonresident(e._data, e.size)):  # pylint: disable=protected-access
             h.update(chunk)
         if h.hexdigest() == digest:
             matched += 1
@@ -37411,18 +37602,42 @@ def _ntfs_reader_fix_checks(image_gz):
         return not got.recoverable and "does not decode" in got.reason
     row("a deleted file whose run list does not decode is not recoverable", deleted_bad_runs)
 
+    def free_rec(units, extra, lsn, base=0):
+        rec = fresh(units, NTFS_ROOT, extra)
+        struct.pack_into("<H", rec, 0x16, 0)
+        struct.pack_into("<Q", rec, 8, lsn)
+        struct.pack_into("<Q", rec, 0x20, base)
+        return rec
+
+    def quiet(want):
+        """``want`` free clusters that no record maps. The fixture has no longer run."""
+        mapped = bytearray(ref.total_sectors * ref.bps // cluster + 1)
+        for num in range(records):
+            raw = ref._record_raw(num)               # pylint: disable=protected-access
+            got = ref._parse_deleted(raw) if raw else None  # pylint: disable=protected-access
+            for a in (got[1] if got else ()):
+                for lcn, count in (a.runs if not a.resident else ()):
+                    if lcn is not None:
+                        mapped[lcn:lcn + count] = b"\x01" * len(mapped[lcn:lcn + count])
+        found = [lcn for offset, length in ref.free_extents()
+                 for lcn in range(offset // cluster, (offset + length) // cluster)
+                 if not mapped[lcn]]
+        if len(found) < want:
+            raise ValueError("too few free clusters")
+        return found[:want]
+
     def deleted_marked():
-        gone = next(e for e in ref.deleted_files() if not e.resident and e.recoverable and e.size
-                    and sum(c for l, c in e._data.runs if l is not None) >= 2)  # pylint: disable=protected-access
-        stored = [(l, c) for l, c in gone._data.runs if l is not None]  # pylint: disable=protected-access
-        clusters = sum(c for _l, c in stored)
-        table = ref._data_attr(NTFS_BITMAP).runs[0][0] * cluster  # pylint: disable=protected-access
+        free = quiet(4)
+        size = 4 * cluster
         img = bytearray(clean)
-        for lcn in (stored[0][0], stored[-1][0] + stored[-1][1] - 1):
-            img[table + (lcn >> 3)] |= 1 << (lcn & 7)
-        got = next(e for e in walker(img).deleted_files() if e.record == gone.record)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 3, [(c, 1) for c in free], size, size))], 70))
+        table = ref._data_attr(NTFS_BITMAP).runs[0][0] * cluster  # pylint: disable=protected-access
+        for used in (free[0], free[3]):
+            img[table + (used >> 3)] |= 1 << (used & 7)
+        got = next(e for e in walker(img).deleted_files() if e.record == spare[0])
         return (not got.recoverable
-                and got.reason == f"$Bitmap marks 2 of the {clusters:,} clusters it reads as in use")
+                and got.reason == "$Bitmap marks 2 of the 4 clusters it reads as in use")
     row("a deleted file's reason counts the clusters $Bitmap marks in use", deleted_marked)
 
     def deleted_overlapping_runs():
@@ -37441,6 +37656,94 @@ def _ntfs_reader_fix_checks(image_gz):
                 and got.reason == f"its runs store {2 * total:,} clusters and this volume has "
                                   f"{total:,}")
     row("a deleted file whose runs store more than the volume has says so", deleted_overlapping_runs)
+
+    def shared_case(first, second, live=False):
+        free = quiet(4)
+        size = 3 * cluster
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 2, [(c, 1) for c in free[:3]], size, size))], first))
+        other = free_rec([0x62], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 2, [(c, 1) for c in free[1:]], size, size))], second)
+        if live:
+            struct.pack_into("<H", other, 0x16, 1)
+        put(img, spare[1], other)
+        return {e.record: e for e in walker(img).deleted_files()}
+
+    def shared_later():
+        got = shared_case(100, 200)
+        return (not got[spare[0]].recoverable and got[spare[1]].recoverable
+                and got[spare[0]].reason == f"2 of its 3 clusters are also mapped by record "
+                                            f"{spare[1]}, whose log sequence number is later")
+    row("a deleted record sharing clusters with a later one is refused, the later one kept",
+        shared_later)
+
+    def shared_unordered():
+        same = shared_case(150, 150)
+        none = shared_case(0, 150)
+        return all(not g[n].recoverable and "do not order" in g[n].reason
+                   for g in (same, none) for n in spare[:2])
+    row("two deleted records the log cannot order are both refused", shared_unordered)
+
+    def shared_live():
+        got = shared_case(900, 100, live=True)
+        return (spare[1] not in got and not got[spare[0]].recoverable
+                and f"live record {spare[1]}" in got[spare[0]].reason)
+    row("a deleted record sharing a cluster with a live record is refused", shared_live)
+
+    def deleted_wof():
+        img = bytearray(clean)
+        wof = struct.pack("<IIII", 1, 2, 1, 0)
+        hole = nonresident(NTFS_DATA, "", 0, 3, [(None, 4)], 4 * cluster, 4 * cluster)
+        put(img, spare[0], free_rec([0x77], [
+            (0xC0, resident(0xC0, struct.pack("<IHH", 0x80000017, len(wof), 0) + wof)),
+            (NTFS_DATA, hole)], 50))
+        put(img, spare[1], free_rec([0x63], [
+            (0xC0, resident(0xC0, struct.pack("<IHH", 0x9000001A, 0, 0))),
+            (NTFS_DATA, hole)], 50))
+        got = {e.record: e for e in walker(img).deleted_files()}
+        return (not got[spare[0]].recoverable and "compressed stream" in got[spare[0]].reason
+                and not got[spare[1]].recoverable and "placeholder" in got[spare[1]].reason)
+    row("a deleted overlay-compressed file or cloud placeholder is not recoverable", deleted_wof)
+
+    def deleted_extension():
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x78], [(NTFS_DATA, resident(NTFS_DATA, b"x" * 8))], 50,
+                                    base=names["small.txt"]))
+        return spare[0] not in {e.record for e in walker(img).deleted_files()}
+    row("a freed extension record is not listed as a deleted file", deleted_extension)
+
+    def deleted_list_no_data():
+        img = bytearray(clean)
+        entry = bytearray(32)
+        struct.pack_into("<IHBB", entry, 0, NTFS_DATA, 32, 0, 26)
+        struct.pack_into("<QQ", entry, 8, 0, spare[1])
+        put(img, spare[0], free_rec([0x79], [
+            (NTFS_ATTRIBUTE_LIST, resident(NTFS_ATTRIBUTE_LIST, bytes(entry)))], 50))
+        got = next(e for e in walker(img).deleted_files() if e.record == spare[0])
+        return (got.size is None and got.resident is None and not got.recoverable
+                and got.reason == "attributes overflowed the record")
+    row("a deleted file with its data in an extension record has no false size or kind",
+        deleted_list_no_data)
+
+    def torn_past_use():
+        img = bytearray(clean)
+        put(img, spare[0], fresh([0x64], NTFS_ROOT, is_dir=True))
+        img[at(spare[0]) + 1022:at(spare[0]) + 1024] = b"\xEE\xEE"
+
+        class Indexed(NtfsWalker):
+            """The fixture's root index does not name the record built here."""
+
+            def listdir(self, num):
+                got = super().listdir(num)
+                return got + [("d", spare[0])] if num == NTFS_ROOT else got
+
+        w = Indexed(io.BytesIO(bytes(img)), 0)
+        got = sorted(p for p, _n, s, _m in collect(w, w.root) if s is not None)
+        return (got == sorted(p for p, _n, s, _m in collect(ref, ref.root) if s is not None)
+                and w.folders_not_read == 0 and "update sequence" in damage(w))
+    row("a stale stride past a directory record's bytes in use loses nothing and is noted",
+        torn_past_use)
 
     def alloc_flip():
         node = names["frag/target.bin"]
