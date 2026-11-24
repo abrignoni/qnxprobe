@@ -1764,16 +1764,92 @@ def parse_apm(fh):
     return out if types and types[0] == "Apple_partition_map" else []
 
 
-def disk_sector_size(fh):
-    """The logical sector size partition LBAs on this image count: the one a
-    valid GPT was found at, else 512. The legacy and protective MBR count the
-    same logical blocks (UEFI 2.10 Table 5.2, SizeInLBA "in LBA units of logical
-    blocks"; Table 5.4, the protective StartingLBA is 1, "the LBA of the GPT
-    Partition Header"), so this is the unit for both tables."""
-    gpt = parse_gpt(fh)
+def container_sector_size(fh):
+    """The logical sector size the image's container states, 512 or 4096, or None
+    when it states none. A VHDX states it in its metadata (LogicalSectorSize) and an
+    EWF acquisition as its bytes per sector (the volume section of an E01 or S01, the
+    device information of an Ex01). A raw file states none. Only these two kinds are
+    asked: for the others ewfprobe's sector size is 512 whenever the container holds
+    no value, which cannot be told from a stated 512."""
+    vhdx = getattr(fh, "vhdx", None)
+    stated = vhdx.get("logical_sector_size") if isinstance(vhdx, dict) else None
+    if stated is None and getattr(fh, "format", None) in ("EWF-E01", "EWF-S01", "EWF2-Ex01"):
+        stated = getattr(fh, "sector_size", None)
+    return stated if stated in GPT_SECTOR_SIZES else None
+
+
+def _volume_starts_at(fh, base, mbr_type):
+    """True when what an MBR entry of this type names begins at byte ``base``, judged
+    by the volume's own first structure and by nothing a partition table says: a FAT,
+    exFAT, NTFS, ReFS or BitLocker boot sector, an ext, XFS, Btrfs, F2FS or qnx6
+    superblock, a LUKS header, or, for an extended partition, the 0x55AA of its first EBR. Each is
+    a fixed signature at a fixed offset from the start, so the test costs a few small
+    reads and can run before any filesystem is identified."""
+    b = read_at(fh, base, 512)
+    if len(b) < 512:
+        return False
+    if mbr_type in EXT_PARTITION_TYPES:
+        return b[510:512] == b"\x55\xaa"
+    if b[510:512] == b"\x55\xaa" and (
+            b[3:11] in (b"EXFAT   ", NTFS_OEM, BDE_SIGNATURE)
+            or b[82:90] in (b"FAT32   ", b"TFAT32  ")
+            or b[54:62] in (b"FAT16   ", b"FAT12   ", b"FAT     ", b"TFAT16  ")):
+        return True
+    if b[3:11] == REFS_FS_NAME and b[0x10:0x14] == REFS_FSRS:
+        return True
+    if b[:6] == LUKS_MAGIC:
+        return True
+    if b[:4] == b"XFSB" and struct.unpack_from(">I", b, 4)[0] in (
+            512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
+        return True
+    q6 = check(fh, base + BOOTBLOCK_SIZE)
+    if q6 and not q6[2]:
+        return True
+    sb = read_at(fh, base + EXT_SB_OFF, 1024)
+    if len(sb) == 1024:
+        if (_e(sb, "magic", 2) == EXT_MAGIC and _e(sb, "log_block_size") <= 6
+                and _e(sb, "blocks_count")):
+            return True
+        if struct.unpack_from("<I", sb, 0)[0] == F2FS_MAGIC:
+            return True
+    return read_at(fh, base + BTRFS_SUPER_OFF + 64, 8) == BTRFS_MAGIC
+
+
+def tables_sector_size(fh, gpt, parts):
+    """The logical sector size, in bytes, that the LBAs of this image's partition
+    tables count. ``gpt`` is what parse_gpt() gave and ``parts`` what parse_mbr() gave.
+
+    A valid GPT names it: the size its header was found at (UEFI 2.10 Table 5.2,
+    SizeInLBA "in LBA units of logical blocks"; Table 5.4, the protective StartingLBA
+    is 1, "the LBA of the GPT Partition Header", so the MBR beside a GPT counts the
+    same blocks). An MBR alone states no sector size, and a disk with 4096-byte
+    logical sectors counts its entries in those. So with no GPT: the size the
+    container states is used when it states one (container_sector_size); otherwise
+    the entries are tried at 512 bytes and, only when none of them leads to a volume
+    there, at 4096, and the first size at which an entry's own boot sector or
+    superblock checks is kept (_volume_starts_at). With no table, or when nothing
+    checks at either size, the answer is 512, as it always was."""
     # An empty table is falsy: a valid GPT with no used entry still names the
     # sector size, so the test is for no table, not for no entries.
-    return gpt.sector_size if gpt is not None else SECTOR
+    if gpt is not None:
+        return gpt.sector_size
+    if not parts:
+        return SECTOR
+    stated = container_sector_size(fh)
+    if stated is not None:
+        return stated
+    for ss in GPT_SECTOR_SIZES:
+        if any(_volume_starts_at(fh, st * ss, t) for _idx, t, st, _cnt in parts):
+            return ss
+    return SECTOR
+
+
+def disk_sector_size(fh):
+    """The logical sector size partition LBAs on this image count: the one a
+    valid GPT was found at, else the one its MBR's entries are read at
+    (tables_sector_size), else 512."""
+    gpt = parse_gpt(fh)
+    return tables_sector_size(fh, gpt, None if gpt is not None else parse_mbr(fh))
 
 
 # ---------------------------------------------------------------------------
@@ -16906,6 +16982,33 @@ class Qnx4Walker:
 
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
+        # ``damage`` lists what could not be read, for damage_lines(), and
+        # ``folders_not_read`` counts the folders whose listing is known to be short.
+        self.damage, self.folders_not_read, self._not_read = [], 0, set()
+        # Where the volume ends, from the .bitmap file: one bit per block
+        # (fs/qnx4/inode.c qnx4_statfs, f_blocks = BitMap->di_size * 8). The size is in
+        # whole bytes, so the last byte may cover fewer than eight blocks: the end used
+        # is the lowest the size allows, one block into the last byte, so that a whole
+        # volume is never said to reach past the end of its image.
+        self.declared_end = None
+        sb = read_at(fh, base + QNX4_BLOCK, QNX4_DIRENT)
+        if len(sb) == QNX4_DIRENT:
+            bitmap = _qnx4_bitmap_entry(fh, base, *struct.unpack_from("<II", sb, 20))
+            bsize = struct.unpack_from("<I", bitmap, 16)[0] if bitmap else 0
+            if bsize:
+                self.declared_end = base + ((bsize - 1) * 8 + 1) * QNX4_BLOCK
+
+    def _lost(self, folder, line):
+        """Record something of a folder that could not be read, once per line, and count
+        the folder in folders_not_read, once, because names in it may be missing."""
+        if line in self._not_read:
+            return
+        self._not_read.add(line)
+        if len(self.damage) < 1000:
+            self.damage.append(line)
+        if ("folder", folder) not in self._not_read:
+            self._not_read.add(("folder", folder))
+            self.folders_not_read += 1
 
     def _raw(self, num):
         blk, ndx = divmod(num, 8)
@@ -16967,6 +17070,10 @@ class Qnx4Walker:
                 buf = read_at(self.fh, self.base + sbnum * QNX4_BLOCK,
                               QNX4_BLOCK)
                 if len(buf) < QNX4_BLOCK:
+                    self._lost(num, f"a directory block could not be read in full (block "
+                                    f"{sbnum + 1:,}, {len(buf)} of {QNX4_BLOCK} bytes), so the "
+                                    f"folder's entries from byte {done:,} of its {size:,} on "
+                                    f"are not listed: the folder with inode {num:,}")
                     break
                 for ix in range(8):
                     e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
@@ -16979,8 +17086,15 @@ class Qnx4Walker:
                     else:
                         name = e[0:16].split(b"\x00")[0]
                         child = sbnum * 8 + ix
-                    name = name.decode("utf-8", "replace")
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
                     if name not in (".", ".."):
+                        if e[63] & QNX4_F_LINK and self._raw(child) is None:
+                            self._lost(num, f"the inode entry a name points to could not be "
+                                            f"read (block {iblk:,}, entry {e[52]}), so what it "
+                                            f"names is not exported and its size and dates are "
+                                            f"not known, in the folder with inode {num:,}: "
+                                            f"{name!r}")
                         out.append((name, child))
                 done += QNX4_BLOCK
         return out
@@ -17006,6 +17120,23 @@ class Qnx4Walker:
             left -= avail
 
 
+def _qnx4_bitmap_entry(fh, base, first_blk, first_sz):
+    """The ".bitmap" inode entry of the root directory whose first extent is first_sz
+    blocks from block first_blk (1-based), or None: the search fs/qnx4/inode.c
+    qnx4_checkroot() makes, over that extent only."""
+    if not (1 <= first_blk and 1 <= first_sz <= 65536):
+        return None
+    for j in range(first_sz):
+        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
+        if len(buf) < QNX4_BLOCK:
+            return None
+        for ix in range(8):
+            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
+            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
+                return e
+    return None
+
+
 def identify_qnx4(fh, base, size=None):
     """Return ("qnx4", lines) if a QNX4 filesystem starts at base, else None.
 
@@ -17021,20 +17152,7 @@ def identify_qnx4(fh, base, size=None):
     if (struct.unpack_from("<H", sb, 50)[0] & 0o170000) != S_IFDIR:
         return None
     first_blk, first_sz = struct.unpack_from("<II", sb, 20)
-    if not (1 <= first_blk and 1 <= first_sz <= 65536):
-        return None
-    bitmap = None
-    for j in range(first_sz):
-        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
-        if len(buf) < QNX4_BLOCK:
-            break
-        for ix in range(8):
-            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
-            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
-                bitmap = e
-                break
-        if bitmap:
-            break
+    bitmap = _qnx4_bitmap_entry(fh, base, first_blk, first_sz)
     if bitmap is None:
         return None
     bsize = struct.unpack_from("<I", bitmap, 16)[0]      # .bitmap di_size, bytes
@@ -17126,6 +17244,14 @@ def _etfs_scan_transactions(fh, base, pagesize, n, want_fid=None, cap=None):
             break
 
 
+def _etfs_name(raw):
+    """A stored ETFS name, or the part of one an entry holds, as text: up to its first
+    NUL, a byte that is not UTF-8 as %XX of the stored byte, and a "/" stored inside the
+    name as %2F so that it cannot invent a folder."""
+    return (raw.split(b"\x00", 1)[0].decode("utf-8", "qnxprobe-name")
+            .replace("\x00", "%00").replace("/", "%2F"))
+
+
 def _etfs_parse_entry(raw):
     """One 64-byte .filetable entry, or None."""
     if len(raw) < ETFS_ENTRY_SIZE:
@@ -17138,17 +17264,20 @@ def _etfs_parse_entry(raw):
              is_valid=efid != 0xFFFF, body=None, full=None)
     if etype == 0:                                # file entry
         mode, uid, gid, atime, mtime, ctime, size = struct.unpack_from("<7I", raw, 4)
-        name = raw[32:64].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        name = _etfs_name(raw[32:64])
         e["body"] = dict(mode=mode, uid=uid, gid=gid, mtime=mtime,
                          ctime=ctime, size=size, name=name)
     elif etype == 1:                              # extension-name entry
-        e["body"] = dict(name=raw[4:63].split(b"\x00", 1)[0].decode("utf-8", "replace"))
+        e["body"] = dict(name=_etfs_name(raw[4:63]))
     return e
 
 
 class EtfsWalker:
     """Reconstruct an ETFS filesystem by replaying its transactions, then walk
-    it through the shared collect()/extract interface. A node is a file id."""
+    it through the shared collect()/extract interface. A node is a file id.
+
+    ``volume_note`` says so when the region is not a whole number of pages: the
+    bytes after the last whole page are part of one page and are not read."""
 
     root = ETFS_FID_ROOT
 
@@ -17156,6 +17285,7 @@ class EtfsWalker:
         self.fh, self.base, self.bs = fh, base, pagesize
         self.unit = pagesize + ETFS_TRANS_SIZE
         self.n = size // self.unit
+        self.volume_note = _etfs_tail_note(size, pagesize)
         # current page for every (fid, cluster): the highest sequence wins, and
         # for equal sequences the later physical page, matching qnxmount.
         cur = {}
@@ -27631,15 +27761,46 @@ def _etfs_reserved_match(fh, base, pagesize, n, need=3):
     return False
 
 
+def _etfs_tail_note(size, pagesize):
+    """What to say of a region that is not a whole number of pages, or None."""
+    unit = pagesize + ETFS_TRANS_SIZE
+    tail = size % unit
+    if not tail:
+        return None
+    return (f"the image or region ends inside a page: after its {size // unit:,} whole "
+            f"pages of {unit:,} bytes ({pagesize:,} of data and {ETFS_TRANS_SIZE} of "
+            f"transaction record) come {tail:,} bytes that are part of one more page, "
+            f"and that page was not read")
+
+
 def etfs_pagesize(fh, base, size):
     """The ETFS page size for the region, or None. A candidate is accepted only
-    when the region divides evenly into (pagesize + 16)-byte pages AND the
-    .filetable carries its reserved names, so a chance size match is rejected.
+    when the .filetable, read in (pagesize + 16)-byte pages, carries its reserved
+    names at their fixed ids.
+
+    Whether the region must also be a whole number of pages depends on what it is,
+    and table_regions() says which: when the image has an MBR, GPT or APM entry,
+    every region tested is a partition or something inside one, its size is the
+    table's and not a cut's, and the whole-page test is kept, which declines almost
+    every such region on arithmetic alone before a byte of it is read. When the
+    image has no partition table, the region is the whole image or a flash region
+    found by its own headers (raw_flash_layout), the shape of a flash dump: that one
+    may end inside a page, because a dump cut inside its last page is still that
+    volume, and the walker says the page was not read (_etfs_tail_note).
     """
+    tabled = None
     for P in ETFS_PAGE_SIZES:
         unit = P + ETFS_TRANS_SIZE
-        if size < unit or size % unit != 0:
+        if size < unit:
             continue
+        if size % unit:
+            if tabled is None:
+                try:
+                    tabled = bool(table_regions(fh)[0])
+                except Exception:                      # pylint: disable=broad-except
+                    tabled = True       # tables that cannot be read: the stricter test
+            if tabled:
+                continue
         if _etfs_reserved_match(fh, base, P, size // unit):
             return P
     return None
@@ -27650,12 +27811,16 @@ def identify_etfs(fh, base, size):
     P = etfs_pagesize(fh, base, size)
     if P is None:
         return None
-    return "etfs", [
+    lines = [
         f"page size    {P:,} bytes data + {ETFS_TRANS_SIZE} bytes transaction",
         f"pages        {size // (P + ETFS_TRANS_SIZE):,}",
         "layout       transaction based, live state replayed from the spare area",
         "reserved     .filetable/.badblks/.counts/.lost+found/.reserved present",
     ]
+    tail = _etfs_tail_note(size, P)
+    if tail:
+        lines.append(f"note         {tail}")
+    return "etfs", lines
 
 
 def identify_efs(fh, base, size):
@@ -27917,11 +28082,12 @@ def _fat_partition_type(fh, base):
     """What the partition table calls the region at ``base``, as text, when that is a FAT
     type, else None. A bare image has no table and so gives no sign it was FAT."""
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
+    mbr = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, mbr)
     for _idx, _name, guid, first, _last in gpt or ():
         if first * ss == base and str(guid).lower() == _EFI_SYSTEM_GUID:
             return "EFI system partition"
-    for _idx, kind, start, _count in parse_mbr(fh) or ():
+    for _idx, kind, start, _count in mbr or ():
         if start * ss == base and kind in _FAT_MBR_TYPES:
             return f"MBR type {kind:#04x}"
         if kind not in EXT_PARTITION_TYPES:
@@ -32414,7 +32580,7 @@ def raid_assemble(images):
         size = image_size(fh)
         parts.append((label, fh, size))
         gpt = parse_gpt(fh)
-        lbs = gpt.sector_size if gpt is not None else SECTOR      # disk_sector_size()
+        lbs = tables_sector_size(fh, gpt, parse_mbr(fh))
         for _idx, pname, tguid, first, _last in (gpt or []):
             kind = RAID_GPT_TYPES.get(tguid.lower())
             if kind:
@@ -32743,7 +32909,7 @@ def _raid_identity_scan(fh):
     partition that ends where the image does belongs to the partition."""
     size = image_size(fh)
     gpt = parse_gpt(fh)
-    lbs = gpt.sector_size if gpt is not None else SECTOR      # as raid_assemble()
+    lbs = tables_sector_size(fh, gpt, parse_mbr(fh))          # as raid_assemble()
     out, md_at = [], {}
     for plabel, base, psize in _raid_places(fh, size):
         psize = min(psize, size - base)
@@ -42509,10 +42675,11 @@ def table_regions(fh):
     regions, names = [], {}
     containers, protective = set(), set()
     # Read first, reported last: the sector size the GPT header was found at is
-    # the unit every LBA on this disk counts, the MBR's included.
+    # the unit every LBA on this disk counts, the MBR's included. An MBR alone is
+    # read at the size its own partitions answer at (tables_sector_size).
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
     parts = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, parts)
     if parts:
         for idx, t, st, cnt in parts:
             regions.append((f"MBR part {idx}", st * ss, cnt * ss))
@@ -42609,7 +42776,8 @@ def volumes(fh, size=None):
         label       the region as the report names it ("GPT part 3 storage")
         base, size  byte offset and byte length of the region
         lba         base in the disk's logical sectors (4096 bytes on a disk
-                    whose GPT header is at byte 4096, else 512), the identity
+                    whose GPT header is at byte 4096 or whose MBR is read
+                    at 4096, tables_sector_size(); else 512), the identity
                     an extraction is named by
         kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
                     or "not recognised"
@@ -46262,16 +46430,18 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # its header was found at is the unit of every LBA on this disk,
         # the MBR's included (disk_sector_size).
         gpt, gpt_rejected = read_gpt(fh)
-        ss = gpt.sector_size if gpt is not None else SECTOR
-        image_rec["sector_bytes"] = ss
         parts = parse_mbr(fh)
+        ss = tables_sector_size(fh, gpt, parts)
+        image_rec["sector_bytes"] = ss
         if parts is None:
             print("  MBR      none (no 0x55AA signature at offset 510, or "
                   "sector 0 is a filesystem's own boot sector)")
         else:
             gpt_prot = any(t == 0xEE for _, t, _, _ in parts)
             print(f"  MBR      valid, {len(parts)} entries"
-                  + ("  (0xEE = GPT protective)" if gpt_prot else ""))
+                  + ("  (0xEE = GPT protective)" if gpt_prot else "")
+                  + (f", read in {ss}-byte logical sectors" if ss != SECTOR and gpt is None
+                     else ""))
             for idx, t, st, cnt in parts:
                 tag = f"   <- {MBR_QNX_TYPES[t]}" if t in MBR_QNX_TYPES else ""
                 print(f"    {idx}  type 0x{t:02x}  LBA {st:<12,} {human(cnt*ss):>10}{tag}")
@@ -55370,6 +55540,44 @@ def self_test():
         exf[510:512] = b"\x55\xaa"
         xp = os.path.join(d, "exfat.img"); open(xp, "wb").write(exf)
 
+        # An MBR states no sector size. On a disk with 4096-byte logical sectors its
+        # entries count 4096-byte sectors, so the partition at LBA 16 begins at byte
+        # 65,536, where read as 512-byte sectors it would be sought at byte 8,192.
+        # Built in memory from the exFAT boot sector above: the same entry with the
+        # volume at 16 x 4096, at 16 x 512, at both, and at neither.
+        def mbr_disk(*volume_at):
+            disk = bytearray(16 * 4096 + len(exf))
+            disk[446 + 4] = 0x07
+            struct.pack_into("<II", disk, 446 + 8, 16, len(exf) // 4096)
+            disk[510:512] = b"\x55\xaa"
+            for at in volume_at:
+                disk[at:at + 512] = exf[:512]
+            return bytes(disk)
+
+        def mbr_read(disk):
+            dfh = io.BytesIO(disk)
+            part = [v for v in volumes(dfh, len(disk)) if v["label"] == "MBR part 1"]
+            return (disk_sector_size(dfh), table_regions(dfh)[4],
+                    [(v["base"], v["lba"], v["kind"]) for v in part])
+
+        try:
+            at4k, at512 = mbr_read(mbr_disk(16 * 4096)), mbr_read(mbr_disk(16 * 512))
+            both = mbr_read(mbr_disk(16 * 512, 16 * 4096))
+            neither = mbr_read(mbr_disk())
+            mgood = (at4k == (4096, 4096, [(65536, 16, "exfat")])
+                     and at512 == (512, 512, [(8192, 16, "exfat")])
+                     and both == (512, 512, [(8192, 16, "exfat")])
+                     and neither[:2] == (512, 512) and neither[2][0][:2] == (8192, 16)
+                     and neither[2][0][2] != "exfat")
+            msaid = (f"the volume at byte 65,536 is read at {at4k[0]}, at byte 8,192 at "
+                     f"{at512[0]}, at both at {both[0]}, at neither at {neither[0]}")
+        except Exception as exc:                     # pylint: disable=broad-except
+            mgood, msaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not mgood:
+            ok = False
+        print(f"  [{'PASS' if mgood else 'FAIL'}] an MBR on a 4096-byte-sector disk is read "
+              f"at the sector size its partition answers at, and at 512 otherwise ({msaid})")
+
         for path, want_kind, label in (
                 (fp, "fat32", "fat32 boot sector recognised"),
                 (xp, "exfat", "exfat boot sector recognised"),
@@ -55449,6 +55657,96 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic ETFS recognised and one file round-tripped: "
               f"kind={kind}")
+
+        # ETFS names, in both places a name is stored: the 32 bytes of a file entry and
+        # the continuation in an extension entry. A byte that is not UTF-8 becomes %XX
+        # of the stored byte and a stored "/" becomes %2F, so two names that differ in
+        # one such byte stay two names, neither invents a folder, and both go into SQLite.
+        try:
+            nt = bytearray(etfs_img)
+            struct.pack_into("<H", nt, 6 * 64, 7)                    # fid 6 continues in fid 7
+            nt[6 * 64 + 32:7 * 64] = b"a\xffb/c".ljust(32, b"\x00")
+            nt[7 * 64:8 * 64] = (struct.pack("<HH", 0x8000, 6) + b"\xfe/x").ljust(64, b"\x00")
+            nt[8 * 64:9 * 64] = (struct.pack("<HH", 0x0000, 0)
+                                 + struct.pack("<7I", 0o100644, 0, 0, 0, 1712000000, 0, 0)
+                                 + b"a\xfdb/c".ljust(32, b"\x00"))
+            ew = walker_for("etfs", io.BytesIO(bytes(nt)), 0, len(nt))
+            et_paths = sorted(e[0] for e in collect(ew, ew.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            edb = sqlite3.connect(":memory:")
+            edb.execute("create table n (name text)")
+            edb.executemany("insert into n values (?)", [(n,) for n in et_paths])
+            ekept = sorted(r[0] for r in edb.execute("select name from n"))
+            edb.close()
+            long_node = dict(ew.listdir(ew.root)).get("a%FFb%2Fc%FE%2Fx")
+            egood = ("a%FFb%2Fc%FE%2Fx" in et_paths and "a%FDb%2Fc" in et_paths
+                     and not any("/" in n or "\ufffd" in n for n in et_paths)
+                     and ekept == et_paths and long_node == 6
+                     and b"".join(ew.read_file(6, len(payload))) == payload)
+            esaid = ", ".join(n for n in et_paths if n.startswith("a"))
+        except Exception as exc:                     # pylint: disable=broad-except
+            egood, esaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not egood:
+            ok = False
+        print(f"  [{'PASS' if egood else 'FAIL'}] ETFS names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, in a file entry and in its extension "
+              f"entry, kept apart and stored in SQLite ({ascii(esaid)[1:-1][:120]})")
+
+        # An ETFS image that ends inside a page. The synthetic volume with one more,
+        # erased, page after it, cut 100 bytes short: no page size divides it. It is
+        # still the volume, with the same members as the whole image, and the export
+        # says the last page was not read. Removed when the row ends, because the
+        # build workflow counts the images left in this folder.
+        def etfs_export(raw):
+            path = os.path.join(d, "etfs_cut_in_page.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = [(i.filename, i.CRC, i.file_size) for i in zf.infolist()
+                            if not i.filename.endswith(".tsv")]
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            erased = etfs_img + b"\xff" * (Pz + ETFS_TRANS_SIZE)
+            wrec, wheld, _wout = etfs_export(erased)
+            trec, theld, tout = etfs_export(erased[:-100])
+            w0, t0 = (wrec[0] if wrec else {}), (trec[0] if trec else {})
+            tgood = (len(wrec) == 1 and w0.get("filesystem") == "etfs" and "note" not in w0
+                     and len(trec) == 1 and t0.get("filesystem") == "etfs"
+                     and theld == wheld and len(theld) >= 1
+                     and t0.get("files") == w0.get("files") and t0.get("short") == 0
+                     and t0.get("failed") == 0 and "damage_recorded" not in t0
+                     and "ends inside a page" in t0.get("note", "")
+                     and f"come {Pz + ETFS_TRANS_SIZE - 100:,} bytes" in t0.get("note", "")
+                     and "that page was not read" in t0.get("note", "")
+                     and "NOTE" in tout and _volumes_not_read(trec) == 0)
+            tsaid = t0.get("note", "not recognised")[:150]
+            # Behind a partition table the region's size is the table's, so the
+            # whole-page test stays: the same volume as a partition of 32 whole pages
+            # (65 sectors) is ETFS, and read as 64 sectors, not a whole number of
+            # pages at any page size, it is declined.
+            tdisk = bytearray(8 * SECTOR) + erased + b"\xff" * (29 * (Pz + ETFS_TRANS_SIZE))
+            tdisk[446 + 4] = 0x83
+            struct.pack_into("<II", tdisk, 446 + 8, 8, 65)
+            tdisk[510:512] = b"\x55\xaa"
+            tfh = io.BytesIO(bytes(tdisk))
+            in_table = (identify_etfs(tfh, 8 * SECTOR, 65 * SECTOR),
+                        identify_etfs(tfh, 8 * SECTOR, 64 * SECTOR))
+            tgood = (tgood and len(tdisk) == 73 * SECTOR and in_table[0] is not None
+                     and in_table[0][0] == "etfs" and in_table[1] is None)
+        except Exception as exc:                     # pylint: disable=broad-except
+            tgood, tsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not tgood:
+            ok = False
+        print(f"  [{'PASS' if tgood else 'FAIL'}] an ETFS image that ends inside a page is "
+              f"still read, with the members of the whole image and a note that the page "
+              f"was not read, and a partition must still be whole pages ({tsaid})")
 
         # A synthetic EFS image: one erase unit whose unit_info sizes it, whose
         # boot record carries the QSSL_F3S signature, and whose header 2
@@ -55902,7 +56200,9 @@ def self_test():
                                          0o100444, 1712000000, 0x11)
         # block 3: the root directory
         root = bytearray(512)
-        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 64, 5, 1, 0, 1,
+        # .bitmap is 2 bytes: one bit per block for the 12 blocks of this image
+        # (fs/qnx4/inode.c qnx4_statfs), which is what the walker's declared end reads.
+        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 2, 5, 1, 0, 1,
                              0o100444, 1712000000, 0x01)
         root[64:128] = _q4_ino(b"selftest.txt", len(q4_pay), 6, 1, 0, 1,
                                0o100644, 1712000001, 0x01)
@@ -55962,6 +56262,91 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic QNX4: root, .bitmap, link entry, "
               f"two-extent xblk file all read: kind={kind}")
+
+        # QNX4 names. A byte that is not UTF-8 becomes %XX of the stored byte and a "/"
+        # stored inside one name becomes %2F, so two names that differ in one such byte
+        # stay two names, neither invents a folder, and both go into SQLite as they are.
+        try:
+            q4n = bytearray(q4)
+            q4n[1024 + 64:1024 + 80] = b"a\xffb/c".ljust(16, b"\x00")     # was selftest.txt
+            q4n[1024 + 192:1024 + 208] = b"a\xfeb/c".ljust(16, b"\x00")   # was multi.bin
+            nw = Qnx4Walker(io.BytesIO(bytes(q4n)), 0)
+            q4_paths = sorted(e[0] for e in collect(nw, nw.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            ndb = sqlite3.connect(":memory:")
+            ndb.execute("create table n (name text)")
+            ndb.executemany("insert into n values (?)", [(n,) for n in q4_paths])
+            kept = sorted(r[0] for r in ndb.execute("select name from n"))
+            ndb.close()
+            ngood = (q4_paths == sorted([".bitmap", "a%FEb%2Fc", "a%FFb%2Fc",
+                                         "a_longer_name_than_sixteen.txt"])
+                     and kept == q4_paths and not nw.damage and not nw.folders_not_read)
+            nsaid = ", ".join(q4_paths)
+        except Exception as exc:                     # pylint: disable=broad-except
+            ngood, nsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not ngood:
+            ok = False
+        print(f"  [{'PASS' if ngood else 'FAIL'}] QNX4 names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, kept apart and stored in SQLite "
+              f"({ascii(nsaid)[1:-1][:120]})")
+
+        # A QNX4 volume cut just after its root directory block. The inode entry the long
+        # name links to (block 4) and every file's data lie past the cut. The export has
+        # to say the volume reaches past the end, record the name it could not follow and
+        # count the folder as not read in full, which is what makes the run exit 1; the
+        # whole volume gains none of that. Removed when the row ends, because the build
+        # workflow counts the images left in this folder.
+        def q4_export(raw):
+            path = os.path.join(d, "qnx4_cut_after_root.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = zf.namelist()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            crec, cheld, cout = q4_export(bytes(q4[:1536]))
+            wrec, wheld, wout = q4_export(bytes(q4))
+            c0, w0 = (crec[0] if crec else {}), (wrec[0] if wrec else {})
+            first = (c0.get("damage_first") or [""])[0]
+            # the same cut with a root directory of two blocks: the second is past the cut
+            two = bytearray(q4[:1536])
+            struct.pack_into("<I", two, 512 + 16, 1024)          # RootDir di_size
+            struct.pack_into("<II", two, 512 + 20, 3, 2)         # its extent: blocks 3 and 4
+            tw = Qnx4Walker(io.BytesIO(bytes(two)), 0)
+            tnames = [n for n, _c in tw.listdir(tw.root)]
+            cgood = (len(crec) == 1 and c0.get("filesystem") == "qnx4"
+                     and c0.get("folders_not_read") == 1 and c0.get("damage_recorded") == 1
+                     and "block 4, entry 1" in first
+                     and first.endswith("in the folder with inode 8: "
+                                        "'a_longer_name_than_sixteen.txt'")
+                     and c0.get("files") == 0 and c0.get("short") == 3
+                     and c0.get("extends_past_image_by_bytes") == 9 * 512 - 1536
+                     and "INCOMPLETE" in cout and _volumes_not_read(crec) == 1
+                     and not any("a_longer_name" in n for n in cheld)
+                     and len(wrec) == 1 and w0.get("files") == 4 and w0.get("short") == 0
+                     and "damage_recorded" not in w0 and "folders_not_read" not in w0
+                     and "extends_past_image_by_bytes" not in w0
+                     and "INCOMPLETE" not in wout and _volumes_not_read(wrec) == 0
+                     and len(tnames) == 4 and tw.folders_not_read == 1
+                     and any("a directory block could not be read in full (block 4, 0 of "
+                             "512 bytes)" in line and "from byte 512 of its 1,024" in line
+                             for line in tw.damage))
+            csaid = first[:150] or "no damage record"
+        except Exception as exc:                     # pylint: disable=broad-except
+            cgood, csaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not cgood:
+            ok = False
+        print(f"  [{'PASS' if cgood else 'FAIL'}] a QNX4 volume cut after its root directory "
+              f"records the name whose inode entry is past the cut and a directory block "
+              f"past it, counts the folder as not read and is marked incomplete; the whole "
+              f"volume records nothing ({csaid})")
 
         # Sabotage: break the .bitmap name and detection must refuse, exactly
         # as the kernel refuses to mount without it (qnx4_checkroot).

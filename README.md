@@ -266,7 +266,9 @@ tool reproduces, and two volumes cannot share one, so names cannot collide. A
 label is only ever a suffix. An LBA counts the disk's own logical sectors: 512
 bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as on
 4Kn drives and UFS LUN images, so `p1_lba300` on such a disk begins at byte
-1,228,800.
+1,228,800. An MBR alone is counted in 4096-byte sectors only when the container
+says so or when its partitions answer there and not at 512 (see
+[An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)).
 
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
@@ -3896,8 +3898,10 @@ leaves them out (`rebuilt_bytes_not_written` in `unallocated.json`).
 
 A 1.1 or 1.2 superblock's role table is rounded up to the device's logical block size
 before its data offset is checked against it (md.c 1872-1882). An image says its logical
-block size only through a GPT header found at 4096 bytes; for any other image 512 bytes
-is assumed.
+block size through a GPT header found at 4096 bytes, or through an MBR read in 4096-byte
+sectors (see [An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk));
+for any other image 512 bytes is assumed. No md member on an MBR disk with 4096-byte
+sectors was run.
 
 From Python, `raid_open(paths)` opens the images and assembles them, and
 `raid_assemble([(label, image), ...])` does the same for images already open; each of
@@ -4863,6 +4867,48 @@ the ext4 fixture and requires the volume at the byte its entry names. Those imag
 the same in The Sleuth Kit's `mmls -b 4096` and in util-linux `sfdisk --sector-size
 4096`, and a GPT that `sfdisk` wrote with 4096-byte sectors is read as `sfdisk` wrote it.
 
+### An MBR on a 4096-byte-sector disk
+
+An MBR records no sector size. Its start and count fields are in the disk's logical
+sectors, so on a disk with 4096-byte logical sectors the first partition at LBA 64
+begins at byte 262,144, and read as 512-byte sectors it was sought at byte 32,768, where
+nothing is: such an image used to list its partition as "not recognised" and export
+nothing, with exit 0. Two sector sizes are tried, 512 and 4096, and no other:
+
+1. A valid GPT decides, as before, for both tables.
+2. With no GPT, a container that states a logical sector size decides: a VHDX
+   (`LogicalSectorSize` in its metadata) or an EWF acquisition (its bytes per sector),
+   when the value is 512 or 4096. A raw file states none, and no other kind of container
+   is asked.
+3. Otherwise the MBR's entries are tried at 512 bytes. If at least one leads to a
+   volume there, the disk is read at 512, exactly as before. Only when none does are the
+   same entries tried at 4096, and that reading is kept when at least one leads to a
+   volume. When nothing answers at either size the disk is read at 512, as before.
+
+"Leads to a volume" is a test of the partition's own first structure and of nothing the
+table says: a FAT, exFAT, NTFS, ReFS or BitLocker boot sector; an ext, XFS, Btrfs, F2FS
+or qnx6 superblock; a LUKS header; or, for an extended partition, the 0x55AA of its
+first EBR. A partition holding anything else does not count toward either size.
+
+The report says so on the MBR line (`read in 4096-byte logical sectors`), and
+`sector_bytes` in `volumes.json` and every `lba` are then in 4096-byte sectors.
+
+What this was checked against: two whole-disk images Windows 11 wrote on a virtual disk
+with 4096-byte logical sectors and an MBR, each holding one NTFS volume (one with 1 KiB
+and one with 4 KiB file records). Before, neither listed a volume. Now each lists its
+NTFS volume at the byte its entry names, and the export of the whole disk holds the same
+members, with the same CRC, size and date, as the export of that partition's bytes
+copied out and read alone as a bare volume. The VHDX of the first, which states its
+sector size, lists the same volume at the same byte (262,144), and all 1,409 files in
+the listing Windows made match on path, size and SHA-256 from the VHDX as from the raw
+image. The two exports are not identical: 5 of their 1,430 members, all NTFS system
+files, differ in CRC or date, because the raw image and the VHDX are not the same bytes
+(they differ in 21 4-KiB sectors inside the volume). This rule finds the volume and nothing
+more: what is exported from it is the NTFS reader's work. The self-test builds the MBR case in memory around an exFAT boot sector: the volume at
+16 x 4096, at 16 x 512, at both (512 is kept) and at neither (512 is kept). Not run on
+real data: an EWF acquisition of such a disk, any filesystem other than NTFS on one, and
+an extended partition on one.
+
 The QNX4 reader was validated by round-trip against the Linux kernel driver
 itself: a fixture populated with nested directories, a multi-extent file, a
 long name, a symlink, an empty file and distinct modes, owners and mtimes was
@@ -4872,6 +4918,25 @@ reported matched what this walker reads, 15 of 15 entries. The fixture was
 written by a separate generator program (its skeleton follows Peter
 Waechtler's Linux-side QNX4 `dinit`, a second independent statement of the
 layout), not by this parser, so the two sides are independent.
+
+QNX4 names and a cut QNX4 volume. A name is stored as bytes and the kernel passes them
+on as they are (`fs/qnx4/dir.c`). Here a byte that is not UTF-8 becomes `%XX` of the
+stored byte and a `/` stored inside one name becomes `%2F`, as for the other readers,
+where before the byte became U+FFFD and the `/` split the name into folders. The walker
+also takes an end for the volume from the `.bitmap` file, one bit per block as
+`qnx4_statfs()` in `fs/qnx4/inode.c` counts it (`BitMap->di_size * 8`). The size is in
+whole bytes, so its last byte may stand for fewer than eight blocks: the end used is the
+lowest that size allows, `(di_size - 1) * 8 + 1` blocks, so the report can fall up to
+seven blocks (3,584 bytes) short of how far a cut volume reached, and a whole volume is
+never said to reach past its image because of the rounding. When the image ends before
+that, the volume is marked INCOMPLETE with `extends_past_image_by_bytes`. A directory
+block that cannot be read in full, and a long name whose inode entry (reached through
+its link) cannot be read, each get a damage record naming the block, and the folder is
+counted in `folders_not_read`, so the run exits 1. Before, such a name was dropped with
+no record and exit 0. **Both changes are proven on the self-test's synthetic 12-block
+image only**, built by the test itself and not by a QNX4 writer: no real QNX4 volume
+was available, so non-ASCII names, the way a real formatter sizes `.bitmap`, and a cut
+through a real volume are not exercised.
 
 QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0):
@@ -4889,9 +4954,39 @@ extracting qnxmount's own committed test images and comparing every name, mode, 
 timestamp, symlink target and byte of content against the tar archive built from the
 same live filesystem, which qnxmount produced on QNX independently of this code: ETFS
 matched 32 of 32 entries, EFS 31 of 31. ETFS has no magic, so it is claimed only when
-the page geometry divides evenly and the `.filetable` carries its fixed reserved names
-at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
-u-boot, boot_fs or ext partitions of the two vehicle images tested.
+the `.filetable`, read in pages of one of the six page sizes tried, carries its fixed
+reserved names at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither
+fired on the u-boot, boot_fs or ext partitions of the two vehicle images tested.
+
+An ETFS image need not be a whole number of pages. Until this version the region also
+had to divide evenly into pages of data plus 16 bytes of transaction record, so an image
+cut anywhere but on a page boundary was "not recognised" and exported nothing, with exit
+0. The two qnxmount volumes with their last 4 KiB removed read so, though the pages
+that cut touches are erased ones (data all 0xFF, transaction code 3, `ETFS_TRANS_FOXES`
+in `fs/etfs.h`). The size test now applies only where a size is not a cut's: when the
+image has a partition table (`table_regions()` finds an MBR, GPT or APM entry), every
+region tested is a partition or lies in one, and it must still be a whole number of
+pages. That keeps the test that declines almost every such region without reading it:
+with it gone everywhere, listing the volumes of a 248 GB disk image with six
+unrecognised partitions took about six times as long. When the image has no partition
+table, the region is the whole image or a flash region found by its own headers, and
+it may end inside a page. The reserved-name test applies in both cases.
+Such an image is read as the volume it is, and its record in `volumes.json` carries a
+`note` (also printed as `NOTE`) saying the image or region ends inside a page, how many
+bytes of that page are there, and that the page was not read. Whole pages cut off with
+it are not counted: the note speaks for the one partial page only. Checked on the two qnxmount volumes: whole, each still matches the tar its writer
+made on path, size, CRC and modification time (23 and 14 regular files) and exports
+exactly what it did before; cut by 4 KiB, each exports the same members as whole, with
+the note. Where the size test no longer applies the reserved names are all that claims a region, so
+the change was also run over 23 raw flash dumps from the test corpus that hold no ETFS:
+none gained an ETFS volume, and each lists the same kinds of volume as before.
+
+ETFS names follow the rule the other readers use, in both places a name is stored (the
+32 bytes of a file entry and the continuation in an extension entry): a byte that is
+not UTF-8 becomes `%XX` of the stored byte, where before it became U+FFFD, and a `/`
+stored inside a name becomes `%2F`, where before it split the name into folders. No
+name in the two qnxmount volumes has either, so this is proven by a self-test row on
+the synthetic volume only.
 
 The EFS layouts are read from qnxmount at commit
 `11c8a7f9ee9b945d584263743f6ea8524e8776d2`. The extent status bits (condition mask 0x70
@@ -5167,9 +5262,14 @@ above are in this README only for now.)
   at or past the end of the image holds nothing to read: with `--extract` it gets a
   `volumes.json` record whose `extract_error` gives the listed offset and where the
   image ends, and the run exits 1.
-- **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
-  a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
-  sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
+- **A 4096-byte-sector disk is recognised by its GPT, by its container, or by where
+  its MBR's partitions answer.** A 4Kn disk that carries only a legacy MBR states its
+  sector size nowhere, so its entries are read at 4096 bytes only when a VHDX or EWF
+  container says 4096, or when none of them leads to a volume at 512 and one does at
+  4096 ([An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)). Such
+  a disk whose partitions hold nothing that test knows is still read at 512, and a
+  container that states 512 is believed. Sector sizes other than 512 and 4096 are not
+  probed. A GPT header that fails
   a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted (zlib tested on a synthetic image only,
@@ -5237,8 +5337,9 @@ above are in this README only for now.)
   measured on six vehicle flash images since 1.60 (see "QNX EFS in a raw flash image").
   ETFS keeps its transaction metadata in the NAND spare/out-of-band
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
-  an image that dropped it will not divide into pages and will be reported as not
-  recognised rather than misread.
+  an image that dropped it has no transaction record after each page, so the
+  `.filetable` should not be found and the image should be reported as not recognised;
+  no such image was available to run.
 - **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
   were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
   driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
