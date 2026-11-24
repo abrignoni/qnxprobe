@@ -14432,8 +14432,9 @@ class Jffs2Walker:
     recorded: ``damage`` (see damage_lines) says when the region ends inside a node,
     when a file's size is not covered by its readable data nodes, and when a name in a
     directory the root does not reach has an inode with no readable node, and
-    ``folders_not_read`` counts those findings; ``note`` counts every name whose inode
-    has no readable node, and ``unread_entries()`` lists the ones the root reaches.
+    ``folders_not_read`` counts those findings; ``note`` counts the names in folders the
+    root does not reach and every name whose inode has no readable node, and
+    ``unread_entries()`` lists the ones of those the root reaches.
     ``linked`` is the number of names the root reaches and ``unreached`` the number in
     directories it does not reach. A region cut between two nodes, with every name it
     still holds complete, shows none of this and reads as a smaller filesystem."""
@@ -14800,18 +14801,29 @@ class Jffs2Walker:
                 f"marks each such file SHORT")
 
     @property
-    def note(self):
-        """What the reader says about the volume as a whole, without the damage, or None."""
+    def volume_note(self):
+        """What the reader says about the volume as a whole, without the damage, or None.
+        Names in a folder the root does not reach are a count here and nothing more: a
+        region with nothing cut from it can hold them."""
+        parts = []
+        if self.unreached:
+            one = self.unreached == 1
+            parts.append(f"{self.unreached:,} name{' is' if one else 's are'} in a folder the "
+                         f"root does not reach: {'its' if one else 'their'} parent folder has "
+                         f"no entry the root reaches, and {'it is' if one else 'they are'} "
+                         f"not exported")
         away = self._unread_unreached
         count = len(self._unread) + away
-        if not count:
-            return None
-        one = count == 1
-        return (f"{count:,} name{' leads' if one else 's lead'} to an inode with no readable "
-                f"node in this region, so {'it is' if one else 'they are'} not listed or "
-                f"exported"
-                + (f"; {away:,} of them {'is' if away == 1 else 'are'} in a directory the "
-                   f"root does not reach" if away else ""))
+        if count:
+            one = count == 1
+            parts.append(f"{count:,} name{' leads' if one else 's lead'} to an inode with no "
+                         f"readable node in this region, so {'it is' if one else 'they are'} "
+                         f"not listed or exported"
+                         + (f"; {away:,} of them {'is' if away == 1 else 'are'} in a directory "
+                            f"the root does not reach" if away else ""))
+        return "; ".join(parts) or None
+
+    note = volume_note
 
     def unread_entries(self):
         """[(path, inode)] of every name the root reaches whose inode has no readable
@@ -15211,13 +15223,7 @@ def identify_jffs2(fh, base, size=None):
         lines.append(f"damaged      {s['bad']:,} nodes whose header CRC held but whose body "
                      f"or data CRC did not ({s['data CRC failures']:,} data); dropped, as the "
                      "kernel drops them")
-    if w.unreached:
-        one = w.unreached == 1
-        lines.append(f"note         {w.unreached:,} more name{' is' if one else 's are'} in a "
-                     f"directory the root does not reach and {'is' if one else 'are'} not listed "
-                     "(the kernel's mount pass removes an inode no name links, and a "
-                     "directory's children with it: fs/jffs2/build.c)")
-    if w.note:
+    if w.note:                 # the names the root does not reach are counted here
         lines.append(f"note         {w.note}")
     for line in damage_lines(w)[1]:
         lines.append(f"damage       {line}")
@@ -39481,11 +39487,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            volume_note = getattr(w, "note", None)
-                            if volume_note:          # any walker that has one to give
+                            wnote = w.volume_note if hasattr(w, "volume_note") else getattr(w, "note", None)
+                            if wnote:
                                 if manifest is not None:
-                                    manifest[-1]["note"] = volume_note
-                                _say(f"            NOTE {volume_note}")
+                                    manifest[-1]["note"] = wnote
+                                _say(f"            NOTE {wnote}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
@@ -40217,8 +40223,8 @@ def _jffs2_reader_checks():
         return {p: b"".join(w.read_file(n, sz)) for p, n, sz, _m in collect(w, w.root)
                 if sz is not None}
 
-    def quiet(w):
-        return not w.damage and not w.folders_not_read and w.note is None \
+    def quiet(w, note=False):
+        return not w.damage and not w.folders_not_read and (note or w.note is None) \
             and not w.unread_entries()
 
     out = []
@@ -40360,12 +40366,18 @@ def _jffs2_reader_checks():
                     inode(6, 1, b"six"))
         w = walker(raw)
         lines = identify_jffs2(io.BytesIO(raw), 0, len(raw))[1]
+        said = "1 name is in a folder the root does not reach"
         if not (any("1 name linked from the root" in ln for ln in lines)
-                and any("1 more name is in a directory the root does not reach" in ln
-                        for ln in lines)):
+                and any(said in ln for ln in lines)):
             return False
-        return (w.linked == 1 and w.unreached == 1 and quiet(w)
-                and [p for p, _n, _s, _m in collect(w, w.root)] == ["a"])
+        if not (w.linked == 1 and w.unreached == 1 and quiet(w, note=True)
+                and said in (w.note or "") and "not exported" in w.note
+                and [p for p, _n, _s, _m in collect(w, w.root)] == ["a"]):
+            return False
+        got = export(raw)
+        return got is None or (got[0] == 0 and said in (got[1].get("note") or "")
+                               and "damage_recorded" not in got[1]
+                               and "folders_not_read" not in got[1] and got[1]["files"] == 1)
 
     def unreached_without_a_node():
         # the same, with no node for inode 6: a name with no path to put in a row
@@ -40391,8 +40403,9 @@ def _jffs2_reader_checks():
         "nodes hold and nothing after them, where it was full size with zeros", cut_through_a_file)
     row("JFFS2: a range inside a file that no node covers is zeros in a SHORT member that "
         "counts only the bytes held, and a file whose nodes cover it is not SHORT", gap_inside)
-    row("JFFS2: names are counted from the root, and a name in a directory the root does not "
-        "reach is counted apart and not listed", unreached)
+    row("JFFS2: names are counted from the root, and a name in a folder the root does not "
+        "reach is counted in the volume's note, not listed, and leaves the exit status 0",
+        unreached)
     row("JFFS2: a name the root does not reach whose inode has no node is recorded as damage "
         "and in the note", unreached_without_a_node)
     return out

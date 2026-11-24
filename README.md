@@ -2626,8 +2626,11 @@ entries. 1.87 listed such a name with a surrogate character, which SQLite refuse
 
 The report counts the names linked from the root. A name in a directory the root does not
 reach is counted apart and not listed: the kernel's mount pass removes an inode no name
-links, and a directory's children with it (`fs/jffs2/build.c`). A region with nothing cut
-from it can hold such names, so they are a count in the report and not a record of loss.
+links, and a directory's children with it (`fs/jffs2/build.c`). The volume's `note` in
+`volumes.json` states how many there are, that their parent folder has no entry the root
+reaches, and that they are not exported. A region with nothing cut from it can hold such
+names (one real flash region read whole holds 14), so the note is a count and does not
+change the exit status.
 
 JFFS2 records no size and no count of its own, so a region that holds only part of a
 filesystem reads as a smaller one. What the region itself shows is recorded:
@@ -2648,8 +2651,9 @@ filesystem reads as a smaller one. What the region itself shows is recorded:
 
 None of these appears on the nine fixtures read whole. A region cut where no node is
 split, with every name it still holds complete, has nothing to record and reads as a
-smaller filesystem with exit 0: that is the case for a kernel-written image stopped
-before the block holding its root names. Only cuts were tested. The fixtures were stopped
+smaller filesystem with exit 0. A kernel-written image stopped before the block holding
+its root names is close to that: it exits 0, and its only record is the note counting
+the one name the root no longer reaches. Only cuts were tested. The fixtures were stopped
 at three points each (4 KiB before the end, half way, and after the first node); other
 damage was not tested. Every file those cuts left short had lost its end. A range missing
 before the end, and a name the root does not reach, were run on images of a few nodes
