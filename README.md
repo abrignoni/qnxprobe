@@ -1204,7 +1204,8 @@ repeated contents a later name lists nothing, and the volume's `note` counts tho
 
 A resource fork or an extended attribute held in the attributes tree is not exported as a
 member. Each file or folder holding any gets one `NAMED_STREAM` row in the exceptions table,
-with each stream's name and size (eight are named, then a count), and `--list` names them.
+with each stream's name and size (eight are named, then a count). The root folder's row has
+the path `/`. `--list` names them on the entries it prints, and the root is not one of those.
 `com.apple.FinderInfo` is kept in the catalog record, not the attributes tree, so it gets no
 row.
 `com.apple.decmpfs`, a resource fork holding the file's compressed data and the
@@ -1218,6 +1219,8 @@ its `note` says so and gives the bytes of transactions the journal holds: newer 
 exist there, and the listing shows the blocks as stored. On such a volume a catalog count or
 order that disagrees with its header, or a node that does not pass its checks, can be
 waiting in the journal, so it is stated in the `note` and does not change the exit status.
+The exception is a node the image ends inside: that is still a loss, counted in
+`folders_not_read`, and the run exits 1.
 
 Damage is recorded in `damage_first`. A B-tree node that fails its checks is never read as
 the end of a folder. The walk keeps what it reached, and `folders_not_read` and exit status
@@ -1226,7 +1229,9 @@ catalog leaf in the same folder are not listed, and a damaged root or header nod
 volume unlisted, with that record. A node that is damaged but still passes these checks is
 read as stored, so this is not a general detector of damaged sectors. A
 fork's extents each stay at their own file offset: a range that cannot be read is zeros,
-the file is named `SHORT`, and its row says which blocks. A primary volume header that is
+the file is named `SHORT`, and its row gives how many bytes were read and why: what is wrong
+with the extent map when that is the cause, or that the rest lies past the end of the image.
+A primary volume header that is
 not valid is replaced by the alternate at the end of the volume, and the record says so.
 
 Names are given as macOS shows them. The catalog stores a `:` in a name as `/` (a file

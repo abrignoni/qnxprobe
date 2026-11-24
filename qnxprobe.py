@@ -9453,8 +9453,9 @@ class HfsPlusWalker:
         """One NAMED_STREAM row per file or folder that holds a resource fork or a visible
         extended attribute, for the exceptions table: (path, member, issue, detail, 1). The
         bytes are not exported. ``entries`` is collect()'s list; a folder is named from the
-        walk that listed it. com.apple.provenance is left out of every row, and ``note``
-        gives the count of files holding it."""
+        walk that listed it, and the root folder, which no walk lists, is "/".
+        com.apple.provenance is left out of every row, and ``note`` gives the count of files
+        holding it."""
         rows = []
         self._count_provenance()
 
@@ -9476,7 +9477,7 @@ class HfsPlusWalker:
                 continue
             if streams:
                 add(path, members.get(path, ""), streams)
-        for cnid in sorted(self._folder_names):
+        for cnid in sorted({HFSP_ROOT} | set(self._folder_names)):
             try:
                 streams = self._attr_streams(cnid)
             except (ValueError, struct.error) as exc:
@@ -9488,7 +9489,7 @@ class HfsPlusWalker:
                     at, name = self._folder_names[at]
                     parts.append(name)
                     hops += 1
-                add("/".join(reversed(parts)), "", streams)
+                add("/".join(reversed(parts)) or "/", "", streams)
         return rows
 
     def read_file(self, node, size):
@@ -36393,6 +36394,24 @@ def _hfs_reader_checks():
                 and not [r for r in issues if r[2] == "NAMED_STREAM"])
     row("HFS+: a file with several hard links counts once for com.apple.provenance",
         provenance_once)
+
+    def root_stream():
+        v = _HfsTestVolume()
+        cnid = v.file(HFSP_ROOT, "f.txt", b"x")
+        v.xattr(cnid, "user.on_file", b"12")
+        v.xattr(HFSP_ROOT, "user.on_root", b"abc")
+        v.xattr(HFSP_ROOT, "com.apple.provenance", b"12345678901")
+        _w, _t, issues, _z = export(v.image())
+        rows = {r[0]: r for r in issues if r[2] == "NAMED_STREAM"}
+        plain = _HfsTestVolume()
+        plain.file(HFSP_ROOT, "f.txt", b"x")
+        plain.xattr(HFSP_ROOT, "com.apple.provenance", b"12345678901")
+        _w, _t, others, _z = export(plain.image())
+        return (set(rows) == {"/", "f.txt"} and rows["/"][1] == ""
+                and "1 named stream(s)" in rows["/"][3] and "user.on_root (3 bytes)" in rows["/"][3]
+                and not [r for r in others if r[2] == "NAMED_STREAM"])
+    row("HFS+: an attribute on the root folder gets a NAMED_STREAM row, with the path /",
+        root_stream)
 
     def stream_count():
         v = _HfsTestVolume()
