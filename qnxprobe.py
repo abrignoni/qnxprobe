@@ -1764,16 +1764,92 @@ def parse_apm(fh):
     return out if types and types[0] == "Apple_partition_map" else []
 
 
-def disk_sector_size(fh):
-    """The logical sector size partition LBAs on this image count: the one a
-    valid GPT was found at, else 512. The legacy and protective MBR count the
-    same logical blocks (UEFI 2.10 Table 5.2, SizeInLBA "in LBA units of logical
-    blocks"; Table 5.4, the protective StartingLBA is 1, "the LBA of the GPT
-    Partition Header"), so this is the unit for both tables."""
-    gpt = parse_gpt(fh)
+def container_sector_size(fh):
+    """The logical sector size the image's container states, 512 or 4096, or None
+    when it states none. A VHDX states it in its metadata (LogicalSectorSize) and an
+    EWF acquisition as its bytes per sector (the volume section of an E01 or S01, the
+    device information of an Ex01). A raw file states none. Only these two kinds are
+    asked: for the others ewfprobe's sector size is 512 whenever the container holds
+    no value, which cannot be told from a stated 512."""
+    vhdx = getattr(fh, "vhdx", None)
+    stated = vhdx.get("logical_sector_size") if isinstance(vhdx, dict) else None
+    if stated is None and getattr(fh, "format", None) in ("EWF-E01", "EWF-S01", "EWF2-Ex01"):
+        stated = getattr(fh, "sector_size", None)
+    return stated if stated in GPT_SECTOR_SIZES else None
+
+
+def _volume_starts_at(fh, base, mbr_type):
+    """True when what an MBR entry of this type names begins at byte ``base``, judged
+    by the volume's own first structure and by nothing a partition table says: a FAT,
+    exFAT, NTFS, ReFS or BitLocker boot sector, an ext, XFS, Btrfs, F2FS or qnx6
+    superblock, a LUKS header, or, for an extended partition, the 0x55AA of its first EBR. Each is
+    a fixed signature at a fixed offset from the start, so the test costs a few small
+    reads and can run before any filesystem is identified."""
+    b = read_at(fh, base, 512)
+    if len(b) < 512:
+        return False
+    if mbr_type in EXT_PARTITION_TYPES:
+        return b[510:512] == b"\x55\xaa"
+    if b[510:512] == b"\x55\xaa" and (
+            b[3:11] in (b"EXFAT   ", NTFS_OEM, BDE_SIGNATURE)
+            or b[82:90] in (b"FAT32   ", b"TFAT32  ")
+            or b[54:62] in (b"FAT16   ", b"FAT12   ", b"FAT     ", b"TFAT16  ")):
+        return True
+    if b[3:11] == REFS_FS_NAME and b[0x10:0x14] == REFS_FSRS:
+        return True
+    if b[:6] == LUKS_MAGIC:
+        return True
+    if b[:4] == b"XFSB" and struct.unpack_from(">I", b, 4)[0] in (
+            512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
+        return True
+    q6 = check(fh, base + BOOTBLOCK_SIZE)
+    if q6 and not q6[2]:
+        return True
+    sb = read_at(fh, base + EXT_SB_OFF, 1024)
+    if len(sb) == 1024:
+        if (_e(sb, "magic", 2) == EXT_MAGIC and _e(sb, "log_block_size") <= 6
+                and _e(sb, "blocks_count")):
+            return True
+        if struct.unpack_from("<I", sb, 0)[0] == F2FS_MAGIC:
+            return True
+    return read_at(fh, base + BTRFS_SUPER_OFF + 64, 8) == BTRFS_MAGIC
+
+
+def tables_sector_size(fh, gpt, parts):
+    """The logical sector size, in bytes, that the LBAs of this image's partition
+    tables count. ``gpt`` is what parse_gpt() gave and ``parts`` what parse_mbr() gave.
+
+    A valid GPT names it: the size its header was found at (UEFI 2.10 Table 5.2,
+    SizeInLBA "in LBA units of logical blocks"; Table 5.4, the protective StartingLBA
+    is 1, "the LBA of the GPT Partition Header", so the MBR beside a GPT counts the
+    same blocks). An MBR alone states no sector size, and a disk with 4096-byte
+    logical sectors counts its entries in those. So with no GPT: the size the
+    container states is used when it states one (container_sector_size); otherwise
+    the entries are tried at 512 bytes and, only when none of them leads to a volume
+    there, at 4096, and the first size at which an entry's own boot sector or
+    superblock checks is kept (_volume_starts_at). With no table, or when nothing
+    checks at either size, the answer is 512, as it always was."""
     # An empty table is falsy: a valid GPT with no used entry still names the
     # sector size, so the test is for no table, not for no entries.
-    return gpt.sector_size if gpt is not None else SECTOR
+    if gpt is not None:
+        return gpt.sector_size
+    if not parts:
+        return SECTOR
+    stated = container_sector_size(fh)
+    if stated is not None:
+        return stated
+    for ss in GPT_SECTOR_SIZES:
+        if any(_volume_starts_at(fh, st * ss, t) for _idx, t, st, _cnt in parts):
+            return ss
+    return SECTOR
+
+
+def disk_sector_size(fh):
+    """The logical sector size partition LBAs on this image count: the one a
+    valid GPT was found at, else the one its MBR's entries are read at
+    (tables_sector_size), else 512."""
+    gpt = parse_gpt(fh)
+    return tables_sector_size(fh, gpt, None if gpt is not None else parse_mbr(fh))
 
 
 # ---------------------------------------------------------------------------
@@ -24551,11 +24627,12 @@ def _fat_partition_type(fh, base):
     """What the partition table calls the region at ``base``, as text, when that is a FAT
     type, else None. A bare image has no table and so gives no sign it was FAT."""
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
+    mbr = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, mbr)
     for _idx, _name, guid, first, _last in gpt or ():
         if first * ss == base and str(guid).lower() == _EFI_SYSTEM_GUID:
             return "EFI system partition"
-    for _idx, kind, start, _count in parse_mbr(fh) or ():
+    for _idx, kind, start, _count in mbr or ():
         if start * ss == base and kind in _FAT_MBR_TYPES:
             return f"MBR type {kind:#04x}"
         if kind not in EXT_PARTITION_TYPES:
@@ -29049,7 +29126,7 @@ def raid_assemble(images):
         size = image_size(fh)
         parts.append((label, fh, size))
         gpt = parse_gpt(fh)
-        lbs = gpt.sector_size if gpt is not None else SECTOR      # disk_sector_size()
+        lbs = tables_sector_size(fh, gpt, parse_mbr(fh))
         for _idx, pname, tguid, first, _last in (gpt or []):
             kind = RAID_GPT_TYPES.get(tguid.lower())
             if kind:
@@ -29378,7 +29455,7 @@ def _raid_identity_scan(fh):
     partition that ends where the image does belongs to the partition."""
     size = image_size(fh)
     gpt = parse_gpt(fh)
-    lbs = gpt.sector_size if gpt is not None else SECTOR      # as raid_assemble()
+    lbs = tables_sector_size(fh, gpt, parse_mbr(fh))          # as raid_assemble()
     out, md_at = [], {}
     for plabel, base, psize in _raid_places(fh, size):
         psize = min(psize, size - base)
@@ -37055,10 +37132,11 @@ def table_regions(fh):
     regions, names = [], {}
     containers, protective = set(), set()
     # Read first, reported last: the sector size the GPT header was found at is
-    # the unit every LBA on this disk counts, the MBR's included.
+    # the unit every LBA on this disk counts, the MBR's included. An MBR alone is
+    # read at the size its own partitions answer at (tables_sector_size).
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
     parts = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, parts)
     if parts:
         for idx, t, st, cnt in parts:
             regions.append((f"MBR part {idx}", st * ss, cnt * ss))
@@ -37155,7 +37233,8 @@ def volumes(fh, size=None):
         label       the region as the report names it ("GPT part 3 storage")
         base, size  byte offset and byte length of the region
         lba         base in the disk's logical sectors (4096 bytes on a disk
-                    whose GPT header is at byte 4096, else 512), the identity
+                    whose GPT header is at byte 4096 or whose MBR is read
+                    at 4096, tables_sector_size(); else 512), the identity
                     an extraction is named by
         kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
                     or "not recognised"
@@ -40797,16 +40876,18 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # its header was found at is the unit of every LBA on this disk,
         # the MBR's included (disk_sector_size).
         gpt, gpt_rejected = read_gpt(fh)
-        ss = gpt.sector_size if gpt is not None else SECTOR
-        image_rec["sector_bytes"] = ss
         parts = parse_mbr(fh)
+        ss = tables_sector_size(fh, gpt, parts)
+        image_rec["sector_bytes"] = ss
         if parts is None:
             print("  MBR      none (no 0x55AA signature at offset 510, or "
                   "sector 0 is a filesystem's own boot sector)")
         else:
             gpt_prot = any(t == 0xEE for _, t, _, _ in parts)
             print(f"  MBR      valid, {len(parts)} entries"
-                  + ("  (0xEE = GPT protective)" if gpt_prot else ""))
+                  + ("  (0xEE = GPT protective)" if gpt_prot else "")
+                  + (f", read in {ss}-byte logical sectors" if ss != SECTOR and gpt is None
+                     else ""))
             for idx, t, st, cnt in parts:
                 tag = f"   <- {MBR_QNX_TYPES[t]}" if t in MBR_QNX_TYPES else ""
                 print(f"    {idx}  type 0x{t:02x}  LBA {st:<12,} {human(cnt*ss):>10}{tag}")
@@ -48322,6 +48403,44 @@ def self_test():
         struct.pack_into("<I", exf, 92, 16)
         exf[510:512] = b"\x55\xaa"
         xp = os.path.join(d, "exfat.img"); open(xp, "wb").write(exf)
+
+        # An MBR states no sector size. On a disk with 4096-byte logical sectors its
+        # entries count 4096-byte sectors, so the partition at LBA 16 begins at byte
+        # 65,536, where read as 512-byte sectors it would be sought at byte 8,192.
+        # Built in memory from the exFAT boot sector above: the same entry with the
+        # volume at 16 x 4096, at 16 x 512, at both, and at neither.
+        def mbr_disk(*volume_at):
+            disk = bytearray(16 * 4096 + len(exf))
+            disk[446 + 4] = 0x07
+            struct.pack_into("<II", disk, 446 + 8, 16, len(exf) // 4096)
+            disk[510:512] = b"\x55\xaa"
+            for at in volume_at:
+                disk[at:at + 512] = exf[:512]
+            return bytes(disk)
+
+        def mbr_read(disk):
+            dfh = io.BytesIO(disk)
+            part = [v for v in volumes(dfh, len(disk)) if v["label"] == "MBR part 1"]
+            return (disk_sector_size(dfh), table_regions(dfh)[4],
+                    [(v["base"], v["lba"], v["kind"]) for v in part])
+
+        try:
+            at4k, at512 = mbr_read(mbr_disk(16 * 4096)), mbr_read(mbr_disk(16 * 512))
+            both = mbr_read(mbr_disk(16 * 512, 16 * 4096))
+            neither = mbr_read(mbr_disk())
+            mgood = (at4k == (4096, 4096, [(65536, 16, "exfat")])
+                     and at512 == (512, 512, [(8192, 16, "exfat")])
+                     and both == (512, 512, [(8192, 16, "exfat")])
+                     and neither[:2] == (512, 512) and neither[2][0][:2] == (8192, 16)
+                     and neither[2][0][2] != "exfat")
+            msaid = (f"the volume at byte 65,536 is read at {at4k[0]}, at byte 8,192 at "
+                     f"{at512[0]}, at both at {both[0]}, at neither at {neither[0]}")
+        except Exception as exc:                     # pylint: disable=broad-except
+            mgood, msaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not mgood:
+            ok = False
+        print(f"  [{'PASS' if mgood else 'FAIL'}] an MBR on a 4096-byte-sector disk is read "
+              f"at the sector size its partition answers at, and at 512 otherwise ({msaid})")
 
         for path, want_kind, label in (
                 (fp, "fat32", "fat32 boot sector recognised"),

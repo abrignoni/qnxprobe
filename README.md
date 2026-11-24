@@ -247,7 +247,9 @@ tool reproduces, and two volumes cannot share one, so names cannot collide. A
 label is only ever a suffix. An LBA counts the disk's own logical sectors: 512
 bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as on
 4Kn drives and UFS LUN images, so `p1_lba300` on such a disk begins at byte
-1,228,800.
+1,228,800. An MBR alone is counted in 4096-byte sectors only when the container
+says so or when its partitions answer there and not at 512 (see
+[An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)).
 
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
@@ -3363,8 +3365,10 @@ leaves them out (`rebuilt_bytes_not_written` in `unallocated.json`).
 
 A 1.1 or 1.2 superblock's role table is rounded up to the device's logical block size
 before its data offset is checked against it (md.c 1872-1882). An image says its logical
-block size only through a GPT header found at 4096 bytes; for any other image 512 bytes
-is assumed.
+block size through a GPT header found at 4096 bytes, or through an MBR read in 4096-byte
+sectors (see [An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk));
+for any other image 512 bytes is assumed. No md member on an MBR disk with 4096-byte
+sectors was run.
 
 From Python, `raid_open(paths)` opens the images and assembles them, and
 `raid_assemble([(label, image), ...])` does the same for images already open; each of
@@ -4285,6 +4289,44 @@ the ext4 fixture and requires the volume at the byte its entry names. Those imag
 the same in The Sleuth Kit's `mmls -b 4096` and in util-linux `sfdisk --sector-size
 4096`, and a GPT that `sfdisk` wrote with 4096-byte sectors is read as `sfdisk` wrote it.
 
+### An MBR on a 4096-byte-sector disk
+
+An MBR records no sector size. Its start and count fields are in the disk's logical
+sectors, so on a disk with 4096-byte logical sectors the first partition at LBA 64
+begins at byte 262,144, and read as 512-byte sectors it was sought at byte 32,768, where
+nothing is: such an image used to list its partition as "not recognised" and export
+nothing, with exit 0. Two sector sizes are tried, 512 and 4096, and no other:
+
+1. A valid GPT decides, as before, for both tables.
+2. With no GPT, a container that states a logical sector size decides: a VHDX
+   (`LogicalSectorSize` in its metadata) or an EWF acquisition (its bytes per sector),
+   when the value is 512 or 4096. A raw file states none, and no other kind of container
+   is asked.
+3. Otherwise the MBR's entries are tried at 512 bytes. If at least one leads to a
+   volume there, the disk is read at 512, exactly as before. Only when none does are the
+   same entries tried at 4096, and that reading is kept when at least one leads to a
+   volume. When nothing answers at either size the disk is read at 512, as before.
+
+"Leads to a volume" is a test of the partition's own first structure and of nothing the
+table says: a FAT, exFAT, NTFS, ReFS or BitLocker boot sector; an ext, XFS, Btrfs, F2FS
+or qnx6 superblock; a LUKS header; or, for an extended partition, the 0x55AA of its
+first EBR. A partition holding anything else does not count toward either size.
+
+The report says so on the MBR line (`read in 4096-byte logical sectors`), and
+`sector_bytes` in `volumes.json` and every `lba` are then in 4096-byte sectors.
+
+What this was checked against: two whole-disk images Windows 11 wrote on a virtual disk
+with 4096-byte logical sectors and an MBR, each holding one NTFS volume (one with 1 KiB
+and one with 4 KiB file records). Before, neither listed a volume. Now each lists its
+NTFS volume at the byte its entry names, and the export of the whole disk holds the same
+members, with the same CRC, size and date, as the export of that partition's bytes
+copied out and read alone as a bare volume; the VHDX of the first, which states its
+sector size, reads the same as its raw image. This rule finds the volume and nothing
+more: what is exported from it is the NTFS reader's work. The self-test builds the MBR case in memory around an exFAT boot sector: the volume at
+16 x 4096, at 16 x 512, at both (512 is kept) and at neither (512 is kept). Not run on
+real data: an EWF acquisition of such a disk, any filesystem other than NTFS on one, and
+an extended partition on one.
+
 The QNX4 reader was validated by round-trip against the Linux kernel driver
 itself: a fixture populated with nested directories, a multi-extent file, a
 long name, a symlink, an empty file and distinct modes, owners and mtimes was
@@ -4580,9 +4622,14 @@ above are in this README only for now.)
   at or past the end of the image holds nothing to read: with `--extract` it gets a
   `volumes.json` record whose `extract_error` gives the listed offset and where the
   image ends, and the run exits 1.
-- **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
-  a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
-  sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
+- **A 4096-byte-sector disk is recognised by its GPT, by its container, or by where
+  its MBR's partitions answer.** A 4Kn disk that carries only a legacy MBR states its
+  sector size nowhere, so its entries are read at 4096 bytes only when a VHDX or EWF
+  container says 4096, or when none of them leads to a volume at 512 and one does at
+  4096 ([An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)). Such
+  a disk whose partitions hold nothing that test knows is still read at 512, and a
+  container that states 512 is believed. Sector sizes other than 512 and 4096 are not
+  probed. A GPT header that fails
   a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
