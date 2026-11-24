@@ -1240,8 +1240,8 @@ points and held against QNX's tar, and the self-test runs all three. With the la
 gone, or the second half gone, the 22 files are exported with the tar's bytes, the record
 gives 524,288 bytes against the 520,192 or 262,144 the image holds, and the run exits 1.
 Cut after the first unit, the root folder is recorded as not listed in full, no file is
-exported and the run exits 1. The five corpus images `xtrmp_item020`, `027`, `030`, `031`
-and `081` were cut at half their length. The partition the cut crosses is reported with
+exported and the run exits 1. The five corpus images named above other than `115` were cut at
+half their length. The partition the cut crosses is reported with
 its record on all five. Of its 442 files (3, 3, 3, 3 and 430), 339 are exported with the
 bytes the whole image gives, 4 are counted failed and 99 sit under the 8 folders recorded
 as not listed in full. No exported file differs from the whole image's, and the partitions
@@ -1260,8 +1260,8 @@ checked against anything.
 An EFS node is `(first_logi, first_index, mode, mtime)`, so that element is the logical
 unit of the folder's first entry, and through 1.87 folders whose first entries shared a
 logical unit were walked once between them. On the QNX-written image `walk_all()` returned
-13 of the 31 entries, and on the corpus images `xtrmp_item020`, `027`, `030`, `031` and
-`081` it returned 1,728, 1,728, 1,925, 1,655 and 1,996 of 2,960, 2,956, 3,530, 2,851 and
+13 of the 31 entries, and on the five corpus images named above other than `115`, in the
+order given there, it returned 1,728, 1,728, 1,925, 1,655 and 1,996 of 2,960, 2,956, 3,530, 2,851 and
 3,678. `collect()`, `--list` and `--extract` do not use that guard and were not affected.
 `walk_all()` now asks a walker that has a `walk_key(node)` method for the key, and
 `EfsWalker.walk_key` gives the logical unit and the header index together. It returns
