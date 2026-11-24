@@ -3203,7 +3203,7 @@ class Fat32Walker:
         """Note what a folder holds past its end marker and any reserved attribute bits.
         These are notes: they change neither what is listed nor the exit status, because
         Linux commit 6a2875517c77 reports media whose trailing slots were never zeroed,
-        with nothing lost. A real loss shows in _note_unreached.
+        with nothing lost. A loss that leaves clusters allocated shows in _note_unreached.
 
         Microsoft's FAT specification says every entry after one whose first byte is 0x00
         is free. A slot there with the 0xE5 mark is free too, and is counted apart from one
@@ -3244,9 +3244,11 @@ class Fat32Walker:
         1 are the media descriptor and the end-of-chain marker rather than
         clusters.
 
-        A cluster is free only when every FAT copy that holds its entry says so.
-        One copy with a sector lost to zeros must not turn live files into free
-        space. The copies that disagree are counted in ``free_space_note`` and in
+        A cluster is free only when every FAT copy that counts and holds its entry says
+        so. Where a second copy counts, a sector of one copy lost to zeros does not turn
+        live files into free space. With one FAT, or with mirroring off, there is no
+        second copy to ask and a zeroed entry reads as free. The copies that disagree are
+        counted in ``free_space_note`` and in
         ``damage``. An entry no copy holds, past the end of a truncated image, reads
         as zero.
 
@@ -38632,12 +38634,12 @@ def _fat_reader_checks():
         keep = short(b"KEEP    BIN", first=10, size=1)
         late = short(b"LATE    BIN", first=11, size=1)
         lab = Lab(16, 5000, keep=64)
-        lab.root([keep, bytes(32), late])            # a sector lost to zeros in the middle
+        lab.root([keep, bytes(32), late])            # a zero slot before an allocated file
         lab.chain([10])
         lab.chain([11])                              # the file past the gap is still allocated
         names, gap = listed(lab)
         odd = Lab(16, 5000, keep=64)
-        odd.root([keep, b"\xff" * 32])               # a sector of 0xFF
+        odd.root([keep, b"\xff" * 32])               # a slot of 0xFF
         odd_names, ffs = listed(odd)
         cut = Lab(16, 5000, keep=64)
         cut.root([short(b"DIR        ", 0x10, 20)])
@@ -39050,9 +39052,9 @@ def _fat_reader_checks():
         (impossible_day, "a stored 30 February is shown as its stored words, not as a date"),
         (folder_cap_counts_gaps, "clusters the image lacks count toward the most a FAT folder "
                                  "can hold, so a damaged chain is not walked to its end"),
-        (lost_sector_recorded, "a lost sector in a FAT folder is recorded (slots past an end "
-                               "marker, a link only another copy holds, reserved attribute "
-                               "bits), a clean folder records nothing, and the listing holds"),
+        (lost_sector_recorded, "a FAT folder with a zero slot before an allocated file, a 0xFF "
+                               "slot, or a chain only another FAT copy continues is recorded, "
+                               "a clean folder records nothing, and the listing holds"),
         (generic_type_string, "a FAT12 or FAT16 volume typed FAT is read, a blank type string "
                               "is not, and the geometry checks still apply"),
         (ambiguous_stops_at_used, "an ambiguous deleted entry claims its candidate runs only "

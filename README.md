@@ -572,23 +572,28 @@ on a volume whose boot state byte is clear (see below).
     is what an interrupted write leaves (`chkdsk` turns them into `FOUND.000`), and the
     count does not mean that much content was lost: on five Windows FAT32 captures of a
     large file being written, every folder read, every known file matched, and the lost
-    chains of over 120,000 clusters held 2 to 7 MiB of the writer's bytes and zeros. A
-    sector lost on such a volume that held only file entries shows as this note too.
+    chains of over 120,000 clusters held 2 to 7 MiB of the writer's bytes and zeros.
   - **Boot sector lost:** the backup does not carry the byte, so a clean unmount cannot be
     shown, and this counts as a loss.
 
   FAT[1]'s clean-shutdown bit does not separate these: it read clean on all 95 FAT16 and
   FAT32 volumes measured, the five captures included. The record also says when a live
   empty or deleted entry still names the chain.
+
+  This count sees only allocated clusters, so it does not detect damage to a folder in
+  general. On Windows-written FAT16 and FAT32 volumes, zeroing a folder's last sector when
+  it held only an empty long-named file lost that file with exit 0 and no record.
 - **Notes, which change neither the listing nor the exit status.** Slots after an
   end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
   bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
   they do not show that anything was lost.
 - **Recorded and still read:** a cluster two chains hold, a chain longer than its size
   needs, and two entries that start at one cluster.
-- **Free space.** A cluster is free only when every FAT copy that holds its entry says so,
-  so one copy with a sector lost to zeros cannot turn live files into unallocated space.
-  The count of clusters the copies differ on is in the `--unallocated` output.
+- **Free space.** A cluster is free only when every FAT copy that counts and holds its entry
+  says so. Where a second copy counts, a sector of one copy lost to zeros does not turn live
+  files into unallocated space. With one FAT, or with mirroring off, there is no second copy
+  to ask and a zeroed entry reads as free. The count of clusters the copies differ on is in
+  the `--unallocated` output.
 - **Boot sector.** A FAT32 boot sector that is all zeros is replaced by the backup at
   sector 6, if the copy has a usable geometry and a table where it says one is. On a
   partition the table types FAT, the same applies to a boot sector that fails validation any
