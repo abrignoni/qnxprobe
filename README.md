@@ -2770,20 +2770,43 @@ opens with `NVRM`. Neither is a filesystem, so each is reported as a volume hold
 file, `uboot-env.bin` or `nvram.bin`: the store's bytes as held on flash, for a consumer to
 parse. The report gives a store's layout and how many name=value strings it holds, never
 their values. A store is named by its layout, and the layout does not say which program wrote
-it. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
-steps up to 256 KiB, and a U-Boot environment only when its first string opens with a name
-and `=` and its strings end inside it. A store sits in its own MTD partition, so a JFFS2 in
-front of one ends where it begins. A partition or a file is taken for a store when the store
-fills it or only erased flash follows, so a dump that merely begins with an environment is
-still searched for the rest.
+it. A store is taken only when its CRC-32 holds over it, and a U-Boot environment only
+when its first string opens with a name and `=` and its strings end inside it. A libnvram
+store's size is tried in 4 KiB steps up to 256 KiB. A U-Boot environment's size is tried at
+128 bytes, 400 bytes, every multiple of 512 bytes up to 64 KiB, and every multiple of 4 KiB
+from there up to 1 MiB. An environment of any other size is not found. A store sits in its
+own MTD partition, so a JFFS2 in front of one ends where it begins. A partition or a file
+is taken for a store when the store fills it or only erased flash follows, so a dump that
+merely begins with an environment is still searched for the rest.
 
 The U-Boot layout is `env_t` in
 [include/env_internal.h](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86)
-(v2024.01): a little-endian CRC-32, a flags byte only on a board that keeps a redundant copy,
+(v2024.01): a CRC-32, a flags byte only on a board that keeps a redundant copy,
 then NUL-separated strings ending in an empty one, the CRC covering the rest of the
 environment as
 [`env_import`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310)
-checks it. The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
+checks it. The CRC is a `uint32_t` in the byte order of the CPU U-Boot runs on, and
+[`mkenvimage -b`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/tools/mkenvimage.c#L257-L258)
+writes it big-endian, so the stored value is accepted read either way and the report says
+which order held.
+
+The size of an environment is the board's `CONFIG_ENV_SIZE`. Of the 1,266
+`configs/*_defconfig` files in that tree, 856 set it, to 19 values: 0x80, 0x190, 0x800,
+0x1000, 0x2000, 0x2800, 0x3000, 0x4000, 0x4200, 0x8000, 0x10000, 0x18000, 0x20000, 0x21000,
+0x30000, 0x40000, 0x80000, 0x100000 and 0x2a00000.
+[env/Kconfig](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/Kconfig#L601-L610)
+gives a board that sets none 0x1f000 or one of those. The sizes tried cover each of them
+but 0x2a00000 (42 MiB, set by one file, `total_compute_defconfig`): every candidate offset
+is read and summed up to the largest size tried, so that one is left out. A board outside
+that tree can use a size that is not tried, and its environment is then not found.
+
+A board that keeps a redundant copy writes two environments, and each one found is a volume
+of its own. `--extract` puts the flags byte of such a copy in the volume's `note` in
+`volumes.json`, as stored. U-Boot compares the two bytes to choose the copy it loads
+([`env_check_redund`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L332-L378));
+qnxprobe does not make that choice and names neither copy as the one in use.
+
+The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
 header carries Belkin's copyright), as found in a public copy of the WeMo firmware tree,
 [libnvram.c](https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
 `NVRM`, a CRC-32 over the partition less the 16-byte header, an entry count and the offset
@@ -2792,7 +2815,19 @@ and not checked, because the CRC does not cover them and libnvram rebuilds both 
 strings. Both layouts are round-trip tested on stores the self-test builds, one U-Boot
 environment of each layout and an NVRM store after the JFFS2 fixture, with three controls
 that must not be claimed: one flipped data byte, strings that never end, and a CRC over a
-shorter length.
+shorter length. The self-test also builds U-Boot environments with the CRC stored in each
+byte order, and at 128, 400, 512, 6,144, 16,896, 135,168, 524,288 and 1,048,576 bytes, with
+three sizes that are not tried (6,400, 70,144 and 1,052,672 bytes) as controls, and checks
+the `note` of a redundant copy in a real export.
+
+The U-Boot reading was also checked against known data from U-Boot's own tools
+(u-boot-tools 2025.10 on Ubuntu). `mkenvimage` wrote a single-copy environment at 21
+sizes, the 18 defconfig values and the Kconfig value that are tried plus 512 and 6,144
+bytes, each with the CRC in both byte orders, and redundant-layout ones at 400, 16,384 and
+1,048,576 bytes. `fw_setenv` wrote a redundant pair into a 1 MiB flash file over five
+saves, kept after each. Every one of those stores was found and exported byte for byte.
+Three more `mkenvimage` environments, at 6,400, 70,144 and 44,040,192 bytes, were not
+found, as stated above. No big-endian store written by a board itself was available.
 
 Two JFFS2 partitions can sit side by side with nothing between them, an OpenWrt overlay
 followed by a vendor's settings partition for example. Each numbers its inodes and versions
