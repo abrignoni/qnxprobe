@@ -496,9 +496,10 @@ exFAT's 10 ms field gives one) shows as the even second before it. When an exFAT
 marks its modified time's UTC offset valid (the top bit of the offset byte, exFAT
 specification section 7.4.10), the member also gets an extended timestamp (extra field
 0x5455) holding the reading minus that offset, as UTC. When the offset is not marked
-valid, the member has the reading alone and it is never shifted. A reading that names no
-real day gives 1980-01-01, and a UTC past 2038-01-19, which the field's signed 32 bits
-cannot hold, is left out. Earlier versions gave every FAT and exFAT member 1980-01-01.
+valid, the member has the reading alone and it is never shifted. No reading, or one that
+names no real day, gives 1980-01-01, and a UTC past 2038-01-19, which the field's signed
+32 bits cannot hold, is left out. Earlier versions gave every FAT and exFAT member
+1980-01-01.
 
 The UTC is only as right as the offset the last writer stored. Nordvik and Axelsson
 ([FSI: Digital Investigation 42-43, 2022](https://doi.org/10.1016/j.fsidi.2022.301476))

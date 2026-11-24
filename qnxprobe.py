@@ -58684,6 +58684,22 @@ def self_test():
                 and _fz_rec == {"times_table": "v.times.tsv"})
         except Exception:                            # pylint: disable=broad-except
             fat_zip_dates_ok = False
+        # 2107-12-31 is a valid exFAT reading whose UTC the field's signed 32 bits cannot
+        # hold, 30 February names no day, and an entry with no reading has none
+        try:
+            zip_time_edges_ok = (
+                _zip_reading_time({"modified": "2107-12-31 23:59:58",
+                                   "modified utc offset": "+00:00"})
+                == ((2107, 12, 31, 23, 59, 58), None)
+                and _zip_reading_time({"modified": "2023-02-30 10:00:00",
+                                       "modified utc offset": "+00:00"})
+                == ((1980, 1, 1, 0, 0, 0), None)
+                and _zip_reading_time({}) == ((1980, 1, 1, 0, 0, 0), None)
+                and _zip_reading_time({"modified": "2026-11-24 09:00:01.50",
+                                       "modified utc offset": "+09:00"})
+                == ((2026, 11, 24, 9, 0, 1), 1795478401))     # 2026-11-24 00:00:01 UTC
+        except Exception:                            # pylint: disable=broad-except
+            zip_time_edges_ok = False
 
         # Cut each image so the read of the next FAT entry falls off the end.
         try:
@@ -58829,7 +58845,9 @@ def self_test():
                  "the same tuples either way", collect_times_ok),
                 ("--extract gives a FAT member the modified reading its entry stores as "
                  "its date, with no extended timestamp, and the times table names it",
-                 fat_zip_dates_ok)):
+                 fat_zip_dates_ok),
+                ("a FAT or exFAT member gets 1980-01-01 for no reading or one naming no "
+                 "day, and no extended timestamp past 2038-01-19", zip_time_edges_ok)):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
