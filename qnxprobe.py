@@ -2756,10 +2756,17 @@ F2FS_FILE_TYPES = {0o100000: 1, 0o040000: 2, 0o020000: 3, 0o060000: 4, 0o010000:
 F2FS_CP_CRC_RECOVERY = 0x0040
 F2FS_CP_NOCRC_RECOVERY = 0x0200
 F2FS_CP_DISABLED = 0x1000
+F2FS_FADVISE_KEEP_SIZE = 0x10       # i_advise: FADVISE_KEEP_SIZE_BIT (f2fs.h)
 F2FS_CASEFOLD_FL = 0x40000000       # i_flags (f2fs.h)
+F2FS_XATTR_NODE_OFS = 0x1FFFFFFF    # XATTR_NODE_OFFSET, a footer offset (f2fs.h)
 F2FS_COMPRESS_NAMES = {0: "LZO", 1: "LZ4", 2: "zstd", 3: "LZO-RLE"}  # f2fs.h COMPRESS_*
 F2FS_COMPRESS_HEADER = 24           # struct compress_data before cdata (f2fs.h)
 F2FS_DAMAGE_CAP = 1000              # damage lines one walker keeps
+F2FS_LOG_MEMORY_MAX = 1 << 30       # the most a roll-forward replay may hold, in bytes
+F2FS_LOG_PASSES = 8                 # replays before failures that keep moving end it
+F2FS_LOG_ENTRY_COST = 256           # bytes counted per fsynced inode found
+F2FS_LOG_STATE_COST = 2048          # per inode replayed
+F2FS_LOG_RUN_COST = 128             # per run of addresses or stored name
 
 
 def f2fs_time(v):
@@ -2823,6 +2830,19 @@ class _F2fsChild(int):
     __slots__ = ()
 
 
+class _F2fsLogRefused(Exception):
+    """The roll-forward log holds something the kernel would stop recovery on."""
+
+
+class _F2fsLogBudget(Exception):
+    """A replay would hold more than its memory bound. ``nodes`` is how many nodes of the
+    log fit before that."""
+
+    def __init__(self, nodes):
+        super().__init__(f"the replay reached its memory bound after {nodes:,} nodes")
+        self.nodes = nodes
+
+
 class _F2fsBadCluster(Exception):
     """One compressed cluster cannot be decoded. The rest of the file does not depend on it."""
 
@@ -2838,8 +2858,9 @@ class F2fsWalker:
     validate_checkpoint (checkpoint.c), f2fs_sanity_check_node_footer and get_node_path
     (node.c), max_file_blocks (super.c).
 
-    The roll-forward log, which holds files fsynced after the last checkpoint, is not
-    replayed. Its blocks are counted, and the volume's note says what that leaves out."""
+    Files fsynced after the last checkpoint are read from the roll-forward log, replayed
+    in memory by the rules of fs/f2fs/recovery.c. The image is never written. Each file
+    that takes anything from the log gets a ROLL_FORWARD row in the exceptions table."""
 
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
@@ -2849,14 +2870,19 @@ class F2fsWalker:
         self._folder_names, self._folder_parents = {}, {}
         self._encrypted_folders = set()
         self.encrypted_files = 0                        # set by the export from its table
+        self._rf, self._rf_dents, self._rf_used = {}, {}, None
+        self.log_nodes, self.log_refused = 0, None
+        self.log_skipped, self.log_cut = {}, None       # inodes left out; nodes replayed
+        self._log_parsed, self._log_cost = None, 0
         self._tail_missing = {}                         # encrypted file -> bytes past the image
         self._bad_ranges = {}                           # file -> clusters that did not decode
-        self.log_unreplayed = 0                         # log blocks written after the checkpoint
+        self.log_gap, self.log_gap_at = 0, None         # log blocks past where the chain stopped
         self.inode_shortfall = None                     # (checkpoint's count, inodes reached)
         self._unchecked = set()                         # inodes that say they have no checksum
         self.cp_fallback = None                         # why the older checkpoint was read
+        self._cur_sums, self._log_orphans, self._log_skip = None, None, {}
         self._reached, self._dirs_seen, self._dirs_listed = set(), set(), set()
-        self._reached_done = False
+        self._rf_replaced, self._log_end, self._reached_done = set(), None, False
         self.sit_j = {}
         self._cache = {}
         sb = self._sb(base)
@@ -2870,6 +2896,7 @@ class F2fsWalker:
         self.cp_blkaddr = struct.unpack_from("<I", sb, 76)[0]
         self.sit_blkaddr = struct.unpack_from("<I", sb, 80)[0]
         self.nat_blkaddr = struct.unpack_from("<I", sb, 84)[0]
+        self.ssa_blkaddr = struct.unpack_from("<I", sb, 88)[0]
         self.main_blkaddr = struct.unpack_from("<I", sb, 92)[0]
         self.sit_segs_total = struct.unpack_from("<I", sb, 56)[0]   # segment_count_sit, both copies
         self.main_segs = struct.unpack_from("<I", sb, 68)[0]        # segment_count_main
@@ -2890,7 +2917,7 @@ class F2fsWalker:
                             if self.feature & F2FS_FEAT_QUOTA_INO else set())
         self.image_short = self._check_image_end()
         self._load_checkpoint()
-        self.log_unreplayed = self._count_log_blocks()
+        self._replay_log()
 
     root = property(lambda self: self.root_ino)
 
@@ -2937,13 +2964,25 @@ class F2fsWalker:
                          "may have been live or crashed when it was acquired")
         if self.cp_flags & F2FS_CP_ERROR:
             parts.append("the checkpoint carries an error flag")
+        if self.log_nodes:
+            parts.append(f"{len(self._rf):,} file(s) or folder(s) take content from the "
+                         f"roll-forward log ({self.log_nodes:,} node blocks written after the "
+                         "last checkpoint, replayed in memory; the image was not changed)")
         if self.cp_fallback:
             parts.append(self.cp_fallback)
-        if self.log_unreplayed:
-            parts.append(f"the roll-forward log holds at least {self.log_unreplayed:,} node "
-                         "block(s) written after the last checkpoint; this version does not "
-                         "replay it, so what was fsynced after that checkpoint is not in this "
-                         "export")
+        if self.log_refused:
+            parts.append(f"the roll-forward log was not used: {self.log_refused}")
+        if self.log_skipped:
+            parts.append(f"{len(self.log_skipped):,} inode(s) in the roll-forward log could not "
+                         "be replayed and stay as the last checkpoint holds them")
+        if self.log_cut is not None:
+            parts.append(f"the roll-forward log was replayed through its first {self.log_cut:,} "
+                         "node blocks and the rest was not used")
+        if self.log_gap:
+            parts.append(f"the roll-forward log stops at block {self.log_gap_at:,} while "
+                         f"{self.log_gap:,} later block(s) of its segment carry this "
+                         "checkpoint's version, so fsynced files may be missing, from a bad "
+                         "sector or from writes still in flight at a crash")
         if self.inode_shortfall:
             parts.append(f"the checkpoint counts {self.inode_shortfall[0]:,} inodes and the "
                          f"folders account for {self.inode_shortfall[1]:,}, so files may be "
@@ -3321,7 +3360,7 @@ class F2fsWalker:
             else:
                 bad_log = log
         return dict(
-            nid=nid, raw=b, mode=mode, advise=b[2], inline=i_inline,
+            nid=nid, raw=b, nid_raw=b, mode=mode, advise=b[2], inline=i_inline,
             size=struct.unpack_from("<Q", b, 16)[0], flags=flags,
             atime=struct.unpack_from("<Q", b, 32)[0], mtime=struct.unpack_from("<Q", b, 48)[0],
             crtime=crtime, base=base, addrs_in_inode=addrs_in_inode, addr_room=addr_room,
@@ -3329,21 +3368,37 @@ class F2fsWalker:
             iaddr_off=360 + base * 4, cluster=cluster, algo=algo, cflag=cflag, bad_log=bad_log)
 
     def _load_inode(self, nid):
-        """The parsed inode for nid, or _F2fsNodeLost saying why there is none. A node whose
-        footer nid equals its footer ino is an inode (f2fs.h RAW_IS_INODE)."""
-        b = self._node(nid)
-        if b is None:
-            raise _F2fsNodeLost("the node table holds no block for it")
-        if struct.unpack_from("<I", b, self.bs - 24)[0] != struct.unpack_from("<I", b, self.bs - 20)[0]:
-            raise _F2fsNodeLost("the block it resolves to is not an inode")
-        if self._inode_chksum_bad(b, nid):
-            raise _F2fsNodeLost("its inode fails its checksum")
-        ino = self._parse_inode(b, nid)
+        """The parsed inode for nid with anything the roll-forward log changed, or
+        _F2fsNodeLost saying why there is none. A node whose footer nid equals its
+        footer ino is an inode (f2fs.h RAW_IS_INODE)."""
+        st = self._rf.get(nid)
+        if st is not None and st["block"] is not None:
+            b = self.block(st["block"])
+            if len(b) < self.bs:
+                raise _F2fsNodeLost(f"log block {st['block']:,} is past the end of the image",
+                                    past_end=True)
+            ino = self._parse_inode(b, nid)
+            ino["nid_raw"] = self.block(st["base"]) if st["base"] is not None else None
+            if ino["nid_raw"] is not None and len(ino["nid_raw"]) < self.bs:
+                ino["nid_raw"] = None
+        else:
+            b = self._node(nid)
+            if b is None:
+                raise _F2fsNodeLost("the node table holds no block for it")
+            if struct.unpack_from("<I", b, self.bs - 24)[0] != struct.unpack_from("<I", b, self.bs - 20)[0]:
+                raise _F2fsNodeLost("the block it resolves to is not an inode")
+            if self._inode_chksum_bad(b, nid):
+                raise _F2fsNodeLost("its inode fails its checksum")
+            ino = self._parse_inode(b, nid)
         if ino["mode"] & S_IFMT not in F2FS_FILE_TYPES:      # inode.c f2fs_iget: -EIO
             raise _F2fsNodeLost(f"its inode records an invalid file type ({ino['mode']:#o})")
         if ino["addr_room"] < 1:
             raise _F2fsNodeLost("its extra attribute and inline xattr lengths do not fit its "
                                 "address area")
+        if st is not None:
+            ino["size"] = st["size"]
+            if st["inline_off"]:
+                ino["inline"] &= ~F2FS_INLINE_DATA
         return ino
 
     def inode(self, nid):
@@ -3364,7 +3419,8 @@ class F2fsWalker:
         return struct.unpack_from("<I", ino["raw"], ino["iaddr_off"] + k * 4)[0]
 
     def _nid_slot(self, ino, k):        # i_nid[k], the five node-id pointers
-        return struct.unpack_from("<I", ino["raw"], self.bs - 44 + k * 4)[0]
+        raw = ino["nid_raw"]            # None for an inode only the log holds
+        return struct.unpack_from("<I", raw, self.bs - 44 + k * 4)[0] if raw is not None else 0
 
     def _node_path(self, ino, L):
         """(i_nid slot, index in each node, node offset of each, logical blocks under
@@ -3396,13 +3452,32 @@ class F2fsWalker:
         """(data block address of logical block L, how many blocks from L that answer
         covers). A span above 1 is a hole under an absent node, so a sparse range is
         crossed without a lookup per block. NULL_ADDR and NEW_ADDR read as zeros."""
-        n = ino["addrs_in_inode"]
+        st = self._rf.get(ino["nid"]) if self._rf else None
+        n, apb = ino["addrs_in_inode"], ino["apb"]
+        if st is not None:
+            if L < n and st["inline_off"]:               # those slots held inline data
+                return F2FS_NULL_ADDR, 1
+            key, slot = (0, L) if L < n else (n + ((L - n) // apb) * apb, (L - n) % apb)
+            rec = st["maps"].get(key)
+            if isinstance(rec, array.array):
+                return rec[slot], 1
+            if rec is not None:
+                b = self.block(rec)
+                if len(b) < self.bs:
+                    raise _F2fsNodeLost(f"log block {rec:,} is past the end of the image",
+                                        past_end=True)
+                first = ino["iaddr_off"] if key == 0 else 0
+                return struct.unpack_from("<I", b, first + slot * 4)[0], 1
+            if st["drop_tree"]:
+                return F2FS_NULL_ADDR, (n - L if L < n else key + apb - L)
         if L < n:
             return self._iaddr(ino, L), 1
         slot, idx, ofs, sizes, pos = self._node_path(ino, L)
         nid = self._nid_slot(ino, slot)
         for i, want, size in zip(idx, ofs, sizes):
             span = size - pos % size
+            if st is not None:                           # a log window may sit inside it
+                span = min(span, apb - (L - n) % apb)
             if nid == 0:
                 return F2FS_NULL_ADDR, span
             b = self._node(nid, ino["nid"], want, span)
@@ -3424,6 +3499,30 @@ class F2fsWalker:
 
     # ------------------------------------------------------------ the roll-forward log
 
+    @staticmethod
+    def _start_bidx(ofs, n, apb, nids):
+        """The first logical block a direct node of offset ``ofs`` maps
+        (fs/f2fs/gc.c f2fs_start_bidx_of_node at v7.0)."""
+        if ofs == 0:
+            return 0
+        indirect = 2 * nids + 4
+        if ofs <= 2:
+            bidx = ofs - 1
+        elif ofs <= indirect:
+            bidx = ofs - 2 - (ofs - 4) // (nids + 1)
+        else:
+            bidx = ofs - 5 - (ofs - indirect - 3) // (nids + 1)
+        return bidx * apb + n
+
+    def _is_dnode(self, ofs):
+        """f2fs node.h IS_DNODE."""
+        nids = self.addrs_per_block
+        if ofs == F2FS_XATTR_NODE_OFS:
+            return True
+        if ofs in (3, 4 + nids, 5 + 2 * nids):
+            return False
+        return not (ofs >= 6 + 2 * nids and (ofs - 6 - 2 * nids) % (nids + 1) == 0)
+
     def _log_version_ok(self, ver, want):
         """Whether a node footer's version is this checkpoint's (node.h
         is_recoverable_dnode)."""
@@ -3431,34 +3530,57 @@ class F2fsWalker:
             return ver & 0xFFFFFFFF == want & 0xFFFFFFFF
         return ver == want
 
-    def _count_log_blocks(self):
-        """How many blocks of the warm node log's current segment, from its next free block
-        on, carry this checkpoint's version, so were written after it. They are counted
-        and not replayed, and a log that runs on into another segment holds more."""
-        if self.cp_flags & F2FS_CP_DISABLED:             # super.c f2fs_fill_super
-            return 0
-        warm_seg = struct.unpack_from("<I", self.ckpt, 36 + 4)[0]    # cur_node_segno[1]
-        warm_off = struct.unpack_from("<H", self.ckpt, 68 + 2)[0]    # cur_node_blkoff[1]
-        first = self.main_blkaddr + warm_seg * self.seg_blocks + warm_off
-        if not self._in_main(first):
-            return 0
-        want = self.cp_ver
-        if self.cp_flags & F2FS_CP_CRC_RECOVERY:         # node.h is_recoverable_dnode
-            off = struct.unpack_from("<I", self.ckpt, 164)[0]
-            want |= struct.unpack_from("<I", self.ckpt, off)[0] << 32
-        stop = self.main_blkaddr + (warm_seg + 1) * self.seg_blocks
-        found = 0
-        for addr in range(first, min(stop, self.main_end)):
+    def _log_block(self, addr, want):
+        """The node block at addr if the kernel would take it as part of the log, else
+        None: in the main area, readable, and carrying this checkpoint's version. None
+        ends the log, as it does in the kernel."""
+        if not self._in_main(addr):
+            return None
+        b = self.block(addr)
+        if len(b) < self.bs:
+            return None
+        return b if self._log_version_ok(struct.unpack_from("<Q", b, self.bs - 12)[0],
+                                         want) else None
+
+    def _log_check_cut(self, end, want):
+        """The log ended at block ``end``. Blocks later in that segment carrying this
+        checkpoint's version mean a bad sector broke the chain, or that writes were still
+        in flight at a crash, and the kernel stops at the same place in both cases. So this
+        is a note in the volume's record and does not change the exit status. Nothing is
+        replayed from those blocks. A fault in the footer of the log's last node leaves
+        nothing after it, so it cannot be seen this way."""
+        if end is None or not self._in_main(end):
+            return
+        seg = (end - self.main_blkaddr) // self.seg_blocks
+        stop = self.main_blkaddr + (seg + 1) * self.seg_blocks
+        later = 0
+        for addr in range(end + 1, stop):
             foot = read_at(self.fh, self.base + addr * self.bs + self.bs - 12, 8)
             if len(foot) == 8 and self._log_version_ok(int.from_bytes(foot, "little"), want):
-                found += 1
-        return found
+                later += 1
+        if later:
+            self.log_gap, self.log_gap_at = later, end
 
     def _count_root_not_read(self):
         """Count something lost that no one folder can answer for, once, against the root."""
         if self.root_ino not in self._not_read:
             self._not_read = self._not_read | {self.root_ino}
             self.folders_not_read += 1
+
+    def _log_inode_exists(self, ino, made):
+        """Whether f2fs_iget would find ino: False for -ENOENT, and any other failure
+        stops recovery."""
+        if ino in made:
+            return True
+        if ino < self.root_ino or ino >= self.max_nid:
+            raise _F2fsLogRefused(f"it names inode {ino:,}, outside the node table")
+        try:
+            if self.resolve(ino) in (F2FS_NULL_ADDR, F2FS_NEW_ADDR):
+                return False
+            self._load_inode(ino)
+        except _F2fsNodeLost as exc:
+            raise _F2fsLogRefused(f"inode {ino:,} cannot be read: {exc}") from None
+        return True
 
     def _damage_mark(self):
         """The damage record as it stands, so a pass that is thrown away leaves no trace."""
@@ -3470,12 +3592,534 @@ class F2fsWalker:
         self.damage_count, self._damage_seen = mark[1], set(mark[2])
         self._not_read, self.folders_not_read = set(mark[3]), mark[4]
 
+    def _log_budget(self):
+        """The most memory a replay may hold: the main area's size, up to a fixed ceiling."""
+        return min(F2FS_LOG_MEMORY_MAX, (self.main_end - self.main_blkaddr) * self.bs)
+
+    def _find_fsync_nodes(self, first, want, limit, skip, failed):
+        """Pass one, recovery.c find_fsync_dnodes: {ino: [last fsync block, last inode
+        block with the dentry mark, inode block the entry was made from]} and the inodes
+        only the log holds. An inode the kernel would stop on goes into ``failed`` and
+        costs only itself. Only a loop in the chain condemns the whole log; the check is
+        the kernel's (sanity_check_node_chain). ``limit`` ends the walk after that many
+        nodes, as a chain that ended there would."""
+        entries, made = {}, set()
+        addr, fast, detecting, walked = first, first, True, 0
+        budget = self._log_budget()
+        most = self.main_end - self.main_blkaddr
+        while limit is None or walked < limit:
+            b = self._log_block(addr, want)
+            if b is None:
+                break
+            walked += 1
+            if walked > most:
+                raise _F2fsLogRefused("its node chain is longer than the main area")
+            nid, ino, flag = struct.unpack_from("<III", b, self.bs - 24)
+            if flag & 2 and ino not in skip and ino not in failed:   # FSYNC_BIT_SHIFT
+                try:
+                    ent = entries.get(ino)
+                    is_dent_inode = nid == ino and flag & 4          # DENT_BIT_SHIFT
+                    if ent is None:
+                        if is_dent_inode:
+                            # node.c f2fs_recover_inode_page refuses an inode that exists
+                            if ino < self.root_ino or ino >= self.max_nid:
+                                raise _F2fsLogRefused(f"it names inode {ino:,}, outside the "
+                                                      "node table")
+                            try:
+                                held = self.resolve(ino)
+                            except _F2fsNodeLost as exc:
+                                raise _F2fsLogRefused(str(exc)) from None
+                            if held != F2FS_NULL_ADDR:
+                                raise _F2fsLogRefused(f"block {addr:,} recreates inode {ino:,}, "
+                                                      "which the checkpoint already holds")
+                            made.add(ino)
+                            ent = entries[ino] = [addr, None, addr]
+                        elif self._log_inode_exists(ino, made):
+                            ent = entries[ino] = [addr, None, None]
+                    if ent is not None:
+                        ent[0] = addr
+                        if is_dent_inode:
+                            ent[1] = addr
+                except _F2fsLogRefused as exc:
+                    failed[ino] = str(exc)
+                    entries.pop(ino, None)
+                    made.discard(ino)
+                if len(entries) * F2FS_LOG_ENTRY_COST > budget:
+                    raise _F2fsLogBudget(walked - 1)
+            addr = struct.unpack_from("<I", b, self.bs - 4)[0]
+            for _ in range(2):
+                if not detecting:
+                    break
+                fb = self._log_block(fast, want)
+                if fb is None:
+                    detecting = False
+                    break
+                fast = struct.unpack_from("<I", fb, self.bs - 4)[0]
+            if detecting and fast == addr:
+                raise _F2fsLogRefused(f"its node chain loops at block {addr:,}")
+        self._log_end = addr
+        return entries, made
+
+    def _log_state(self, ino, ent):
+        """What the replay keeps for one inode. ``maps`` holds, per run of addresses (0 for
+        the inode's own, else the first logical block of a direct node), the log block
+        that now maps it, or an array of addresses when no one block says it all."""
+        base = None
+        try:
+            held = self.resolve(ino)
+            if held not in (F2FS_NULL_ADDR, F2FS_NEW_ADDR) and self._node(ino) is not None:
+                base = held
+        except _F2fsNodeLost as exc:
+            raise _F2fsLogRefused(f"inode {ino:,} cannot be read: {exc}") from None
+        lay = self._parse_inode(self.block(base if base is not None else ent[2]), ino)
+        return {"block": None, "base": base,
+                "layout": {k: lay[k] for k in ("addrs_in_inode", "apb", "iaddr_off")},
+                "size": lay["size"] if base is not None else 0, "advise": lay["advise"],
+                "maps": {}, "inline_off": False, "drop_tree": False, "ino": ino,
+                "inode_last": False}
+
+    def _log_base(self, st):
+        """The checkpoint's parsed inode for this state, or None. One is kept at a time."""
+        if st["base"] is None:
+            return None
+        held = self._log_parsed
+        if held is None or held["nid"] != st["ino"]:
+            held = self._log_parsed = self._parse_inode(self.block(st["base"]), st["ino"])
+        return held
+
+    def _log_slot(self, st, L):
+        """(key in maps, index in it, how many addresses it has) for logical block L."""
+        n, apb = st["layout"]["addrs_in_inode"], st["layout"]["apb"]
+        if L < n:
+            return 0, L, n
+        return n + ((L - n) // apb) * apb, (L - n) % apb, apb
+
+    def _log_src(self, st, L):
+        """What logical block L maps to at this point of the replay."""
+        if L < st["layout"]["addrs_in_inode"] and st["inline_off"]:
+            return F2FS_NULL_ADDR
+        key, slot, _count = self._log_slot(st, L)
+        rec = st["maps"].get(key)
+        if isinstance(rec, array.array):
+            return rec[slot]
+        if rec is not None:
+            raw = self.block(rec)
+            if len(raw) < self.bs:
+                raise _F2fsLogRefused(f"log block {rec:,} is past the end of the image")
+            first = st["layout"]["iaddr_off"] if key == 0 else 0
+            return struct.unpack_from("<I", raw, first + slot * 4)[0]
+        if st["drop_tree"]:
+            return F2FS_NULL_ADDR
+        base = self._log_base(st)
+        if base is None:
+            return F2FS_NULL_ADDR
+        try:
+            return self._map(base, L)[0]
+        except _F2fsNodeLost as exc:
+            raise _F2fsLogRefused(f"the checkpoint's mapping cannot be read: {exc}") from None
+
+    def _log_array(self, st, L):
+        """The array of addresses for the run holding L, built once from what it maps now,
+        and the index of L in it. It costs one block's worth of memory per run."""
+        key, slot, count = self._log_slot(st, L)
+        rec = st["maps"].get(key)
+        if not isinstance(rec, array.array):
+            if rec is not None:                          # one read for the whole run
+                raw = self.block(rec)
+                if len(raw) < self.bs:
+                    raise _F2fsLogRefused(f"log block {rec:,} is past the end of the image")
+                first = st["layout"]["iaddr_off"] if key == 0 else 0
+                rec = array.array("I", struct.unpack_from(f"<{count}I", raw, first))
+            else:
+                rec = array.array("I", (self._log_src(st, key + k) for k in range(count)))
+            st["maps"][key] = rec
+            self._log_cost += 4 * count + F2FS_LOG_RUN_COST
+        return rec, slot
+
+    def _curseg_sums(self):
+        """{segment: its 7-byte summary entries} for the three current data logs, whose
+        summaries the checkpoint holds (segment.c read_compacted_summaries and
+        read_normal_summaries)."""
+        if self._cur_sums is not None:
+            return self._cur_sums
+        out = {}
+        sum_bs = 4096 if (self.feature & F2FS_FEAT_PACKED_SSA) else self.bs
+        entries = sum_bs // 8
+        ck = self.ckpt
+        if self.cp_flags & F2FS_CP_COMPACT_SUM:
+            at = self.start_cp + struct.unpack_from("<I", ck, 140)[0]
+            buf = self.block(at)
+            at += 1
+            offset = 2 * (sum_bs - 5 - 7 * entries)          # past the two journals
+            for kind in range(3):
+                segno = struct.unpack_from("<I", ck, 84 + 4 * kind)[0]
+                used = struct.unpack_from("<H", ck, 116 + 2 * kind)[0]
+                if ck[176 + kind] == 1:                      # SSR: a full segment is stored
+                    used = self.seg_blocks
+                rows = bytearray(7 * self.seg_blocks)
+                for j in range(min(used, self.seg_blocks)):
+                    piece = buf[offset:offset + 7]
+                    rows[j * 7:j * 7 + len(piece)] = piece
+                    offset += 7
+                    if offset + 7 > self.bs - 5:
+                        buf = self.block(at)
+                        at += 1
+                        offset = 0
+                out[segno] = bytes(rows)
+        else:
+            base = 7 if self.cp_flags & (F2FS_CP_UMOUNT | F2FS_CP_FASTBOOT) else 4
+            for kind in range(3):
+                segno = struct.unpack_from("<I", ck, 84 + 4 * kind)[0]
+                out[segno] = self.block(self.start_cp + self.cp_total - base + kind)[:7 * entries]
+        self._cur_sums = out
+        return out
+
+    def _log_block_owner(self, block):
+        """(inode, logical block) the segment summary names for a data block, or None when
+        it names nothing that can be read (recovery.c check_index_in_prev_nodes)."""
+        seg, off = divmod(block - self.main_blkaddr, self.seg_blocks)
+        raw = self._curseg_sums().get(seg)
+        if raw is None:
+            sum_bs = 4096 if (self.feature & F2FS_FEAT_PACKED_SSA) else self.bs
+            per = self.bs // sum_bs                          # sums_per_block
+            b = self.block(self.ssa_blkaddr + seg // per)
+            if len(b) < self.bs:
+                return None
+            raw = b[(seg % per) * sum_bs:(seg % per + 1) * sum_bs]
+        if (off + 1) * 7 > len(raw):
+            return None
+        nid = struct.unpack_from("<I", raw, off * 7)[0]
+        ofs_in_node = struct.unpack_from("<H", raw, off * 7 + 5)[0]
+        try:
+            node = self._node(nid)
+            if node is None:
+                return None
+            f_nid, f_ino, flag = struct.unpack_from("<III", node, self.bs - 24)
+            if f_nid == f_ino:
+                lay = self._parse_inode(node, f_ino)
+                return (f_ino, ofs_in_node) if ofs_in_node < lay["addrs_in_inode"] else None
+            top = self._node(f_ino)
+            if top is None:
+                return None
+            lay = self._parse_inode(top, f_ino)
+        except _F2fsNodeLost:
+            return None
+        if ofs_in_node >= lay["apb"] or not self._is_dnode(flag >> 3):
+            return None
+        return f_ino, self._start_bidx(flag >> 3, lay["addrs_in_inode"], lay["apb"],
+                                       self.addrs_per_block) + ofs_in_node
+
+    def _log_take_from_owner(self, state, dest, ino):
+        """The log gives a file a block the checkpoint marks in use. The earlier owner is
+        in the segment summary, and the kernel takes the block from that index if it still
+        holds it (recovery.c check_index_in_prev_nodes). An orphan's blocks were freed
+        before replay (super.c: f2fs_recover_orphan_inodes runs first), so they need
+        nothing. Only a summary naming no holder is left to record."""
+        if self._log_orphans is None:
+            self._log_orphans = self._orphan_inos() or set()
+        owner = self._log_block_owner(dest)
+        if owner is not None and owner[0] in self._log_orphans:
+            return
+        other = None
+        if owner is not None:
+            other = state.get(owner[0])
+            if other is None and owner[0] not in self._log_skip:
+                try:
+                    candidate = self._log_state(owner[0], [None, None, None])
+                    if candidate["base"] is not None:
+                        other = candidate
+                except _F2fsLogRefused:
+                    other = None
+                if other is not None:
+                    if self._log_src(other, owner[1]) != dest:
+                        other = None
+                    else:
+                        state[owner[0]] = other
+                        self._log_cost += F2FS_LOG_STATE_COST
+            elif other is not None and self._log_src(other, owner[1]) != dest:
+                return                                   # the log already moved it from there
+        if other is None:
+            self._damaged(f"the roll-forward log maps block {dest:,} to inode {ino:,} while the "
+                          "checkpoint marks it in use, and its segment summary names no file "
+                          "that still holds it")
+            return
+        rec, slot = self._log_array(other, owner[1])
+        rec[slot] = F2FS_NULL_ADDR
+
+    def _log_take_block(self, state, own, dest, ino, L, used):
+        """Mark dest as live, and when an earlier node of the log gave it to another index,
+        take it from there (recovery.c check_index_in_prev_nodes). ``own`` records the
+        last index given each block, one page per segment the log touches, so the lookup
+        does not depend on how long the log is."""
+        at = dest - self.main_blkaddr
+        seg, off = divmod(at, self.seg_blocks)
+        page = own.get(seg)
+        if page is None:
+            page = own[seg] = array.array("Q", bytes(8 * self.seg_blocks))
+            self._log_cost += 8 * self.seg_blocks
+        me = (ino << 32) | L
+        prev = page[off]
+        if prev and prev != me:
+            other = state.get(prev >> 32)
+            where = prev & 0xFFFFFFFF
+            if other is not None and self._log_src(other, where) == dest:
+                rec, slot = self._log_array(other, where)
+                rec[slot] = F2FS_NULL_ADDR
+        elif not prev and self._sit_valid(dest):
+            self._log_take_from_owner(state, dest, ino)
+        page[off] = me
+        used[at >> 3] |= 0x80 >> (at & 7)
+
+    def _log_apply_data(self, state, own, st, ino, addr, b, is_inode, ofs, used):
+        """recovery.c do_recover_data for one node, kept as an overlay."""
+        at = addr - self.main_blkaddr
+        used[at >> 3] |= 0x80 >> (at & 7)
+        if not is_inode and ofs == F2FS_XATTR_NODE_OFS:
+            return
+        lay = st["layout"]
+        cur = self.block(st["block"] if st["block"] is not None else st["base"]) if (
+            st["block"] is not None or st["base"] is not None) else None
+        was_inline = bool(cur is not None and cur[3] & F2FS_INLINE_DATA and not st["inline_off"])
+        if is_inode and b[3] & F2FS_INLINE_DATA:         # inline.c f2fs_recover_inline_data
+            st["maps"].clear()
+            st["inline_off"], st["drop_tree"] = False, True
+            return
+        if was_inline:                                   # inline.c:334-341 clears the area
+            st["maps"].clear()
+            st["inline_off"], st["drop_tree"] = True, True
+        if not is_inode:
+            if ofs == 0 or not self._is_dnode(ofs):
+                raise _F2fsLogRefused(f"block {addr:,} is not a direct node")
+            base = self._log_base(st)
+            if base is not None and not st["drop_tree"]:
+                start_l = self._start_bidx(ofs, lay["addrs_in_inode"], lay["apb"],
+                                           self.addrs_per_block)
+                try:
+                    path = self._node_path(base, start_l)
+                    nid = self._nid_slot(base, path[0])
+                    for i, want in zip(path[1], path[2]):
+                        if nid == 0:
+                            break
+                        node = self._node(nid, ino)
+                        if node is None:
+                            break
+                        if want == path[2][-1] and struct.unpack_from(
+                                "<I", node, self.bs - 16)[0] >> 3 != ofs:
+                            raise _F2fsLogRefused(f"block {addr:,} records node offset {ofs:,} "
+                                                  "and the checkpoint's node there another")
+                        nid = struct.unpack_from("<I", node, i * 4)[0]
+                except _F2fsNodeLost as exc:
+                    raise _F2fsLogRefused("the checkpoint's node path cannot be read: "
+                                          f"{exc}") from None
+        n, apb = lay["addrs_in_inode"], lay["apb"]
+        start = 0 if is_inode else self._start_bidx(ofs, n, apb, self.addrs_per_block)
+        count = n if is_inode else apb
+        first = lay["iaddr_off"] if is_inode else 0
+        reserved = (F2FS_NULL_ADDR, F2FS_NEW_ADDR, F2FS_COMPRESS_ADDR)
+        words = struct.unpack_from(f"<{count}I", b, first)
+        for k, dest in enumerate(words):
+            if dest == F2FS_NULL_ADDR:
+                continue
+            L = start + k
+            src = self._log_src(st, L)
+            if src not in reserved and not self._in_main(src):
+                raise _F2fsLogRefused(f"inode {ino:,} maps block {L:,} to {src:,}, outside the "
+                                      "main area")
+            if dest == F2FS_COMPRESS_ADDR:               # do_recover_data has no case for it
+                continue
+            if dest != F2FS_NEW_ADDR and not self._in_main(dest):
+                raise _F2fsLogRefused(f"block {addr:,} maps block {L:,} to {dest:,}, outside "
+                                      "the main area")
+            if src == dest:
+                continue
+            if not st["advise"] & F2FS_FADVISE_KEEP_SIZE and st["size"] <= L << self.log_bs:
+                st["size"] = (L + 1) << self.log_bs
+            if dest != F2FS_NEW_ADDR:
+                self._log_take_block(state, own, dest, ino, L, used)
+        kept = words.count(F2FS_COMPRESS_ADDR)
+        if kept == count and not is_inode:               # this node changes no address
+            return
+        key = 0 if is_inode else start
+        if kept:                                         # the marked slots keep what they map
+            rec, _slot = self._log_array(st, start)
+            for k, dest in enumerate(words):
+                if dest != F2FS_COMPRESS_ADDR:
+                    rec[k] = dest
+            return
+        if key not in st["maps"]:
+            self._log_cost += F2FS_LOG_RUN_COST
+        st["maps"][key] = addr
+
+    def _log_apply_dentry(self, dents, listed, made, ino, addr, b):
+        """recovery.c recover_dentry: the name in the inode goes into its parent folder,
+        taking the place of an entry of that name for another inode. A fault elsewhere in
+        the parent does not stop this: the kernel looks in one hash bucket, and the folder
+        is recorded as partly read when it is listed."""
+        pino = struct.unpack_from("<I", b, 84)[0]
+        nlen = struct.unpack_from("<I", b, 88)[0]
+        if nlen > 255:
+            raise _F2fsLogRefused(f"block {addr:,} records a name of {nlen:,} bytes")
+        if not self._log_inode_exists(pino, made):
+            raise _F2fsLogRefused(f"inode {ino:,} names parent folder {pino:,}, which does not "
+                                  "exist")
+        if pino not in listed:
+            if pino in made:
+                listed[pino] = ({}, False)
+            else:
+                try:
+                    dir_ino = self._load_inode(pino)
+                except _F2fsNodeLost as exc:
+                    raise _F2fsLogRefused(f"parent folder {pino:,} cannot be read: {exc}") from None
+                if dir_ino["mode"] & S_IFMT != S_IFDIR:
+                    raise _F2fsLogRefused(f"inode {ino:,} names parent {pino:,}, not a folder")
+                hashed = bool(self._encrypted(dir_ino) and dir_ino["flags"] & F2FS_CASEFOLD_FL)
+                mark = self._damage_mark()
+                names = {n: c for n, c, _t in self._raw_entries(pino, dir_ino)}
+                self._damage_reset(mark)
+                listed[pino] = (names, hashed)
+                self._log_cost += F2FS_LOG_RUN_COST * (len(names) + 1)
+        names, hashed = listed[pino]
+        if hashed and nlen + 4 > 255:                    # init_recovered_filename
+            raise _F2fsLogRefused(f"block {addr:,} leaves no room for its name's hash")
+        name = b[92:92 + nlen]
+        old = names.get(name)
+        if old is not None and old != ino and not self._log_inode_exists(old, made):
+            raise _F2fsLogRefused(f"the entry it replaces names inode {old:,}, which does not "
+                                  "exist")
+        if old is None:
+            self._log_cost += F2FS_LOG_RUN_COST + nlen
+        elif old != ino:                                 # recover_dentry unlinks it
+            self._rf_replaced.add(old)
+        names[name] = ino
+        dents.setdefault(pino, {})[name] = ino
+
+    def _replay_once(self, first, want, limit, skip):
+        """One replay of the log, leaving out the inodes in ``skip``. Returns (state,
+        dentries, live blocks, nodes applied, {inode: why it failed}). Raises _F2fsLogBudget
+        with a node count to stop at when the replay would hold more than its bound."""
+        failed = {}
+        self._log_parsed = None
+        self._rf_replaced = set()
+        self._log_skip = skip
+        entries, made = self._find_fsync_nodes(first, want, limit, skip, failed)
+        active = dict(entries)
+        state, dents, listed, own = {}, {}, {}, {}
+        used = bytearray((self.main_end - self.main_blkaddr + 7) // 8)
+        self._log_cost = len(entries) * F2FS_LOG_ENTRY_COST
+        budget = self._log_budget()
+        applied, walked, addr = 0, 0, first
+        while limit is None or walked < limit:
+            b = self._log_block(addr, want)
+            if b is None:
+                break
+            walked += 1
+            nid, ino, flag = struct.unpack_from("<III", b, self.bs - 24)
+            ent = active.get(ino)
+            if ent is not None:
+                try:
+                    st = state.get(ino)
+                    if st is None:
+                        st = state[ino] = self._log_state(ino, ent)
+                        self._log_cost += F2FS_LOG_STATE_COST
+                    is_inode = nid == ino
+                    if is_inode:                         # recover_inode
+                        if self._inode_chksum_bad(b, ino):
+                            raise _F2fsLogRefused(f"its inode in log block {addr:,} fails its "
+                                                  "checksum")
+                        st["size"] = struct.unpack_from("<Q", b, 16)[0]
+                        st["advise"] = b[2]
+                    if ent[1] == addr:
+                        self._log_apply_dentry(dents, listed, made, ino, addr, b)
+                    self._log_apply_data(state, own, st, ino, addr, b, is_inode, flag >> 3, used)
+                    if is_inode:
+                        st["block"], st["inline_off"] = addr, False
+                    st["inode_last"] = is_inode          # i_blocks speaks for the last inode
+                    applied += 1
+                except (_F2fsLogRefused, _F2fsNodeLost, struct.error) as exc:
+                    failed[ino] = str(exc)
+                    del active[ino]
+                    state.pop(ino, None)
+                else:
+                    if ent[0] == addr:
+                        del active[ino]
+                if self._log_cost > budget:
+                    raise _F2fsLogBudget(walked - 1)
+            addr = struct.unpack_from("<I", b, self.bs - 4)[0]
+        return state, dents, used, applied, failed
+
+    def _replay_log(self):
+        """Replay the roll-forward log in memory, as the kernel does at mount
+        (fs/f2fs/recovery.c f2fs_recover_fsync_data). The walk starts at the next free
+        block of the warm node log, and a node counts only if it carries this
+        checkpoint's version. A block that does not ends the log. The result is an
+        overlay, so the image is never written.
+
+        A failure costs only its part. An inode the kernel would stop on stays as the
+        checkpoint holds it and the replay runs again without it, since it may have taken
+        a block from another file. Past the memory bound, the log is replayed as if it
+        ended at the last node that fit. Only a chain that cannot be followed leaves the
+        whole volume at its checkpoint. Each of these is recorded."""
+        if self.cp_flags & F2FS_CP_DISABLED:             # super.c f2fs_fill_super
+            return
+        warm_seg = struct.unpack_from("<I", self.ckpt, 36 + 4)[0]    # cur_node_segno[1]
+        warm_off = struct.unpack_from("<H", self.ckpt, 68 + 2)[0]    # cur_node_blkoff[1]
+        first = self.main_blkaddr + warm_seg * self.seg_blocks + warm_off
+        want = self.cp_ver
+        if self.cp_flags & F2FS_CP_CRC_RECOVERY:         # node.h is_recoverable_dnode
+            off = struct.unpack_from("<I", self.ckpt, 164)[0]
+            want |= struct.unpack_from("<I", self.ckpt, off)[0] << 32
+        if self._log_block(first, want) is None:
+            self._log_check_cut(first, want)
+            return
+        mark = self._damage_mark()
+        skip, limit, done = {}, None, None
+        try:
+            for _ in range(F2FS_LOG_PASSES):
+                self._damage_reset(mark)
+                try:
+                    state, dents, used, applied, failed = self._replay_once(first, want, limit,
+                                                                            skip)
+                except _F2fsLogBudget as exc:
+                    limit = exc.nodes
+                    continue
+                new = {i: why for i, why in failed.items() if i not in skip}
+                if not new:
+                    done = (state, dents, used, applied)
+                    break
+                skip.update(new)
+            if done is None:
+                raise _F2fsLogRefused(f"its failures did not settle in {F2FS_LOG_PASSES} passes")
+        except (_F2fsLogRefused, _F2fsNodeLost, struct.error) as exc:
+            self._damage_reset(mark)
+            self.log_refused = str(exc)
+            self._rf_replaced = set()
+            self._damaged(f"the roll-forward log was not used, so anything fsynced after the "
+                          f"last checkpoint is not in this export: {exc}")
+            self._count_root_not_read()                  # what it held is not listed
+            return
+        finally:
+            self._log_parsed = None
+        self._rf, self._rf_dents, self._rf_used, self.log_nodes = done
+        self.log_skipped, self.log_cut = skip, limit
+        for ino, why in skip.items():
+            self._damaged(f"inode {ino:,}: its part of the roll-forward log was not used, so it "
+                          f"stays as the last checkpoint holds it: {why}")
+        if limit is not None:
+            self._damaged(f"the roll-forward log was replayed through its first {limit:,} node "
+                          "blocks, where the replay reached its memory bound; later nodes were "
+                          "not used")
+        if skip or limit is not None:                    # fsynced content is not here
+            self._count_root_not_read()
+        if limit is None:
+            self._log_check_cut(self._log_end, want)
+
     # ------------------------------------------------------------ files and folders
 
     def valid_data_note(self, node, _held):
         """[(issue, detail)] for the exceptions table: ENCRYPTED for an inode flagged
-        encrypted, whose stored bytes are exported, and BLOCKS_UNREACHED when the inode counts
-        more blocks than its map reaches. None when neither applies."""
+        encrypted, whose stored bytes are exported, ROLL_FORWARD for a file that takes
+        anything from the roll-forward log, and BLOCKS_UNREACHED when the inode counts more
+        blocks than its map reaches. None when none applies."""
         rows = []
         ino = self.inode(node)
         if ino is not None and self._encrypted(ino):
@@ -3491,7 +4135,15 @@ class F2fsWalker:
                 detail += (f"; the last {tail:,} bytes of that block are past the end of the "
                            "image, so its last data unit is incomplete")
             rows.append(("ENCRYPTED", detail))
-        if ino is not None:
+        st = self._rf.get(node)
+        if st is not None:
+            rows.append(("ROLL_FORWARD",
+                         ("the last checkpoint does not hold this file: its inode and content "
+                          if st["base"] is None else
+                          "the last checkpoint holds an older state of this file: what changed ")
+                         + "came from the roll-forward log, replayed in memory as the kernel "
+                           "does at mount, and the image was not changed"))
+        if ino is not None and (st is None or (st["block"] is not None and st["inode_last"])):
             counted = struct.unpack_from("<Q", ino["raw"], 24)[0]    # i_blocks
             have = self._tree_blocks(ino)
             if have is not None and have < counted:
@@ -3557,7 +4209,7 @@ class F2fsWalker:
         """After the tree has been walked, hold the inodes reached against the checkpoint's
         valid_inode_count. Fewer than it counts means a folder or table the reader used was
         not the one the checkpoint describes, which nothing else on the volume shows. Orphans
-        and quota inodes count without a name.
+        and quota inodes count without a name, and inodes the log only adds do not count.
         A folder below the walk's depth limit is read here so it is not taken for a loss."""
         if self._reached_done:
             return
@@ -3574,7 +4226,9 @@ class F2fsWalker:
                 ino = self._load_inode(nid)
             except _F2fsNodeLost:
                 continue
-            for _name, child, _kind in self._raw_entries(nid, ino):
+            children = [c for _n, c, _t in self._raw_entries(nid, ino)]
+            children += list((self._rf_dents.get(nid) or {}).values())
+            for child in children:
                 self._reached.add(child)
                 if child not in self._dirs_listed:
                     try:
@@ -3593,8 +4247,9 @@ class F2fsWalker:
         if orphans is None:
             return
         want = struct.unpack_from("<I", self.ckpt, 148)[0]   # valid_inode_count
-        held = self._reached
-        unnamed = (orphans | self._quota_inos) - held
+        log_only = {i for i, st in self._rf.items() if st["base"] is None}
+        held = self._reached - log_only
+        unnamed = (orphans | self._quota_inos | self._rf_replaced) - held
         found = len(held) + len(unnamed)
         if found < want:
             self.inode_shortfall = (want, found)
@@ -3613,6 +4268,8 @@ class F2fsWalker:
         count = 1 + (1 if struct.unpack_from("<I", ino["raw"], 76)[0] else 0)
         if ino["inline"] & F2FS_INLINE_DATA:
             return count
+        st = self._rf.get(ino["nid"]) if self._rf else None
+        maps = st["maps"] if st is not None else {}
         released = bool(ino["cluster"] and ino["inline"] & F2FS_COMPRESS_RELEASED)
         cluster = ino["cluster"]
 
@@ -3623,7 +4280,14 @@ class F2fsWalker:
                     if words[at] == F2FS_COMPRESS_ADDR and F2FS_NEW_ADDR not in words[at:at + cluster]:
                         total -= 1                       # the marker is not counted once released
             return total
-        count += mapped(struct.unpack_from(f"<{n}I", ino["raw"], ino["iaddr_off"]))
+        if st is None:
+            count += mapped(struct.unpack_from(f"<{n}I", ino["raw"], ino["iaddr_off"]))
+        else:
+            try:
+                count += mapped([self._map(ino, k)[0] for k in range(n)])
+            except _F2fsNodeLost:
+                return None
+        found = set()
 
         def walk(nid, depth, ofs, step):
             nonlocal count
@@ -3634,7 +4298,10 @@ class F2fsWalker:
                 return
             count += 1
             if depth == 0:
-                count += mapped(struct.unpack_from(f"<{apb}I", b, 0))
+                start = self._start_bidx(ofs, n, apb, nids)
+                found.add(start)
+                if start not in maps:
+                    count += mapped(struct.unpack_from(f"<{apb}I", b, 0))
                 return
             for i, child in enumerate(struct.unpack_from(f"<{nids}I", b, 0)):
                 if depth == 1:
@@ -3642,11 +4309,27 @@ class F2fsWalker:
                 else:
                     walk(child, 1, ofs + 1 + i * (nids + 1), 0)
         try:
-            walk(self._nid_slot(ino, 0), 0, 1, 0)
-            walk(self._nid_slot(ino, 1), 0, 2, 0)
-            walk(self._nid_slot(ino, 2), 1, 3, 0)
-            walk(self._nid_slot(ino, 3), 1, 4 + nids, 0)
-            walk(self._nid_slot(ino, 4), 2, 5 + 2 * nids, 0)
+            if st is None or not st["drop_tree"]:
+                walk(self._nid_slot(ino, 0), 0, 1, 0)
+                walk(self._nid_slot(ino, 1), 0, 2, 0)
+                walk(self._nid_slot(ino, 2), 1, 3, 0)
+                walk(self._nid_slot(ino, 3), 1, 4 + nids, 0)
+                walk(self._nid_slot(ino, 4), 2, 5 + 2 * nids, 0)
+            added = 0
+            for key, rec in maps.items():
+                if key == 0:
+                    continue
+                if isinstance(rec, array.array):
+                    count += mapped(rec.tolist())
+                else:
+                    b = self.block(rec)
+                    if len(b) < self.bs:
+                        return None
+                    count += mapped(struct.unpack_from(f"<{apb}I", b, 0))
+                if key not in found:
+                    added += 1
+            if added:                                    # its node, and parents it may have added
+                count += 2 * added + 1
         except (_F2fsNodeLost, RecursionError):
             return None
         return count
@@ -3804,6 +4487,9 @@ class F2fsWalker:
         if self._encrypted(ino):
             self._encrypted_folders.add(nid)
         raw = self._raw_entries(nid, ino)
+        added = self._rf_dents.get(nid)
+        if added:
+            raw = [e for e in raw if e[0] not in added] + [(n, c, 0) for n, c in added.items()]
         named = [(self._stored_name(n), _F2fsChild(c), t) for n, c, t in raw]
         if len(self._pending) > 1 << 20:                 # names no caller asked about
             self._pending.clear()
@@ -4067,6 +4753,15 @@ class F2fsWalker:
             self.sit_j[struct.unpack_from("<I", buf, p)[0]] = buf[p + 4:p + 78]
             p += 78
 
+    def _sit_valid(self, blk):
+        """True when the checkpoint's SIT marks this main-area block in use."""
+        if not getattr(self, "_sit_loaded", False):
+            self._load_sit_journal()
+            self._sit_loaded = True
+        seg, off = divmod(blk - self.main_blkaddr, self.seg_blocks)
+        raw = self._sit_entry(seg)
+        return bool(raw) and bool(self._f2fs_test_bit(raw[2:2 + (self.seg_blocks >> 3)], off))
+
     def _sit_entry(self, segno):
         """The raw 74-byte f2fs_sit_entry for main-area segment segno, journal
         first, else the current on-disk copy (segment.h current_sit_addr); None
@@ -4102,7 +4797,8 @@ class F2fsWalker:
         way, and an entry still in the cold-data summary journal overrides the
         table. Only the main area is reported: the superblock, checkpoint, SIT,
         NAT and SSA areas are the filesystem's own bookkeeping and hold no user
-        content.
+        content. Blocks the roll-forward log replayed are live, so they are left out
+        even though the checkpoint's table still marks them free.
 
         Offsets are into the image rather than the volume, so a caller reading
         the whole disk can use them directly. ``min_bytes`` drops runs too short
@@ -4133,6 +4829,10 @@ class F2fsWalker:
                 break
             base_blk = self.main_blkaddr + segno * self.seg_blocks
             vmap = raw[2:2 + (self.seg_blocks >> 3)]
+            if self._rf_used is not None:                # blocks the roll-forward log made live
+                extra = self._rf_used[segno * (self.seg_blocks >> 3):
+                                      (segno + 1) * (self.seg_blocks >> 3)]
+                vmap = bytes(x | y for x, y in zip(vmap, extra))
             for i, byte in enumerate(vmap):
                 for first, n in table[byte]:
                     blk = base_blk + i * 8 + first
@@ -15799,7 +16499,7 @@ def _valid_data_note(w, node, held):
     """(issue, detail) for a file's own row in the exceptions table, else None: an exFAT
     file whose ValidDataLength differs from its DataLength, a FAT file whose chain crosses
     a link the FAT copies disagree on, or a qnx6 file with blocks that have no pointer. A
-    list of them for an F2FS file flagged encrypted or whose block count is short. None
+    list of them for an F2FS file flagged encrypted or read from the roll-forward log. None
     for any other walker."""
     report = getattr(w, "valid_data_note", None)
     if report is None:
@@ -16706,8 +17406,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip. The
     two ValidDataLength counts, the count of FAT files whose chain crosses a link the FAT
-    copies disagree on and the count of files exported as stored because they are flagged
-    encrypted appear only when not zero and do not change the exit status."""
+    copies disagree on, the count of files exported as stored because they are flagged
+    encrypted and the count of files read from an F2FS roll-forward log appear only when
+    not zero and do not change the exit status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -16729,6 +17430,7 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                        ("valid_data_damaged", "VALID_DATA_DAMAGED"),
                        ("fat_copies_differ", "FAT_COPIES_DIFFER"),
                        ("encrypted", "ENCRYPTED"),
+                       ("roll_forward", "ROLL_FORWARD"),
                        ("blocks_unreached", "BLOCKS_UNREACHED")):
         if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
@@ -16751,6 +17453,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
             valid += ", each FAT file whose chain crosses a link the FAT copies disagree on"
         if counts["ENCRYPTED"]:
             valid += ", each file flagged encrypted and exported as stored"
+        if counts["ROLL_FORWARD"]:
+            valid += ", each file read from the roll-forward log"
         if counts["BLOCKS_UNREACHED"]:
             valid += ", each file whose inode counts more blocks than its map reaches"
         _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
@@ -21887,9 +22591,11 @@ def identify_f2fs(fh, base):
     if w.cp_flags & F2FS_CP_ERROR:
         clean += "; checkpoint carries an error flag"
     lines.append(f"checkpoint   {clean}")
-    if w.log_unreplayed:
-        lines.append(f"log          at least {w.log_unreplayed:,} node block(s) written after the "
-                     "checkpoint; not replayed, so what they hold is not read")
+    if w.log_nodes:
+        lines.append(f"log          {w.log_nodes:,} node block(s) written after the checkpoint "
+                     f"replayed in memory, for {len(w._rf):,} file(s) or folder(s)")  # pylint: disable=protected-access
+    if w.log_refused:
+        lines.append(f"log          not used: {w.log_refused}")
     if len(w.devices) > 1:
         lines.append(f"devices      {len(w.devices)} listed in the superblock")
     if feat & F2FS_FEAT_ENCRYPT:
@@ -38199,6 +38905,21 @@ def _f2fs_reader_checks():
                 return block * BS + hit
         raise KeyError(name)
 
+    def log_blocks(img, w):
+        """The warm node log after the checkpoint, read here from its footers."""
+        seg = struct.unpack_from("<I", w.ckpt, 40)[0]
+        at = w.main_blkaddr + seg * w.seg_blocks + struct.unpack_from("<H", w.ckpt, 70)[0]
+        off = struct.unpack_from("<I", w.ckpt, 164)[0]
+        want = w.cp_ver | struct.unpack_from("<I", w.ckpt, off)[0] << 32
+        out = []
+        while len(out) < 64:
+            block = bytes(img.raw[at * BS:(at + 1) * BS])
+            if len(block) < BS or struct.unpack_from("<Q", block, BS - 12)[0] != want:
+                return out
+            out.append(at)
+            at = struct.unpack_from("<I", block, BS - 4)[0]
+        return out
+
     def export(img, edits=(), end=None):
         """(exit status, the volume's record, exceptions rows, {member: (crc, size)}) from
         a real --extract."""
@@ -38251,7 +38972,7 @@ def _f2fs_reader_checks():
     def clean():
         for img, want, pack in ((free_v, want_free, 1), (holes, want_holes, 2)):
             w = walker(img)
-            if matches(w, want) != len(want) or w.cur_pack != pack or w.damage:
+            if matches(w, want) != len(want) or w.cur_pack != pack or w.damage or w.log_nodes:
                 return False
         return True
 
@@ -38510,12 +39231,364 @@ def _f2fs_reader_checks():
             return "not marked as a clean unmount" in (w.volume_note or "")
         return with_edits(free_v, cp_edits(free_v, w0, [(132, struct.pack("<I", flags))]), check)
 
-    def log_not_replayed():
+    def log_read():
         w = walker(roll)
-        note = w.volume_note or ""
-        clean_note = walker(free_v).volume_note or ""
-        return (len(files(w)) == 1 and not w.damage and "at least 20 node" in note
-                and "does not replay" in note and "does not replay" not in clean_note)
+        return matches(w, want_roll) == len(want_roll) == 21 and w.log_nodes == 20
+
+    def log_export():
+        got = export(roll)
+        if got is None:
+            return None
+        rc, rec, rows, members = got
+        marked = [r for r in rows if r[2] == "ROLL_FORWARD"]
+        return (rc == 0 and rec["files"] == 21 and len(marked) == 20
+                and rec["exceptions"].get("roll_forward") == 20
+                and "roll-forward log" in (rec.get("note") or "")
+                and all(r[1].split("/", 1)[-1] in members for r in marked))
+
+    def log_not_free():
+        w = walker(roll)
+        runs = w.free_extents()
+        starts = [a for a, _n in runs]
+
+        def is_free(block):
+            off = block * BS
+            i = bisect.bisect_right(starts, off) - 1
+            return i >= 0 and off < runs[i][0] + runs[i][1]
+        blocks = log_blocks(roll, w)
+        return len(blocks) == 20 and not any(is_free(b) for b in blocks)
+
+    def log_stale():
+        w0 = walker(roll)
+        first = log_blocks(roll, w0)[0]
+        ver = struct.unpack_from("<Q", roll.raw, first * BS + BS - 12)[0]
+
+        def check():
+            w = walker(roll)
+            return w.log_nodes == 0 and not w.log_refused and len(files(w)) == 1
+        return with_edits(roll, [(first * BS + BS - 12, struct.pack("<Q", ver - 1))], check)
+
+    def log_cut():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+
+        def check():
+            w = walker(roll)
+            have = files(w)
+            return (w.log_nodes == 5 and not w.log_refused and len(have) == 6
+                    and matches(w, {p: d for p, d in want_roll.items() if p in have}) == 6)
+        return with_edits(roll, [(blocks[5] * BS, bytes(BS))], check)
+
+    def log_loop():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+
+        def check():
+            w = walker(roll)
+            return ("loops" in (w.log_refused or "") and w.log_nodes == 0
+                    and len(files(w)) == 1 and w.folders_not_read == 1)
+        return with_edits(roll, [(blocks[6] * BS + BS - 4, struct.pack("<I", blocks[2]))], check)
+
+    def log_existing_inode():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+        kept = files(w0)["before_checkpoint.bin"][0]
+
+        def check():
+            w = walker(roll)
+            return (not w.log_refused and w.log_nodes == 19 and kept in w.log_skipped
+                    and len(files(w)) == 20 and w.folders_not_read == 1)
+        return with_edits(roll, [(blocks[0] * BS + BS - 24, struct.pack("<II", kept, kept))], check)
+
+    def log_tail(img, w):
+        """Where the next log node goes, and the footer version it must carry."""
+        off = struct.unpack_from("<I", w.ckpt, 164)[0]
+        want = w.cp_ver
+        if w.cp_flags & F2FS_CP_CRC_RECOVERY:
+            want |= struct.unpack_from("<I", w.ckpt, off)[0] << 32
+        have = log_blocks(img, w) if w.cp_flags & F2FS_CP_CRC_RECOVERY else []
+        if have:
+            return struct.unpack_from("<I", img.raw, have[-1] * BS + BS - 4)[0], want
+        seg = struct.unpack_from("<I", w.ckpt, 40)[0]
+        return (w.main_blkaddr + seg * w.seg_blocks
+                + struct.unpack_from("<H", w.ckpt, 70)[0]), want
+
+    def spare_blocks(w, count, tail):
+        """Blocks the checkpoint marks free, away from the log's own segment."""
+        seg = (tail - w.main_blkaddr) // w.seg_blocks
+        low = w.main_blkaddr + seg * w.seg_blocks
+        out = []
+        for off, length in w.free_extents():
+            for block in range(off // BS, (off + length) // BS):
+                if not low <= block < low + w.seg_blocks:
+                    out.append(block)
+                    if len(out) == count:
+                        return out
+        raise ValueError("not enough free blocks")
+
+    def chain(img, tail, want, spare, nodes):
+        """Edits that append (body, nid, ino, node offset, flags) to the log."""
+        edits, at = [], tail
+        for i, (body, nid, ino, ofs, marks) in enumerate(nodes):
+            block = bytearray(body)
+            nxt = spare[i] if i + 1 < len(nodes) else 0
+            struct.pack_into("<IIIQI", block, BS - 24, nid, ino, (ofs << 3) | marks, want, nxt)
+            if nid == ino:
+                seal(img, block)
+            edits.append((at * BS, bytes(block)))
+            at = nxt
+        return edits
+
+    def with_addrs(w, raw, nid, addrs, size):
+        """An inode block holding ``addrs`` and no inline data."""
+        block = bytearray(raw)
+        block[3] &= ~(F2FS_INLINE_DATA | 0x08)
+        struct.pack_into("<Q", block, 16, size)
+        ino = w._parse_inode(bytes(block), nid)          # pylint: disable=protected-access
+        for k in range(ino["addrs_in_inode"]):
+            struct.pack_into("<I", block, ino["iaddr_off"] + k * 4,
+                             addrs[k] if k < len(addrs) else 0)
+        return block
+
+    def direct_offsets(w, count):
+        out, ofs = [], 1
+        nids = w.addrs_per_block
+        while len(out) < count:
+            special = ofs in (3, 4 + nids, 5 + 2 * nids) or (
+                ofs >= 6 + 2 * nids and (ofs - 6 - 2 * nids) % (nids + 1) == 0)
+            if not special:
+                out.append(ofs)
+            ofs += 1
+        return out
+
+    def log_inline_grows():
+        img, w0, nid = None, None, None
+        for candidate in (full, free_v, holes, lz4, roll):
+            w0 = walker(candidate)
+            for n, size in sorted(files(w0).values()):
+                ino = w0.inode(n)
+                # the first stored word sits in address slot 1, where a read would take it
+                if size >= 4 and ino["inline"] & F2FS_INLINE_DATA and struct.unpack_from(
+                        "<I", ino["raw"], ino["iaddr_off"] + 4)[0]:
+                    img, nid = candidate, n
+                    break
+            if img is not None:
+                break
+        if img is None:
+            return None
+        tail, want = log_tail(img, w0)
+        spare = spare_blocks(w0, 3, tail)
+        data = bytes((i * 7) & 0xFF for i in range(6000))
+        raw = bytes(img.raw[w0.resolve(nid) * BS:(w0.resolve(nid) + 1) * BS])
+        node = with_addrs(w0, raw, nid, spare[:2], len(data))
+        edits = chain(img, tail, want, spare[2:], [(node, nid, nid, 0, 2)])
+        edits += [(spare[0] * BS, data[:BS]), (spare[1] * BS, data[BS:].ljust(BS, b"\0"))]
+
+        def check():
+            w = walker(img)
+            return (not w.log_refused and w.log_nodes == 1 and not w.damage
+                    and b"".join(w.read_file(nid, len(data))) == data)
+        return with_edits(img, edits, check)
+
+    def log_parent_fault():
+        w0 = walker(full)
+        folder, last = None, None
+        for _p, n, m, _s, _t, _r in walk_all(w0):
+            if m & S_IFMT != S_IFDIR or w0.inode(n)["inline"] & F2FS_INLINE_DENTRY:
+                continue
+            ino = w0.inode(n)
+            held = [w0._block_of(ino, k)                 # pylint: disable=protected-access
+                    for k in range((ino["size"] + BS - 1) // BS)]
+            held = [b for b in held if b not in (F2FS_NULL_ADDR, F2FS_NEW_ADDR)]
+            if len(held) >= 2:
+                folder, last = n, held[-1]
+                break
+        if folder is None:
+            return None
+        template = next(n for n, size in files(w0).values() if size > 8192
+                        and not w0.inode(n)["inline"] & F2FS_INLINE_DATA)
+        new = next(k for k in range(100, w0.max_nid) if w0.resolve(k) == 0)
+        tail, want = log_tail(full, w0)
+        spare = spare_blocks(w0, 2, tail)
+        data = b"fsynced into the folder after the checkpoint\n" * 80
+        raw = bytes(full.raw[w0.resolve(template) * BS:(w0.resolve(template) + 1) * BS])
+        node = with_addrs(w0, raw, new, spare[:1], len(data))
+        node[BS - 44:BS - 24] = bytes(20)
+        name = b"after_checkpoint.bin"
+        struct.pack_into("<II", node, 84, folder, len(name))
+        node[92:92 + 255] = name.ljust(255, b"\0")
+        edits = chain(full, tail, want, spare[1:], [(node, new, new, 0, 6)])
+        edits += [(spare[0] * BS, data.ljust(BS, b"\0")),
+                  (last * BS, bytes(w0._dentry_geom(BS)[1]))]    # pylint: disable=protected-access
+
+        def check():
+            w = walker(full)
+            listed = dict(w.listdir(folder))
+            return (not w.log_refused and w.log_nodes == 1 and listed.get(name.decode()) == new
+                    and b"".join(w.read_file(new, len(data))) == data)
+        return with_edits(full, edits, check)
+
+    def log_one_bad_inode():
+        w0 = walker(roll)
+        blocks = log_blocks(roll, w0)
+        victim = struct.unpack_from("<I", roll.raw, blocks[3] * BS + BS - 24)[0]
+        ino = w0._parse_inode(bytes(roll.raw[blocks[3] * BS:(blocks[3] + 1) * BS]), victim)  # pylint: disable=protected-access
+        block = bytearray(roll.raw[blocks[3] * BS:(blocks[3] + 1) * BS])
+        struct.pack_into("<I", block, ino["iaddr_off"], 0x7FFFFFF0)
+        seal(roll, block)
+
+        def check():
+            w = walker(roll)
+            have = files(w)
+            return (not w.log_refused and w.log_nodes == 19 and victim in w.log_skipped
+                    and len(have) == 20 and w.folders_not_read == 1
+                    and matches(w, {p: d for p, d in want_roll.items() if p in have}) == 20)
+        return with_edits(roll, [(blocks[3] * BS, bytes(block))], check)
+
+    def log_many_reuses():
+        w0 = walker(roll)
+        nid = files(w0)["before_checkpoint.bin"][0]
+        tail, want = log_tail(roll, w0)
+        count, shifts = 700, 3
+        spare = spare_blocks(w0, count + shifts + shifts + 1, tail)
+        data, links = spare[:count + shifts], spare[count + shifts:]
+        raw = bytes(roll.raw[w0.resolve(nid) * BS:(w0.resolve(nid) + 1) * BS])
+        nodes = [(with_addrs(w0, raw, nid, data[k:k + count], count * BS), nid, nid, 0, 2)
+                 for k in range(shifts + 1)]
+        edits = chain(roll, tail, want, links, nodes)
+        edits += [(a * BS, struct.pack("<I", k) * (BS // 4)) for k, a in enumerate(data)]
+        expect = b"".join(struct.pack("<I", k) * (BS // 4) for k in range(shifts, shifts + count))
+
+        def check():
+            w = walker(roll)
+            return (not w.log_refused and not w.log_skipped and w.log_nodes == 20 + shifts + 1
+                    and b"".join(w.read_file(nid, count * BS)) == expect)
+        return with_edits(roll, edits, check)
+
+    def log_lookup_cost():
+        w0 = walker(roll)
+        nid = files(w0)["before_checkpoint.bin"][0]
+        tail, want = log_tail(roll, w0)
+        width = 1200
+        spare = spare_blocks(w0, width + width + 1, tail)
+        data, links = spare[:width], spare[width:]
+        nodes = []
+        for ofs, block in zip(direct_offsets(w0, width), data):
+            body = bytearray(BS)
+            struct.pack_into("<I", body, 0, block)
+            nodes.append((body, 70000 + ofs, nid, ofs, 0))
+        raw = bytes(roll.raw[w0.resolve(nid) * BS:(w0.resolve(nid) + 1) * BS])
+        nodes.append((with_addrs(w0, raw, nid, data[:800], 800 * BS), nid, nid, 0, 2))
+
+        class Counted(F2fsWalker):
+            """Stops a replay whose lookups grow with the log times the reuses."""
+            calls = 0
+
+            def block(self, blkaddr):
+                Counted.calls += 1
+                if Counted.calls > 60000:
+                    raise OverflowError("the replay read too many blocks")
+                return super().block(blkaddr)
+
+        def check():
+            w = Counted(Held(roll), 0)
+            return not w.log_refused and w.log_nodes == 20 + width + 1
+        return with_edits(roll, chain(roll, tail, want, links, nodes), check)
+
+    def log_memory():
+        import tracemalloc
+        w0 = walker(roll)
+        path = "before_checkpoint.bin"
+        nid = files(w0)[path][0]
+        tail, want = log_tail(roll, w0)
+        count = 600
+        spare = spare_blocks(w0, count + 1, tail)
+        full_c = struct.pack("<I", F2FS_COMPRESS_ADDR) * w0.addrs_per_block
+        half_c = (struct.pack("<II", 0, F2FS_COMPRESS_ADDR) * w0.addrs_per_block)[
+            :w0.addrs_per_block * 4]
+        nodes = [((full_c if k % 2 else half_c).ljust(BS, b"\0"), 70000 + k, nid, ofs,
+                  2 if k == count - 1 else 0)
+                 for k, ofs in enumerate(direct_offsets(w0, count))]
+
+        def check():
+            tracemalloc.start()
+            try:
+                w = walker(roll)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            return (peak < 16 << 20 and not w.log_refused and w.log_nodes == 20 + count
+                    and matches(w, {path: want_roll[path]}) == 1)
+        return with_edits(roll, chain(roll, tail, want, spare, nodes), check)
+
+    def log_memory_bound():
+        held = globals().get("F2FS_LOG_MEMORY_MAX")
+        globals()["F2FS_LOG_MEMORY_MAX"] = 24000
+        try:
+            w = walker(roll)
+            have = files(w)
+            return (not w.log_refused and w.log_cut is not None and 0 < w.log_nodes < 20
+                    and len(have) == 1 + w.log_nodes and w.folders_not_read == 1
+                    and matches(w, {p: d for p, d in want_roll.items() if p in have}) == len(have)
+                    and any("memory bound" in d for d in w.damage))
+        finally:
+            if held is None:
+                del globals()["F2FS_LOG_MEMORY_MAX"]
+            else:
+                globals()["F2FS_LOG_MEMORY_MAX"] = held
+
+    def log_direct_node():
+        """Crafted: a log copy of a held file's first direct node, with one address moved
+        to a free block. The kernel volume's log holds inodes only, so this is the one row
+        that reaches a direct node, and it rests on reading recovery.c and gc.c."""
+        w0 = walker(full)
+        _path, nid, size = largest(w0)
+        ino = w0.inode(nid)
+        dnode = w0._nid_slot(ino, 0)                     # pylint: disable=protected-access
+        seg = struct.unpack_from("<I", w0.ckpt, 40)[0]
+        first = w0.main_blkaddr + seg * w0.seg_blocks + struct.unpack_from("<H", w0.ckpt, 70)[0]
+        free_block = first + 1
+        off = struct.unpack_from("<I", w0.ckpt, 164)[0]
+        want = w0.cp_ver
+        if w0.cp_flags & 0x40:
+            want |= struct.unpack_from("<I", w0.ckpt, off)[0] << 32
+        node = bytearray(full.raw[w0.resolve(dnode) * BS:(w0.resolve(dnode) + 1) * BS])
+        struct.pack_into("<I", node, 5 * 4, free_block)
+        flag = struct.unpack_from("<I", node, BS - 16)[0] | 2     # the fsync mark
+        struct.pack_into("<I", node, BS - 16, flag)
+        struct.pack_into("<Q", node, BS - 12, want)
+        struct.pack_into("<I", node, BS - 4, 0)
+        mark = b"LOG-BLOCK-".ljust(BS, b"x")
+        before = b"".join(w0.read_file(nid, size))
+        at = (ino["addrs_in_inode"] + 5) * BS
+
+        def check():
+            w = walker(full)
+            got = b"".join(w.read_file(nid, size))
+            return (w.log_nodes == 1 and not w.log_refused and got[at:at + BS] == mark
+                    and got[:at] == before[:at] and got[at + BS:] == before[at + BS:])
+        return with_edits(full, [(first * BS, bytes(node)), (free_block * BS, mark)], check)
+
+    def node_offsets():
+        """The log places a direct node by its offset (gc.c f2fs_start_bidx_of_node) and a
+        read finds it by logical block (node.c get_node_path). The two must agree at every
+        level of the tree, including the ones no fixture file is large enough to reach."""
+        w = walker(free_v)
+        ino = w.inode(sorted(files(w).values())[0][0])
+        n, apb, nids = ino["addrs_in_inode"], ino["apb"], w.addrs_per_block
+        ind = apb * nids
+        spots = [n, n + apb - 1, n + apb, n + 2 * apb - 1]
+        for base in (n + 2 * apb, n + 2 * apb + ind):
+            spots += [base + m * apb + k for m in (0, 1, 7, nids - 1) for k in (0, 1, apb - 1)]
+        base = n + 2 * apb + 2 * ind
+        spots += [base + top * ind + mid * apb + k for top in (0, 1, 7, nids - 1)
+                  for mid in (0, 1, 7, nids - 1) for k in (0, 1, apb - 1)]
+        for logical in spots:
+            ofs = w._node_path(ino, logical)[2][-1]      # pylint: disable=protected-access
+            start = w._start_bidx(ofs, n, apb, nids)     # pylint: disable=protected-access
+            if not start <= logical < start + apb or not w._is_dnode(ofs):  # pylint: disable=protected-access
+                return False
+        return True
 
     def intact_no_record():
         for img in (full, free_v, holes, roll, lz4):
@@ -38524,7 +39597,7 @@ def _f2fs_reader_checks():
             w.check_reached()
             rows = [r for n, s in have.values() for r in (w.valid_data_note(n, s) or ())
                     if r[0] == "BLOCKS_UNREACHED"]
-            if w.damage or w.folders_not_read or w.inode_shortfall or rows:
+            if w.damage or w.folders_not_read or w.log_gap or w.inode_shortfall or rows:
                 return False
         return True
 
@@ -38543,6 +39616,35 @@ def _f2fs_reader_checks():
         rc, _rec, rows, members = got
         return (rc == 1 and path not in members
                 and any(r[0] == path and r[2] == "FAILED" for r in rows))
+
+    def log_inode_sector():
+        w0 = walker(roll)
+        block = log_blocks(roll, w0)[4]
+        ino = struct.unpack_from("<I", roll.raw, block * BS + BS - 24)[0]
+
+        def check():
+            w = walker(roll)
+            return (w.log_nodes == 19 and ino in w.log_skipped and not w.log_refused
+                    and "checksum" in w.log_skipped[ino] and len(files(w)) == 20
+                    and w.folders_not_read == 1)
+        return with_edits(roll, [(block * BS + 1024, b"\xff" * 512)], check)
+
+    def log_footer_sector():
+        """The state a bad footer sector leaves is also what a crash with two fsyncs in flight
+        leaves, so it is a note and the exit status does not change."""
+        w0 = walker(roll)
+        block = log_blocks(roll, w0)[5]
+        edits = [(block * BS + BS - 512, bytes(512))]
+
+        def check():
+            w = walker(roll)
+            note = w.volume_note or ""
+            return (w.log_nodes == 5 and w.log_gap > 0 and not w.folders_not_read
+                    and not w.damage and "may be missing" in note and "in flight" in note)
+        if not with_edits(roll, edits, check):
+            return False
+        got = export(roll, edits)
+        return None if got is None else got[0] == 0
 
     def summary_sector():
         w0 = walker(holes)
@@ -38595,9 +39697,96 @@ def _f2fs_reader_checks():
                 and any(r[0] == name and r[2] == "BLOCKS_UNREACHED" for r in rows)
                 and any(m == name or m.startswith(name + ".") for m in members))
 
+    def plain_pair(w):
+        """Two files with at least three blocks, all in the inode's own addresses."""
+        got = [(n, s) for n, s in sorted(files(w).values())
+               if 3 * BS < s <= w.inode(n)["addrs_in_inode"] * BS
+               and not w.inode(n)["inline"] & F2FS_INLINE_DATA]
+        return got[0], got[1]
+
+    def blocks_of(w, nid, size):
+        ino = w.inode(nid)
+        return [w._block_of(ino, k)                      # pylint: disable=protected-access
+                for k in range((size + BS - 1) // BS)]
+
     def inode_raw(img, w, nid):
         at = w.resolve(nid) * BS
         return bytes(img.raw[at:at + BS])
+
+    def orphan_edits(img, w, orphan):
+        """The current checkpoint pack rebuilt with one orphan block, as the kernel lays it
+        out: the checkpoint, the orphan block, the summaries, the closing checkpoint."""
+        old = [bytes(img.raw[(w.start_cp + k) * BS:(w.start_cp + k + 1) * BS])
+               for k in range(w.cp_total)]
+        block = bytearray(BS)
+        struct.pack_into("<I", block, 0, orphan)
+        struct.pack_into("<HHI", block, BS - 12, 1, 1, 1)
+        struct.pack_into("<I", block, BS - 4, crc(F2FS_MAGIC, bytes(block[:BS - 4])))
+        flags = w.cp_flags | F2FS_CP_ORPHAN
+        start = struct.unpack_from("<I", w.ckpt, 140)[0]
+        head = cp_edits(img, w, [(132, struct.pack("<I", flags)),
+                                 (136, struct.pack("<I", w.cp_total + 1)),
+                                 (140, struct.pack("<I", start + 1))])[0][1]
+        pack = [head, bytes(block)] + old[1:-1] + [head]
+        return [(w.start_cp * BS, b"".join(pack))]
+
+    def log_same_file_move():
+        w0 = walker(free_v)
+        (nid, size), _other = plain_pair(w0)
+        before = b"".join(w0.read_file(nid, size))
+        cur = blocks_of(w0, nid, size)
+        node = with_addrs(w0, inode_raw(free_v, w0, nid), nid, cur[1:], size - BS)
+        struct.pack_into("<Q", node, 24, struct.unpack_from("<Q", node, 24)[0] - 1)
+        tail, want = log_tail(free_v, w0)
+        edits = chain(free_v, tail, want, [], [(node, nid, nid, 0, 2)])
+
+        def check():
+            w = walker(free_v)
+            rows = [r[0] for r in w.valid_data_note(nid, size - BS) or ()]
+            return (not w.damage and not w.log_refused and w.log_nodes == 1
+                    and "BLOCKS_UNREACHED" not in rows
+                    and b"".join(w.read_file(nid, size - BS)) == before[BS:])
+        return with_edits(free_v, edits, check)
+
+    def log_from_orphan():
+        w0 = walker(free_v)
+        (nid, _size), (orphan, o_size) = plain_pair(w0)
+        o_blocks = blocks_of(w0, orphan, o_size)
+        data = b"".join(w0.read_file(orphan, o_size))
+        node = with_addrs(w0, inode_raw(free_v, w0, nid), nid, o_blocks, o_size)
+        pack = orphan_edits(free_v, w0, orphan)
+        undo = free_v.apply(pack)                        # the log carries the new pack's checksum
+        try:
+            tail, want = log_tail(free_v, walker(free_v))
+        finally:
+            free_v.restore(undo)
+        edits = pack + chain(free_v, tail, want, [], [(node, nid, nid, 0, 2)])
+
+        def check():
+            w = walker(free_v)
+            return (not w.damage and not w.log_refused and w.log_nodes == 1
+                    and orphan not in w._rf              # pylint: disable=protected-access
+                    and b"".join(w.read_file(nid, o_size)) == data)
+        return with_edits(free_v, edits, check)
+
+    def log_move_range():
+        w0 = walker(free_v)
+        (dst, d_size), (src, s_size) = plain_pair(w0)
+        s_blocks = blocks_of(w0, src, s_size)
+        s_before = b"".join(w0.read_file(src, s_size))
+        cur = blocks_of(w0, dst, d_size)
+        cur[0] = s_blocks[1]
+        node = with_addrs(w0, inode_raw(free_v, w0, dst), dst, cur, d_size)
+        tail, want = log_tail(free_v, w0)
+        edits = chain(free_v, tail, want, [], [(node, dst, dst, 0, 2)])
+        expect = s_before[:BS] + bytes(BS) + s_before[2 * BS:]
+
+        def check():
+            w = walker(free_v)
+            got = b"".join(w.read_file(dst, d_size))
+            return (not w.damage and not w.log_refused and got[:BS] == s_before[BS:2 * BS]
+                    and b"".join(w.read_file(src, s_size)) == expect)
+        return with_edits(free_v, edits, check)
 
     def no_checksum_edits(img, w):
         return sb_edits(img, [(2180, struct.pack("<I", w.feature & ~0x20))])
@@ -38805,12 +39994,48 @@ def _f2fs_reader_checks():
     row("F2FS: crtime is not read from an extra area too short to hold it", short_extra)
     row("F2FS: a multi-device superblock is named in the volume note", two_devices)
     row("F2FS: a checkpoint that is not a clean unmount is in the volume note", not_clean)
+    row("F2FS roll-forward: all 21 files of a kernel crash-state image match the kernel's "
+        "read-back", log_read)
+    row("F2FS roll-forward: the export labels each of the 20 replayed files and exits 0",
+        log_export)
+    row("F2FS roll-forward: replayed node blocks are not reported as free space", log_not_free)
+    row("F2FS roll-forward: a first node from another checkpoint ends the log with nothing "
+        "applied", log_stale)
+    row("F2FS roll-forward: a chain cut after 5 nodes applies those 5", log_cut)
+    row("F2FS roll-forward: a looped chain applies nothing and is recorded", log_loop)
+    row("F2FS roll-forward: a log inode recreating a held inode costs only that inode",
+        log_existing_inode)
+    row("F2FS roll-forward: a file inline at the checkpoint grows past a block and its old "
+        "inline bytes are not read as addresses", log_inline_grows)
+    row("F2FS roll-forward: a minor fault in the parent folder keeps the replay",
+        log_parent_fault)
+    row("F2FS roll-forward: one inode with a bad address costs only that inode",
+        log_one_bad_inode)
+    row("F2FS roll-forward: more than 1,024 block reuses replay in full", log_many_reuses)
+    row("F2FS roll-forward: finding a reused block's owner does not scan the log",
+        log_lookup_cost)
+    row("F2FS roll-forward: nodes full of compressed-cluster markers hold little memory",
+        log_memory)
+    row("F2FS roll-forward: at the memory bound the replay keeps the nodes that fit and says so",
+        log_memory_bound)
+    row("F2FS roll-forward: a direct node's offset and its logical blocks agree at every tree "
+        "level", node_offsets)
+    row("F2FS roll-forward: a crafted direct node in the log changes the one block it moves",
+        log_direct_node)
     row("F2FS records: intact fixtures, the kernel crash-state image included, get none of the "
-        "checksum, inode-count, name or block-count records", intact_no_record)
-    row("F2FS log: a crash-state image's note says its log was not replayed, and a clean image "
-        "has no such note", log_not_replayed)
+        "checksum, log, inode-count, name or block-count records", intact_no_record)
     row("F2FS inode checksum: a checkpoint inode whose stored checksum differs is a FAILED row",
         inode_sector)
+    row("F2FS inode checksum: a log inode whose stored checksum differs costs only that inode",
+        log_inode_sector)
+    row("F2FS roll-forward: a log that stops with later blocks of its version is a note that "
+        "names both causes, with no damage record and exit 0", log_footer_sector)
+    row("F2FS roll-forward: a block moved within one file records nothing and reads shifted",
+        log_same_file_move)
+    row("F2FS roll-forward: a block taken from an orphan records nothing and leaves it alone",
+        log_from_orphan)
+    row("F2FS roll-forward: a block moved between files reads as zeros in the source",
+        log_move_range)
     row("F2FS file type: an invalid mode on a volume with no inode checksums is a FAILED row",
         bad_mode_sector)
     row("F2FS file type: a folder entry that disagrees with its inode's mode is recorded",
@@ -46048,6 +47273,7 @@ def self_test():
             _sit_entry = F2fsWalker._sit_entry                 # pylint: disable=protected-access
             _sit_bitmap = F2fsWalker._sit_bitmap               # pylint: disable=protected-access
             _journal_capacity = F2fsWalker._journal_capacity   # pylint: disable=protected-access
+            _rf_used = None
             _f2fs_test_bit = staticmethod(F2fsWalker._f2fs_test_bit)  # pylint: disable=protected-access
             bs, seg_blocks, base = SIT_BS, SIT_SEG, SIT_BASE
             main_blkaddr, main_segs = SIT_MAIN, 2

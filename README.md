@@ -378,7 +378,8 @@ files are named per stored value and one row with no path counts the rest. A tim
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
 time, and for the last four for a value out of their range too. F2FS keeps the signed value
 it stores, so a stored 0 is recorded as 1970-01-01. An F2FS file flagged encrypted gets an
-`ENCRYPTED` row, which does not change the exit status.
+`ENCRYPTED` row, and one that takes anything from the roll-forward log a `ROLL_FORWARD` row.
+Neither changes the exit status.
 
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
@@ -2383,11 +2384,26 @@ Address Table, choosing the current copy of each NAT block from the active check
 bitmap and applying any override in the checkpoint's NAT journal, exactly as the kernel
 does.
 
-Files fsynced after the last checkpoint are not read. A copy of a running or crashed device
-can hold them only in the roll-forward log, and this version does not replay it. The reader
-counts the blocks in the current segment of the warm node log that carry this checkpoint's
-version, and the volume's note gives that count as a minimum and says that what was fsynced
-after the checkpoint is not in the export.
+Files fsynced after the last checkpoint are read too. A copy of a running or crashed
+device can hold them only in the roll-forward log, so the reader replays that log in
+memory by the rules of `fs/f2fs/recovery.c`. The walk starts at the next free block of the
+warm node log, and a node counts only if its footer carries this checkpoint's version, and
+its checksum when the checkpoint's flags say so. A failure costs only its part: an inode the
+kernel would stop on stays as the checkpoint holds it, the other files are still replayed,
+and the volume exits 1 with the inode named in `damage_first`. A replay that would pass its
+memory bound (the main area's size, at most 1 GiB) stops at the last node that fit, as if
+the log ended there, and says so. The whole log is left unused only when its chain loops, or
+when its failures do not settle within 8 replay passes. The
+image is never written, and each file that takes anything from the log has a `ROLL_FORWARD`
+row in the exceptions table.
+Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
+files match the kernel's read-back hashes, where 1.87 listed 1. That is the only log from a
+real kernel in the test data, and it holds inode nodes only. Replay of direct nodes and the
+owner lookup described next have not run on a log a real kernel wrote: they follow
+`recovery.c` and have been run on crafted logs. When the log gives a file a block the
+checkpoint still marks in use, the segment summary names the earlier owner. As in the kernel,
+that index is cleared if it still holds the block, so after a move the source reads zeros
+there. An orphan's blocks need nothing, because the kernel frees them before replay.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
@@ -2412,13 +2428,20 @@ only a note. A file under a damaged node is refused, a folder that cannot be rea
 counts in `folders_not_read`, and a name whose inode cannot be read is a `FAILED` row. A real
 hole, a node id of 0 or a block address of 0, stays a hole.
 
-Five more checks compare what the volume stores against itself. Each records nothing on the
+Six more checks compare what the volume stores against itself. Each records nothing on the
 intact known-data volumes, and each has been run on specific patched cases. They do not show
 that damage in general is found:
 
 - **Inode checksum.** The stored checksum is compared with `f2fs_inode_chksum`. A mismatch is a
-  `FAILED` row. An inode that says it has no checksum, on a volume with the feature, is counted in
+  `FAILED` row. In the log it costs only that inode, which stays as the checkpoint holds it.
+  An inode that says it has no checksum, on a volume with the feature, is counted in
   `damage_first`, because the flag that says so is stored in the inode itself.
+- **End of the log.** When the chain stops, the later blocks of its segment are compared with
+  this checkpoint's version. If any match, a note in the volume's record says fsynced files
+  may be missing, from a bad sector or from writes still in flight at a crash. The kernel
+  stops at the same place in both cases, so the exit status does not change. A fault in the
+  footer of the log's last node leaves nothing after it, so this comparison cannot see it, and
+  the files in that node are missing with no record.
 - **Inode count.** The inodes reached, with orphans and quota inodes, are compared with the
   checkpoint's `valid_inode_count`. Fewer is recorded with both numbers, and the run exits 1.
 - **Name hash.** Each name is compared with its stored `hash_code`. A mismatch is recorded and
@@ -4007,6 +4030,10 @@ sanity_check_raw_super, sanity_check_area_boundary, max_file_blocks
 read_normal_summaries             fs/f2fs/segment.c   (the NAT journal)
 do_read_inode                     fs/f2fs/inode.c
 f2fs_fill_dentries                fs/f2fs/dir.c
+f2fs_recover_fsync_data, find_fsync_dnodes, recover_data, do_recover_data,
+  recover_dentry                  fs/f2fs/recovery.c
+f2fs_recover_inline_data          fs/f2fs/inline.c
+f2fs_start_bidx_of_node           fs/f2fs/gc.c
 f2fs_decompress_cluster, __f2fs_cluster_blocks
                                   fs/f2fs/compress.c
 f2fs_read_multi_pages             fs/f2fs/data.c
