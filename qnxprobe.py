@@ -39175,9 +39175,9 @@ def _f2fs_reader_checks():
         log_direct_node)
     row("F2FS records: intact fixtures, the kernel crash-state image included, get none of the "
         "checksum, log, inode-count, name or block-count records", intact_no_record)
-    row("F2FS inode checksum: a bad sector in a checkpoint inode is a FAILED row, not an export",
+    row("F2FS inode checksum: a checkpoint inode whose stored checksum differs is a FAILED row",
         inode_sector)
-    row("F2FS inode checksum: a bad sector in a log inode costs only that inode",
+    row("F2FS inode checksum: a log inode whose stored checksum differs costs only that inode",
         log_inode_sector)
     row("F2FS roll-forward: a log that stops with later blocks of its version is a note that "
         "names both causes, with no damage record and exit 0", log_footer_sector)
@@ -39195,7 +39195,7 @@ def _f2fs_reader_checks():
         "named", released_cluster)
     row("F2FS checkpoint: a newest pack not written whole is a note that newer content may be "
         "absent, not damage", torn_newest_checkpoint)
-    row("F2FS inode count: a bad sector in the compacted summary is recorded with both numbers",
+    row("F2FS inode count: fewer inodes reached than valid_inode_count records both numbers",
         summary_sector)
     row("F2FS names: a name that fails its stored hash is kept and recorded, and a casefolded "
         "folder is not checked", name_sector)

@@ -2294,16 +2294,18 @@ its checksum when the checkpoint's flags say so. A failure costs only its part: 
 kernel would stop on stays as the checkpoint holds it, the other files are still replayed,
 and the volume exits 1 with the inode named in `damage_first`. A replay that would pass its
 memory bound (the main area's size, at most 1 GiB) stops at the last node that fit, as if
-the log ended there, and says so. Only a chain that loops leaves the whole log unused. The
+the log ended there, and says so. The whole log is left unused only when its chain loops, or
+when its failures do not settle within 8 replay passes. The
 image is never written, and each file that takes anything from the log has a `ROLL_FORWARD`
 row in the exceptions table.
 Measured on a volume Linux 7.0 wrote, copied after `fsync` and before a checkpoint: 21 of 21
-files match the kernel's read-back hashes, where 1.87 listed 1. The log on that volume holds
-inode nodes only, so replay of a direct node has been run on a crafted log and not on one the
-kernel wrote. When the log gives a file a block the checkpoint still marks in use, the
-segment summary names the earlier owner. As in the kernel, that index is cleared if it still
-holds the block, so after a move the source reads zeros there. An orphan's blocks need
-nothing, because the kernel frees them before replay.
+files match the kernel's read-back hashes, where 1.87 listed 1. That is the only log from a
+real kernel in the test data, and it holds inode nodes only. Replay of direct nodes and the
+owner lookup described next have not run on a log a real kernel wrote: they follow
+`recovery.c` and have been run on crafted logs. When the log gives a file a block the
+checkpoint still marks in use, the segment summary names the earlier owner. As in the kernel,
+that index is cleared if it still holds the block, so after a move the source reads zeros
+there. An orphan's blocks need nothing, because the kernel frees them before replay.
 
 Compression: a cluster that is not compressed is read as plain blocks, and an LZ4 cluster
 is decoded. All 3 files of a kernel-written LZ4 volume match the kernel's read-back hashes.
@@ -2319,7 +2321,7 @@ an encrypted folder is shown as stored, with `%XX` where it does not decode, and
 real name. A file that is both encrypted and holds compressed clusters is refused. This
 path has been run on inodes with the flag patched in, not on a real fscrypt volume.
 
-Damage is recorded and not read through. A node whose footer names another node or inode,
+A structure that fails one of these checks is recorded and not read through. A node whose footer names another node or inode,
 an address outside the main area, a size past what the format allows or a checkpoint or
 superblock copy that fails its checksum is named in `damage_first`. A bad copy falls back to
 the good one, and when the checkpoint read is the older pack the note says newer content may
@@ -2328,31 +2330,34 @@ only a note. A file under a damaged node is refused, a folder that cannot be rea
 counts in `folders_not_read`, and a name whose inode cannot be read is a `FAILED` row. A real
 hole, a node id of 0 or a block address of 0, stays a hole.
 
-Six checks catch one bad sector that would otherwise read as valid. Each was measured on the
-known-data volumes before it was used, and none fires on an intact one:
+Six more checks compare what the volume stores against itself. Each records nothing on the
+intact known-data volumes, and each has been run on specific patched cases. They do not show
+that damage in general is found:
 
-- An inode that fails its checksum (`f2fs_inode_chksum`) is a `FAILED` row. In the log it costs
-  only that inode, which stays as the checkpoint holds it. An inode that says it has no
-  checksum, on a volume with the feature, is counted in `damage_first`, because damage can
-  clear the flag that says so.
-- A log whose chain stops while later blocks of its segment still carry this checkpoint's
-  version gets a note in the volume's record: fsynced files may be missing, from a bad sector
-  or from writes still in flight at a crash. The kernel stops at the same place in both
-  cases, so the exit status does not change. A fault in the footer of the log's last node
-  leaves nothing after it, so it cannot be seen this way, and the files in that node are
-  missing with no record.
-- Fewer inodes reached than the checkpoint's `valid_inode_count`, after orphans and quota
-  inodes, is recorded with both numbers, and the run exits 1.
-- A name that does not match its stored hash is recorded and kept, since it may be the only
-  trace of the entry. Casefolded and encrypted folders hash another input and are not checked.
-- An inode with an invalid file type is a `FAILED` row, as the kernel answers `-EIO`. A folder
-  entry whose `file_type` disagrees with its inode's mode is named in `damage_first`.
-- A file whose `i_blocks` is more than its block map accounts for gets a `BLOCKS_UNREACHED`
-  row, and the run exits 1. Compressed clusters are counted as the kernel counts them, with
-  a released cluster counting only its data blocks. A direct node sector read as 0xFF, or
-  an inode's address sector on a volume with no inode checksums,
-  looks like reserved blocks (`NEW_ADDR`), which are valid and read as zeros, so it is not
-  caught.
+- **Inode checksum.** The stored checksum is compared with `f2fs_inode_chksum`. A mismatch is a
+  `FAILED` row. In the log it costs only that inode, which stays as the checkpoint holds it.
+  An inode that says it has no checksum, on a volume with the feature, is counted in
+  `damage_first`, because the flag that says so is stored in the inode itself.
+- **End of the log.** When the chain stops, the later blocks of its segment are compared with
+  this checkpoint's version. If any match, a note in the volume's record says fsynced files
+  may be missing, from a bad sector or from writes still in flight at a crash. The kernel
+  stops at the same place in both cases, so the exit status does not change. A fault in the
+  footer of the log's last node leaves nothing after it, so this comparison cannot see it, and
+  the files in that node are missing with no record.
+- **Inode count.** The inodes reached, with orphans and quota inodes, are compared with the
+  checkpoint's `valid_inode_count`. Fewer is recorded with both numbers, and the run exits 1.
+- **Name hash.** Each name is compared with its stored `hash_code`. A mismatch is recorded and
+  the entry is kept, since it may be the only trace of it. Casefolded and encrypted folders
+  hash another input and are not compared.
+- **File type.** An inode whose mode is not a type the kernel accepts is a `FAILED` row, as the
+  kernel answers `-EIO`. A folder entry whose `file_type` differs from its inode's mode is
+  named in `damage_first`.
+- **Block count.** `i_blocks` is compared with what the block map accounts for. A file whose
+  `i_blocks` is higher gets a `BLOCKS_UNREACHED` row, and the run exits 1. Compressed clusters
+  are counted as the kernel counts them, with a released cluster counting only its data
+  blocks. A direct node sector read as 0xFF, or an inode's address sector on a volume with no
+  inode checksums, looks like reserved blocks (`NEW_ADDR`), which are valid and read as zeros,
+  so this comparison cannot see it.
 
 See [What it does not do](#what-it-does-not-do).
 
@@ -2368,7 +2373,8 @@ that reads unallocated, so the journal path is not just exercised but load-beari
 without it no file on that volume resolves. The journal in the normal (non-compact)
 summary form is read by the same rules and is not exercised by either fixture. No real
 F2FS volume is in the test corpus yet, and the double-indirect path (reached only past
-about 8 GiB in one file) is not exercised at all.
+about 8 GiB in one file) has been run only on crafted nodes, never on a file a real writer
+stored.
 
 A defect in 1.28 is worth knowing about: the bitmap that says which copy of each NAT
 block is current was read with bit 0 as the least significant bit of a byte, but F2FS's
@@ -4369,7 +4375,7 @@ above are in this README only for now.)
   the Linux kernel driver's own read-back for the kernel-written fixtures, one of which
   resolves every file through the NAT journal. No F2FS volume from a real device is in the
   test corpus, and the double-indirect path (past about 8 GiB in one file) has been run
-  only on crafted nodes.
+  only on crafted nodes, never on a file a real writer stored.
 - **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
   write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
   either.
