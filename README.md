@@ -1911,6 +1911,38 @@ self-test compares the bytes with its recorded size cut in memory to 65,535 clus
 fragmented file whose run reaches clusters in use is refused by this reader and is the one case
 `icat` will read on the contiguous assumption.
 
+On exFAT, `recoverable` means nothing on the volume contradicts the file: its first cluster
+is known, every cluster its read touches is free, and no surviving live or valid deleted
+entry names those clusters. Valid deleted sets in allocated clusters no live entry reaches
+and after an end marker count too, including one with the same first cluster and size. An
+orphan entry counts as a surviving entry here, and a deleted
+record and an orphan entry naming one cluster refuse each other. Every entry that passes, from
+`deleted_files()` and `recover_deleted()`, has `content_unverified = True`. Its bytes are a candidate. exFAT cannot prove a free cluster
+still holds a deleted file: a later file can reuse the cluster and be deleted with its
+directory slot overwritten, the volume records that nowhere, and the read then returns the
+later file's content.
+
+exFAT adds four things to that. A cluster that more than one deleted record names is not
+safe to read for either, because the bitmap shows it free and the volume does not record
+which file wrote last: both records are listed, neither is `recoverable`, and `reason` says
+how many clusters they share. Only the clusters a read would touch count, so nothing past
+ValidDataLength does. A record whose own fields cannot be relied on, because it fails its
+SetChecksum once the in-use bits are put back or its length is more than the volume can hold,
+is refused and claims no clusters. One refused only because a live file took a cluster keeps its claim
+on the rest, since an earlier file there may hold its bytes. A record with good fields whose
+FAT chain is cut or leaves the volume keeps its claim on every cluster the chain still reaches. Records with identical fields
+count like any others: a rename leaves such a pair, and so do same-size files written and
+deleted in a burst, and no stored field tells the two apart. `reason` names the other record.
+A deleted folder claims only free clusters that are all zero or hold a valid entry set, and
+its chain stops at its first cluster allocated again, so a live file's bytes are never read
+as deleted children. A chain too short for its file says where it stopped. Measured on a volume Windows wrote, a renamed file, a moved file and a plain file
+deleted in turn all named one first cluster, and only the last one's bytes were there.
+Children Windows left marked in use inside a deleted folder are listed with
+`in_deleted_dir`. `read_deleted()` returns zeros past a record's ValidDataLength and raises
+at the first cluster the image does not hold, so nothing after a gap lands in its place.
+The search has no depth limit unless `max_depth` sets one, and a limit that cuts anything
+is recorded in `damage`.
+
 ### exFAT: what the reader checks before it trusts a structure
 
 - **Boot region.** The Boot Checksum and the sector and cluster shifts are checked. When the
@@ -1937,8 +1969,8 @@ fragmented file whose run reaches clusters in use is refused by this reader and 
   `CLUSTERS_MARKED_FREE` row, also with no change to the exit status. A folder whose set failed
   is still walked,
   and `damage` says the files under it may not be its own.
-- **Names.** In the live listing a name is decoded as one UTF-16 string, so a character
-  outside the BMP is right even across two name entries. An unpaired surrogate, which Windows stores, becomes `%XX` of
+- **Names.** A name is decoded as one UTF-16 string, so a character outside the BMP is right
+  even across two name entries. An unpaired surrogate, which Windows stores, becomes `%XX` of
   its two stored bytes in on-disk order (U+D800 is `%00%D8`), because a surrogate is refused
   by SQLite, by UTF-8 and by file paths. A literal `%` is not escaped, so a file really named
   that way can match an escaped one, and the export's duplicate handling keeps both. A stored
@@ -1949,13 +1981,28 @@ fragmented file whose run reaches clusters in use is refused by this reader and 
 - **Folders.** A folder is read for the clusters its DataLength needs (specification 7.6.7),
   whether it is one run or a FAT chain, since real writers leave chains running past it. The
   root records no size and is read along its chain up to the 256MB a folder can hold. The
-  listing stops at the end-of-directory marker, as the specification requires.
+  listing stops at the end-of-directory marker, as the specification requires. Whole entry
+  sets after the marker are classified by every cluster their run or chain names. Sets naming allocated clusters no
+  live entry reaches are evidence of files lost from the listing (a sector filled with zeros
+  reads as a marker): they are recorded as not listed, the folder counts as not read and the run exits 1. Sets naming only
+  clusters the live tree holds, free clusters or no data are recorded as not listed, with
+  those counts, because they can be old entries or live files cut off by a damaged sector.
+  Those, and any other bytes after a marker, are notes and do not change the exit status.
   A root folder that names no Allocation Bitmap, which the specification requires (7.1), is
   recorded, counts as not read and exits 1.
   A root chain that stops before a marker on anything but an end-of-chain mark is recorded.
-  A folder whose recorded size disagrees with what could be read, but whose end marker is in
-  what was read, lists every entry: that is recorded and is not counted as a folder not read.
-  These records state what the reader found. They are not a claim that damage to a sector is
+  So is a folder full to its size when the next cluster is allocated, reached by nothing in
+  the live tree and holds valid entry sets, or when its chain goes on to sets naming
+  allocated clusters no live entry reaches. A folder whose recorded size disagrees with what
+  could be read, but whose end marker is in what was read, lists every entry: that is
+  recorded and is not counted as a folder not read. An export also counts every allocated cluster no live entry reaches,
+  and how many hold valid entry sets. The record says files may be missing. Those clusters
+  can also be leftovers of an interrupted write, so it does not change the exit status.
+  When one bad sector holds only whole entry sets of empty files at the end of a folder and
+  only zeros follow it, those files leave no trace and no record is possible: they own no
+  clusters, and the folder reads the same as one that ends there. Non-zero bytes after a
+  marker are recorded, and the record says files are not listed or may be missing. These
+  records state what the reader found. They are not a claim that damage to a sector is
   detected in general.
 - **Files and volumes.** A FAT-chained file is read in pieces of about 1 MiB and is not held
   in memory. A chain longer than the recorded size is recorded when the read reaches that size. A
@@ -2000,18 +2047,23 @@ says what it is in `note`, and none of them is ever added to the live listing.
   cluster no orphan directory entry names has a `parent_path` of `None`: nothing on the
   volume says what that directory was called. `parent` is the cluster the entry set is in
   and `ident` the file's first cluster.
-- **When a file is recoverable.** Its size is not zero and every cluster it names is
-  allocated and unreached: the run when NoFatChain is set, else a chain in the active FAT
-  that runs to an end-of-chain mark and covers the size. Otherwise `reason` says what
+- **When a file is recoverable.** Its size is not zero and every cluster its read touches
+  is allocated and unreached: the run when NoFatChain is set, else a chain in the active FAT
+  that covers what is read and, when that is the whole size, runs to an end-of-chain mark. Otherwise `reason` says what
   failed, and `read_deleted()` refuses it. A cluster a live file holds is never read as
-  the orphan's.
+  the orphan's. A recoverable orphan has `content_unverified = True`: nothing on the volume
+  contradicts it, and that does not prove the bytes are its own.
 - **Times are readings.** `mtime` and `mode` are `None`. `times` holds the stored readings
   and UTC offset fields as `listdir_records()` gives them, for the reason under
   [FAT32 and exFAT times](#fat32-and-exfat-times-are-readings-and-are-listed-as-such).
 - **Copies are one record.** Entry sets that are byte for byte the same in several
   clusters come back once, and `note` gives the count. When two different entries name
-  the same cluster both stay recoverable and `note` says the bytes may be another file's,
-  because the volume does not say which wrote last.
+  the same cluster, both are listed and neither is `recoverable`, because the volume does
+  not say which wrote last and a caller that reads `recoverable` would otherwise take
+  another file's bytes. `reason` says how many clusters they share and names the other
+  entry. Only the clusters a read touches, up to ValidDataLength, are checked. A file whose
+  clusters hold orphan entry sets stays recoverable and `note` says so, since a file's
+  content can hold such bytes.
 
 It does not search free clusters, does not follow the inactive FAT, does not list entries
 marked deleted, and does not list the orphan directories themselves. Why a volume holds
@@ -2035,9 +2087,11 @@ all with 4,096-byte clusters and two FATs:
 | not recoverable: fewer clusters than the size needs | 4 | 4 | 0 | 0 |
 | not recoverable: empty | 7 | 1 | 2 | 0 |
 
-Every recoverable file read back at its recorded size. On item016 p2, 608 entries were in
-more than one cluster, 3 recoverable ones carry the shared-cluster note, and the 2,455
-recoverable files hold 1,947 distinct contents. One of them is 17,408 bytes with a
+These counts are what 1.61 gave. Entries sharing a cluster have since stopped being
+recoverable, so the recoverable counts are not what this version gives. Every recoverable
+file read back at its recorded size. On item016 p2, 608 entries were in more than one
+cluster, 3 recoverable ones carried 1.61's shared-cluster note, and the 2,455 recoverable
+files hold 1,947 distinct contents. One of them is 17,408 bytes with a
 `.sqlite` name; it opens as SQLite and `PRAGMA integrity_check` answers `ok`. Listing took
 under half a second per image on the machine that measured it. The images had been read
 before, so that is not the time of a cold read.
