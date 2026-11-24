@@ -4080,7 +4080,10 @@ declines the sector if one is there. As a last resort it also declines any table
 of whose partitions begins inside the image. The boot indicator byte is not used as a
 test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table on it.
 The self-test builds an image of this shape and requires both superblock copies to be
-found and the volume to be listed.
+found and the volume to be listed. A declined table is not read from. When nothing
+recognises the file and each entry with a boot flag of 0x00 or 0x80, a type and a sector
+count starts past the end, `--extract` writes a `volumes.json` record saying so and that
+the file may be a cut disk image, and the run exits 1.
 
 Since 1.31 the GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
 so its byte offset is the logical sector size: 512 on most disks, 4096 on 4Kn drives

@@ -1494,7 +1494,7 @@ def qnx6_walker(fh, base, pick):
     return w
 
 
-def parse_mbr(fh):
+def parse_mbr(fh, past_end_too=False):
     mbr = read_at(fh, 0, 512)
     if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
         return None
@@ -1543,9 +1543,25 @@ def parse_mbr(fh):
         size = image_size(fh)
     except (OSError, AttributeError, ValueError):
         size = None
-    if out and size and all(start * SECTOR >= size for _, _, start, _ in out):
+    if out and size and not past_end_too and all(start * SECTOR >= size for _, _, start, _ in out):
         return None
     return out
+
+
+def mbr_starts_past_end(fh, size):
+    """The start LBAs of an MBR-style table parse_mbr declines because nothing it lists
+    begins inside the image, or [].
+
+    Counted are the entries with a boot flag of 0x00 or 0x80, a type and a sector count,
+    and every one of them must start at or past the end. The table is not used for
+    reading. Only a file nothing else recognised should be asked, because boot code can
+    have this shape, so what this finds is reported as what may be a cut disk image."""
+    parsed = parse_mbr(fh, past_end_too=True)
+    if not parsed:
+        return []
+    mbr = read_at(fh, 0, 512)
+    starts = [st for idx, _t, st, _n in parsed if mbr[446 + (idx - 1) * 16] in (0x00, 0x80)]
+    return starts if starts and all(st * SECTOR >= size for st in starts) else []
 
 
 # The GPT header is at LBA 1, the second logical block (UEFI 2.10 section
@@ -37082,6 +37098,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # not turn out to be qnx6 rather than trusting what they claim to be.
         others = [(lab, b, sz) for lab, b, sz in sized_regions
                   if lab not in vols and lab not in protective]
+        whole_unclaimed = False           # the whole image, and no identifier took it
         if others:
             print("  WHAT IS IN THE OTHER PARTITIONS")
             past_end_recorded = set()    # a hybrid MBR and GPT can list one start twice
@@ -37208,6 +37225,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                           or (ext_name and only.lower() in ext_name.lower()))
 
                 fat_note = None if kind else _fat_not_read_note(fh, b)
+                whole_unclaimed = whole_unclaimed or (lab == "whole image" and not kind
+                                                      and not fat_note)
                 if fat_note:
                     print(f"        {fat_note}")
                     if zf is not None and wanted:
@@ -37459,6 +37478,24 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                      partition_size_bytes=sz,
                                                      filesystem="qnx_ifs")
                 print()
+
+        # Nothing recognised the file, and its first sector holds a table whose every
+        # entry starts past its end. The table is not read from (parse_mbr declines it).
+        mbr_starts = (mbr_starts_past_end(fh, size) if whole_unclaimed and not confirmed
+                      and not raid_kind and len(sized_regions) == 1 else [])
+        if mbr_starts:
+            said = (f"the first sector has an MBR-style table and its {len(mbr_starts)} "
+                    + ("entry starts" if len(mbr_starts) == 1 else "entries start")
+                    + f" past the end of the file (lowest at LBA {min(mbr_starts):,}, the file "
+                      f"ends at byte {size:,}); none of that data is here, and the file may be "
+                      f"a cut disk image")
+            print(f"  {said}")
+            print()
+            if zf is not None and (only is None or only.lower() in "whole image"):
+                vol = _zip_names(zf).volume(name_prefix + (vol_names.get(0) or "lba0"),
+                                            (".exceptions.tsv",))
+                _zip_volume_not_read(zf, manifest, vol, image_rec, ValueError(said), lba=0,
+                                     offset_bytes=0, partition_size_bytes=size, filesystem=None)
 
         if marked_incomplete:
             print("  A volume marked INCOMPLETE above reaches past the end of the file. A file")
@@ -43152,6 +43189,36 @@ def self_test():
         print(f"  [{'PASS' if cond else 'FAIL'}] a partition that begins past the end of a cut "
               f"disk gets a record, counts as not read, and no volume is said to be marked "
               f"INCOMPLETE")
+
+        # A file cut just after its MBR: nothing recognises it and its one entry starts
+        # past the end. The same sector with its entries zeroed is not a table.
+        cut_mbr = bytearray(512)
+        cut_mbr[446:462] = b"\x80" + bytes(3) + b"\x83" + bytes(3) + struct.pack("<II", 2048, 4096)
+        cut_mbr[510:512] = b"\x55\xaa"
+        blank_mbr = bytearray(512)
+        blank_mbr[510:512] = b"\x55\xaa"
+        cut_mans = []
+        mbr_path = os.path.join(d, "cut_after_mbr.img")
+        try:
+            for sector in (cut_mbr, blank_mbr):
+                with open(mbr_path, "wb") as out:
+                    out.write(sector)
+                cut_mans.append([])
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(mbr_path, extract="x.zip", zf=zf, manifest=cut_mans[-1])
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(mbr_path)
+        cond = (len(cut_mans[0]) == 1 and _volumes_not_read(cut_mans[0]) == 1
+                and cut_mans[0][0]["extract_error"].startswith(
+                    "the first sector has an MBR-style table and its 1 entry starts past the "
+                    "end of the file (lowest at LBA 2,048, the file ends at byte 512)")
+                and cut_mans[1] == [])
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a file cut after its MBR gets a record saying "
+              f"what was found, and a 0x55AA sector with no entries gets none")
 
         # A split image, joined by the reader. FTK Imager and its peers write a
         # raw image as numbered segments, and since 1.13 a run on any one of
