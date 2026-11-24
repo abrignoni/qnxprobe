@@ -1842,19 +1842,20 @@ class Qnx6Walker:
 
     Block pointers follow Linux fs/qnx6/inode.c (v6.12). Only ~0 means unused
     (qnx6.rst lines 65-66, qnx6_check_blockptr): stored block 0 is an ordinary block,
-    and real volumes use it (a Bitmap root pointer on six of the nine vehicle volumes
-    measured). Each slot is judged on its own, and zeros are counted per 512-byte
-    sector, the unit an imager zero-fills. A 0 is block 0 only when it is alone in its
-    sector and no other sector holds a lone 0 inside the tree's size, because one block
-    cannot be stored twice. So a zeroed sector costs the slots it covers and leaves a
+    and real volumes use it (a Bitmap root pointer in the active generation of six of the
+    nine vehicle volumes measured). Each slot is judged on its own, and zeros are counted
+    per 512-byte sector, a unit an imager can zero-fill. A 0 is block 0 only when it is
+    alone in its sector and no other sector holds a lone 0 inside the tree's size, because
+    one block cannot be stored twice. So a zeroed sector costs the slots it covers and leaves a
     real block 0 in another sector alone. A zero slot past the tree's size is not a
     pointer. On those nine volumes every slot past a tree's size is ~0 and 0 never
     appears inside an indirect block.
 
-    A ~0 pointer inside a file's size reads as zeros at full length, as the kernel
-    reads it. QNX documents that fs-qnx6 creates sparse files by default since 7.1 and
-    does not document how a hole is stored, so such a block may be a hole or a damaged
-    pointer: the file is not SHORT, and valid_data_note() gives it one exceptions row.
+    A ~0 pointer inside a file's size reads as zeros at full length. The Linux driver
+    does that for a ~0 inside an indirect block (inode.c lines 145-148) and does not test
+    an inode's own 16 pointers (line 135). QNX documents that fs-qnx6 creates sparse files
+    by default since 7.1 and does not document how a hole is stored, so such a block may
+    be a hole or a damaged pointer: the file is not SHORT, and valid_data_note() gives it one exceptions row.
 
     What cannot be read is recorded in ``damage`` (see damage_lines) and a folder not
     read in full in ``folders_not_read``. ``layout`` comes from qnx6_select()."""
@@ -2134,14 +2135,14 @@ class Qnx6Walker:
                                  f"so a name may be missing; it is listed at: {self._path_of(num)}")
 
     @staticmethod
-    def _has_dots(buf, num):
-        """Whether a directory's first block starts with its "." (naming itself) and ".."
-        entries. Every directory on all 19 superblock generations measured does, and the
-        kernel tests the same two names on the root (inode.c qnx6_checkroot)."""
-        return (len(buf) >= 2 * QNX6_DIRENT_SIZE and struct.unpack_from("<I", buf, 0)[0] == num
-                and buf[4] == 1 and buf[5:6] == b"."
-                and struct.unpack_from("<I", buf, 32)[0] != 0
-                and buf[36] == 2 and buf[37:39] == b"..")
+    def _has_dots(buf):
+        """Whether a directory's first block starts with the names "." and "..", the test
+        the Linux driver makes on the root and refuses the mount without (inode.c
+        qnx6_checkroot, lines 180-200). No QNX or Linux source requires them first in any
+        other directory, so listdir() only notes it there. Every directory on all 19
+        superblock generations measured does start with them."""
+        return (len(buf) >= 2 * QNX6_DIRENT_SIZE and buf[5:8] == b".\0\0"
+                and buf[32 + 5:32 + 8] == b"..\0")
 
     def listdir(self, num):
         ino = self.inode(num)
@@ -2174,9 +2175,13 @@ class Qnx6Walker:
             if len(buf) < self.bs:
                 lost["a block that could not be read"] = (
                     lost.get("a block that could not be read", 0) + 1)
-            if lb == 0 and not self._has_dots(buf, num):
-                self._folder_short(num, f"its first block has no valid . and .. entries, so "
-                                        f"this folder could not be read in full{self._at(num)}")
+            if lb == 0 and not self._has_dots(buf):
+                if num == self.root:
+                    self._folder_short(num, "the root folder's first block does not start with "
+                                            "valid . and .. entries, so entries may be missing")
+                else:
+                    self.note_damage(f"directory inode {num}: its first block does not start "
+                                     f"with . and ..{self._at(num)}")
             # the kernel stops at i_size (dir.c last_entry(), lines 38-45 and 142)
             end = min(len(buf), size - lb * self.bs)
             for p in range(0, end - QNX6_DIRENT_SIZE + 1, QNX6_DIRENT_SIZE):
@@ -2234,7 +2239,7 @@ class Qnx6Walker:
     def read_file(self, num, size):
         """Yield the file's bytes a block at a time, each at its own offset.
 
-        A block with an unused (~0) pointer is zeros, as the kernel reads it, and does
+        A block with an unused (~0) pointer is zeros (see the class docstring) and does
         not make the file short. A block whose pointer is damaged is zeros only when a
         later block is read, so offsets stay correct, and nothing is written after the
         last block that exists. Those bytes are added to EOF_SHORTFALL, which makes the
@@ -40608,12 +40613,15 @@ def _qnx6_reader_checks():
         man3, got3, _s, _t = run(linked)
         return (not got and man[0].get("folders_not_read") == 1
                 and any("counts 6 inodes" in d and "reached 1:" in d for d in man[0]["damage_first"])
-                and "sub/small.txt" not in got2 and man2[0].get("folders_not_read") == 1
+                and "sub/small.txt" not in got2 and not man2[0].get("folders_not_read")
+                and _volumes_not_read(man2) == 0
+                and any("does not start with . and .." in d and d.endswith(": sub")
+                        for d in man2[0]["damage_first"])
                 and any("counts 6 inodes" in d and "reached 5:" in d for d in man2[0]["damage_first"])
                 and got3.get("hard.txt") == want["sub/small.txt"] and not man3[0].get("damage_recorded")
                 and not man3[0].get("folders_not_read"))
-    row("qnx6: a zeroed directory sector loses its . and .. and exits 1, the inode count "
-        "notes the shortfall, and a hard link does not trip it", dir_sector)
+    row("qnx6: a zeroed root sector exits 1, a zeroed sector of another folder gets counted "
+        "notes and exit 0, and a hard link does not trip the count", dir_sector)
 
     def unlinked_inode():
         img = bytearray(base)                       # in use, with no directory entry
@@ -40632,11 +40640,20 @@ def _qnx6_reader_checks():
         at = block_of(img, 2)
         img[at:at + 2 * QNX6_DIRENT_SIZE] = bytes(2 * QNX6_DIRENT_SIZE)     # the rest survives
         man, got, _s, _t = run(img)
-        return (got == want and man[0].get("folders_not_read") == 1
-                and any("no valid . and .." in d and d.endswith(": sub")
-                        for d in man[0]["damage_first"]))
-    row("qnx6: a directory whose first block has no valid . and .. is a folder not read, and "
-        "the record names it", dots_gone)
+        root = bytearray(base)
+        at = block_of(root, 1)
+        root[at:at + 2 * QNX6_DIRENT_SIZE] = bytes(2 * QNX6_DIRENT_SIZE)
+        man2, got2, _s, _t = run(root)
+        return (got == want and not man[0].get("folders_not_read")
+                and _volumes_not_read(man) == 0
+                and any("does not start with . and .." in d and d.endswith(": sub")
+                        for d in man[0]["damage_first"])
+                and not any("could not be read" in d for d in man[0]["damage_first"])
+                and got2 == want and man2[0].get("folders_not_read") == 1
+                and any("root folder's first block does not start" in d
+                        and "entries may be missing" in d for d in man2[0]["damage_first"]))
+    row("qnx6: a first block without . and .. is a note on a folder and a folder not read "
+        "only on the root, as the kernel tests it", dots_gone)
 
     def noise_type():
         unused = bytearray(base)                    # a valid type, not marked in use

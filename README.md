@@ -764,8 +764,8 @@ and that volume is then recorded as not read.
 
 The report and `volumes()` pick the superblock with one function, `qnx6_select()`, so they
 always walk the same one. The Linux driver (`fs/qnx6/inode.c`, v6.12) refuses a volume with a
-failed copy and does not rank copies. This reader uses the driver's checksum and serial
-tests, and goes on where the driver would stop:
+failed copy, and of two valid copies takes the higher serial (lines 397-409). This reader
+uses the same checksum and serial tests, and goes on where the driver would stop:
 
 - A copy whose checksum holds beats one that fails, whatever their serials. A failed copy
   is read only when no copy passes, and the run says so.
@@ -801,9 +801,9 @@ read is a fixture written from that same struct.
 
 **Block pointers.** Only ~0 means unused. A stored 0 is block 0, which real volumes use. On
 the nine vehicle volumes at hand, a stored 0 appears only as a top-level Bitmap pointer (on
-six of them), no pointer block is all zeros, and every slot past a tree's size is ~0. Each
-slot is judged on its own and zeros are counted per 512-byte sector, the unit an imager
-zero-fills. A 0 is followed as block 0 only when it is alone in its sector and no other
+six of them in the active generation), no pointer block is all zeros, and every slot past a tree's size is ~0. Each
+slot is judged on its own and zeros are counted per 512-byte sector, a unit an imager can
+zero-fill. A 0 is followed as block 0 only when it is alone in its sector and no other
 sector holds a lone 0 inside the tree's size, because one block cannot be stored twice.
 Pointers past the volume's block count, more than 5 levels, and a pointer back to its own
 pointer block are refused the same way.
@@ -811,9 +811,10 @@ pointer block are refused the same way.
 **Sparse files.** QNX documents that fs-qnx6 [creates sparse files by default since
 7.1](https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.user_guide/topic/fsystems_QNX6_filesystem.html),
 with a [`nosparse` mount option](https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.utilities/topic/f/fs-qnx6.so.html).
-Those pages do not say how a hole is stored. The Linux driver reads a ~0 pointer as no
-block, which returns zeros, and logs an error. So a ~0 pointer inside a file's size is read
-as zeros at full length here too. The file is not SHORT and the exit code does not change.
+Those pages do not say how a hole is stored. The Linux driver treats a ~0 inside an indirect
+block as no block, which reads as zeros, and logs an error (`inode.c` lines 145-148). It does
+not test an inode's own 16 pointers (line 135). Here a ~0 at either level inside a file's size
+is read as zeros at full length. The file is not SHORT and the exit code does not change.
 One `NO_POINTER_ZEROS` row in the exceptions table says how many blocks that covers,
 because a sparse hole and a damaged pointer look the same. That ~0 is how QNX stores a hole
 has not been confirmed on a real 7.1 volume: none of the nine volumes at hand has an unused
@@ -833,8 +834,10 @@ an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a
 written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`, and a stored NUL as `%00`.
 A long name that fails the checksum in its directory entry is kept and recorded.
 
-A directory whose first block has no valid `.` and `..` entries is recorded as a folder not
-read and the run exits 1. An inode a directory names is recorded as damage, with its path, and
+A root folder whose first block does not start with `.` and `..` is recorded as a folder not
+read and the run exits 1, because the Linux driver tests those two names on the root and
+refuses the mount (`qnx6_checkroot`). On any other folder it is a counted note with no exit
+change, because no QNX or Linux source requires them first there. An inode a directory names is recorded as damage, with its path, and
 not counted as a special file when its format bits are not a type QNX defines (`sys/stat.h`,
 including `S_IFNAM`), when `QNX6FS_INO_USED` is clear (`sys/fs_qnx6.h`), or when it records
 more than 5 pointer levels.
