@@ -52,6 +52,25 @@ decompresses to exactly the size its header records and the image checksum
 balances). See [What it does not do](#what-it-does-not-do) for the compression
 methods it recognises but does not yet read.
 
+An IFS entry stores its whole path, and `mkifs` writes an entry only for each item on
+its file list (`mk_image_fsys.c:2261-2326`), so a folder can exist only inside the path
+of another entry. The image holds no time for a folder like that. `--list` shows it
+with no date, and `entry()` and `walk_all()` give `None` for its time, as they do for
+any time a filesystem does not record. Before, it was given the time of the first entry
+found under it. On the three Sync G4 volumes that was 7, 8 and 8 folders. The zip is
+not affected: it holds files, and a file has its own entry.
+
+Bytes in a stored name or a symlink target that are not UTF-8 are kept as `%XX`, one
+path component at a time, so two names that differ only in such a byte stay two files.
+Before, such bytes became U+FFFD and two names like that became one. No name on the
+three volumes has such a byte, so this is proven on the self-test's synthetic image only.
+
+The zlib method is read as the gzip stream `mkifs` writes with `gzopen()`
+(`mk_image_fsys.c:441`); a plain zlib stream is accepted too. Before, the gzip header
+was rejected. No image that a real `mkifs` compressed this way was available: the
+self-test wraps its own synthetic image the way the `mkifs` source does, and the zlib
+method has not been run on an image a real writer made.
+
 It also opens BitLocker volumes with their password, recovery password or startup key
 (`.BEK`) file, and reads the NTFS, FAT32 or exFAT inside them; without a key it names
 the volume, its protectors and what would open it. See [BitLocker](#bitlocker).
@@ -387,6 +406,8 @@ files are named per stored value and one row with no path counts the rest. A tim
 not recorded from FAT, exFAT, NTFS, ReFS or HFS+, whose readers use 0 for no time, and
 for ReFS and HFS+ for a value out of their range too. An NTFS
 FILETIME that no date can show gets a `TIME_NOT_HELD` row with the raw value as stored.
+A ReFS time its reader answers 0 for while the volume stores one gets its row all the same,
+with the FILETIME as stored (see [ReFS](#refs)).
 F2FS keeps the signed value it
 stores, so a stored 0 is recorded as 1970-01-01. APFS keeps every stored time. Apple's
 reference gives the field no unset value, so a stored 0 gets a row like any other time
@@ -2393,8 +2414,29 @@ listed as links with `readlink()` giving their target, and are not followed. Alt
 streams are listed by `named_streams(node)` and read through `stream_ref(node, name)`,
 including a stream on a directory.
 
+A name is stored as UTF-16 and need not be valid UTF-16: Windows 11 wrote file and folder
+names holding an unpaired surrogate on a test volume here. Such a unit is shown as `%XX` of
+its two stored bytes in stored order (U+D800 is `%00%D8`), so two stored names stay two and
+no name holds a surrogate. Before this the unit became U+FFFD, and two of that volume's
+files, whose names differ only in such a unit, came out under one name with the second
+renamed `.dup-2`. A stream's name is read the same way, a NUL is
+written `%00` and a `/` inside a name `%2F`; no volume to hand stores any of those three,
+so they are checked on rows the self-test builds. A literal `%` is not escaped, so a file
+really named `a%00%D8` reads the same as one whose name ends in U+D800. A link's target and
+the volume label are not entry names and are still decoded with U+FFFD for such a unit.
+
 ReFS keeps four times per file, as NTFS does. `stamps(node)` gives created, modified and
-accessed in Unix seconds, like `NtfsWalker.stamps`; `filetimes(node)` gives all four
+accessed in Unix seconds, like `NtfsWalker.stamps`, and 0 for a time that is unset or from
+9999-12-31 23:59:59 on, as `entry()` does for the modified time. Windows 11 stored modified
+times of 9999-12-31 23:59:59, of a FILETIME near year 11998 and of the largest positive
+64-bit value on the same test volume. Each reads as 0, which an export took for no time, so
+its member showed 1980-01-01 with no `TIME_NOT_HELD` row. `entry()` and `stamps()` still
+answer 0 for them, and `RefsWalker.mtime_not_held(node)` now gives the export the stored
+value, so each gets its row, as `FILETIME <ticks>` followed by the date to the 100 ns or by
+"outside any date this reader can show". A time stored exactly at 1970-01-01 00:00:00 UTC
+also converts to 0 and gets its row the same way; no volume to hand stores one, so that is
+checked on a row the self-test builds. Only the modified time has such a record.
+`filetimes(node)` gives all four
 FILETIMEs as stored, with the change time, to the 100 ns. A file's times come from its own
 record. The name row of a moved or linked file keeps a copy that ReFS refreshes only when
 that name is opened, so it can be older, and two names of one file can disagree; the record
@@ -2421,9 +2463,18 @@ seconds after its files were written, and its checkpoint predates every one of t
         checkpoint   clock 20 at cluster 1,570,928, written as ReFS 3.14
         log          16 metadata log records follow the newest checkpoint. Windows applies
                      them when it mounts the volume; this reader does not, so it shows the
-                     volume as of that checkpoint, and what changed after it is missing or
-                     older here
+                     volume as of that checkpoint: newer files and newer content may exist,
+                     and are missing or older here
 ```
+
+`--extract` writes the same sentence as the volume's `note` in `volumes.json` and prints it
+as a `NOTE` line; before this it was on the console only and the zip said nothing. The exit
+status does not change. On a second test volume, given 20 more files and one overwrite and
+detached at once, 25 log records follow the checkpoint. Windows lists 50 files on it
+outside `System Volume Information` once it has mounted it again; the export holds 30 of
+them, none of the 20, and the earlier content of the overwritten one. The note is the only
+record of that in the zip. When the log's control page is not found the report says the
+count is not known, and that case is still on the console only.
 
 Its root lists empty here, which is what its checkpoint holds; the six files Windows hashed
 on that volume while it was mounted are in the log only. If you see this line, image the volume as it is and do not mount it first:
@@ -2482,16 +2533,19 @@ files. The first test volume's log held the machine security identifier of the W
 computer that wrote it in 2 records; its three machine numbers are replaced with 1-2-3 and
 those records' check values recomputed, which the tool prints.
 
-The self-test runs nineteen ReFS checks on these. Ten use the volumes as Windows wrote them,
+The self-test runs twenty-two ReFS checks on these. Eleven use the volumes as Windows wrote them,
 or broken on purpose: the listing and every field above, the hashes, the streams, the
-deleted paths, the 16 log records, one letter of one name changed in a directory page
+deleted paths, the 16 log records, the note an export of that volume writes, one letter of
+one name changed in a directory page
 (reported, that page's rows left out), a boot sector saying 2.x (refused), and a byte
-changed in a log record (the count stops before it). Nine check one rule each on the
+changed in a log record (the count stops before it). Eleven check one rule each on the
 fixture or on records the self-test builds: `stamps()` in Unix seconds; an unwritten run
 and bytes past the valid length reading as zeros; container arithmetic, a run crossing a
 container, a compressed container and containers that cannot be where the table says; a
 directory's change time from its name row; a snapshot not listed as a stream, and snapshots
-read newest first; short snapshot rows, overlapping extents, a 2^60-byte stream, an
+read newest first; names holding an unpaired surrogate, listed, put into SQLite and exported;
+modified times a zip cannot hold, each with its row; short snapshot rows, overlapping
+extents, a 2^60-byte stream, an
 encrypted file, a gap in a file not marked sparse and extents past the allocation; a page
 named twice in one table, a cached page asked for under another digest or checksum kind, and
 the damage cap; directory rows naming the root or a directory named elsewhere; and versions
@@ -3115,20 +3169,43 @@ opens with `NVRM`. Neither is a filesystem, so each is reported as a volume hold
 file, `uboot-env.bin` or `nvram.bin`: the store's bytes as held on flash, for a consumer to
 parse. The report gives a store's layout and how many name=value strings it holds, never
 their values. A store is named by its layout, and the layout does not say which program wrote
-it. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
-steps up to 256 KiB, and a U-Boot environment only when its first string opens with a name
-and `=` and its strings end inside it. A store sits in its own MTD partition, so a JFFS2 in
-front of one ends where it begins. A partition or a file is taken for a store when the store
-fills it or only erased flash follows, so a dump that merely begins with an environment is
-still searched for the rest.
+it. A store is taken only when its CRC-32 holds over it, and a U-Boot environment only
+when its first string opens with a name and `=` and its strings end inside it. A libnvram
+store's size is tried in 4 KiB steps up to 256 KiB. A U-Boot environment's size is tried at
+128 bytes, 400 bytes, every multiple of 512 bytes up to 64 KiB, and every multiple of 4 KiB
+from there up to 1 MiB. An environment of any other size is not found. A store sits in its
+own MTD partition, so a JFFS2 in front of one ends where it begins. A partition or a file
+is taken for a store when the store fills it or only erased flash follows, so a dump that
+merely begins with an environment is still searched for the rest.
 
 The U-Boot layout is `env_t` in
 [include/env_internal.h](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86)
-(v2024.01): a little-endian CRC-32, a flags byte only on a board that keeps a redundant copy,
+(v2024.01): a CRC-32, a flags byte only on a board that keeps a redundant copy,
 then NUL-separated strings ending in an empty one, the CRC covering the rest of the
 environment as
 [`env_import`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310)
-checks it. The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
+checks it. The CRC is a `uint32_t` in the byte order of the CPU U-Boot runs on, and
+[`mkenvimage -b`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/tools/mkenvimage.c#L257-L258)
+writes it big-endian, so the stored value is accepted read either way and the report says
+which order held.
+
+The size of an environment is the board's `CONFIG_ENV_SIZE`. Of the 1,266
+`configs/*_defconfig` files in that tree, 856 set it, to 19 values: 0x80, 0x190, 0x800,
+0x1000, 0x2000, 0x2800, 0x3000, 0x4000, 0x4200, 0x8000, 0x10000, 0x18000, 0x20000, 0x21000,
+0x30000, 0x40000, 0x80000, 0x100000 and 0x2a00000.
+[env/Kconfig](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/Kconfig#L601-L610)
+gives a board that sets none 0x1f000 or one of those. The sizes tried cover each of them
+but 0x2a00000 (42 MiB, set by one file, `total_compute_defconfig`): every candidate offset
+is read and summed up to the largest size tried, so that one is left out. A board outside
+that tree can use a size that is not tried, and its environment is then not found.
+
+A board that keeps a redundant copy writes two environments, and each one found is a volume
+of its own. `--extract` puts the flags byte of such a copy in the volume's `note` in
+`volumes.json`, as stored. U-Boot compares the two bytes to choose the copy it loads
+([`env_check_redund`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L332-L378));
+qnxprobe does not make that choice and names neither copy as the one in use.
+
+The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
 header carries Belkin's copyright), as found in a public copy of the WeMo firmware tree,
 [libnvram.c](https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
 `NVRM`, a CRC-32 over the partition less the 16-byte header, an entry count and the offset
@@ -3137,7 +3214,19 @@ and not checked, because the CRC does not cover them and libnvram rebuilds both 
 strings. Both layouts are round-trip tested on stores the self-test builds, one U-Boot
 environment of each layout and an NVRM store after the JFFS2 fixture, with three controls
 that must not be claimed: one flipped data byte, strings that never end, and a CRC over a
-shorter length.
+shorter length. The self-test also builds U-Boot environments with the CRC stored in each
+byte order, and at 128, 400, 512, 6,144, 16,896, 135,168, 524,288 and 1,048,576 bytes, with
+three sizes that are not tried (6,400, 70,144 and 1,052,672 bytes) as controls, and checks
+the `note` of a redundant copy in a real export.
+
+The U-Boot reading was also checked against known data from U-Boot's own tools
+(u-boot-tools 2025.10 on Ubuntu). `mkenvimage` wrote a single-copy environment at 21
+sizes, the 18 defconfig values and the Kconfig value that are tried plus 512 and 6,144
+bytes, each with the CRC in both byte orders, and redundant-layout ones at 400, 16,384 and
+1,048,576 bytes. `fw_setenv` wrote a redundant pair into a 1 MiB flash file over five
+saves, kept after each. Every one of those stores was found and exported byte for byte.
+Three more `mkenvimage` environments, at 6,400, 70,144 and 44,040,192 bytes, were not
+found, as stated above. No big-endian store written by a board itself was available.
 
 Two JFFS2 partitions can sit side by side with nothing between them, an OpenWrt overlay
 followed by a vendor's settings partition for example. Each numbers its inodes and versions
@@ -4373,6 +4462,7 @@ STARTUP_HDR_VERSION             1   qnx sys/startup.h:89
 struct startup_header               qnx sys/startup.h
 flags1 compression, block framing   qnx dumpifs.c  (none/zlib/lzo/ucl)
 struct image_header, image_dirent   qnx sys/image.h
+which entries get a dirent, gzopen  qnx mk_image_fsys.c  (vocho/openqnx at cc95df3)
 UCL NRV2B (_8) decompressor          Oberhumer UCL src/n2b_d.c, src/getbit.h
 ```
 
@@ -4383,9 +4473,10 @@ The startup header's field widths sum to 256 bytes, which each image's own
 compressed imagefs is a run of blocks, each a two-byte big-endian length then
 that many bytes decompressing to at most 64 KiB, ending at a zero length. Each
 UCL block is NRV2B, ported from Oberhumer's UCL into a small pure-Python decoder
-so the tool still installs nothing, and `zlib` images are read through the
-standard library. The decompressed image is walked from its `image_header` and a
-flat table of `image_dirent` records.
+so the tool still installs nothing. A `zlib` image is one gzip stream, written
+with `gzopen()` (`mk_image_fsys.c:441`), and is read through the standard library;
+that path is tested on a synthetic image only. The decompressed image is walked from
+its `image_header` and a flat table of `image_dirent` records.
 
 This is proven byte for byte against the Ford Sync G4 `ifs_a`, `ifs_b` and
 `ifs_recovery` volumes: each decompressed to exactly the `imagefs_size` its own
@@ -4751,7 +4842,8 @@ above are in this README only for now.)
   sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
   a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
-  QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
+  QNX IFS boot images are listed and extracted (zlib tested on a synthetic image only,
+  never on one a real `mkifs` wrote); `lzo`-compressed images and the Harman
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.

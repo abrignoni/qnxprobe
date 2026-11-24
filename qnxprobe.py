@@ -20039,8 +20039,12 @@ def print_tree(w, num, depth, maxdepth, budget, indent=0, pad=6):
 # evidence to hand is UCL, and there is no UCL decompressor in the standard
 # library, so a small one is carried below rather than taking a dependency: this
 # tool's whole point is that it installs nothing. zlib is handled through the
-# standard library. lzo and the Harman Becker HBCIFS container are recognised but
-# not decompressed here, because no sample exists to validate a reader against.
+# standard library: mkifs writes that method with gzopen() (mk_image_fsys.c:441),
+# so the stored bytes are one gzip stream, then the pad and the 4-byte checksum
+# mkifs puts after any compressed image (mk_image_fsys.c:2425-2428). No image a
+# real mkifs compressed this way is to hand; the self-test wraps its own. lzo
+# and the Harman Becker HBCIFS container are recognised but not decompressed
+# here, because no sample exists to validate a reader against.
 # ---------------------------------------------------------------------------
 QNX_IFS_SIG = 0x00FF7EEB
 QNX_IFS_VER = 1
@@ -20155,6 +20159,14 @@ def ifs_decompress_blocks(stored, decompress):
     return bytes(out)
 
 
+def _ifs_path(raw):
+    """A stored path or symlink target as text. A dirent holds a whole path
+    (image.h:75-108), so "/" separates its components and is kept; inside a
+    component, bytes that are not UTF-8 become %XX and a NUL becomes %00."""
+    return "/".join(part.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+                    for part in raw.split(b"/"))
+
+
 class IfsUnsupported(Exception):
     """Raised when an IFS is recognised but its contents cannot be read here,
     for example an lzo-compressed image or the HBCIFS container. The header is
@@ -20192,7 +20204,10 @@ class IfsWalker:
             img = ifs_decompress_blocks(stored, ucl_nrv2b_decompress)
         elif self.compress == "zlib":
             import zlib
-            img = zlib.decompress(stored)       # a single gzip stream, dumpifs.c:534
+            # gzopen() wrote it (mk_image_fsys.c:441) and dumpifs.c:534-550 reads it
+            # with gzread(): a gzip stream. 32 + 15 takes that header or a zlib one,
+            # and stops at the stream's end, before the pad and checksum behind it.
+            img = zlib.decompress(stored, 47)
         else:
             raise IfsUnsupported(f"{self.compress} compression not read here")
         if img[:len(IMG_SIG)] != IMG_SIG:
@@ -20236,32 +20251,33 @@ class IfsWalker:
             typ = mode & IFS_S_IFMT
             if typ == IFS_S_IFREG:
                 foff, fsize = struct.unpack_from("<II", rec, IFS_ATTR_LEN)
-                path = rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0])
                 self._add(path, mode, fsize, mtime)
-                self.files[path.decode("utf-8", "replace")] = (foff, fsize)
+                self.files[path] = (foff, fsize)
             elif typ == IFS_S_IFDIR:
-                path = rec[IFS_ATTR_LEN:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN:].split(b"\x00")[0])
                 self._add(path, mode, 0, mtime)
                 if path:
-                    self.kids.setdefault(path.decode("utf-8", "replace"), [])
+                    self.kids.setdefault(path, [])
                 else:
                     root_mode, root_mtime = mode, mtime
             elif typ == IFS_S_IFLNK:
                 soff, ssize = struct.unpack_from("<HH", rec, IFS_ATTR_LEN)
                 nb = IFS_ATTR_LEN + 4                 # name and target follow the two u16
-                path = rec[nb:].split(b"\x00")[0]
-                self.links[path.decode("utf-8", "replace")] = \
-                    rec[nb + soff:nb + soff + ssize].decode("utf-8", "replace")
+                path = _ifs_path(rec[nb:].split(b"\x00")[0])
+                self.links[path] = _ifs_path(rec[nb + soff:nb + soff + ssize])
                 self._add(path, mode, 0, mtime)
             else:                                # device, fifo, or QNX name special
-                path = rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0])
                 self._add(path, mode, 0, mtime)
         self.nodes[""] = (root_mode, 0, root_mtime)
 
-    def _add(self, path_b, mode, size, mtime):
+    def _add(self, path, mode, size, mtime):
         """Place one entry, materialising any parent directories the flat table
-        left implicit (a file at a/b/c with no dirent for a or a/b)."""
-        path = path_b.decode("utf-8", "replace")
+        left implicit (a file at a/b/c with no dirent for a or a/b). mkifs writes
+        a dirent only for a listed entry (mk_image_fsys.c:2261-2326), so such a
+        directory has no time in the image and gets None here, not the time of
+        the entry that named it. Its own dirent, if one follows, replaces this."""
         if path == "":
             return
         parts = path.split("/")
@@ -20269,7 +20285,7 @@ class IfsWalker:
         for i in range(len(parts) - 1):
             ap = "/".join(parts[:i + 1])
             if ap not in self.nodes:
-                self.nodes[ap] = (IFS_S_IFDIR, 0, mtime)
+                self.nodes[ap] = (IFS_S_IFDIR, 0, None)
                 self.kids.setdefault(parent, [])
                 self.kids[parent].append((parts[i], ap))
                 self.kids.setdefault(ap, [])
@@ -20343,7 +20359,7 @@ def _zip_zero_is_no_time(w, node):
 
 def _zip_time_lost(v, w=None, node=None):
     """The stored time as text when a zip cannot hold it, else None. None also when
-    no time exists (_zip_zero_is_no_time). A walker with ``mtime_not_held`` (NTFS) says
+    no time exists (_zip_zero_is_no_time). A walker with ``mtime_not_held`` (NTFS, ReFS) says
     itself when its 0 stands for a stored value, and gives that value as text."""
     if v == 0:
         report = getattr(w, "mtime_not_held", None)
@@ -24664,6 +24680,29 @@ def _refs_self_checksum(page, cluster, desc_off, desc_len):
     return _refs_digest_matches(kind, digest, bytes(body))
 
 
+def _refs_name(raw):
+    """One stored name, UTF-16LE, as text. Windows 11 stores a name holding an unpaired
+    surrogate as it was given, so such a unit is real: it becomes %XX of its two stored
+    bytes (U+D800 is %00%D8), where a replacement character would make two stored names
+    one. A NUL becomes %00 and a / inside the name %2F, so the text is one path component
+    that SQLite and a file path accept. A literal % is not escaped."""
+    return raw.decode("utf-16-le", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
+# The first FILETIME tick of year 10000, which no date here can show.
+REFS_FILETIME_YEAR_10000 = (253402300800 + NTFS_EPOCH_DELTA) * 10_000_000
+
+
+def _refs_filetime_shown(raw):
+    """A stored FILETIME as text for a record, to the tick and with no float in the way:
+    the ticks, then the date, or that no date here can show it."""
+    if raw >= REFS_FILETIME_YEAR_10000:
+        return f"FILETIME {raw} (outside any date this reader can show)"
+    whole, ticks = divmod(raw, 10_000_000)
+    when = datetime.datetime(1601, 1, 1) + datetime.timedelta(seconds=whole)
+    return f"FILETIME {raw} ({when:%Y-%m-%d %H:%M:%S}.{ticks:07d} UTC)"
+
+
 def _refs_node(buf, hoff, where="a node"):
     """(level, flags, [(key, value, row flags)]) of the B+ tree node whose
     header is at hoff in buf.
@@ -24749,7 +24788,8 @@ class RefsWalker:
     (mode S_IFLNK, target from readlink()), hard links (each name lists the one
     record). Not read, and refused with a reason rather than guessed: a stream
     record laid out other than as ReFS 3.14 writes it. ``note`` says when the metadata log
-    holds changes newer than the checkpoint, which are not applied.
+    holds changes newer than the checkpoint, which are not applied; an export writes it
+    as the volume's ``note`` in volumes.json.
     """
 
     root = REFS_ROOT_DIR
@@ -24815,8 +24855,8 @@ class RefsWalker:
                 f"{self.logged:,} metadata log "
                 f"{'records follow' if self.logged != 1 else 'record follows'} "
                 "the newest checkpoint. Windows applies them when it mounts the volume; "
-                "this reader does not, so it shows the volume as of that checkpoint, and "
-                "what changed after it is missing or older here")
+                "this reader does not, so it shows the volume as of that checkpoint: newer "
+                "files and newer content may exist, and are missing or older here")
         self.note = "; ".join(notes) or None
 
     def _hurt(self, what):
@@ -25076,7 +25116,7 @@ class RefsWalker:
         d = self._dir(node.dir)
         got = d.names.get(node.key)
         if got is None:
-            raise RefsDamage(f"no name row for {node.key.decode('utf-16-le', 'replace')!r} "
+            raise RefsDamage(f"no name row for {_refs_name(node.key)!r} "
                              f"in directory {node.dir:#x}")
         return got
 
@@ -25111,7 +25151,7 @@ class RefsWalker:
         oid = node if isinstance(node, int) else self._link_dir(node)
         out = []
         for key, (kf, val) in self._dir(oid).names.items():
-            name = key.decode("utf-16-le", "replace")
+            name = _refs_name(key)
             if self._is_dir_row(kf, val):
                 child = struct.unpack_from("<Q", val, 8)[0]
                 # A directory has one name: a row naming the root, the
@@ -25303,7 +25343,7 @@ class RefsWalker:
         for marker, atype, key, value in attrs:
             if atype == 0xB0 and marker == 0x80000002 and len(value) >= 0x28:
                 if struct.unpack_from("<H", value, 0x10)[0] == 0:
-                    out[key[0x10:].decode("utf-16-le", "replace")] = value
+                    out[_refs_name(key[0x10:])] = value
         return out, attrs
 
     def _stream_owner(self, ref):
@@ -25521,6 +25561,17 @@ class RefsWalker:
         c, m, _ch, a = self.filetimes(node)
         return ntfs_time(c), ntfs_time(m), ntfs_time(a)
 
+    def mtime_not_held(self, node):
+        """The stored modified time as text when it is not 0 and entry() answers 0 for it:
+        a FILETIME from 9999-12-31 23:59:59 on, or one at the Unix epoch. None otherwise.
+        An export asks this for a time of 0 (_zip_time_lost), so such a file gets its
+        TIME_NOT_HELD row while entry() and stamps() go on answering 0 for it. Raises as
+        filetimes() does when the record does not check out."""
+        raw = self.filetimes(node)[1]
+        if not raw or ntfs_time(raw):
+            return None
+        return _refs_filetime_shown(raw)
+
     def inode(self, node):
         return node
 
@@ -25551,7 +25602,7 @@ class RefsWalker:
         if isinstance(node, RefsStreamRef):
             return f"{RefsWalker._name_of(node.file)}:{node.name}"
         if isinstance(node, RefsEntry):
-            return f"{node.key.decode('utf-16-le', 'replace')!r} in directory {node.dir:#x}"
+            return f"{_refs_name(node.key)!r} in directory {node.dir:#x}"
         return f"directory {node:#x}"
 
     def _entry(self, node):
@@ -25934,6 +25985,12 @@ class _RefsSparseImage:
                 return self.data[at:at + n]
         raise ValueError("no such run")
 
+    def __enter__(self):                # main() reads an open image inside a with
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def seek(self, off, whence=0):
         self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
         return self.pos
@@ -26056,13 +26113,13 @@ def walker_for(kind, fh, base, size=None):
         return _cached_walker(fh, base, size, kind, lambda: Jffs2Walker(fh, base, size))
     if kind in ("yaffs1", "yaffs2"):
         return _cached_walker(fh, base, size, kind, lambda: YaffsWalker(fh, base, size))
-    room = CFG_STORE_MAX if size is None else size
     if kind == "nvram":
-        st = nvram_store(fh, base, room)
+        st = nvram_store(fh, base, CFG_STORE_MAX if size is None else size)
         return ConfigStoreWalker(fh, base, st[0], "nvram.bin") if st else None
     if kind == "uboot-env":
-        st = uboot_env_store(fh, base, room)
-        return ConfigStoreWalker(fh, base, st[0], "uboot-env.bin") if st else None
+        st = uboot_env_store(fh, base, UBOOT_ENV_MAX if size is None else size)
+        return (ConfigStoreWalker(fh, base, st[0], "uboot-env.bin", uboot_env_note(st))
+                if st else None)
     return None
 
 
@@ -38518,6 +38575,74 @@ def _refs_unit_checks(img, w, got, known):
                 named == ["one"]
                 and [e[2] for e in w._extents(merged[3], merged[4])] == [0x2222]))  # pylint: disable=protected-access
 
+    # Names and times as Windows 11 stored them on a volume it wrote (unpaired
+    # surrogates; 9999-12-31 23:59:59, a FILETIME of 3281000000000000000 and the
+    # largest one), put on rows of the fixture's times folder and exported. The last
+    # tick of year 9999 and the Unix epoch are the edges of what entry() answers 0 for.
+    import sqlite3
+    odd = RefsWalker(img, 0)
+    plain = got["times/fixed.txt"][1]
+    kf, val = odd._row(plain)  # pylint: disable=protected-access
+    folder = odd._dir(plain.dir)  # pylint: disable=protected-access
+    lone = ["pair_\ud800x.txt", "pair_\ud801x.txt", "rev_\udc00\ud800.txt", "end_\ud800"]
+    lone_raw = [n.encode("utf-16-le", "surrogatepass") for n in lone]
+    lone_want = ["pair_%00%D8x.txt", "pair_%01%D8x.txt", "rev_%00%DC%00%D8.txt", "end_%00%D8"]
+    far = (("t9999", 2650467743990000000), ("tlast", 2650467743999999999),
+           ("t12000", 3281000000000000000), ("tmax", 0x7FFFFFFFFFFFFFFF),
+           ("tepoch", 116444736000000000), ("tunset", 0))
+    for raw in lone_raw:
+        folder.names[raw] = (kf, val)
+    for name, filetime in far:
+        folder.names[name.encode("utf-16-le")] = (kf, val[:0x30] + struct.pack("<Q", filetime)
+                                                  + val[0x38:])
+    by_key = {node.key: (name, node) for name, node in odd.listdir(plain.dir)
+              if isinstance(node, RefsEntry)}
+    lone_got = [by_key[raw][0] for raw in lone_raw]
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("create table t (n text primary key)")
+        db.executemany("insert into t values (?)", [(n,) for n in lone_got])
+        in_db = db.execute("select count(*) from t").fetchone()[0]
+    except (sqlite3.Error, UnicodeError):
+        in_db = -1
+    finally:
+        db.close()
+    issues = []
+    with zipfile.ZipFile(io.BytesIO(), "w") as zout:
+        extract_to_zip(zout, odd, "v", collect(odd, plain.dir, "times"), [], issues=issues)
+        members = {i.filename: tuple(i.date_time) for i in zout.infolist()}
+    two = [_refs_attr_key(0x80000002, 0xB0, 5, n.encode("utf-16-le", "surrogatepass"))
+           for n in ("s\ud800", "s\ud801")]
+    streams = list(odd._named(_refs_test_record([(two[0], ads), (two[1], ads)]))[0])  # pylint: disable=protected-access
+    folder.names[b"n\x00\x00\x00/\x00"] = (kf, val)       # after the export: a NUL and a /
+    inside = [name for name, node in odd.listdir(plain.dir)
+              if isinstance(node, RefsEntry) and node.key == b"n\x00\x00\x00/\x00"]
+    out.append(("a name Windows stored with an unpaired surrogate is listed with that unit as "
+                "%XX of its two stored bytes; two such names stay two, go into SQLite and "
+                "are exported under those names with none renamed; two such stream names stay "
+                "two; a NUL is %00 and a / inside a name %2F",
+                lone_got == lone_want and in_db == len(lone)
+                and all(f"v/times/{n}" in members for n in lone_want)
+                and not [r for r in issues if r[2] == "RENAMED"]
+                and streams == ["s%00%D8", "s%01%D8"] and inside == ["n%00%2F"]))
+    rows = {r[0]: r[3] for r in issues if r[2] == "TIME_NOT_HELD"}
+    kept = {name: odd.entry(by_key[name.encode("utf-16-le")][1])[2] for name, _f in far}
+    dated = {"t9999": "9999-12-31 23:59:59.0000000 UTC", "tlast": "9999-12-31 23:59:59.9999999 UTC",
+             "t12000": "outside any date this reader can show",
+             "tmax": "outside any date this reader can show",
+             "tepoch": "1970-01-01 00:00:00.0000000 UTC"}
+    out.append(("a modified time of 9999-12-31 23:59:59, of the last tick of that year, of two "
+                "FILETIMEs past year 9999 and of the Unix epoch reads as 0 from entry() and "
+                "stamps(), and gets a TIME_NOT_HELD row in an export that gives the FILETIME as "
+                "stored; an unset time and one a zip holds get none",
+                sorted(rows) == sorted(f"times/{n}" for n in dated)
+                and all(rows[f"times/{n}"].startswith(f"stored time FILETIME {raw} ({dated[n]})")
+                        for n, raw in far if n in dated)
+                and all(kept[n] == 0 for n, _f in far)
+                and all(odd.stamps(by_key[n.encode("utf-16-le")][1])[1] == 0 for n, _f in far)
+                and all(members.get(f"v/times/{n}") == (1980, 1, 1, 0, 0, 0) for n, _f in far)
+                and odd.entry(plain) == w.entry(plain) and w.entry(plain)[2] > 0))
+
     # Damaged and hostile records.
     broken = []
     shorted = _refs_test_record([(data(0x1000, 0x1001), _refs_test_stream([], 10)),
@@ -38755,6 +38880,22 @@ def _refs_fixture_checks():
                 kind == "refs" and wd.logged == 16 and wd.note is not None
                 and any(line.startswith("log          16 metadata log records") for line in ident)
                 and wd.listdir(wd.root) == []))
+    import contextlib
+    man, said = [], io.StringIO()
+    with zipfile.ZipFile(io.BytesIO(), "w") as zout, contextlib.redirect_stdout(said):
+        main("refs-dirty", extract="(memory)", zf=zout, manifest=man, image=dirty)
+    noted = (man[0].get("note") or "") if len(man) == 1 else ""
+    out.append(("an export of that volume puts the same in the note of its volumes.json record: "
+                "16 log records follow the checkpoint, Windows applies them when it mounts the "
+                "volume, this reader does not, and newer files and content may exist; the "
+                "clean fixture's walker has no note",
+                noted == wd.note
+                and noted.startswith("16 metadata log records follow the newest checkpoint")
+                and "Windows applies them when it mounts the volume" in noted
+                and "this reader does not" in noted
+                and "newer files and newer content may exist" in noted
+                and "NOTE 16 metadata log records" in said.getvalue()
+                and w.note is None))
 
     # Broken on purpose: each must be reported, not read past.
     # One letter of one name in a leaf page of the 2,500-entry directory: the
@@ -39303,15 +39444,33 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # Neither has a directory, so each is given as a volume holding one file, the
 # store's bytes as they sit on the chip, for a consumer to parse. Both are
 # accepted only on a CRC-32 that holds over the store, and a store's size is the
-# one its CRC holds for, tried in 4 KiB steps up to CFG_STORE_MAX.
+# one its CRC holds for: a libnvram store's is tried in 4 KiB steps up to
+# CFG_STORE_MAX, a U-Boot environment's at the sizes in UBOOT_ENV_SIZES.
 #
 # U-Boot's environment layout, env_t in include/env_internal.h at v2024.01
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86):
-# a little-endian CRC-32, a flags byte only when the board keeps a redundant copy
+# a CRC-32, a flags byte only when the board keeps a redundant copy
 # (ENV_HEADER_SIZE, lines 59-61), then CONFIG_ENV_SIZE less that header of
 # NUL-separated name=value strings ending in an empty one. env_import() checks
 # crc32(0, data, ENV_SIZE) before it reads them
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310).
+# The CRC is a uint32_t in the byte order of the CPU U-Boot runs on, and
+# mkenvimage writes either order (-b,
+# https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/tools/mkenvimage.c#L257-L258),
+# so the stored value is accepted read either way and the order that held is
+# reported.
+#
+# CONFIG_ENV_SIZE is the board's choice. The 1,266 configs/*_defconfig files of
+# that tree set it in 856, to 19 values: 0x80, 0x190, 0x800, 0x1000, 0x2000,
+# 0x2800, 0x3000, 0x4000, 0x4200, 0x8000, 0x10000, 0x18000, 0x20000, 0x21000,
+# 0x30000, 0x40000, 0x80000, 0x100000 and 0x2a00000, and env/Kconfig gives a
+# board that sets none 0x1f000 or one of those. All but 0x80 and 0x190 are
+# multiples of 512 bytes, and those above 0x4200 are multiples of 4 KiB.
+# UBOOT_ENV_SIZES is 0x80, 0x190, every multiple of 512 bytes up to 64 KiB and
+# every multiple of 4 KiB from there up to 1 MiB. That covers each value above
+# but 0x2a00000 (one file, total_compute_defconfig): every candidate offset is
+# read and summed up to the largest size tried, and 42 MiB per candidate is
+# not spent on one board file. An environment of any other size is not found.
 #
 # Belkin libnvram store, env_image_gemtek in Belkin's own libnvram source (its
 # header carries Belkin's copyright), as found in a public copy of the WeMo firmware
@@ -39321,26 +39480,34 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # 16-byte header (lines 853-874); the count and end of data are written after it,
 # from the index of strings (lines 420-450 and 1165-1178).
 # ---------------------------------------------------------------------------
-CFG_STORE_MAX = 256 << 10         # the largest store size tried
+CFG_STORE_MAX = 256 << 10         # the largest libnvram store size tried
+UBOOT_ENV_MAX = 1 << 20           # the largest U-Boot environment size tried
+UBOOT_ENV_SIZES = ((0x80, 0x190) + tuple(range(512, 64 << 10, 512))
+                   + tuple(range(64 << 10, UBOOT_ENV_MAX + 1, 4096)))
 CFG_KINDS = ("nvram", "uboot-env")
 NVRM_MAGIC = b"NVRM"
 NVRM_HEADER = 16
 _CFG_NAME = re.compile(rb"[A-Za-z0-9_.:+-]{1,64}=")   # what a store's first string opens with
 
 
-def _cfg_crc_size(fh, base, start, crc, room):
-    """The smallest size, a multiple of 4 KiB and at most room and CFG_STORE_MAX,
-    for which the CRC-32 of the bytes from base + start to base + size is crc,
-    or None. One read and one pass, whatever the number of sizes tried."""
-    buf = read_at(fh, base, max(0, min(room, CFG_STORE_MAX)))
+def _cfg_crc_size(fh, base, start, crcs, room, sizes=None):
+    """(size, crc) for the smallest size, among sizes (ascending; the multiples
+    of 4 KiB up to CFG_STORE_MAX when not given) and at most room, for which the
+    CRC-32 of the bytes from base + start to base + size is one of crcs, or None.
+    One read and one pass, whatever the number of sizes tried."""
+    if sizes is None:
+        sizes = range(FLASH_ALIGN, CFG_STORE_MAX + 1, FLASH_ALIGN)
+    buf = memoryview(read_at(fh, base, max(0, min(room, sizes[-1]))))
     c, done = 0, start
-    for size in range(FLASH_ALIGN, len(buf) + 1, FLASH_ALIGN):
+    for size in sizes:
+        if size > len(buf):
+            break
         if size <= start:
             continue
         c = binascii.crc32(buf[done:size], c)
         done = size
-        if c == crc:
-            return size
+        if c in crcs:
+            return size, c
     return None
 
 
@@ -39368,30 +39535,48 @@ def nvram_store(fh, base, room):
     if len(head) < NVRM_HEADER or head[:4] != NVRM_MAGIC:
         return None
     crc, count, eod = struct.unpack_from("<III", head, 4)
-    size = _cfg_crc_size(fh, base, NVRM_HEADER, crc, room)
-    if size is None:
+    hit = _cfg_crc_size(fh, base, NVRM_HEADER, (crc,), room)
+    if hit is None:
         return None
-    return size, count, eod
+    return hit[0], count, eod
 
 
 def uboot_env_store(fh, base, room):
-    """(size, header, flags) for a U-Boot environment at base whose CRC-32 holds
-    and whose strings end inside it, else None. header is 4 for a single copy and
-    5 for one of a redundant pair, whose flags byte is returned (else None)."""
+    """(size, header, flags, order) for a U-Boot environment at base whose CRC-32
+    holds and whose strings end inside it, else None. header is 4 for a single
+    copy and 5 for one of a redundant pair, whose flags byte is returned as
+    stored (else None). order is the byte order the stored CRC held in,
+    "little-endian" or "big-endian", or "either byte order" for a value that
+    reads the same both ways. The size is one of UBOOT_ENV_SIZES."""
     head = read_at(fh, base, 5 + 65)
     if len(head) < 8:
         return None
-    crc = struct.unpack_from("<I", head)[0]
+    le, be = struct.unpack_from("<I", head)[0], struct.unpack_from(">I", head)[0]
     for hdr in (4, 5):
         if not _CFG_NAME.match(head, hdr):
             continue
-        size = _cfg_crc_size(fh, base, hdr, crc, room)
-        if size is None:
+        hit = _cfg_crc_size(fh, base, hdr, (le, be), room, UBOOT_ENV_SIZES)
+        if hit is None:
             continue
+        size, crc = hit
         strings, ended = cfg_strings(read_at(fh, base + hdr, size - hdr))
         if ended and strings:
-            return size, hdr, (head[4] if hdr == 5 else None)
+            order = ("either byte order" if le == be else
+                     "little-endian" if crc == le else "big-endian")
+            return size, hdr, (head[4] if hdr == 5 else None), order
     return None
+
+
+def uboot_env_note(store):
+    """The note for a volume that is one copy of a redundant pair: its flags byte
+    as stored, which U-Boot compares between the two copies to choose one
+    (env_check_redund in env/common.c). The choice is not made here: it needs
+    both copies, and each copy is a volume of its own. None for a single copy."""
+    _size, hdr, flags, _order = store
+    if hdr != 5:
+        return None
+    return (f"the redundant-copy layout, a 5-byte header: flags byte {flags} as stored; "
+            "which copy U-Boot would use is not worked out")
 
 
 def _erased_after(fh, start, end):
@@ -39430,25 +39615,27 @@ def identify_uboot_env(fh, base, size):
     st = uboot_env_store(fh, base, size)
     if not st or not _erased_after(fh, base + st[0], base + size):
         return None
-    n, hdr, flags = st
+    n, hdr, flags, order = st
     strings, _ = cfg_strings(read_at(fh, base + hdr, n - hdr))
     layout = ("a 4-byte header, the single-copy layout" if hdr == 4 else
               f"a 5-byte header, the redundant-copy layout (flags byte {flags})")
     return "uboot-env", [
-        "format       U-Boot's environment layout (env_t), CRC-32 holds; the layout "
-        "does not say which program wrote the store",
+        "format       U-Boot's environment layout (env_t), CRC-32 holds with the stored "
+        f"value read as {order}; the layout does not say which program wrote the store",
         f"store        {human(n)}, {layout}, {len(strings)} name=value strings",
         "file         uboot-env.bin, the store's bytes as held on flash"]
 
 
 class ConfigStoreWalker:
     """A configuration store as a volume holding one file: the store's bytes, as
-    held on flash, under name. It records no time, so none is reported."""
+    held on flash, under name. It records no time, so none is reported.
+    volume_note is what an export's volumes.json says about the store, or None."""
     root = 1
     _FILE = 2
 
-    def __init__(self, fh, base, size, name):
+    def __init__(self, fh, base, size, name, volume_note=None):
         self.fh, self.base, self.size, self.name = fh, base, size, name
+        self.volume_note = volume_note
 
     def listdir(self, node):
         return [(self.name, self._FILE)] if node == self.root else []
@@ -39531,7 +39718,9 @@ def flash_regions(fh, size):
       NVRM      a Belkin libnvram store whose CRC-32 holds (nvram_store); its
                 extent is the size that CRC holds for
       U-Boot    an environment whose first string opens with a name and "="
-                and whose CRC-32 holds (uboot_env_store); its extent likewise
+                and whose CRC-32 holds, stored in either byte order, at one of
+                the sizes in UBOOT_ENV_SIZES (uboot_env_store); its extent
+                likewise
       EFS       a QNX F3S partition, found by its boot record wherever in the
                 partition wear levelling left it and placed by the record's
                 unit_index (efs_partitions); its extent is the unit count the
@@ -44150,10 +44339,15 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, (F2fsWalker, HfsPlusWalker)) and w.volume_note:
+                            if isinstance(w, (F2fsWalker, HfsPlusWalker, ConfigStoreWalker)) and w.volume_note:
                                 if manifest is not None:
                                     manifest[-1]["note"] = w.volume_note
                                 _say(f"            NOTE {w.volume_note}")
+                            if isinstance(w, RefsWalker) and w.note:
+                                # log records the checkpoint read here does not hold
+                                if manifest is not None:
+                                    manifest[-1]["note"] = w.note
+                                _say(f"            NOTE {w.note}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             locked = getattr(w, "not_read_note", None)
@@ -52349,12 +52543,14 @@ def self_test():
         # trailer checksum are all exercised. The trailer is set over the clean
         # image; the sabotaged copy flips one data byte afterwards, so its stored
         # checksum can no longer balance.
-        def _ifs_image(corrupt=False):
-            f2, f1, tgt = b"second file\n", b"hello d/f1\n", b"/etc/target"
-            def attr(size, ino, mode):
-                return struct.pack("<HHIIIII", size, 0, ino, mode, 0, 0, 0x5000)
-            def d_dir(p, ino):
-                t = p + b"\x00"; return attr(24 + len(t), ino, IFS_S_IFDIR | 0o755) + t
+        def _ifs_image(corrupt=False, n2=b"f2", n1=b"d/f1", link=b"d/l1",
+                       tgt=b"/etc/target", own_dir=False, wbits=0):
+            f2, f1 = b"second file\n", b"hello d/f1\n"
+            def attr(size, ino, mode, when=0x5000):
+                return struct.pack("<HHIIIII", size, 0, ino, mode, 0, 0, when)
+            def d_dir(p, ino, when=0x5000):
+                t = p + b"\x00"
+                return attr(24 + len(t), ino, IFS_S_IFDIR | 0o755, when) + t
             def d_file(p, ino, off, sz):
                 t = struct.pack("<II", off, sz) + p + b"\x00"
                 return attr(24 + len(t), ino, IFS_S_IFREG | 0o644) + t
@@ -52363,9 +52559,10 @@ def self_test():
                 return (attr(24 + 4 + len(t), ino, IFS_S_IFLNK | 0o777)
                         + struct.pack("<HH", len(nm), len(target)) + t)
             def table(o2, o1):
-                return (d_dir(b"", 1) + d_file(b"f2", 2, o2, len(f2))
-                        + d_file(b"d/f1", 3, o1, len(f1))
-                        + d_link(b"d/l1", tgt, 4) + struct.pack("<H", 0))
+                return (d_dir(b"", 1) + d_file(n2, 2, o2, len(f2))
+                        + d_file(n1, 3, o1, len(f1)) + d_link(link, tgt, 4)
+                        + (d_dir(b"d", 5, 0x6000) if own_dir else b"")
+                        + struct.pack("<H", 0))
             dir_off = 92
             hdr_dir = dir_off + len(table(0, 0)) - 2
             data = (dir_off + len(table(0, 0)) + 3) & ~3
@@ -52390,10 +52587,22 @@ def self_test():
             struct.pack_into("<H", hdr, 4, 1); hdr[6] = 0x01
             struct.pack_into("<H", hdr, 8, 256)
             struct.pack_into("<H", hdr, 10, 183)
+            stored = bytes(img)
+            if wbits:
+                # The zlib method as mkifs lays it down: one stream (gzopen() writes
+                # gzip, wbits 31), a pad to 4 bytes and a checksum over the stored
+                # words (mk_image_fsys.c:441, 2425-2428). wbits 15 is a zlib stream.
+                import zlib
+                z = zlib.compressobj(9, zlib.DEFLATED, wbits)
+                stored = z.compress(stored) + z.flush()
+                stored += bytes(-len(stored) % 4)
+                words = struct.unpack_from("<%dI" % (len(stored) // 4), stored, 0)
+                stored += struct.pack("<I", -sum(words) & 0xFFFFFFFF)
+                hdr[6] = 0x01 | 0x04
             struct.pack_into("<I", hdr, 32, 512)
-            struct.pack_into("<I", hdr, 36, 512 + len(img))
+            struct.pack_into("<I", hdr, 36, 512 + len(stored))
             struct.pack_into("<I", hdr, 44, len(img))
-            return bytes(hdr) + b"\x00" * (512 - 256) + bytes(img)
+            return bytes(hdr) + b"\x00" * (512 - 256) + stored
 
         ip = os.path.join(d, "ifs_ok.img"); open(ip, "wb").write(_ifs_image())
         try:
@@ -52423,6 +52632,89 @@ def self_test():
         if balanced is not False:
             ok = False
         print(f"  [{mark}] a flipped imagefs byte breaks the image checksum")
+
+        # mkifs writes a dirent only for a listed entry (mk_image_fsys.c:2261-2326),
+        # so "d" above is named only inside the paths under it and the image holds
+        # no time for it. A folder with its own dirent keeps the time that records.
+        try:
+            w = IfsWalker(io.BytesIO(_ifs_image()), 0)
+            own = IfsWalker(io.BytesIO(_ifs_image(own_dir=True)), 0)
+            walked = {p: mt for p, _n, _m, _s, mt, _r in walk_all(w)}
+            said = io.StringIO()
+            with contextlib.redirect_stdout(said):
+                print_tree(w, w.root, 1, 3, [100])
+            shown = {ln.split()[1]: ln.split()[2:] for ln in said.getvalue().splitlines()}
+            good = (w.entry("d") == (IFS_S_IFDIR, 0, None) and walked["d"] is None
+                    and walked["d/f1"] == 0x5000 and shown["d"] == []
+                    and shown["f2"][-1] == "1970-01-01"
+                    and [e[3] for e in collect(w, w.root)] == [0x5000] * 3
+                    and own.entry("d")[2] == 0x6000 and own.entry("d/f1")[2] == 0x5000)
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] an IFS folder with no entry of its own is listed with no time, "
+              f"and one with an entry keeps it")
+
+        # Two stored paths that differ in one byte that is not UTF-8 stay two files,
+        # each with its own bytes, and every name is text SQLite stores.
+        try:
+            w = IfsWalker(io.BytesIO(_ifs_image(n2=b"d\xff/f", n1=b"d\xfe/f", link=b"l\x80",
+                                                tgt=b"/t\xc3\x00x")), 0)
+            files = {p: (node, sz) for p, node, sz, _ in collect(w, w.root) if sz is not None}
+            names = sorted(p for p, *_r in walk_all(w))
+            good = (names == ["d%FE", "d%FE/f", "d%FF", "d%FF/f", "l%80"]
+                    and b"".join(w.read_file(*files["d%FF/f"])) == b"second file\n"
+                    and b"".join(w.read_file(*files["d%FE/f"])) == b"hello d/f1\n"
+                    and w.links == {"l%80": "/t%C3%00x"})
+            try:
+                import sqlite3
+            except ImportError:
+                sqlite3 = None
+            if sqlite3 is not None:
+                db = sqlite3.connect(":memory:")
+                db.execute("create table t (name text unique)")
+                db.executemany("insert into t values (?)",
+                               [(n,) for n in names + list(w.links.values())])
+                good = good and db.execute("select count(*) from t").fetchone()[0] == 6
+                db.close()
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] IFS names and a link target with bytes that are not UTF-8 are "
+              f"kept as %XX, and two such names stay two files")
+
+        # The zlib method. No image a real mkifs compressed is to hand, so this wraps
+        # the synthetic image above the way mk_image_fsys.c does, and as a zlib stream.
+        try:
+            good = True
+            for wbits in (31, 15):
+                blob = _ifs_image(wbits=wbits)
+                w = IfsWalker(io.BytesIO(blob), 0)
+                files = {p: (node, sz) for p, node, sz, _ in collect(w, w.root)}
+                good = (good and w.compress == "zlib" and w.cksum_ok is True
+                        and blob[512:514] == (b"\x1f\x8b" if wbits == 31 else b"\x78\xda")
+                        and b"".join(w.read_file(*files["f2"])) == b"second file\n"
+                        and b"".join(w.read_file(*files["d/f1"])) == b"hello d/f1\n")
+            man = []
+            with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main("ifs-gz.img", extract="(memory)", zf=zf, manifest=man,
+                     image=io.BytesIO(_ifs_image(wbits=31)))
+            good = (good and len(man) == 1 and man[0]["filesystem"] == "qnx_ifs"
+                    and man[0]["compression"] == "zlib" and man[0]["files"] == 2
+                    and man[0]["image_checksum_balances"] is True
+                    and "extract_error" not in man[0])
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] a synthetic IFS stored as a gzip stream, as mkifs writes the zlib "
+              f"method, or as a zlib stream reads the same files")
 
         # QNX4. The root name, the .bitmap name and the xblk signature are
         # spelled here as independent literals, deliberately NOT read from the
@@ -56943,7 +57235,7 @@ def self_test():
             ccond = (got == want and jentries == 310 + 3
                      and reads == {0x10000: ("uboot-env.bin", e1), 0x14000: ("uboot-env.bin", e2),
                                    nv_at: ("nvram.bin", nv)}
-                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2)) == (len(e2), 5, 3))
+                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2))[:3] == (len(e2), 5, 3))
             if not ccond:
                 ok = False
             print(f"  [{'PASS' if ccond else 'FAIL'}] a flash dump's U-Boot environments and "
@@ -56987,6 +57279,123 @@ def self_test():
             print(f"  [{'PASS' if wcond else 'FAIL'}] and an environment that is the whole file "
                   f"is that file ({alone}), while one that only begins a larger file leaves "
                   f"the rest to be searched ({lead_kinds})")
+
+        # A U-Boot environment's CRC is a uint32_t in the byte order of the CPU
+        # U-Boot runs on (env_t), mkenvimage -b writes it big-endian, and its size
+        # is the board's CONFIG_ENV_SIZE. Built here from made-up strings on
+        # erased flash, each store at a 4 KiB boundary. The first image holds a
+        # little-endian store and two big-endian ones, one of each layout:
+        # volumes() must find the three and the description must name the order
+        # that held. The second holds a store at sizes the 4 KiB steps up to
+        # 256 KiB never reached (128 and 400 bytes, 512 bytes, 6 KiB, 0x4200,
+        # 512 KiB and 1 MiB), at one they did (0x21000) and, as controls, at
+        # three sizes that are not tried (off the 512-byte steps, off the 4 KiB
+        # steps above 64 KiB, and over 1 MiB), which must not be claimed. The
+        # sizes are written out here and not taken from UBOOT_ENV_SIZES, which
+        # they check. The third is exported for real: a redundant-layout store's
+        # volumes.json record must carry its flags byte as stored and name no
+        # copy as the one in use, and a single-copy store's record must carry no
+        # note.
+        def _uenv(strings, size, hdr=4, flags=1, order="<"):
+            data = (b"\x00".join(strings) + b"\x00\x00").ljust(size - hdr, b"\x00")
+            return (struct.pack(order + "I", binascii.crc32(data))
+                    + (bytes([flags]) if hdr == 5 else b"") + data)
+
+        def _uflash(stores, size):
+            chip = bytearray(b"\xff" * size)
+            for at, blob in stores:
+                chip[at:at + len(blob)] = blob
+            return bytes(chip)
+
+        def _ufound(chip):
+            return [(v["base"], v["kind"], v["size"])
+                    for v in volumes(io.BytesIO(chip), len(chip))]
+
+        ustr = [b"bootdelay=2", b"baudrate=115200", b"example_addr=192.0.2.7"]
+        o_le, o_be = _uenv(ustr, 0x1000), _uenv(ustr, 0x1000, order=">")
+        o_red = _uenv(ustr, 0x2000, hdr=5, flags=9, order=">")
+        o_chip = _uflash([(0x1000, o_le), (0x3000, o_be), (0x5000, o_red)], 0x10000)
+        o_got = _ufound(o_chip)
+        o_said = [" ".join(identify_fs(io.BytesIO(o_chip), b, n)[1]) for b, _k, n in o_got]
+        uo_cond = (o_got == [(0x1000, "uboot-env", 0x1000), (0x3000, "uboot-env", 0x1000),
+                             (0x5000, "uboot-env", 0x2000)]
+                   and ["read as little-endian" in s for s in o_said] == [True, False, False]
+                   and ["read as big-endian" in s for s in o_said] == [False, True, True]
+                   and "flags byte 9" in o_said[2]
+                   and _ufound(o_be) == [(0, "uboot-env", 0x1000)])
+        if not uo_cond:
+            ok = False
+        print(f"  [{'PASS' if uo_cond else 'FAIL'}] a U-Boot environment whose CRC-32 is stored "
+              f"big-endian is found in both layouts, alone and in a flash dump, and its "
+              f"description names the byte order that held "
+              f"({', '.join(f'{b:#x} {human(n)}' for b, _k, n in o_got)})")
+
+        s_at, s_stores, s_want = 0x1000, [], []
+        s_tried = (0x80, 0x190, 0x200, 0x1800, 0x4200, 0x21000, 0x80000, 0x100000)
+        for s_size in s_tried + (0x1900, 0x11200, 0x101000):
+            s_blob = _uenv(ustr[:2] + [b"example_size=%d" % s_size], s_size,
+                           hdr=5 if s_size in (0x1800, 0x80000) else 4)
+            s_stores.append((s_at, s_blob))
+            if s_size in s_tried:
+                s_want.append((s_at, "uboot-env", s_size))
+            s_at += -(-s_size // 4096) * 4096 + 4096
+        s_chip = _uflash(s_stores, s_at)
+        s_vols = volumes(io.BytesIO(s_chip), len(s_chip))
+        s_got = [(v["base"], v["kind"], v["size"]) for v in s_vols]
+        s_read = {v["base"]: b"".join(v["walker"].read_file(n, v["walker"].entry(n)[1]))
+                  for v in s_vols if v.get("walker") and v["kind"] == "uboot-env"
+                  for _f, n in v["walker"].listdir(v["walker"].root)}
+        us_cond = (len(s_want) == 8 and s_got == s_want
+                   and s_read == {at: blob for at, blob in s_stores if len(blob) in s_tried})
+        if not us_cond:
+            ok = False
+        print(f"  [{'PASS' if us_cond else 'FAIL'}] U-Boot environments of 128 and 400 bytes, "
+              f"sizes off the 4 KiB steps and sizes over 256 KiB up to 1 MiB are found and "
+              f"read back byte for byte, and three sizes that are not tried (0x1900, 0x11200, "
+              f"0x101000) are not claimed "
+              f"({', '.join(f'{n:#x}' for _b, _k, n in s_got)})")
+
+        if getattr(sys, "frozen", False):
+            print("  [SKIP] a redundant-layout U-Boot environment's flags byte is in its "
+                  "volumes.json record: a packaged build does not run an export here")
+        else:
+            import subprocess as _sp
+            n_chip = _uflash([(0x1000, _uenv(ustr, 0x1000, hdr=5, flags=7)),
+                              (0x3000, _uenv(ustr, 0x1000, hdr=5, flags=8, order=">")),
+                              (0x5000, o_le)], 0x8000)
+            n_stem = os.path.join(d, f"uboot-env-check-{uuid.uuid4().hex}")
+            n_recs, n_rc = [], None
+            try:
+                with open(n_stem + ".dd", "wb") as n_fh:
+                    n_fh.write(n_chip)
+                n_rc = _sp.run([sys.executable, "-B", os.path.abspath(__file__), n_stem + ".dd",
+                                "--extract", n_stem + ".zip"], stdin=_sp.DEVNULL,
+                               stdout=_sp.PIPE, stderr=_sp.PIPE, timeout=240,
+                               check=False).returncode
+                with zipfile.ZipFile(n_stem + ".zip") as n_zip:
+                    n_recs = json.loads(n_zip.read("volumes.json"))["volumes"]
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, _sp.SubprocessError):
+                pass
+            finally:
+                for n_left in (n_stem + ".dd", n_stem + ".zip"):
+                    try:
+                        os.remove(n_left)
+                    except OSError:
+                        pass
+            n_notes = [r.get("note") for r in n_recs]
+            un_cond = (n_rc == 0
+                       and [r.get("offset_bytes") for r in n_recs] == [0x1000, 0x3000, 0x5000]
+                       and n_notes[2:] == [None]
+                       and "flags byte 7 as stored" in (n_notes[0] or "")
+                       and "flags byte 8 as stored" in (n_notes[1] or "")
+                       and not any("active" in (n or "") or "in use" in (n or "")
+                                   for n in n_notes))
+            if not un_cond:
+                ok = False
+            print(f"  [{'PASS' if un_cond else 'FAIL'}] an export's volumes.json record of a "
+                  f"redundant-layout U-Boot environment carries its flags byte as stored and "
+                  f"names no copy as the one in use, and a single-copy one carries no note "
+                  f"({len(n_recs)} records, exit {n_rc})")
 
         # An eMMC image from an embedded device can hold ext filesystems with no
         # partition table in front of them. Built here: 1.25 MiB of random bytes,
@@ -57855,7 +58264,10 @@ what it checks, and where the constants come from:
   nothing has to be installed. The decompressed image is walked from its
   image_header and a flat table of image_dirent records: each carries an inode,
   mode, mtime and a full path, and a file points at an offset and size inside
-  the image. zlib images are read through the standard library.
+  the image. A zlib image is one gzip stream, written with gzopen()
+  (mk_image_fsys.c:441, in the vocho/openqnx mirror at cc95df3), and is read
+  through the standard library; that path is tested on a synthetic image only,
+  not on one a real mkifs wrote.
 
   This is proven byte for byte against the Ford Sync G4 ifs_a, ifs_b and
   ifs_recovery volumes. Each decompressed to exactly the imagefs_size its own
