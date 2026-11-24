@@ -16646,8 +16646,12 @@ def print_tree(w, num, depth, maxdepth, budget, indent=0, pad=6):
 # evidence to hand is UCL, and there is no UCL decompressor in the standard
 # library, so a small one is carried below rather than taking a dependency: this
 # tool's whole point is that it installs nothing. zlib is handled through the
-# standard library. lzo and the Harman Becker HBCIFS container are recognised but
-# not decompressed here, because no sample exists to validate a reader against.
+# standard library: mkifs writes that method with gzopen() (mk_image_fsys.c:441),
+# so the stored bytes are one gzip stream, then the pad and the 4-byte checksum
+# mkifs puts after any compressed image (mk_image_fsys.c:2425-2428). No image a
+# real mkifs compressed this way is to hand; the self-test wraps its own. lzo
+# and the Harman Becker HBCIFS container are recognised but not decompressed
+# here, because no sample exists to validate a reader against.
 # ---------------------------------------------------------------------------
 QNX_IFS_SIG = 0x00FF7EEB
 QNX_IFS_VER = 1
@@ -16762,6 +16766,14 @@ def ifs_decompress_blocks(stored, decompress):
     return bytes(out)
 
 
+def _ifs_path(raw):
+    """A stored path or symlink target as text. A dirent holds a whole path
+    (image.h:75-108), so "/" separates its components and is kept; inside a
+    component, bytes that are not UTF-8 become %XX and a NUL becomes %00."""
+    return "/".join(part.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+                    for part in raw.split(b"/"))
+
+
 class IfsUnsupported(Exception):
     """Raised when an IFS is recognised but its contents cannot be read here,
     for example an lzo-compressed image or the HBCIFS container. The header is
@@ -16799,7 +16811,10 @@ class IfsWalker:
             img = ifs_decompress_blocks(stored, ucl_nrv2b_decompress)
         elif self.compress == "zlib":
             import zlib
-            img = zlib.decompress(stored)       # a single gzip stream, dumpifs.c:534
+            # gzopen() wrote it (mk_image_fsys.c:441) and dumpifs.c:534-550 reads it
+            # with gzread(): a gzip stream. 32 + 15 takes that header or a zlib one,
+            # and stops at the stream's end, before the pad and checksum behind it.
+            img = zlib.decompress(stored, 47)
         else:
             raise IfsUnsupported(f"{self.compress} compression not read here")
         if img[:len(IMG_SIG)] != IMG_SIG:
@@ -16843,32 +16858,33 @@ class IfsWalker:
             typ = mode & IFS_S_IFMT
             if typ == IFS_S_IFREG:
                 foff, fsize = struct.unpack_from("<II", rec, IFS_ATTR_LEN)
-                path = rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0])
                 self._add(path, mode, fsize, mtime)
-                self.files[path.decode("utf-8", "replace")] = (foff, fsize)
+                self.files[path] = (foff, fsize)
             elif typ == IFS_S_IFDIR:
-                path = rec[IFS_ATTR_LEN:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN:].split(b"\x00")[0])
                 self._add(path, mode, 0, mtime)
                 if path:
-                    self.kids.setdefault(path.decode("utf-8", "replace"), [])
+                    self.kids.setdefault(path, [])
                 else:
                     root_mode, root_mtime = mode, mtime
             elif typ == IFS_S_IFLNK:
                 soff, ssize = struct.unpack_from("<HH", rec, IFS_ATTR_LEN)
                 nb = IFS_ATTR_LEN + 4                 # name and target follow the two u16
-                path = rec[nb:].split(b"\x00")[0]
-                self.links[path.decode("utf-8", "replace")] = \
-                    rec[nb + soff:nb + soff + ssize].decode("utf-8", "replace")
+                path = _ifs_path(rec[nb:].split(b"\x00")[0])
+                self.links[path] = _ifs_path(rec[nb + soff:nb + soff + ssize])
                 self._add(path, mode, 0, mtime)
             else:                                # device, fifo, or QNX name special
-                path = rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0]
+                path = _ifs_path(rec[IFS_ATTR_LEN + 8:].split(b"\x00")[0])
                 self._add(path, mode, 0, mtime)
         self.nodes[""] = (root_mode, 0, root_mtime)
 
-    def _add(self, path_b, mode, size, mtime):
+    def _add(self, path, mode, size, mtime):
         """Place one entry, materialising any parent directories the flat table
-        left implicit (a file at a/b/c with no dirent for a or a/b)."""
-        path = path_b.decode("utf-8", "replace")
+        left implicit (a file at a/b/c with no dirent for a or a/b). mkifs writes
+        a dirent only for a listed entry (mk_image_fsys.c:2261-2326), so such a
+        directory has no time in the image and gets None here, not the time of
+        the entry that named it. Its own dirent, if one follows, replaces this."""
         if path == "":
             return
         parts = path.split("/")
@@ -16876,7 +16892,7 @@ class IfsWalker:
         for i in range(len(parts) - 1):
             ap = "/".join(parts[:i + 1])
             if ap not in self.nodes:
-                self.nodes[ap] = (IFS_S_IFDIR, 0, mtime)
+                self.nodes[ap] = (IFS_S_IFDIR, 0, None)
                 self.kids.setdefault(parent, [])
                 self.kids[parent].append((parts[i], ap))
                 self.kids.setdefault(ap, [])
@@ -45260,12 +45276,14 @@ def self_test():
         # trailer checksum are all exercised. The trailer is set over the clean
         # image; the sabotaged copy flips one data byte afterwards, so its stored
         # checksum can no longer balance.
-        def _ifs_image(corrupt=False):
-            f2, f1, tgt = b"second file\n", b"hello d/f1\n", b"/etc/target"
-            def attr(size, ino, mode):
-                return struct.pack("<HHIIIII", size, 0, ino, mode, 0, 0, 0x5000)
-            def d_dir(p, ino):
-                t = p + b"\x00"; return attr(24 + len(t), ino, IFS_S_IFDIR | 0o755) + t
+        def _ifs_image(corrupt=False, n2=b"f2", n1=b"d/f1", link=b"d/l1",
+                       tgt=b"/etc/target", own_dir=False, wbits=0):
+            f2, f1 = b"second file\n", b"hello d/f1\n"
+            def attr(size, ino, mode, when=0x5000):
+                return struct.pack("<HHIIIII", size, 0, ino, mode, 0, 0, when)
+            def d_dir(p, ino, when=0x5000):
+                t = p + b"\x00"
+                return attr(24 + len(t), ino, IFS_S_IFDIR | 0o755, when) + t
             def d_file(p, ino, off, sz):
                 t = struct.pack("<II", off, sz) + p + b"\x00"
                 return attr(24 + len(t), ino, IFS_S_IFREG | 0o644) + t
@@ -45274,9 +45292,10 @@ def self_test():
                 return (attr(24 + 4 + len(t), ino, IFS_S_IFLNK | 0o777)
                         + struct.pack("<HH", len(nm), len(target)) + t)
             def table(o2, o1):
-                return (d_dir(b"", 1) + d_file(b"f2", 2, o2, len(f2))
-                        + d_file(b"d/f1", 3, o1, len(f1))
-                        + d_link(b"d/l1", tgt, 4) + struct.pack("<H", 0))
+                return (d_dir(b"", 1) + d_file(n2, 2, o2, len(f2))
+                        + d_file(n1, 3, o1, len(f1)) + d_link(link, tgt, 4)
+                        + (d_dir(b"d", 5, 0x6000) if own_dir else b"")
+                        + struct.pack("<H", 0))
             dir_off = 92
             hdr_dir = dir_off + len(table(0, 0)) - 2
             data = (dir_off + len(table(0, 0)) + 3) & ~3
@@ -45301,10 +45320,22 @@ def self_test():
             struct.pack_into("<H", hdr, 4, 1); hdr[6] = 0x01
             struct.pack_into("<H", hdr, 8, 256)
             struct.pack_into("<H", hdr, 10, 183)
+            stored = bytes(img)
+            if wbits:
+                # The zlib method as mkifs lays it down: one stream (gzopen() writes
+                # gzip, wbits 31), a pad to 4 bytes and a checksum over the stored
+                # words (mk_image_fsys.c:441, 2425-2428). wbits 15 is a zlib stream.
+                import zlib
+                z = zlib.compressobj(9, zlib.DEFLATED, wbits)
+                stored = z.compress(stored) + z.flush()
+                stored += bytes(-len(stored) % 4)
+                words = struct.unpack_from("<%dI" % (len(stored) // 4), stored, 0)
+                stored += struct.pack("<I", -sum(words) & 0xFFFFFFFF)
+                hdr[6] = 0x01 | 0x04
             struct.pack_into("<I", hdr, 32, 512)
-            struct.pack_into("<I", hdr, 36, 512 + len(img))
+            struct.pack_into("<I", hdr, 36, 512 + len(stored))
             struct.pack_into("<I", hdr, 44, len(img))
-            return bytes(hdr) + b"\x00" * (512 - 256) + bytes(img)
+            return bytes(hdr) + b"\x00" * (512 - 256) + stored
 
         ip = os.path.join(d, "ifs_ok.img"); open(ip, "wb").write(_ifs_image())
         try:
@@ -45334,6 +45365,89 @@ def self_test():
         if balanced is not False:
             ok = False
         print(f"  [{mark}] a flipped imagefs byte breaks the image checksum")
+
+        # mkifs writes a dirent only for a listed entry (mk_image_fsys.c:2261-2326),
+        # so "d" above is named only inside the paths under it and the image holds
+        # no time for it. A folder with its own dirent keeps the time that records.
+        try:
+            w = IfsWalker(io.BytesIO(_ifs_image()), 0)
+            own = IfsWalker(io.BytesIO(_ifs_image(own_dir=True)), 0)
+            walked = {p: mt for p, _n, _m, _s, mt, _r in walk_all(w)}
+            said = io.StringIO()
+            with contextlib.redirect_stdout(said):
+                print_tree(w, w.root, 1, 3, [100])
+            shown = {ln.split()[1]: ln.split()[2:] for ln in said.getvalue().splitlines()}
+            good = (w.entry("d") == (IFS_S_IFDIR, 0, None) and walked["d"] is None
+                    and walked["d/f1"] == 0x5000 and shown["d"] == []
+                    and shown["f2"][-1] == "1970-01-01"
+                    and [e[3] for e in collect(w, w.root)] == [0x5000] * 3
+                    and own.entry("d")[2] == 0x6000 and own.entry("d/f1")[2] == 0x5000)
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] an IFS folder with no entry of its own is listed with no time, "
+              f"and one with an entry keeps it")
+
+        # Two stored paths that differ in one byte that is not UTF-8 stay two files,
+        # each with its own bytes, and every name is text SQLite stores.
+        try:
+            w = IfsWalker(io.BytesIO(_ifs_image(n2=b"d\xff/f", n1=b"d\xfe/f", link=b"l\x80",
+                                                tgt=b"/t\xc3\x00x")), 0)
+            files = {p: (node, sz) for p, node, sz, _ in collect(w, w.root) if sz is not None}
+            names = sorted(p for p, *_r in walk_all(w))
+            good = (names == ["d%FE", "d%FE/f", "d%FF", "d%FF/f", "l%80"]
+                    and b"".join(w.read_file(*files["d%FF/f"])) == b"second file\n"
+                    and b"".join(w.read_file(*files["d%FE/f"])) == b"hello d/f1\n"
+                    and w.links == {"l%80": "/t%C3%00x"})
+            try:
+                import sqlite3
+            except ImportError:
+                sqlite3 = None
+            if sqlite3 is not None:
+                db = sqlite3.connect(":memory:")
+                db.execute("create table t (name text unique)")
+                db.executemany("insert into t values (?)",
+                               [(n,) for n in names + list(w.links.values())])
+                good = good and db.execute("select count(*) from t").fetchone()[0] == 6
+                db.close()
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] IFS names and a link target with bytes that are not UTF-8 are "
+              f"kept as %XX, and two such names stay two files")
+
+        # The zlib method. No image a real mkifs compressed is to hand, so this wraps
+        # the synthetic image above the way mk_image_fsys.c does, and as a zlib stream.
+        try:
+            good = True
+            for wbits in (31, 15):
+                blob = _ifs_image(wbits=wbits)
+                w = IfsWalker(io.BytesIO(blob), 0)
+                files = {p: (node, sz) for p, node, sz, _ in collect(w, w.root)}
+                good = (good and w.compress == "zlib" and w.cksum_ok is True
+                        and blob[512:514] == (b"\x1f\x8b" if wbits == 31 else b"\x78\xda")
+                        and b"".join(w.read_file(*files["f2"])) == b"second file\n"
+                        and b"".join(w.read_file(*files["d/f1"])) == b"hello d/f1\n")
+            man = []
+            with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main("ifs-gz.img", extract="(memory)", zf=zf, manifest=man,
+                     image=io.BytesIO(_ifs_image(wbits=31)))
+            good = (good and len(man) == 1 and man[0]["filesystem"] == "qnx_ifs"
+                    and man[0]["compression"] == "zlib" and man[0]["files"] == 2
+                    and man[0]["image_checksum_balances"] is True
+                    and "extract_error" not in man[0])
+        except Exception:
+            good = False
+        mark = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{mark}] a synthetic IFS stored as a gzip stream, as mkifs writes the zlib "
+              f"method, or as a zlib stream reads the same files")
 
         # QNX4. The root name, the .bitmap name and the xblk signature are
         # spelled here as independent literals, deliberately NOT read from the
@@ -50745,7 +50859,10 @@ what it checks, and where the constants come from:
   nothing has to be installed. The decompressed image is walked from its
   image_header and a flat table of image_dirent records: each carries an inode,
   mode, mtime and a full path, and a file points at an offset and size inside
-  the image. zlib images are read through the standard library.
+  the image. A zlib image is one gzip stream, written with gzopen()
+  (mk_image_fsys.c:441, in the vocho/openqnx mirror at cc95df3), and is read
+  through the standard library; that path is tested on a synthetic image only,
+  not on one a real mkifs wrote.
 
   This is proven byte for byte against the Ford Sync G4 ifs_a, ifs_b and
   ifs_recovery volumes. Each decompressed to exactly the imagefs_size its own

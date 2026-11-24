@@ -52,6 +52,25 @@ decompresses to exactly the size its header records and the image checksum
 balances). See [What it does not do](#what-it-does-not-do) for the compression
 methods it recognises but does not yet read.
 
+An IFS entry stores its whole path, and `mkifs` writes an entry only for each item on
+its file list (`mk_image_fsys.c:2261-2326`), so a folder can exist only inside the path
+of another entry. The image holds no time for a folder like that. `--list` shows it
+with no date, and `entry()` and `walk_all()` give `None` for its time, as they do for
+any time a filesystem does not record. Before, it was given the time of the first entry
+found under it. On the three Sync G4 volumes that was 7, 8 and 8 folders. The zip is
+not affected: it holds files, and a file has its own entry.
+
+Bytes in a stored name or a symlink target that are not UTF-8 are kept as `%XX`, one
+path component at a time, so two names that differ only in such a byte stay two files.
+Before, such bytes became U+FFFD and two names like that became one. No name on the
+three volumes has such a byte, so this is proven on the self-test's synthetic image only.
+
+The zlib method is read as the gzip stream `mkifs` writes with `gzopen()`
+(`mk_image_fsys.c:441`); a plain zlib stream is accepted too. Before, the gzip header
+was rejected. No image that a real `mkifs` compressed this way was available: the
+self-test wraps its own synthetic image the way the `mkifs` source does, and the zlib
+method has not been run on an image a real writer made.
+
 It also opens BitLocker volumes with their password, recovery password or startup key
 (`.BEK`) file, and reads the NTFS, FAT32 or exFAT inside them; without a key it names
 the volume, its protectors and what would open it. See [BitLocker](#bitlocker).
@@ -4106,6 +4125,7 @@ STARTUP_HDR_VERSION             1   qnx sys/startup.h:89
 struct startup_header               qnx sys/startup.h
 flags1 compression, block framing   qnx dumpifs.c  (none/zlib/lzo/ucl)
 struct image_header, image_dirent   qnx sys/image.h
+which entries get a dirent, gzopen  qnx mk_image_fsys.c  (vocho/openqnx at cc95df3)
 UCL NRV2B (_8) decompressor          Oberhumer UCL src/n2b_d.c, src/getbit.h
 ```
 
@@ -4116,9 +4136,10 @@ The startup header's field widths sum to 256 bytes, which each image's own
 compressed imagefs is a run of blocks, each a two-byte big-endian length then
 that many bytes decompressing to at most 64 KiB, ending at a zero length. Each
 UCL block is NRV2B, ported from Oberhumer's UCL into a small pure-Python decoder
-so the tool still installs nothing, and `zlib` images are read through the
-standard library. The decompressed image is walked from its `image_header` and a
-flat table of `image_dirent` records.
+so the tool still installs nothing. A `zlib` image is one gzip stream, written
+with `gzopen()` (`mk_image_fsys.c:441`), and is read through the standard library;
+that path is tested on a synthetic image only. The decompressed image is walked from
+its `image_header` and a flat table of `image_dirent` records.
 
 This is proven byte for byte against the Ford Sync G4 `ifs_a`, `ifs_b` and
 `ifs_recovery` volumes: each decompressed to exactly the `imagefs_size` its own
@@ -4484,7 +4505,8 @@ above are in this README only for now.)
   sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
   a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
-  QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
+  QNX IFS boot images are listed and extracted (zlib tested on a synthetic image only,
+  never on one a real `mkifs` wrote); `lzo`-compressed images and the Harman
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
