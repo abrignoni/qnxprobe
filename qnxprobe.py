@@ -14325,6 +14325,33 @@ class Qnx4Walker:
 
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
+        # ``damage`` lists what could not be read, for damage_lines(), and
+        # ``folders_not_read`` counts the folders whose listing is known to be short.
+        self.damage, self.folders_not_read, self._not_read = [], 0, set()
+        # Where the volume ends, from the .bitmap file: one bit per block
+        # (fs/qnx4/inode.c qnx4_statfs, f_blocks = BitMap->di_size * 8). The size is in
+        # whole bytes, so the last byte may cover fewer than eight blocks: the end used
+        # is the lowest the size allows, one block into the last byte, so that a whole
+        # volume is never said to reach past the end of its image.
+        self.declared_end = None
+        sb = read_at(fh, base + QNX4_BLOCK, QNX4_DIRENT)
+        if len(sb) == QNX4_DIRENT:
+            bitmap = _qnx4_bitmap_entry(fh, base, *struct.unpack_from("<II", sb, 20))
+            bsize = struct.unpack_from("<I", bitmap, 16)[0] if bitmap else 0
+            if bsize:
+                self.declared_end = base + ((bsize - 1) * 8 + 1) * QNX4_BLOCK
+
+    def _lost(self, folder, line):
+        """Record something of a folder that could not be read, once per line, and count
+        the folder in folders_not_read, once, because names in it may be missing."""
+        if line in self._not_read:
+            return
+        self._not_read.add(line)
+        if len(self.damage) < 1000:
+            self.damage.append(line)
+        if ("folder", folder) not in self._not_read:
+            self._not_read.add(("folder", folder))
+            self.folders_not_read += 1
 
     def _raw(self, num):
         blk, ndx = divmod(num, 8)
@@ -14386,6 +14413,10 @@ class Qnx4Walker:
                 buf = read_at(self.fh, self.base + sbnum * QNX4_BLOCK,
                               QNX4_BLOCK)
                 if len(buf) < QNX4_BLOCK:
+                    self._lost(num, f"a directory block could not be read in full (block "
+                                    f"{sbnum + 1:,}, {len(buf)} of {QNX4_BLOCK} bytes), so the "
+                                    f"folder's entries from byte {done:,} of its {size:,} on "
+                                    f"are not listed: the folder with inode {num:,}")
                     break
                 for ix in range(8):
                     e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
@@ -14398,8 +14429,15 @@ class Qnx4Walker:
                     else:
                         name = e[0:16].split(b"\x00")[0]
                         child = sbnum * 8 + ix
-                    name = name.decode("utf-8", "replace")
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
                     if name not in (".", ".."):
+                        if e[63] & QNX4_F_LINK and self._raw(child) is None:
+                            self._lost(num, f"the inode entry a name points to could not be "
+                                            f"read (block {iblk:,}, entry {e[52]}), so what it "
+                                            f"names is not exported and its size and dates are "
+                                            f"not known, in the folder with inode {num:,}: "
+                                            f"{name!r}")
                         out.append((name, child))
                 done += QNX4_BLOCK
         return out
@@ -14425,6 +14463,23 @@ class Qnx4Walker:
             left -= avail
 
 
+def _qnx4_bitmap_entry(fh, base, first_blk, first_sz):
+    """The ".bitmap" inode entry of the root directory whose first extent is first_sz
+    blocks from block first_blk (1-based), or None: the search fs/qnx4/inode.c
+    qnx4_checkroot() makes, over that extent only."""
+    if not (1 <= first_blk and 1 <= first_sz <= 65536):
+        return None
+    for j in range(first_sz):
+        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
+        if len(buf) < QNX4_BLOCK:
+            return None
+        for ix in range(8):
+            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
+            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
+                return e
+    return None
+
+
 def identify_qnx4(fh, base, size=None):
     """Return ("qnx4", lines) if a QNX4 filesystem starts at base, else None.
 
@@ -14440,20 +14495,7 @@ def identify_qnx4(fh, base, size=None):
     if (struct.unpack_from("<H", sb, 50)[0] & 0o170000) != S_IFDIR:
         return None
     first_blk, first_sz = struct.unpack_from("<II", sb, 20)
-    if not (1 <= first_blk and 1 <= first_sz <= 65536):
-        return None
-    bitmap = None
-    for j in range(first_sz):
-        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
-        if len(buf) < QNX4_BLOCK:
-            break
-        for ix in range(8):
-            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
-            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
-                bitmap = e
-                break
-        if bitmap:
-            break
+    bitmap = _qnx4_bitmap_entry(fh, base, first_blk, first_sz)
     if bitmap is None:
         return None
     bsize = struct.unpack_from("<I", bitmap, 16)[0]      # .bitmap di_size, bytes
@@ -48834,7 +48876,9 @@ def self_test():
                                          0o100444, 1712000000, 0x11)
         # block 3: the root directory
         root = bytearray(512)
-        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 64, 5, 1, 0, 1,
+        # .bitmap is 2 bytes: one bit per block for the 12 blocks of this image
+        # (fs/qnx4/inode.c qnx4_statfs), which is what the walker's declared end reads.
+        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 2, 5, 1, 0, 1,
                              0o100444, 1712000000, 0x01)
         root[64:128] = _q4_ino(b"selftest.txt", len(q4_pay), 6, 1, 0, 1,
                                0o100644, 1712000001, 0x01)
@@ -48894,6 +48938,91 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic QNX4: root, .bitmap, link entry, "
               f"two-extent xblk file all read: kind={kind}")
+
+        # QNX4 names. A byte that is not UTF-8 becomes %XX of the stored byte and a "/"
+        # stored inside one name becomes %2F, so two names that differ in one such byte
+        # stay two names, neither invents a folder, and both go into SQLite as they are.
+        try:
+            q4n = bytearray(q4)
+            q4n[1024 + 64:1024 + 80] = b"a\xffb/c".ljust(16, b"\x00")     # was selftest.txt
+            q4n[1024 + 192:1024 + 208] = b"a\xfeb/c".ljust(16, b"\x00")   # was multi.bin
+            nw = Qnx4Walker(io.BytesIO(bytes(q4n)), 0)
+            q4_paths = sorted(e[0] for e in collect(nw, nw.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            ndb = sqlite3.connect(":memory:")
+            ndb.execute("create table n (name text)")
+            ndb.executemany("insert into n values (?)", [(n,) for n in q4_paths])
+            kept = sorted(r[0] for r in ndb.execute("select name from n"))
+            ndb.close()
+            ngood = (q4_paths == sorted([".bitmap", "a%FEb%2Fc", "a%FFb%2Fc",
+                                         "a_longer_name_than_sixteen.txt"])
+                     and kept == q4_paths and not nw.damage and not nw.folders_not_read)
+            nsaid = ", ".join(q4_paths)
+        except Exception as exc:                     # pylint: disable=broad-except
+            ngood, nsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not ngood:
+            ok = False
+        print(f"  [{'PASS' if ngood else 'FAIL'}] QNX4 names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, kept apart and stored in SQLite "
+              f"({ascii(nsaid)[1:-1][:120]})")
+
+        # A QNX4 volume cut just after its root directory block. The inode entry the long
+        # name links to (block 4) and every file's data lie past the cut. The export has
+        # to say the volume reaches past the end, record the name it could not follow and
+        # count the folder as not read in full, which is what makes the run exit 1; the
+        # whole volume gains none of that. Removed when the row ends, because the build
+        # workflow counts the images left in this folder.
+        def q4_export(raw):
+            path = os.path.join(d, "qnx4_cut_after_root.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = zf.namelist()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            crec, cheld, cout = q4_export(bytes(q4[:1536]))
+            wrec, wheld, wout = q4_export(bytes(q4))
+            c0, w0 = (crec[0] if crec else {}), (wrec[0] if wrec else {})
+            first = (c0.get("damage_first") or [""])[0]
+            # the same cut with a root directory of two blocks: the second is past the cut
+            two = bytearray(q4[:1536])
+            struct.pack_into("<I", two, 512 + 16, 1024)          # RootDir di_size
+            struct.pack_into("<II", two, 512 + 20, 3, 2)         # its extent: blocks 3 and 4
+            tw = Qnx4Walker(io.BytesIO(bytes(two)), 0)
+            tnames = [n for n, _c in tw.listdir(tw.root)]
+            cgood = (len(crec) == 1 and c0.get("filesystem") == "qnx4"
+                     and c0.get("folders_not_read") == 1 and c0.get("damage_recorded") == 1
+                     and "block 4, entry 1" in first
+                     and first.endswith("in the folder with inode 8: "
+                                        "'a_longer_name_than_sixteen.txt'")
+                     and c0.get("files") == 0 and c0.get("short") == 3
+                     and c0.get("extends_past_image_by_bytes") == 9 * 512 - 1536
+                     and "INCOMPLETE" in cout and _volumes_not_read(crec) == 1
+                     and not any("a_longer_name" in n for n in cheld)
+                     and len(wrec) == 1 and w0.get("files") == 4 and w0.get("short") == 0
+                     and "damage_recorded" not in w0 and "folders_not_read" not in w0
+                     and "extends_past_image_by_bytes" not in w0
+                     and "INCOMPLETE" not in wout and _volumes_not_read(wrec) == 0
+                     and len(tnames) == 4 and tw.folders_not_read == 1
+                     and any("a directory block could not be read in full (block 4, 0 of "
+                             "512 bytes)" in line and "from byte 512 of its 1,024" in line
+                             for line in tw.damage))
+            csaid = first[:150] or "no damage record"
+        except Exception as exc:                     # pylint: disable=broad-except
+            cgood, csaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not cgood:
+            ok = False
+        print(f"  [{'PASS' if cgood else 'FAIL'}] a QNX4 volume cut after its root directory "
+              f"records the name whose inode entry is past the cut and a directory block "
+              f"past it, counts the folder as not read and is marked incomplete; the whole "
+              f"volume records nothing ({csaid})")
 
         # Sabotage: break the .bitmap name and detection must refuse, exactly
         # as the kernel refuses to mount without it (qnx4_checkroot).

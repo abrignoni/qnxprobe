@@ -4337,6 +4337,25 @@ written by a separate generator program (its skeleton follows Peter
 Waechtler's Linux-side QNX4 `dinit`, a second independent statement of the
 layout), not by this parser, so the two sides are independent.
 
+QNX4 names and a cut QNX4 volume. A name is stored as bytes and the kernel passes them
+on as they are (`fs/qnx4/dir.c`). Here a byte that is not UTF-8 becomes `%XX` of the
+stored byte and a `/` stored inside one name becomes `%2F`, as for the other readers,
+where before the byte became U+FFFD and the `/` split the name into folders. The walker
+also takes an end for the volume from the `.bitmap` file, one bit per block as
+`qnx4_statfs()` in `fs/qnx4/inode.c` counts it (`BitMap->di_size * 8`). The size is in
+whole bytes, so its last byte may stand for fewer than eight blocks: the end used is the
+lowest that size allows, `(di_size - 1) * 8 + 1` blocks, so the report can fall up to
+seven blocks (3,584 bytes) short of how far a cut volume reached, and a whole volume is
+never said to reach past its image because of the rounding. When the image ends before
+that, the volume is marked INCOMPLETE with `extends_past_image_by_bytes`. A directory
+block that cannot be read in full, and a long name whose inode entry (reached through
+its link) cannot be read, each get a damage record naming the block, and the folder is
+counted in `folders_not_read`, so the run exits 1. Before, such a name was dropped with
+no record and exit 0. **Both changes are proven on the self-test's synthetic 12-block
+image only**, built by the test itself and not by a QNX4 writer: no real QNX4 volume
+was available, so non-ASCII names, the way a real formatter sizes `.bitmap`, and a cut
+through a real volume are not exercised.
+
 QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0):
 
