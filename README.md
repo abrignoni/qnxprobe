@@ -271,8 +271,9 @@ bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as o
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
-(files that could not be read, which are not in the zip) and, on a
-volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
+(files that could not be read, which are not in the zip), on a
+volume that does, `extends_past_image_by_bytes`, and on an ext volume with something to
+say about the whole volume, `note`. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -333,9 +334,75 @@ back a shorter file with its pages in the wrong order. The two ext fixtures unde
 `tests/fixtures/` hold a hole first, a hole in the middle, a trailing hole past the
 last block, a file that is nothing but hole and a 3 MiB file with data at both ends,
 built with `mke2fs -d` from one tree (`tools/make_ext_fixtures.sh`); the self-test
-requires every one to hash to what `sha256sum` recorded over that tree. A file whose
-data is inline in its inode is read when it fits the inode's 60 bytes and refused,
-by name, when the rest lives in an extended attribute this does not read.
+requires every one to hash to what `sha256sum` recorded over that tree. A file or
+folder whose data is inline in its inode is read from the inode's 60 bytes and its
+`system.data` attribute. Past what those two hold, a file reads as zeros, as it does in
+the kernel. `meta_bg` volumes are read through the descriptor block of each meta group.
+A stored ext name that is not valid UTF-8 keeps its bytes as `%XX`, so `bad_<0xFF>.bin` is
+`bad_%FF.bin` and two such names stay two names. A NUL or `/` stored inside one name becomes
+`%00` or `%2F`, so it cannot cut a path or invent a folder.
+
+This reader records the damage it recognises. It does not claim to detect damage in
+general: a damaged value that still looks valid is read as stored. Cut images were tested at
+three points per known-data volume (the last 4 KiB, halfway, and just after the superblock). A
+folder that cannot be read in full (its inode, a block past the end of the image, a record
+length that cannot be right) is counted in `folders_not_read` and named in `damage_first`,
+and the run exits 1. So is a group descriptor that points off the volume, and each name
+whose inode that costs gets a `FAILED` row. A live name whose inode is blank (mode 0), has
+a mode that is none of the seven file types, or fails its checksum on a `metadata_csum`
+volume is `FAILED` the same way, and is never counted as a special file. A regular file
+whose size is past what e2fsck accepts for that volume is `FAILED` with that size in its row
+(`e2fsck/pass1.c` in e2fsprogs 1.47.2). With extents the limit is 2^(32 + block bits) - 1
+bytes, 16 TiB at 4 KiB blocks. With a block map it is what the direct and three indirect
+levels address, about 4 TiB at 4 KiB blocks. A size below that limit is exported at full
+length, so a damaged size can still produce a very large run of zeros.
+
+A file whose block map is partly lost or past the end of the image keeps the blocks of
+every map entry it can follow, at their own offsets. An extent entry that fails the map's
+checks is not followed. Inside an extent block, neither are the others in its 512-byte
+sector, and entries outside that sector are kept. In the extent root in the inode, only the
+bad entry is left out. On `metadata_csum` volumes an extent block that fails its checksum is
+recorded. The file is stored under the
+`.SHORT-<here>-of-<size>-bytes` name, what was lost reads as zeros, and its `SHORT` row
+names the file blocks. A zero pointer counts as lost only when `i_blocks` records more
+blocks than the map reaches, counted as e2fsck counts them, values in EA inodes included.
+The row then says how many bytes among the file's holes may be lost. e2fsck does not make
+that comparison on a volume the Hurd created, so neither does this. Only a file whose extent
+root cannot be read at all is `FAILED`. A 0-byte file has nothing to lose, so it exports
+empty with a damage note.
+
+Limits:
+
+- A volume of one block group has no backup superblock, so losing its one superblock
+  leaves nothing that says an ext volume was there, and no record is written. Where a valid
+  backup exists at a standard position the region gets a `note` saying so, and it is not
+  read. `mkswap` and `wipefs` leave such a copy behind on an undamaged region, so this note
+  does not change the exit status.
+- Without `metadata_csum`, a damaged inode or map entry that still forms valid values reads
+  as valid. An inode whose type disagrees with its folder entry is recorded.
+- A stored size below e2fsck's limit is treated as a real sparse file. On a volume without
+  `metadata_csum`, a damaged size there is exported as zeros up to that size, which can run
+  to terabytes.
+
+The ext journal is not replayed. When a volume has `needs_recovery` set, the state line
+says so instead of calling it cleanly unmounted, and its record in `volumes.json` has a
+`note` saying how much the journal holds pending: committed transactions, the log blocks
+they take and the block copies they carry, counted from the journal's sequence numbers
+with its checksums not checked. The note also says newer data may exist there and that the
+listing shows the blocks as stored. Whether a pending block changes any file is not checked.
+
+A file flagged encrypted (fscrypt) is exported as stored, so an examiner who later holds
+the keys can still use it. fscrypt zero-pads the last data unit, and ciphertext cut at the
+file's size could not be decrypted, so the member runs through the end of the block holding
+the last byte and can be longer than the file's logical size. Each file gets an `ENCRYPTED`
+row that states that size, the volume's `exceptions` counts them as `encrypted`, and its
+`note` gives the count. This alone does not change the exit status. A flagged folder's names
+are not the real names: their stored bytes are shown, with `%XX` for a byte that does not
+decode and for a NUL or `/`. Nothing here decrypts anything, and the flag is all the
+self-test proves.
+
+An external journal device holds no files. It gets a record in `volumes.json` that says what
+it is.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
@@ -516,7 +583,9 @@ Since 1.76, `times(node)` on the ext2/3/4, APFS and HFS+ walkers gives a file's 
 folder's times in the shape the Btrfs walker already used: a dict of `modified`,
 `accessed`, `changed` and `created`, each `(seconds, nanoseconds)` since 1970-01-01
 UTC or `None` where the volume holds no value, and `None` for a node with no inode or
-record. `entry()` is unchanged.
+record. On ext, `entry()` takes its modified time from this reading, so a date before
+1970 or after 2106 reaches the zip's record as stored. On APFS and HFS+ `entry()` is
+unchanged.
 
 | | modified | accessed | changed | created | also |
 | --- | --- | --- | --- | --- | --- |
