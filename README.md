@@ -389,7 +389,8 @@ first letter escaped, so `nul` is held as `%6Eul`. A name with an extension, suc
 walking a volume (a structure that failed its check, a record it could not resolve) is
 printed under `--list` as `DAMAGE`, counted on the extraction line as `DAMAGED`, with
 the first five shown, and kept in `volumes.json` as `damage_recorded` and
-`damage_first` (up to 50).
+`damage_first` (up to 50). A damaged volume can produce wrong or invented entries that the
+tool may not flag.
 
 ## Reading an image from Python
 
@@ -541,13 +542,97 @@ it. A size of zero reads nothing. Asked for the first 3 MiB of a 200 MiB file on
 and an exFAT volume macOS wrote, 1.76 read the whole 200 MiB and 1.77 read about 3 MiB of
 the image. A request for the recorded size or more returns what it did before.
 
+## FAT12, FAT16 and FAT32: what a damaged volume reports
+
+What the reader found goes in the walker's `damage` list, which an export writes to
+`volumes.json` as `damage_recorded` and `damage_first`. A record states what was found.
+`folders_not_read` and exit 1 mean something was lost or could not be read: a folder not
+read to its end, clusters no live chain reaches that hold folder entries, or such clusters
+on a volume whose boot state byte is clear (see below).
+
+- **A chain ends at any table value that is not a cluster of the volume:** a free entry,
+  the bad-cluster mark, or a link past the last cluster. A file read also ends at the first
+  cluster the image does not hold in full, so nothing after a gap lands at the wrong
+  offset. Either way the member is `.SHORT-<got>-of-<size>-bytes`.
+- **A folder is different.** Its entries do not depend on their offset, so a cluster the
+  image lacks is recorded and passed over, and the clusters after it are still listed. A
+  chain that stops before the folder's end marker is recorded, with what another FAT copy
+  holds at that link, including an end-of-chain mark where another copy still holds a link.
+  That link is not followed.
+- **Clusters nothing reaches.** The clusters the FAT marks in use that no live chain
+  reaches are counted, whole chains claimed and the bad-cluster mark left out. What they
+  mean depends on the boot sector's state byte (offset 37, or 65 on FAT32). Microsoft's
+  specification calls it reserved. Linux sets bit 0 at mount and clears it at unmount, and
+  Windows left it set on volumes copied while mounted.
+  - **Any cluster that holds folder entries** is a loss and sets exit 1, whatever the byte
+    says, because the files those folders record are not listed.
+  - **Byte clear:** the volume says it was cleanly unmounted, so an interrupted write does
+    not explain them. That is a loss and sets exit 1. A writer that never sets the byte
+    gets the same record.
+  - **Byte set, no folder entries:** a note with the clusters and bytes, and exit 0. This
+    is what an interrupted write leaves (`chkdsk` turns them into `FOUND.000`), and the
+    count does not mean that much content was lost: on five Windows FAT32 captures of a
+    large file being written, every folder read, every known file matched, and the lost
+    chains of over 120,000 clusters held 2 to 7 MiB of the writer's bytes and zeros.
+  - **Boot sector lost:** the backup does not carry the byte, so a clean unmount cannot be
+    shown, and this counts as a loss.
+
+  FAT[1]'s clean-shutdown bit does not separate these: it read clean on all 95 FAT16 and
+  FAT32 volumes measured, the five captures included. The record also says when a live
+  empty or deleted entry still names the chain.
+
+  This count sees only allocated clusters, so it does not detect damage to a folder in
+  general. On Windows-written FAT16 and FAT32 volumes, zeroing the last used sector of a
+  folder of 121 empty long-named files listed 120 of them, with exit 0 and no record.
+- **Notes, which change neither the listing nor the exit status.** Slots after an
+  end-of-directory marker, whether they hold data or the `0xE5` mark, and reserved attribute
+  bits are recorded as notes. Linux reports media whose trailing slots were never zeroed, so
+  they do not show that anything was lost.
+- **Recorded and still read:** a cluster two chains hold, a chain longer than its size
+  needs, and two entries that start at one cluster.
+- **Free space.** A cluster is free only when every FAT copy that counts and holds its entry
+  says so. Where a second copy counts, a sector of one copy lost to zeros does not turn live
+  files into unallocated space. With one FAT, or with mirroring off, there is no second copy
+  to ask and a zeroed entry reads as free. The count of clusters the copies differ on is in
+  the `--unallocated` output.
+- **Boot sector.** A FAT32 boot sector that is all zeros is replaced by the backup at
+  sector 6, if the copy has a usable geometry and a table where it says one is. On a
+  partition the table types FAT, the same applies to a boot sector that fails validation any
+  other way (0xFF, noise, an impossible geometry), once no other filesystem has claimed the
+  partition. The record says the backup was used. When a partition typed FAT has no valid
+  boot sector and no usable backup (FAT12 and FAT16 have none), `volumes.json` says so in
+  `extract_error` and the run exits 1. A bare image with no partition table gives no sign it
+  was FAT, so a bad boot sector there is reported only as not recognised. A FAT32 boot
+  sector that describes no usable layout and has no usable backup is named as not read.
+- **FAT copies that disagree.** When a file's chain follows a link the FAT copies hold
+  differently, it gets a `FAT_COPIES_DIFFER` row in the exceptions table, counted as
+  `fat_copies_differ`, naming the cluster and both values. Which copy is right is not known,
+  so the table in use is still the one read, and the file's bytes from that point may not
+  be its own. The row does not change the exit status.
+- **Active table.** With FAT32 mirroring off (`BPB_ExtFlags` bit 7), chains, free space
+  and deleted-file checks use only the table that field names, because the others are
+  stale by definition. TFAT is left out of this, as described below.
+- **Names.** A long name is used only when its entries are in order and carry the short
+  entry's checksum; otherwise the short name is the one reported. The volume does not say
+  which OEM code page its short names use, so none is assumed: a byte above `0x7F` shows
+  as `%XX` of the stored byte (`0x82` is `%82`), and a first byte of `0x05`, which stands
+  for `0xE5`, shows as `%E5`. An unpaired UTF-16 unit in a long name shows the same way, in
+  stored order (U+D800 is `%00%D8`). A NUL ends a long name, as Linux reads it, on live and
+  deleted entries alike; in a short name it shows as `%00`. A `/` stored inside a name shows
+  as `%2F`, so it cannot invent a folder. Two different stored names stay different, and a
+  name never holds a surrogate. A literal `%` is not escaped, so a file really named
+  `CAF%82.TXT` can match an escaped one, and the duplicate handling keeps both.
+- **Times.** A stored date or time that is not a valid reading, such as month 13 or
+  30 February, is shown with its raw words, not as a blank.
+
 ## FAT16, FAT12 and transaction-safe FAT (TFAT)
 
 Since 1.62. A FAT16 volume is read through `Fat16Walker` and a FAT12 volume through
 `Fat12Walker`, with the same listing, reading, `deleted_files()`, `free_extents()` and
-`chain_shortfall()` calls as FAT32. Either is recognised by a `FAT16   ` or `FAT12   ` type
-string at offset 54 of the boot sector, the `0x55AA` signature, and a BPB a cluster count
-can be computed from. Which of the two it is comes from that count and not from the
+`chain_shortfall()` calls as FAT32. Either is recognised by a `FAT16   `, `FAT12   ` or
+generic `FAT     ` type string at offset 54 of the boot sector (Microsoft's specification
+lists the generic one and FatFs writes it), the `0x55AA` signature, and a BPB a cluster
+count can be computed from. Which of the two it is comes from that count and not from the
 string, because Microsoft's FAT specification types a volume by its count of clusters and
 nothing else: fewer than 4,085 is FAT12, and 4,085 to 65,524 is FAT16. A volume whose
 string and count disagree is read by its count, and the report says both.
@@ -1665,22 +1750,62 @@ survive, so a deleted file comes back with all of them.
 
 What neither keeps is where a fragmented file's later clusters lay: FAT32 zeroes the
 chain on delete, and exFAT keeps a chain only for a file it wrote fragmented in the
-first place. So a file that occupied one run is recovered exactly, and one whose size
-would need clusters that a later file has since taken is reported as having existed
-rather than read, because reading it would splice in bytes that now belong to something
-else. A recovered file says in `assumed_contiguous` whether its layout was taken on the
-one-run assumption or from a chain the volume still held. A deleted directory whose
-first cluster is still free and still parses as a directory is walked into, so a folder
-of photographs deleted whole comes back file by file.
+first place. A file whose size would need clusters now in use is reported as having existed
+rather than read. A recovered file says in `assumed_contiguous` whether its
+layout was taken on the one-run assumption or from a chain the volume still held.
+
+**`recoverable` means nothing on the volume contradicts the file. It does not mean the bytes
+are the file's.** FAT and exFAT cannot prove that a free cluster still holds a deleted file.
+A later file can reuse the clusters and then be deleted with its directory slot overwritten,
+and nothing on the volume records that, so a recoverable file can read as another file's
+content, or as a splice of several when it was fragmented. Measured on Windows-written
+FAT16 volumes, one such file returned exactly another file's bytes and a 10-cluster one held
+5 clusters of other files. Every recoverable entry therefore has `content_unverified` True,
+and what `read_deleted()` returns for it is a candidate to check.
+
+A FAT file is `recoverable` when every cluster of that run is on the volume, in the image,
+free in every FAT copy that counts, claimed by no other surviving deleted entry, and not a
+folder's first cluster (one that opens with a `.` entry naming it, then `..`). When two deleted entries' runs overlap, the
+volume does not record which wrote last, so both are listed and neither is read. A run
+is claimed only up to its first cluster in use, and a deleted folder claims only clusters
+that were read as its entries. When the other entry has the same first cluster and size,
+`reason` names it: a rename or move then delete leaves that, and so can a same-size
+replacement, so the two are not treated as one file.
+
+**A zero high word on a large FAT32 volume.** The Windows driver zeroes the high word of a
+first cluster when it marks an entry deleted, so on a volume with a cluster numbered
+`0x10000` or above (65,535 clusters or more, since numbering starts at 2) a zero there does
+not by itself say where the file began. This rule is for entries marked
+deleted: an unmarked child of a deleted folder never went through a delete and keeps its
+stored high word. The candidates are the low word plus a multiple of 65,536, within
+clusters 2 to the last, so a low word of 0 or 1 starts at 65,536 or 65,537. When exactly one
+fits, that is the first cluster. Otherwise the entry is listed with `first_cluster` 0 and
+is not recoverable, and `reason` says the first cluster is ambiguous and keeps the low word.
+A file that may overlap such an entry's candidates is not recoverable either. A driver that
+leaves the word alone writes the same zero for a file that really is in the low clusters
+(the macOS-written `fat32-deleted` fixture is one), and the entry cannot tell the two apart,
+so those files are reported as ambiguous too when their low word fits a second cluster.
+
+**Deleted folders.** A deleted directory whose first cluster is free in every FAT copy and
+still parses as a directory is walked into, and every entry in it counts as deleted, marked
+or not, because the Windows driver was seen leaving some unmarked. Its chain is gone, so it
+is read as one run from its first cluster, and the run stops at a cluster in use, at the
+first cluster of another folder, or at one that does not read as folder entries. An end marker counts only as a slot of 32 zero bytes,
+because MP4 and HEIC data also open with zeros. Reading less than the folder's recorded
+size, or stopping before an end marker, is recorded. On the Windows-written test volumes the folder's clusters were interleaved
+with its files, so 3 to 15 of each deleted folder's files were listed (of 50 on FAT12 and
+170 on FAT16 and FAT32). A folder that lost its high word is placed only by a free cluster
+whose `.` entry names that cluster, and only when exactly one does.
 
 Validated the same way as NTFS. `tools/make_fat_deleted_fixtures.sh` builds a FAT32 and
 an exFAT image, each with a folder of two photographs and one fragmented photograph,
 created and then deleted; the self-test recovers them from the directory entries and
 matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers the same
-bytes from the same entries. The fragmented file that lands across reused space is
-refused by this reader and is the one case `icat` will read on the contiguous
-assumption; refusing it is the deliberate choice not to present bytes the entry cannot
-vouch for.
+bytes from the same entries. The FAT32 fixture has 129,022 clusters and its low words fit
+two clusters each, so at its real size its entries are ambiguous under the rule above: the
+self-test compares the bytes with its recorded size cut in memory to 65,535 clusters. The
+fragmented file whose run reaches clusters in use is refused by this reader and is the one case
+`icat` will read on the contiguous assumption.
 
 ### exFAT: orphan directory entries
 
