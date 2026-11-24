@@ -11803,6 +11803,8 @@ EFS_COND, EFS_FREE, EFS_ALLOC, EFS_DELETE, EFS_BAD = 0x0070, 0x0070, 0x0030, 0x0
 EFS_TYPE, EFS_FILE, EFS_DIR, EFS_SYS = 0x0300, 0x0300, 0x0200, 0x0100
 EFS_COND_NAMES = {EFS_FREE: "free", EFS_ALLOC: "allocated", EFS_DELETE: "deleted",
                   EFS_BAD: "bad"}
+EFS_DAMAGE_CAP = 1000              # damage lines kept; folders_not_read counts them all
+_EFS_UNRESOLVED = "a pointer in its extent chain no longer resolves"
 
 
 def _efs_boot_at(buf, at):
@@ -11841,7 +11843,11 @@ def _efs_unit_info(b):
 
 def _efs_partition_from_sig(fh, sig, limit):
     """The partition whose boot record has its signature at byte sig of the
-    image, or None. limit is the offset the partition must end by."""
+    image, or None. limit is the offset the partition must end by, unless the
+    image itself ends at or before limit: a partition the record places past
+    the end of the image is returned with the size the record gives it, so a
+    cut image does not lose the partition without a word (EfsWalker says what
+    the image holds of it)."""
     if sig < 4:
         return None
     boot = _efs_boot_at(read_at(fh, sig - 4, 24), 4)
@@ -11868,9 +11874,10 @@ def _efs_partition_from_sig(fh, sig, limit):
     if toff != sig - 4 - ustart:
         return None
     base = ustart - boot["unit_index"] * unit_size
-    if (base < 0 or boot["unit_total"] < 1 or boot["unit_index"] >= boot["unit_total"]
-            or base + boot["unit_total"] * unit_size > limit):
+    if base < 0 or boot["unit_total"] < 1 or boot["unit_index"] >= boot["unit_total"]:
         return None
+    if base + boot["unit_total"] * unit_size > limit and limit < image_size(fh):
+        return None                           # it does not fit, and the image goes on
     boot.update(base=base, size=boot["unit_total"] * unit_size, unit_size=unit_size,
                 sig_at=sig - base)
     return boot
@@ -11878,6 +11885,8 @@ def _efs_partition_from_sig(fh, sig, limit):
 
 def _efs_locate(fh, base, size):
     """The EFS partition that starts at base and fits in size bytes, or None.
+    One that runs past the end of the image is returned too
+    (_efs_partition_from_sig).
 
     The first unit has to open with a unit_info, which sizes the units; the boot
     record is then looked for at the front of every unit, since the unit holding
@@ -11887,7 +11896,9 @@ def _efs_locate(fh, base, size):
     if info is None:
         return None
     us = info[1]
-    for u in range(min(size // us, 0x10000)):         # unit_total is a u2
+    # A last unit the image cuts is looked at too: its record still counts when
+    # the header that points at it is in the image.
+    for u in range(min(-(-size // us), 0x10000)):     # unit_total is a u2
         head = read_at(fh, base + u * us, EFS_BOOT_SCAN)
         j = head.find(EFS_SIG)
         while j >= 0:
@@ -11907,7 +11918,8 @@ def efs_partitions(fh, size):
     base and size in bytes, unit_size, endian ("<" or ">"), unit_index,
     unit_total, unit_spare, align_pow2, root, and sig_at, the signature's offset
     from base. Two records that place the same partition count once, and a
-    partition that overlaps one already found is left out."""
+    partition that overlaps one already found is left out. size is what the
+    record gives, so on a cut image base + size can lie past the end."""
     sigs, step, pos = [], 1 << 20, 0
     while pos < size:
         chunk = read_at(fh, pos, min(step + len(EFS_SIG), size - pos))
@@ -11942,7 +11954,20 @@ class EfsWalker:
     An extent is a dict: u and i (physical unit and header index), s0
     (status[0]), status1, off and tsize (its text within the unit), next and
     super (extent pointers). recover_deleted() lists what the flash still holds
-    of deleted and superseded files; unaccounted() is the consistency check."""
+    of deleted and superseded files; unaccounted() is the consistency check.
+
+    A partition the image holds only part of is still read. The boot record
+    gives the unit count, so ``declared_end`` is where the partition ends and
+    ``units_cut`` how many of its units the image does not hold whole. A unit's
+    header array sits at its end, so a unit the image cuts has none and nothing
+    in it is read. ``note`` and the first line of ``damage`` say how many bytes
+    the record gives the partition and how many the image holds, and
+    ``folders_not_read`` counts that once, and once more for each folder whose
+    chain of entries stops at a pointer that does not resolve. A file whose
+    extent chain stops that way is not handed back cut: the directory records no
+    size, so read_file() raises, saying how many bytes the chain reached. On a
+    partition the image holds whole none of this applies and a chain is read as
+    it stands."""
 
     def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
@@ -11959,11 +11984,54 @@ class EfsWalker:
         for u in range(boot["unit_total"]):
             raw = read_at(fh, base + u * self.unit_size, self.unit_size)
             self.units.append((raw, self._extents(raw, u)))
+        self.damage, self.folders_not_read = [], 0
+        self._not_read, self._names = set(), {}
+        self.declared_end = base + boot["size"]
+        self.units_cut = sum(1 for raw, _exts in self.units if len(raw) < self.unit_size)
+        self.note = None
+        if self.units_cut:
+            held = sum(len(raw) for raw, _exts in self.units)
+            one = self.units_cut == 1
+            self.note = (f"cut short: the boot record gives this EFS partition "
+                         f"{boot['unit_total']:,} units of {self.unit_size:,} bytes "
+                         f"({boot['size']:,} bytes) and the image holds {held:,} of those "
+                         f"bytes; {self.units_cut:,} of the units {'is' if one else 'are'} "
+                         f"not whole in the image and {'was' if one else 'were'} not read")
+            self._count_not_read("partition", self.note)
         self.logi_map = self._logi_map()
         root = self._dirent(self._get_ext(boot["root"]))
         if root is None:
-            raise ValueError("the EFS root directory entry does not read")
+            raise ValueError("the EFS root directory entry does not read"
+                             + (f" ({self.note})" if self.note else ""))
         self.root = root[1]
+
+    def _count_not_read(self, what, line):
+        """Record one thing not read in full, once per ``what``: a line in
+        ``damage`` (see damage_lines) and one more in ``folders_not_read``."""
+        if what in self._not_read:
+            return
+        self._not_read.add(what)
+        self.folders_not_read += 1
+        if len(self.damage) < EFS_DAMAGE_CAP:
+            self.damage.append(line)
+
+    def _stops_at_cut(self, why):
+        """Whether a chain that stopped (_chain_from) did so at a pointer that
+        does not resolve, on a partition the image holds only part of. What the
+        chain went on to is then not known."""
+        return bool(self.units_cut) and why == _EFS_UNRESOLVED
+
+    def _folder_name(self, node):
+        """The path listdir() has seen a folder under, for a damage line."""
+        if node == self.root:
+            return "the root folder"
+        parts = []
+        while node in self._names and len(parts) < 64:
+            node, name = self._names[node]
+            parts.append(name)
+        if not parts or node != self.root:
+            return "a folder not reached from the root"
+        return "/".join(reversed(parts))
 
     def _extents(self, unit, u):
         """The unit's extent headers, index 0 first. They run down from the end
@@ -12058,7 +12126,7 @@ class EfsWalker:
         ext = self._get_ext(first)
         while True:
             if ext is None:
-                return out, "a pointer in its extent chain no longer resolves"
+                return out, _EFS_UNRESOLVED
             if (ext["u"], ext["i"]) in seen:
                 return out, "its extent chain loops"
             seen.add((ext["u"], ext["i"]))
@@ -12072,12 +12140,22 @@ class EfsWalker:
 
     def listdir(self, node):
         out = []
-        for ext in self._chain(node):
+        chain, why = self._chain_from((node[0], node[1]))
+        for ext in chain:
             if not ext["tsize"]:
                 break
             d = self._dirent(ext)
             if d:
                 out.append(d[:2])
+                if d[1][2] & S_IFMT == S_IFDIR:
+                    self._names.setdefault(d[1], (node, d[0]))     # for _folder_name
+        else:                                        # listed to where the chain stops
+            if self._stops_at_cut(why):
+                self._count_not_read((node[0], node[1]), (
+                    f"folder not listed in full: its chain of entries stops after "
+                    f"{len(chain):,} extent(s) at a pointer that does not resolve, on a "
+                    f"partition the image holds only part of, so what follows is not "
+                    f"known: {self._folder_name(node)}"))
         return out
 
     def _size(self, node):
@@ -12089,8 +12167,15 @@ class EfsWalker:
         return (mode, size, node[3])
 
     def read_file(self, node, size):
+        chain, why = self._chain_from((node[0], node[1]))
+        if self._stops_at_cut(why):
+            raise ValueError(
+                f"not read: its extent chain stops after {len(chain):,} extent(s) holding "
+                f"{sum(ext['tsize'] for ext in chain):,} bytes at a pointer that does not "
+                f"resolve, on a partition the image holds only part of; EFS records no "
+                f"file size, so how much is missing is not known")
         out = bytearray()
-        for ext in self._chain(node):
+        for ext in chain:
             out += self._text(ext)
         yield bytes(out[:size]) if size else bytes(out)
 
@@ -21412,12 +21497,14 @@ def identify_etfs(fh, base, size):
 
 def identify_efs(fh, base, size):
     """Return ("efs", lines) if an EFS (F3S) partition starts at base and fits in
-    size bytes, else None. The boot record may sit in any of its units."""
+    size bytes, else None. The boot record may sit in any of its units. A
+    partition the record places past the end of the image is named too, with a
+    line saying how much of it the image holds."""
     part = _efs_locate(fh, base, size)
     if part is None:
         return None
     us = part["unit_size"]
-    return "efs", [
+    lines = [
         f"unit size    {human(us)}   {part['unit_total']} units, "
         f"{part['unit_spare']} spare",
         f"byte order   {'little' if part['endian'] == '<' else 'big'}-endian",
@@ -21425,6 +21512,11 @@ def identify_efs(fh, base, size):
         f"boot record  QSSL_F3S at +0x{part['sig_at']:x}, in unit {part['unit_index']}",
         f"root         logical unit {part['root'][0]}, extent {part['root'][1]}",
     ]
+    held = image_size(fh) - base
+    if held < part["size"]:
+        lines.append(f"cut short    the boot record gives it {part['size']:,} bytes and the "
+                     f"image holds {max(held, 0):,} of them")
+    return "efs", lines
 
 
 def identify_apfs(fh, base):
@@ -33987,9 +34079,10 @@ def flash_regions(fh, size):
       EFS       a QNX F3S partition, found by its boot record wherever in the
                 partition wear levelling left it and placed by the record's
                 unit_index (efs_partitions); its extent is the unit count the
-                record gives. The signature is looked for at every offset, not
-                only aligned ones, and the partition's start is aligned to its
-                own unit size
+                record gives, or what the image holds of that when it ends
+                first. The signature is looked for at every offset, not only
+                aligned ones, and the partition's start is aligned to its own
+                unit size
 
     A configuration store is not a filesystem, but it has an extent of its own
     and sits in its own MTD partition, so a JFFS2 in front of it ends there.
@@ -34025,7 +34118,8 @@ def flash_regions(fh, size):
             if _CFG_NAME.match(chunk, k + 4) or _CFG_NAME.match(chunk, k + 5):
                 hits.add((pos + k, b"env"))       # a U-Boot environment's first string
         pos += step
-    efs = {p["base"]: p["size"] for p in _efs_partitions_from_sigs(fh, size, efs_sigs)}
+    efs = {p["base"]: min(p["size"], size - p["base"])
+           for p in _efs_partitions_from_sigs(fh, size, efs_sigs)}
     hits.update((base, b"efs") for base in efs)
     found, taken_to = [], 0
     for off, magic in sorted(hits):
@@ -34368,6 +34462,12 @@ def volumes(fh, size=None):
                                                       and r[0] not in protective], ss)
                 vol["free_extents"] = list(lvm_spare.get(base, []))
             elif kind:
+                if kind == "efs" and base not in placed:
+                    # its boot record sizes it, and can put its end past the image's
+                    part = _efs_locate(fh, base, rsize)
+                    if part:
+                        vol["missing_past_end"] = max(vol["missing_past_end"],
+                                                      base + part["size"] - size)
                 vol["walker"] = walker_for(kind, fh, base, rsize)
                 if vol["walker"] is None:
                     vol["note"] = "recognised, but no walker for this kind"
@@ -37501,7 +37601,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         if marked_incomplete:
             print("  A volume marked INCOMPLETE above reaches past the end of the file. A file")
             print("  on it that reaches past the end is counted SHORT and stored under a name")
-            print("  that says how much of it is here, not as an extracted file.")
+            print("  that says how much of it is here, or FAILED where the volume records no")
+            print("  size for it, not as an extracted file.")
             print()
 
         if rejected:
@@ -41423,6 +41524,73 @@ def _efs_qnx_image_check(raw, tar_gz):
     return problems, len(got), n_removed, len(old_bytes)
 
 
+def _efs_cut_check(raw, tar_gz, folder):
+    """Cut the EFS image QNX wrote inside its one partition and export each cut.
+
+    Three cuts on the partition's own span: its last 4 KiB gone, half of it gone,
+    and everything after its first erase unit gone. Each has to come back as an
+    EFS volume whose record gives the bytes the boot record sizes the partition
+    at and the bytes the image holds, marked as reaching past the image, counted
+    as not read in full (so a run exits 1) and listed by volumes() with what is
+    missing. No file may be lost without a word: every regular file of QNX's tar
+    is exported with the tar's bytes, or counted as failed, or sits behind a
+    folder the record says was not listed in full. And nothing exported may
+    differ from the tar. The cut image is written to ``folder`` and removed.
+
+    Returns (problems, [files exported per cut])."""
+    import contextlib, io, tarfile, zipfile
+    want = {}
+    with tarfile.open(tar_gz) as tf:
+        for m in tf.getmembers():
+            if m.isfile():
+                want[m.name.strip("/")] = tf.extractfile(m).read()
+    found = efs_partitions(io.BytesIO(raw), len(raw))
+    if len(found) != 1 or found[0]["base"] != 0:
+        return [f"the whole image holds {len(found)} partitions"], []
+    need, unit = found[0]["size"], found[0]["unit_size"]
+    problems, exported = [], []
+    path = os.path.join(folder, "efs_cut.img")
+    for label, at in (("its last 4 KiB", need - 4096), ("half", need // 2),
+                      ("all but the first unit", unit)):
+        man, said, held = [], io.StringIO(), io.BytesIO()
+        try:
+            with open(path, "wb") as out:
+                out.write(raw[:at])
+            with zipfile.ZipFile(held, "w") as zf, contextlib.redirect_stdout(said):
+                main(path, extract="x.zip", zf=zf, manifest=man)
+            with open(path, "rb") as fh:
+                listed = [(v["kind"], v["missing_past_end"]) for v in volumes(fh, at)]
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        rec = man[0] if len(man) == 1 else {}
+        lines = rec.get("damage_first") or [""]
+        if (rec.get("filesystem") != "efs" or rec.get("extends_past_image_by_bytes") != need - at
+                or f"({need:,} bytes)" not in lines[0]
+                or f"the image holds {at:,} of those bytes" not in lines[0]
+                or not rec.get("folders_not_read") or _volumes_not_read(man) != 1
+                or "INCOMPLETE" not in said.getvalue() or listed != [("efs", need - at)]):
+            problems.append(f"cut of {label}: no record of an EFS volume the image holds {at:,} "
+                            f"of {need:,} bytes of ({len(man)} records, volumes() {listed})")
+            exported.append(0)
+            continue
+        with zipfile.ZipFile(held) as zf:
+            got = {n.split("/", 1)[1]: zf.read(n) for n in zf.namelist()
+                   if n.startswith(rec["volume"] + "/")}
+        wrong = sorted(n for n, data in got.items() if want.get(n) != data)
+        unsaid = len(want) - len(got) - (rec.get("failed") or 0)
+        if wrong or rec.get("files") != len(got) or rec.get("short"):
+            problems.append(f"cut of {label}: {len(wrong)} exported files are not the tar's, "
+                            f"{rec.get('files')} counted and {len(got)} in the zip, "
+                            f"{rec.get('short')} short")
+        if unsaid and not (rec["folders_not_read"] > 1 and any(
+                line.startswith("folder not listed in full") for line in lines)):
+            problems.append(f"cut of {label}: {unsaid} files are neither exported nor failed, "
+                            f"and no folder is recorded as not listed in full")
+        exported.append(len(got))
+    return problems, exported
+
+
 def _fat_reader_checks():
     """[(condition, what it says)] for the FAT12, FAT16 and FAT32 readers, on volumes built
     in memory here, so that each holds exactly the state its row is about. The bytes are
@@ -42822,6 +42990,23 @@ def self_test():
                 ok = False
             print(f"  [{mark}] EFS written by QNX, control: with its extent's header set to "
                   "free the removed file no longer comes back, and the check says so")
+            # The same image cut inside its partition. The boot record sizes the
+            # partition, so a cut one is still an EFS volume, and its record has
+            # to say what the image holds of it (_efs_cut_check).
+            try:
+                cut_problems, cut_files = _efs_cut_check(qnx_raw, qnx_tar, d)
+            except Exception as exc:                 # pylint: disable=broad-except
+                cut_problems, cut_files = [f"raised {type(exc).__name__}: {exc}"], []
+            cond = not cut_problems and cut_files == [22, 22, 0]
+            if not cond:
+                ok = False
+                for line in cut_problems:
+                    print("      " + line)
+            print(f"  [{'PASS' if cond else 'FAIL'}] EFS written by QNX, cut inside its "
+                  f"partition (last 4 KiB, half, after the first unit): each cut is an EFS "
+                  f"volume recorded with the bytes it needs and holds and counted as not read "
+                  f"in full, and no file is lost without a record or exported with other "
+                  f"bytes (files exported {cut_files})")
 
         # QNX IFS. The UCL decompressor and the imagefs layout are proven byte
         # for byte against real Ford Sync G4 images; these legs are the both-ways

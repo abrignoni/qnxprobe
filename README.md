@@ -1092,6 +1092,54 @@ by name with the bytes of its copy, and the superseded extents of the overwritte
 hold 10,240 bytes that are not what the file holds there now. A control sets the removed
 file's extent header to free, and the check has to fail.
 
+**A partition the image holds only part of.** The boot record gives a partition its unit
+count, so where the partition ends is known from the record alone. Through 1.87 a partition
+whose end lay past the end of the image was dropped: nothing was exported from it, no
+record was written and the run exited 0. It is now found (`efs_partitions()`, `volumes()`,
+the report) and read as far as the image goes:
+
+- The report adds a `cut short` line with the bytes the boot record gives the partition
+  and the bytes the image holds. An export marks the volume `INCOMPLETE`, writes
+  `extends_past_image_by_bytes`, puts the same two numbers and the count of units the image
+  does not hold whole in `damage_first`, and counts the volume in `folders_not_read`, so
+  the run exits 1. `volumes()` gives the missing bytes as `missing_past_end` and the line
+  as `note`, and the walker has them as `declared_end`, `units_cut` and `damage`. In the
+  report's `FLASH` list the size shown is what the image holds of the partition.
+- A unit's header array is at the end of the unit, so a unit the image cuts has no headers
+  and nothing in it is read. A file whose extents all sit in units the image holds whole
+  is exported as it is from a whole image.
+- A folder whose chain of entries stops at a pointer that does not resolve is recorded as
+  not listed in full and counted in `folders_not_read`. What the chain went on to is not
+  known, so files under that folder can be missing from the export.
+- A file whose extent chain stops that way is counted `failed` and is not exported. Its row
+  in the exceptions table gives the extents and bytes the chain reached. EFS records no
+  file size, so such a file cannot be stored as `.SHORT-<got>-of-<size>-bytes` the way a
+  cut file is on a filesystem that records one.
+- These two records are made only on a partition the image holds part of. On a whole
+  partition a chain that stops is read as it stands, as before.
+
+This was tested with cut images only: the end of the image removed, nothing else changed.
+`tests/fixtures/efs-qnx.img.gz` was cut inside its one partition of 524,288 bytes at three
+points and held against QNX's tar, and the self-test runs all three. With the last 4 KiB
+gone, or the second half gone, the 22 files are exported with the tar's bytes, the record
+gives 524,288 bytes against the 520,192 or 262,144 the image holds, and the run exits 1.
+Cut after the first unit, the root folder is recorded as not listed in full, no file is
+exported and the run exits 1. The five corpus images `xtrmp_item020`, `027`, `030`, `031`
+and `081` were cut at half their length. The partition the cut crosses is reported with
+its record on all five. Of its 442 files (3, 3, 3, 3 and 430), 339 are exported with the
+bytes the whole image gives, 4 are counted failed and 99 sit under the 8 folders recorded
+as not listed in full. No exported file differs from the whole image's, and the partitions
+in front of the cut export as they do from the whole image.
+
+What a cut still loses without a record: a partition is found only when the unit holding
+its boot record is in the image, up to and including that unit's header 2. When the cut
+falls in front of that, nothing in the image gives the unit count and the partition is not
+reported. Cutting the same five images after the first unit of their first partition, the
+partition was reported with its record on four and not reported on one, where the run
+listed no volume and exited 0. `recover_deleted()` and `unaccounted()` run on a cut
+partition and see only the units the image holds whole. What they return there was not
+checked against anything.
+
 **Fixtures.** No free tool writes EFS, so `tools/make_efs_fixtures.py` writes the two
 fixtures, one per byte order, from one model and records what it wrote. Run with
 `--oracle`, it has qnxmount read the little-endian one, and every live file comes back as
@@ -1104,7 +1152,8 @@ self-test reads both fixtures and breaks three things to show the checks can fai
   and `status[1]` of header 1 to tell a spare unit, as qnxmount does.
 - A partition whose first unit has no `unit_info` is found by `efs_partitions()` but not
   opened. None of the 60 partitions measured is like that.
-- A partition that runs past the end of the image is not reported.
+- A partition cut in front of the unit that holds its boot record is not reported (see "A
+  partition the image holds only part of" above).
 - Free space is not reported for EFS.
 
 ## APFS
