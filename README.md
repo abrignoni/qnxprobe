@@ -253,9 +253,11 @@ The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
 (files that could not be read, which are not in the zip) and, on a
-volume that does, `extends_past_image_by_bytes`. When a volume's reader has something to
-say about the volume as a whole, the text `volumes()` gives as its `note`, the record
-carries it as `note`; 1.87 wrote only the F2FS reader's note there. On a split image `image` names the
+volume that does, `extends_past_image_by_bytes`. The record carries as `note` what the
+volume's reader says about the volume once it has been read: the reader's `volume_note`
+when it has one, otherwise its `note`. For a reader with only `note`, that text can differ
+from the `note` `volumes()` gave before the files were read: XFS adds a count of the
+damaged structures it skipped. 1.87 wrote only the F2FS reader's note there. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -2655,9 +2657,13 @@ smaller filesystem with exit 0. A kernel-written image stopped before the block 
 its root names is close to that: it exits 0, and its only record is the note counting
 the one name the root no longer reaches. Only cuts were tested. The fixtures were stopped
 at three points each (4 KiB before the end, half way, and after the first node); other
-damage was not tested. Every file those cuts left short had lost its end. A range missing
-before the end, and a name the root does not reach, were run on images of a few nodes
-that the self-test writes, since no fixture holds either.
+damage was not tested. On the seven `mkfs.jffs2` images the one file a cut left short had
+lost its end. The kernel-written NAND dump stopped 4 KiB before its end no longer divides
+into pages, so it is read with its spare bytes in place: two nodes fail their data CRC and
+one file is SHORT with 7,000 bytes missing from byte 0, which are zeros in the member. The
+kernel-written NOR image stopped half way holds one name the root does not reach. The
+self-test also runs a range missing in the middle of a file and a name the root does not
+reach on images of a few nodes that it writes.
 The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
 8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
 properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
@@ -4591,9 +4597,13 @@ above are in this README only for now.)
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
   an image that dropped it will not divide into pages and will be reported as not
   recognised rather than misread.
-- **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
+- **SquashFS has not been run against flash from a real device, and JFFS2 only without
+  known data.** Their images
   were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
-  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
+  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. JFFS2
+  was also read on two regions of one real device's flash dump, in full: both list and
+  export with no damage recorded, but nothing independent says what those regions should
+  hold, so the content was not checked. YAFFS2
   and UBIFS have been: an Android phone under
   [YAFFS1 and YAFFS2](#yaffs1-and-yaffs2), and that phone and a Foscam R2 camera under
   [Deleted files on YAFFS2, JFFS2 and UBIFS](#deleted-files-on-yaffs2-jffs2-and-ubifs).
