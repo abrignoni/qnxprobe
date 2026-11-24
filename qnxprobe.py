@@ -14744,9 +14744,8 @@ class Jffs2Walker:
             self.folders_not_read += 1
             self._note_damage(
                 f"the region ends inside a node: its header at byte {off:,} {where} records "
-                f"{totlen:,} bytes and {self.size - off:,} are there, so the image stops "
-                f"before this filesystem does. That node was not read, and nothing stored "
-                f"after it is in the image"
+                f"{totlen:,} bytes and {self.size - off:,} are there. That node was not read, "
+                f"and anything this filesystem stored after it is not in the region"
                 + (f" ({more:,} more such header{'' if more == 1 else 's'} inside it)"
                    if more else ""))
         reached, stack, checked = {self.root}, [(self.root, "")], set()

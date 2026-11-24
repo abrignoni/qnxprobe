@@ -2651,7 +2651,9 @@ split, with every name it still holds complete, has nothing to record and reads 
 smaller filesystem with exit 0: that is the case for a kernel-written image stopped
 before the block holding its root names. Only cuts were tested. The fixtures were stopped
 at three points each (4 KiB before the end, half way, and after the first node); other
-damage was not tested.
+damage was not tested. Every file those cuts left short had lost its end. A range missing
+before the end, and a name the root does not reach, were run on images of a few nodes
+that the self-test writes, since no fixture holds either.
 The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
 8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
 properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
