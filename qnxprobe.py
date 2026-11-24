@@ -16024,32 +16024,50 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
     FAT and exFAT are those: they hold a wall-clock reading and no zone, so
     ``mtime`` above stays zero for them and the readings arrive here as text
     instead, where nothing downstream can put a zone on them.
+
+    Every level under the inode is walked, however deep: the walk keeps its
+    own stack of the folders it is inside, so its depth is not Python's. A
+    folder is listed once, when it is first reached, and a folder already in
+    ``seen`` is not entered again, which is what ends a loop.
     """
     if seen is None:
-        seen, out = set(), []
-    if depth > 64 or num in seen:
+        seen = set()
+    if out is None:
+        out = []
+    records = times is not None and hasattr(w, "listdir_records")
+
+    def listing(node):
+        if records:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    if num in seen:
         return out
     seen.add(num)
-    if times is not None and hasattr(w, "listdir_records"):
-        listing = w.listdir_records(num)
-    else:
-        listing = [(name, ino, None) for name, ino in w.listdir(num)]
-    for name, ino, recorded in listing:
-        ent = w.entry(ino)
-        if not ent:
-            continue
-        mode, size, mtime = ent
-        path = f"{prefix}/{name}" if prefix else name
-        if times is not None and recorded:
-            kept = {k: v for k, v in recorded.items() if v}
-            if kept:
-                times[path] = kept
-        if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
-            collect(w, ino, path, depth + 1, seen, out, times)
-        elif (mode & 0o170000) == 0o100000:          # regular files only
-            out.append((path, ino, size, mtime))
+    stack = [(prefix, listing(num))]                 # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
+            ent = w.entry(ino)
+            if not ent:
+                continue
+            mode, size, mtime = ent
+            path = f"{prefix}/{name}" if prefix else name
+            if times is not None and recorded:
+                kept = {k: v for k, v in recorded.items() if v}
+                if kept:
+                    times[path] = kept
+            if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
+                if ino not in seen:
+                    seen.add(ino)
+                    stack.append((path, listing(ino)))
+                    break                            # its entries come before the rest of this one's
+            elif (mode & 0o170000) == 0o100000:      # regular files only
+                out.append((path, ino, size, mtime))
+            else:
+                out.append((path, ino, None, mtime))     # symlink or special
         else:
-            out.append((path, ino, None, mtime))     # symlink or special
+            stack.pop()
     if depth == 0 and num == getattr(w, "root", None) and hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
     return out
@@ -16085,6 +16103,9 @@ def walk_all(w):
     mode rather than by ``mode & S_IFDIR``, which is also true of a block
     device, whose format bits share that one. The JFFS2 fixtures carry a block
     device, which the looser test would have walked into as a directory.
+
+    The generic route walks every level, as ``collect()`` does, on a stack of
+    its own, and enters a folder once.
     """
     fast = getattr(w, "listing", None)
     if fast is not None:
@@ -16095,32 +16116,32 @@ def walk_all(w):
     if prime is not None:
         prime()
     records = hasattr(w, "listdir_records")
-    seen = set()
 
-    def walk(node, prefix, depth):
-        if depth > 64:
-            return
-        key = node[0] if isinstance(node, tuple) else node
-        if key in seen:
-            return
-        seen.add(key)
+    def listing(node):
         if records:
-            listing = w.listdir_records(node)
-        else:
-            listing = [(name, ino, None) for name, ino in w.listdir(node)]
-        for name, ino, recorded in listing:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    def key(node):
+        return node[0] if isinstance(node, tuple) else node
+
+    seen = {key(w.root)}
+    stack = [("", listing(w.root))]                  # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
             ent = w.entry(ino)
             if not ent:
                 continue
             mode, size, mtime = ent
             path = f"{prefix}/{name}" if prefix else name
             yield (path, ino, mode, size, mtime, recorded)
-            if mode & S_IFMT == S_IFDIR:
-                for item in walk(ino, path, depth + 1):
-                    yield item
-
-    for item in walk(w.root, "", 0):
-        yield item
+            if mode & S_IFMT == S_IFDIR and key(ino) not in seen:
+                seen.add(key(ino))
+                stack.append((path, listing(ino)))
+                break                                # its entries come before the rest of this one's
+        else:
+            stack.pop()
     if hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
 
@@ -40605,6 +40626,91 @@ def _squashfs_reader_checks():
         "the exit status; an image that lost only tables this reader does not use still "
         "reads every file; a folder and a fragment table past the cut are recorded when "
         "they are asked for", cut_images)
+
+    def every_level():
+        image, sums = load("squashfs-deep.img.gz"), load("squashfs-deep.src.sha256")
+        if image is None or sums is None:
+            return None
+        want = dict(reversed(line.split("  ", 1)) for line in sums.decode("utf-8").splitlines())
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        read = {path: hashlib.sha256(b"".join(w.read_file(node, size))).hexdigest()
+                for path, node, size, _mtime in collect(w, w.root)}
+        walked = [path for path, *_rest in walk_all(SquashfsWalker(io.BytesIO(image), 0))]
+        man, members, _said = export(image)
+        return (len(want) == 70 and max(path.count("/") for path in want) == 70
+                and read == want and len(walked) == 140 and set(want) <= set(walked)
+                and {path: hashlib.sha256(data).hexdigest()
+                     for path, data in members.items()} == want
+                and man[0]["files"] == 70 and not man[0].get("damage_recorded")
+                and _volumes_not_read(man) == 0)
+    row("SquashFS: a chain of folders 70 levels deep that mksquashfs wrote is listed and "
+        "exported at every level, 70 of 70 files matching the source tree", every_level)
+
+    def any_depth():
+        class Chain:
+            """A walker over ``depth`` folders, each inside the one before with one file
+            beside it. The last folder also names the root and its own parent, a loop."""
+            root = 0
+
+            def __init__(self, depth):
+                self.depth = depth
+
+            def listdir(self, node):
+                if node < 0:
+                    return []
+                out = [("file.txt", -node - 1)]
+                if node + 1 < self.depth:
+                    return out + [("d", node + 1)]
+                return out + [("back", 0), ("up", max(node - 1, 0))]
+
+            def entry(self, node):
+                return (S_IFREG | 0o644, 1, 0) if node < 0 else (S_IFDIR | 0o755, 0, 0)
+
+        def plain(w, node, prefix, seen, times):
+            """The files under a folder by a walk that calls itself, as collect() did."""
+            if node in seen:
+                return []
+            seen.add(node)
+            out = []
+            listing = (w.listdir_records(node) if times else
+                       [(name, child, None) for name, child in w.listdir(node)])
+            for name, child, _recorded in listing:
+                ent = w.entry(child)
+                if not ent:
+                    continue
+                path = f"{prefix}/{name}" if prefix else name
+                if ent[0] & S_IFMT == S_IFDIR:
+                    out += plain(w, child, path, seen, times)
+                else:
+                    out.append((path, child, ent[1] if ent[0] & S_IFMT == S_IFREG else None,
+                                ent[2]))
+            return out
+
+        depth = 3000                                 # three times Python's own limit
+        files = collect(Chain(depth), 0)
+        every = list(walk_all(Chain(depth)))
+        if not (len(files) == depth == len({path for path, *_rest in files})
+                and files[-1][0] == "d/" * (depth - 1) + "file.txt"
+                and len(every) == 2 * depth + 1):
+            return False
+        for name, times in (("ext4-sparse.img.gz", False), ("fat16-fixture.img.gz", False),
+                            ("fat16-fixture.img.gz", True)):
+            image = load(name)
+            if image is None:
+                return None
+            w = next(v["walker"] for v in volumes(io.BytesIO(image), len(image))
+                     if v.get("walker") is not None)
+            want = plain(w, w.root, "", set(), times)
+            if not want or collect(w, w.root, times={} if times else None) != want:
+                return False
+            if sorted(p for p, *_r in walk_all(w) if p in {x[0] for x in want}) \
+                    != sorted(x[0] for x in want):
+                return False
+        return True
+    row("collect() and walk_all() walk every level and enter a folder once: a chain of "
+        "3,000 folders that loops back on itself gives each of its 3,000 files once, and on "
+        "an ext4 and a FAT16 volume collect() lists what a walk that calls itself lists, in "
+        "its order", any_depth)
     return out
 
 

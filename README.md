@@ -448,7 +448,8 @@ never touches the rest.
 
 `collect()` returns the regular files in tree order, which is what an extraction
 needs. Something that wants **everything**, directories included, should ask
-`walk_all()` instead, because it takes a faster route where one exists.
+`walk_all()` instead, because it takes a faster route where one exists. `collect()` and
+the tree walk of `walk_all()` go as deep as the volume does and enter each folder once.
 
 ```python
 for path, node, mode, size, mtime, recorded in q.walk_all(walker):
@@ -2573,6 +2574,16 @@ file still reads, the record says what is missing, and the exit status stays 0. 
 the padding after the volume's end, where nothing is missing. 4 left a file of 0 bytes,
 which has no superblock to name, so nothing is recorded for it. A folder read only in part
 is recorded by the same code, but no cut tested reached that state.
+
+**Folder depth.** Folders are read at every level. `collect()` and the tree walk of
+`walk_all()`, which every reader's export and listing go through, used to stop below 64
+levels and say nothing: an image mksquashfs wrote with a chain of folders 70 levels deep
+exported 64 of its 70 files and exited 0. Both now keep their own stack of the folders they
+are inside, go as deep as the volume does, and enter each folder once, which is what ends
+a loop. That image (`tools/make_squashfs_deep_fixture.sh`) now exports 70 of 70 files that
+match the source tree. The change is in code every reader shares, so the self-test also
+holds `collect()` against a walk that calls itself on an ext4 and a FAT16 fixture, and
+walks a chain of 3,000 folders that loops back on itself.
 
 ### JFFS2
 
