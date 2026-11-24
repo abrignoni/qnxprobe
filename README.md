@@ -266,7 +266,9 @@ tool reproduces, and two volumes cannot share one, so names cannot collide. A
 label is only ever a suffix. An LBA counts the disk's own logical sectors: 512
 bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as on
 4Kn drives and UFS LUN images, so `p1_lba300` on such a disk begins at byte
-1,228,800.
+1,228,800. An MBR alone is counted in 4096-byte sectors only when the container
+says so or when its partitions answer there and not at 512 (see
+[An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)).
 
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
@@ -280,7 +282,7 @@ committed fixtures, exported on Python 3.12, `note` gives an F2FS volume cut sho
 marked as cleanly unmounted, HFS+ files that hold the provenance attribute, an XFS dirty
 log, a Btrfs log tree, default subvolume or one device of two, and zstd data on a Python
 without zstd (Btrfs and SquashFS). The self-test exports the ReFS fixture whose log
-records follow the newest checkpoint, and its `note` says so. On a split image `image`
+records follow the newest checkpoint, and its `note` says so. 1.87 wrote no note there. On a split image `image`
 names the first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -3171,10 +3173,53 @@ directory nodes. Both byte orders are read.
 Every node is scanned and its header CRC checked. A node the filesystem has marked
 obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
 `check_node_data` does, so an older copy of that data shows through where one exists; the
-report counts the nodes dropped, and a name whose inode is left with no readable node is
-not listed, and counted too. For
+report counts the nodes dropped. For
 each name the newest version wins and a newer entry with inode 0 unlinks it; each file
 takes its mode, owner and times from its newest inode node and is cut to that node's size.
+
+A name is stored as bytes with no encoding. Bytes that are not UTF-8 are listed as `%XX`,
+a stored NUL as `%00` and a slash inside one name as `%2F`. A link target is decoded the
+same way and keeps its slashes. Two stored names that come out as the same text stay two
+entries. 1.87 listed such a name with a surrogate character, which SQLite refuses.
+
+The report counts the names linked from the root. A name in a directory the root does not
+reach is counted apart and not listed: the kernel's mount pass removes an inode no name
+links, and a directory's children with it (`fs/jffs2/build.c`). The volume's `note` in
+`volumes.json` states how many there are, that their parent folder has no entry the root
+reaches, and that they are not exported. A region with nothing cut from it can hold such
+names (one real flash region read whole holds 14), so the note is a count and does not
+change the exit status.
+
+JFFS2 records no size and no count of its own, so a region that holds only part of a
+filesystem reads as a smaller one. What the region itself shows is recorded:
+
+- **The region ends inside a node** (a header whose CRC holds and a length that runs past
+  the end of the region). The volume's `damage_first` in `volumes.json` says so, with
+  `folders_not_read`, and the run exits 1.
+- **A file's data nodes do not cover its size.** JFFS2 writes a hole as a node, so a range
+  no node covers is missing, not a hole. The member is
+  `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is the bytes its nodes hold. Nothing
+  is written after the last byte a node holds, and a missing range before that is zeros
+  so later bytes keep their offsets. The exceptions table says where. The volume's damage
+  counts such files and the run exits 1. 1.87 wrote the missing range as zeros in a
+  member of full size, with no record.
+- **A name's inode has no readable node.** It is a `FAILED` row, the volume's `note`
+  counts it, and the run exits 1. A name in a directory the root does not reach has no
+  path to put in a row, so it is counted in the note and in the damage.
+
+None of these appears on the nine fixtures read whole. A region cut where no node is
+split, with every name it still holds complete, has nothing to record and reads as a
+smaller filesystem with exit 0. A kernel-written image stopped before the block holding
+its root names is close to that: it exits 0, and its only record is the note counting
+the one name the root no longer reaches. Only cuts were tested. The fixtures were stopped
+at three points each (4 KiB before the end, half way, and after the first node); other
+damage was not tested. On the seven `mkfs.jffs2` images the one file a cut left short had
+lost its end. The kernel-written NAND dump stopped 4 KiB before its end no longer divides
+into pages, so it is read with its spare bytes in place: two nodes fail their data CRC and
+one file is SHORT with 7,000 bytes missing from byte 0, which are zeros in the member. The
+kernel-written NOR image stopped half way holds one name the root does not reach. The
+self-test also runs a range missing in the middle of a file and a name the root does not
+reach on images of a few nodes that it writes.
 The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
 8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
 properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
@@ -3255,6 +3300,113 @@ second version. The report names the older copies:
 ```
         note         2 eraseblock(s): an older copy of a block, not the one read
 ```
+
+A UBI volume name and a UBIFS file name are stored bytes. A byte that is not UTF-8 is shown
+as `%XX` of the stored byte, a NUL as `%00`, and a `/` stored inside one name as `%2F`, so a
+volume `ubinize` named `data/vol` is listed as `data%2Fvol`, one volume, and not as a folder
+`data` holding `vol`. No name holds a surrogate, and a literal `%` is not escaped. Up to
+1.87 a volume name lost such a byte to U+FFFD and a file name carried a surrogate, which
+the zip spelled as three escaped bytes (`caf%ED%B3%A9.txt` for a stored `caf<E9>.txt`, now
+`caf%E9.txt`). A symbolic link's target shows such a byte as `%XX` too, and its slashes
+are left as they are.
+
+Because `%` is not escaped, a name that holds the byte and a name that holds the text of
+its escape can list alike. On a volume `mkfs.ubifs` wrote with `caf<E9>.txt` and a file
+really named `caf%E9.txt` in one folder, both list as `caf%E9.txt` and both files are in
+the zip with their own content. The name stored as plain text is listed first and keeps
+the member name, and the one with the byte is written as `caf%E9.txt.dup-2` with a
+`RENAMED` row. That row gives the listed name, which is the same for both, so it is the
+order that tells them apart.
+
+UBIFS stores an inode's seconds as a signed 64-bit number, and the kernel reads them that
+way (`ubifs_iget`). Up to 1.87 they were read unsigned, and a file dated 1960 came out as
+18446744073393932416. It is now -315619200 in the walker and in the file's `TIME_NOT_HELD` row.
+
+Both were checked on five images `mkfs.ubifs` and `ubinize` 2.3.0 wrote from one tree of
+16 files, six copies of the tree in all: three file and folder names with bytes that are
+not UTF-8, a 1960 time, and UBI volumes named `data/vol` and `caf<E9>`. Each copy matches
+its 16 source hashes under the new names, and the static volume named `caf<E9>` matches its
+hash as `caf%E9`.
+
+What a cut or damaged image could not give is recorded in the walker's `damage` list, which
+an export writes to `volumes.json` as `damage_recorded` and `damage_first`. Each record of
+something lost counts in `folders_not_read`, so the run exits 1. A record that begins
+`note:` states something found that loses nothing, and does not count.
+
+- **The data ends inside an eraseblock.** Only whole eraseblocks are read. When that
+  eraseblock's headers are in the image the record names the logical eraseblock and the
+  volume it held. One that is blank, or that holds an older copy of a block read from
+  elsewhere, is a note.
+- **A static volume with fewer eraseblocks than it records.** Every eraseblock of a static
+  volume records how many the volume uses, and the kernel marks a volume short of them as
+  corrupted (`init_volumes`). It is exported up to the first missing eraseblock as a
+  `SHORT` member, and nothing is put where the missing one was. Its size is the recorded
+  one when the header of its last eraseblock is in the image. When it is not, nothing else
+  records where the data ends, so the size shown is the most the volume can hold, and the
+  record and the file's `SHORT` row both say so. A static volume with no eraseblock at all
+  is listed as an empty file with a note: UBI keeps a static volume's size only in its
+  eraseblocks, so an empty volume and one whose eraseblocks are gone look the same, and the
+  kernel takes it to be empty.
+- **A volume table that does not read.** Each volume number with mapped eraseblocks is
+  listed as `vol<number>`, and the record says its name, type and padding are not known.
+- **Only the volume table.** When the table reads and no eraseblock of any volume it lists
+  is in the image, each volume is an empty file with a note, and the exit status is left
+  alone: `ubinize` writes a dynamic volume with no data as no eraseblock at all, so an
+  empty device and one whose eraseblocks were cut away look the same.
+- **One erase counter header and no second one.** Every eraseblock opens with that header
+  and the volume table is kept in two eraseblocks, so a file that opens with a header
+  whose CRC holds and has no second one within 8 MiB holds at most one eraseblock. It is
+  reported as UBI and not read, and the volume's record says why (`extract_error`).
+- **A bare UBIFS volume cut after its superblock node.** When that node's CRC holds, no
+  master node reads, and the eraseblocks the node counts reach past the end of the image,
+  the volume is reported as UBIFS and not read, and its record says how many of its bytes
+  lie past the end.
+- **A volume that opens as UBIFS or SquashFS and cannot be read as one** is exported as one
+  file of its raw bytes, and the record says its files are not listed.
+- **A NAND dump that ends inside a page.** Its whole pages are read with the spare
+  stripped, and the record gives the bytes left over.
+- **UBIFS index nodes that do not read.** Their count is recorded. What they indexed is not
+  known, so files and folders can be missing, and a block of a listed file can read as
+  zeros, the way a hole does. Directory entry nodes that do not read are counted the same
+  way.
+- **A name whose inode node does not read** is a `FAILED` row in the exceptions table.
+  Up to 1.87 the file was left out with no record.
+- **A journal that was not replayed.** The log's first eraseblock always opens with the
+  commit start node of the current commit, and the kernel does not mount a volume without
+  it (`replay_log_leb`, `ubifs_replay_journal`). When that eraseblock holds no node, or
+  opens with another one, the record says what was written since the last commit is
+  missing from the listing.
+
+Measured on the seven fixtures, each cut 4 KiB before its end and at half its size. Cut by
+4 KiB, the five `ubinize` images export the 416 files of their two filesystem volumes
+unchanged and the raw static volume as `kernel.SHORT-126976-of-150000-bytes` (130816 on the
+NOR image), with two records and exit 1. The bare UBIFS image, whose last 4 KiB are blank
+(0xFF), exports all 410 files with exit 0. The NAND dump with spare bytes exports all 12
+files and records the 128 bytes of a page left over, with exit 1. Cut in half, the five
+`ubinize` images and the bare UBIFS image each record one index node that does not read,
+list no file of the UBIFS volume and exit 1, and the NAND dump records the journal that was
+not replayed and exits 1. Uncut, all seven export as before with no record. On a NAND dump
+from a real device, one of its four UBIFS volumes has 10 index nodes and 1 directory entry node
+that do not read and 6 names whose inode does not read. It now carries two records and six
+more `FAILED` rows.
+
+A cut that falls between two eraseblocks leaves no part of one behind, so it shows only
+through what is then missing: one of the halved `ubinize` images and the halved NAND dump
+are cut that way, and are recorded by the index node and by the log. A static volume whose
+eraseblocks are all gone is then only a note. A dynamic volume with no eraseblock, beside
+others that have theirs, is an empty file with no record: a volume `ubinize` wrote empty
+looks the same.
+
+Cut to 128, 576, 2,112 and 4,096 bytes, the six UBI fixtures are each reported as UBI and
+not read, with a record and exit 1, 24 runs of 24. So are a UBI fixture cut to its
+64-byte header and three cut to one eraseblock. The NOR fixture cut to two eraseblocks,
+which hold its volume table alone, exports three empty files with the note that no
+volume's eraseblock is here, and exits 0. The bare UBIFS fixture cut to 4,096 bytes, its whole
+superblock node, is reported as UBIFS with 1,773,568 of its 1,777,664 bytes past the end,
+and exits 1. Cut to 128, 576 and 2,112 bytes, inside that node, its CRC cannot be checked
+and the file is not recognised: an empty export and exit 0. The NOR fixture cut to one
+eraseblock with one bit of its first header changed, so that the CRC fails, is not taken
+for UBI.
 
 ### YAFFS1 and YAFFS2
 
@@ -3896,8 +4048,10 @@ leaves them out (`rebuilt_bytes_not_written` in `unallocated.json`).
 
 A 1.1 or 1.2 superblock's role table is rounded up to the device's logical block size
 before its data offset is checked against it (md.c 1872-1882). An image says its logical
-block size only through a GPT header found at 4096 bytes; for any other image 512 bytes
-is assumed.
+block size through a GPT header found at 4096 bytes, or through an MBR read in 4096-byte
+sectors (see [An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk));
+for any other image 512 bytes is assumed. No md member on an MBR disk with 4096-byte
+sectors was run.
 
 From Python, `raid_open(paths)` opens the images and assembles them, and
 `raid_assemble([(label, image), ...])` does the same for images already open; each of
@@ -4863,6 +5017,48 @@ the ext4 fixture and requires the volume at the byte its entry names. Those imag
 the same in The Sleuth Kit's `mmls -b 4096` and in util-linux `sfdisk --sector-size
 4096`, and a GPT that `sfdisk` wrote with 4096-byte sectors is read as `sfdisk` wrote it.
 
+### An MBR on a 4096-byte-sector disk
+
+An MBR records no sector size. Its start and count fields are in the disk's logical
+sectors, so on a disk with 4096-byte logical sectors the first partition at LBA 64
+begins at byte 262,144, and read as 512-byte sectors it was sought at byte 32,768, where
+nothing is: such an image used to list its partition as "not recognised" and export
+nothing, with exit 0. Two sector sizes are tried, 512 and 4096, and no other:
+
+1. A valid GPT decides, as before, for both tables.
+2. With no GPT, a container that states a logical sector size decides: a VHDX
+   (`LogicalSectorSize` in its metadata) or an EWF acquisition (its bytes per sector),
+   when the value is 512 or 4096. A raw file states none, and no other kind of container
+   is asked.
+3. Otherwise the MBR's entries are tried at 512 bytes. If at least one leads to a
+   volume there, the disk is read at 512, exactly as before. Only when none does are the
+   same entries tried at 4096, and that reading is kept when at least one leads to a
+   volume. When nothing answers at either size the disk is read at 512, as before.
+
+"Leads to a volume" is a test of the partition's own first structure and of nothing the
+table says: a FAT, exFAT, NTFS, ReFS or BitLocker boot sector; an ext, XFS, Btrfs, F2FS
+or qnx6 superblock; a LUKS header; or, for an extended partition, the 0x55AA of its
+first EBR. A partition holding anything else does not count toward either size.
+
+The report says so on the MBR line (`read in 4096-byte logical sectors`), and
+`sector_bytes` in `volumes.json` and every `lba` are then in 4096-byte sectors.
+
+What this was checked against: two whole-disk images Windows 11 wrote on a virtual disk
+with 4096-byte logical sectors and an MBR, each holding one NTFS volume (one with 1 KiB
+and one with 4 KiB file records). Before, neither listed a volume. Now each lists its
+NTFS volume at the byte its entry names, and the export of the whole disk holds the same
+members, with the same CRC, size and date, as the export of that partition's bytes
+copied out and read alone as a bare volume. The VHDX of the first, which states its
+sector size, lists the same volume at the same byte (262,144), and all 1,409 files in
+the listing Windows made match on path, size and SHA-256 from the VHDX as from the raw
+image. The two exports are not identical: 5 of their 1,430 members, all NTFS system
+files, differ in CRC or date, because the raw image and the VHDX are not the same bytes
+(they differ in 21 4-KiB sectors inside the volume). This rule finds the volume and nothing
+more: what is exported from it is the NTFS reader's work. The self-test builds the MBR case in memory around an exFAT boot sector: the volume at
+16 x 4096, at 16 x 512, at both (512 is kept) and at neither (512 is kept). Not run on
+real data: an EWF acquisition of such a disk, any filesystem other than NTFS on one, and
+an extended partition on one.
+
 The QNX4 reader was validated by round-trip against the Linux kernel driver
 itself: a fixture populated with nested directories, a multi-extent file, a
 long name, a symlink, an empty file and distinct modes, owners and mtimes was
@@ -4872,6 +5068,25 @@ reported matched what this walker reads, 15 of 15 entries. The fixture was
 written by a separate generator program (its skeleton follows Peter
 Waechtler's Linux-side QNX4 `dinit`, a second independent statement of the
 layout), not by this parser, so the two sides are independent.
+
+QNX4 names and a cut QNX4 volume. A name is stored as bytes and the kernel passes them
+on as they are (`fs/qnx4/dir.c`). Here a byte that is not UTF-8 becomes `%XX` of the
+stored byte and a `/` stored inside one name becomes `%2F`, as for the other readers,
+where before the byte became U+FFFD and the `/` split the name into folders. The walker
+also takes an end for the volume from the `.bitmap` file, one bit per block as
+`qnx4_statfs()` in `fs/qnx4/inode.c` counts it (`BitMap->di_size * 8`). The size is in
+whole bytes, so its last byte may stand for fewer than eight blocks: the end used is the
+lowest that size allows, `(di_size - 1) * 8 + 1` blocks, so the report can fall up to
+seven blocks (3,584 bytes) short of how far a cut volume reached, and a whole volume is
+never said to reach past its image because of the rounding. When the image ends before
+that, the volume is marked INCOMPLETE with `extends_past_image_by_bytes`. A directory
+block that cannot be read in full, and a long name whose inode entry (reached through
+its link) cannot be read, each get a damage record naming the block, and the folder is
+counted in `folders_not_read`, so the run exits 1. Before, such a name was dropped with
+no record and exit 0. **Both changes are proven on the self-test's synthetic 12-block
+image only**, built by the test itself and not by a QNX4 writer: no real QNX4 volume
+was available, so non-ASCII names, the way a real formatter sizes `.bitmap`, and a cut
+through a real volume are not exercised.
 
 QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
 (Apache-2.0):
@@ -4889,9 +5104,39 @@ extracting qnxmount's own committed test images and comparing every name, mode, 
 timestamp, symlink target and byte of content against the tar archive built from the
 same live filesystem, which qnxmount produced on QNX independently of this code: ETFS
 matched 32 of 32 entries, EFS 31 of 31. ETFS has no magic, so it is claimed only when
-the page geometry divides evenly and the `.filetable` carries its fixed reserved names
-at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
-u-boot, boot_fs or ext partitions of the two vehicle images tested.
+the `.filetable`, read in pages of one of the six page sizes tried, carries its fixed
+reserved names at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither
+fired on the u-boot, boot_fs or ext partitions of the two vehicle images tested.
+
+An ETFS image need not be a whole number of pages. Until this version the region also
+had to divide evenly into pages of data plus 16 bytes of transaction record, so an image
+cut anywhere but on a page boundary was "not recognised" and exported nothing, with exit
+0. The two qnxmount volumes with their last 4 KiB removed read so, though the pages
+that cut touches are erased ones (data all 0xFF, transaction code 3, `ETFS_TRANS_FOXES`
+in `fs/etfs.h`). The size test now applies only where a size is not a cut's: when the
+image has a partition table (`table_regions()` finds an MBR, GPT or APM entry), every
+region tested is a partition or lies in one, and it must still be a whole number of
+pages. That keeps the test that declines almost every such region without reading it:
+with it gone everywhere, listing the volumes of a 248 GB disk image with six
+unrecognised partitions took about six times as long. When the image has no partition
+table, the region is the whole image or a flash region found by its own headers, and
+it may end inside a page. The reserved-name test applies in both cases.
+Such an image is read as the volume it is, and its record in `volumes.json` carries a
+`note` (also printed as `NOTE`) saying the image or region ends inside a page, how many
+bytes of that page are there, and that the page was not read. Whole pages cut off with
+it are not counted: the note speaks for the one partial page only. Checked on the two qnxmount volumes: whole, each still matches the tar its writer
+made on path, size, CRC and modification time (23 and 14 regular files) and exports
+exactly what it did before; cut by 4 KiB, each exports the same members as whole, with
+the note. Where the size test no longer applies the reserved names are all that claims a region, so
+the change was also run over 23 raw flash dumps from the test corpus that hold no ETFS:
+none gained an ETFS volume, and each lists the same kinds of volume as before.
+
+ETFS names follow the rule the other readers use, in both places a name is stored (the
+32 bytes of a file entry and the continuation in an extension entry): a byte that is
+not UTF-8 becomes `%XX` of the stored byte, where before it became U+FFFD, and a `/`
+stored inside a name becomes `%2F`, where before it split the name into folders. No
+name in the two qnxmount volumes has either, so this is proven by a self-test row on
+the synthetic volume only.
 
 The EFS layouts are read from qnxmount at commit
 `11c8a7f9ee9b945d584263743f6ea8524e8776d2`. The extent status bits (condition mask 0x70
@@ -5167,9 +5412,14 @@ above are in this README only for now.)
   at or past the end of the image holds nothing to read: with `--extract` it gets a
   `volumes.json` record whose `extract_error` gives the listed offset and where the
   image ends, and the run exits 1.
-- **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
-  a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
-  sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
+- **A 4096-byte-sector disk is recognised by its GPT, by its container, or by where
+  its MBR's partitions answer.** A 4Kn disk that carries only a legacy MBR states its
+  sector size nowhere, so its entries are read at 4096 bytes only when a VHDX or EWF
+  container says 4096, or when none of them leads to a volume at 512 and one does at
+  4096 ([An MBR on a 4096-byte-sector disk](#an-mbr-on-a-4096-byte-sector-disk)). Such
+  a disk whose partitions hold nothing that test knows is still read at 512, and a
+  container that states 512 is believed. Sector sizes other than 512 and 4096 are not
+  probed. A GPT header that fails
   a check is reported and not used, and nothing is ever written back to restore one.
 - **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
   QNX IFS boot images are listed and extracted (zlib tested on a synthetic image only,
@@ -5237,11 +5487,16 @@ above are in this README only for now.)
   measured on six vehicle flash images since 1.60 (see "QNX EFS in a raw flash image").
   ETFS keeps its transaction metadata in the NAND spare/out-of-band
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
-  an image that dropped it will not divide into pages and will be reported as not
-  recognised rather than misread.
-- **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
+  an image that dropped it has no transaction record after each page, so the
+  `.filetable` should not be found and the image should be reported as not recognised;
+  no such image was available to run.
+- **SquashFS has not been run against flash from a real device, and JFFS2 only without
+  known data.** Their images
   were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
-  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
+  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. JFFS2
+  was also read on two regions of one real device's flash dump, in full: both list and
+  export with no damage recorded, but nothing independent says what those regions should
+  hold, so the content was not checked. YAFFS2
   and UBIFS have been: an Android phone under
   [YAFFS1 and YAFFS2](#yaffs1-and-yaffs2), and that phone and a Foscam R2 camera under
   [Deleted files on YAFFS2, JFFS2 and UBIFS](#deleted-files-on-yaffs2-jffs2-and-ubifs).
