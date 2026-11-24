@@ -1140,6 +1140,19 @@ listed no volume and exited 0. `recover_deleted()` and `unaccounted()` run on a 
 partition and see only the units the image holds whole. What they return there was not
 checked against anything.
 
+**`walk_all()` on EFS.** `walk_all()` tells folders apart by the first element of a node.
+An EFS node is `(first_logi, first_index, mode, mtime)`, so that element is the logical
+unit of the folder's first entry, and through 1.87 folders whose first entries shared a
+logical unit were walked once between them. On the QNX-written image `walk_all()` returned
+13 of the 31 entries, and on the corpus images `xtrmp_item020`, `027`, `030`, `031` and
+`081` it returned 1,728, 1,728, 1,925, 1,655 and 1,996 of 2,960, 2,956, 3,530, 2,851 and
+3,678. `collect()`, `--list` and `--extract` do not use that guard and were not affected.
+`walk_all()` now asks a walker that has a `walk_key(node)` method for the key, and
+`EfsWalker.walk_key` gives the logical unit and the header index together. It returns
+every entry a tree walk does on all six images, and the self-test holds the fixture's 31
+against QNX's tar. The node itself is unchanged, so a node kept from an earlier version
+still names the same file and equals the one handed out now.
+
 **Fixtures.** No free tool writes EFS, so `tools/make_efs_fixtures.py` writes the two
 fixtures, one per byte order, from one model and records what it wrote. Run with
 `--oracle`, it has qnxmount read the little-endian one, and every live file comes back as

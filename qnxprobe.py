@@ -12138,6 +12138,15 @@ class EfsWalker:
     def _chain(self, node):
         return self._chain_from((node[0], node[1]))[0]
 
+    @staticmethod
+    def walk_key(node):
+        """What walk_all() tells one folder from another by: the folder's first
+        pointer, logical unit and header index together. A node's first element
+        is the logical unit alone, which every folder whose first entry sits in
+        that unit shares, so on that key those folders were walked once between
+        them."""
+        return node[0], node[1]
+
     def listdir(self, node):
         out = []
         chain, why = self._chain_from((node[0], node[1]))
@@ -15998,7 +16007,8 @@ def walk_all(w):
     def walk(node, prefix, depth):
         if depth > 64:
             return
-        key = node[0] if isinstance(node, tuple) else node
+        key = (w.walk_key(node) if hasattr(w, "walk_key")
+               else node[0] if isinstance(node, tuple) else node)
         if key in seen:
             return
         seen.add(key)
@@ -42990,6 +43000,31 @@ def self_test():
                 ok = False
             print(f"  [{mark}] EFS written by QNX, control: with its extent's header set to "
                   "free the removed file no longer comes back, and the check says so")
+            # walk_all() tells folders apart by a key, and EFS folders whose first
+            # entries share a logical unit must not share one (EfsWalker.walk_key).
+            # It has to list what QNX's tar lists, each entry once, and hand out
+            # the nodes a tree walk does, unchanged: (first_logi, first_index,
+            # mode, mtime), which a caller may have stored.
+            import tarfile
+            with tarfile.open(qnx_tar) as tf:
+                tar_names = sorted(m.name.strip("/") for m in tf.getmembers() if m.name.strip("/"))
+            walked = list(walk_all(qw))
+            tree_nodes, stack = {}, [(qw.root, "")]
+            while stack:
+                at, prefix = stack.pop()
+                for name, child in qw.listdir(at):
+                    tree_nodes[f"{prefix}/{name}" if prefix else name] = child
+                    if child[2] & S_IFMT == S_IFDIR:
+                        stack.append((child, f"{prefix}/{name}" if prefix else name))
+            cond = (sorted(item[0] for item in walked) == tar_names
+                    and {item[0]: item[1] for item in walked} == tree_nodes
+                    and all(isinstance(n, tuple) and len(n) == 4 and all(type(x) is int for x in n)
+                            for n in tree_nodes.values()))
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] EFS written by QNX: walk_all() lists "
+                  f"{len(walked)} entries, the {len(tar_names)} of QNX's tar each once, with "
+                  f"the nodes a tree walk hands out")
             # The same image cut inside its partition. The boot record sizes the
             # partition, so a cut one is still an EFS volume, and its record has
             # to say what the image holds of it (_efs_cut_check).
