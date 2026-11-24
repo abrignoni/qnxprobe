@@ -1009,10 +1009,13 @@ used exactly as before.
 If the descriptor area holds a later transaction than the newest superblock that passes
 its checksum, the older checkpoint is read, as it should be after an interrupted write,
 and `note` in `volumes.json` names both transactions and says newer data may exist. If the
-newest superblock passes its checksum and the container object map it names does not pass
-its checksum, id and type, the newest older checkpoint whose map passes is read, with the
-same kind of `note`. If none passes, the map's error is recorded and the run exits 1. A
-volume superblock that fails its checksum is named in `damage_first`, because its name and
+newest superblock passes its checksum and its container object map, or the object map of one
+of its volumes, does not pass its checksum, id and type, the newest older checkpoint whose
+maps all pass is read. `note` then gives the one read, the newest found, and each
+transaction skipped with the reason, with a count when the list is long. If no checkpoint
+passes for every volume, the newest whose container map passes is read and each volume it
+cannot read is recorded. If no container map passes, the map's error is recorded and the
+run exits 1. A volume superblock that fails its checksum is named in `damage_first`, because its name and
 other fields may be wrong. A `com.apple.decmpfs` attribute of type 0x80000001, which xnu's
 `bsd/sys/decmpfs.h` names `DATALESS_CMPFS_TYPE`, on a file not flagged compressed is
 counted in `note`, not as damage, and the data stream is read as stored.

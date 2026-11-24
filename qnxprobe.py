@@ -7031,6 +7031,32 @@ def _apfs_remnant_note(fh, base, size=None):
             f"earlier one")
 
 
+def _apfs_fallback_note(passed, read):
+    """One line, at most 240 characters, for a read of an older checkpoint: the one read,
+    the newest found, and each transaction passed over with why, counted when long."""
+    start = (f"transaction {read:,} was read, the newest found is {max(passed):,}, and newer "
+             f"data may exist. Skipped: ")
+    text = start
+    for show in (8, 4, 2, 1, 0):
+        groups = []
+        for why in ("no valid superblock", "bad superblock", "bad container map",
+                    "bad volume map"):
+            held = sorted((x for x, w in passed.items() if w == why), reverse=True)
+            if not held:
+                continue
+            listed = ", ".join(f"{x:,}" for x in held[:show])
+            rest = len(held) - show
+            if not show:
+                listed = f"{len(held):,} transaction{'' if len(held) == 1 else 's'}"
+            elif rest > 0:
+                listed += f" and {rest:,} more"
+            groups.append(f"{listed} ({why})")
+        text = start + "; ".join(groups)
+        if len(text) <= 240:
+            return text
+    return text[:240]
+
+
 def _apfs_typed_partition(fh, base):
     """True when a GPT on this image types the partition starting at ``base`` as APFS."""
     for sector in (512, 4096):
@@ -7834,15 +7860,17 @@ class ApfsWalker:
         lost or never finished, and the older one is still the right one to read, so
         that is noted and the read goes on.
 
-        A newest superblock whose container object map block fails its checksum, id or
-        type cannot be read at all, so the newest older checkpoint whose map passes is
-        used, and noted. With none, the newest stays and the map's own error is reported.
+        A newest superblock whose container object map, or the object map of one of its
+        volumes, fails its checksum, id or type cannot be read whole, so the newest older
+        checkpoint whose maps all pass is used, and noted. With none, the newest checkpoint
+        whose container map passes is used and each volume it cannot read is recorded.
+        With no such checkpoint the newest stays and the map's own error is reported.
         Nothing else moves the read to an older checkpoint.
         """
         best, best_xid = head, struct.unpack_from("<Q", head, 16)[0]
         base = struct.unpack_from("<Q", head, 112)[0]
         blocks = struct.unpack_from("<I", head, 104)[0]
-        maps, torn = [], []
+        maps, torn = [], []                 # checkpoint map blocks, damaged superblocks
         copies = [(best_xid, head)]
         for i in range(min(blocks, 512)):
             raw = self.block(base + i)
@@ -7851,8 +7879,7 @@ class ApfsWalker:
             otype = struct.unpack_from("<I", raw, 24)[0] & APFS_OBJ_TYPE_MASK
             xid = struct.unpack_from("<Q", raw, 16)[0]
             if otype == APFS_OBJECT_TYPE_CHECKPOINT_MAP:
-                if xid > best_xid and _apfs_fletcher_ok(raw):
-                    maps.append(xid)
+                maps.append((xid, raw))
                 continue
             if raw[32:36] != APFS_NX_MAGIC or otype != APFS_OBJECT_TYPE_NX_SUPERBLOCK:
                 continue
@@ -7862,24 +7889,82 @@ class ApfsWalker:
                     best, best_xid = raw, xid
                 else:
                     torn.append(xid)
-        if not self._nx_map_usable(best):
-            for xid, raw in sorted((c for c in copies if c[0] < best_xid),
-                                   key=lambda c: c[0], reverse=True):
-                if _apfs_fletcher_ok(raw) and self._nx_map_usable(raw):
-                    self._notes.append(f"the newest checkpoint, transaction {best_xid:,}, names "
-                                       f"a container object map that cannot be used, so "
-                                       f"transaction {xid:,} was read, and newer data may exist")
-                    self.xid = xid
-                    return raw
+        chosen, read, passed = self._usable_checkpoint(best, best_xid, copies)
+        if read < best_xid:
+            # everything above the one read, each with why it was not read
+            for xid, raw in copies:
+                if read < xid <= best_xid + max(blocks, 1) and xid not in passed:
+                    if not _apfs_fletcher_ok(raw):
+                        passed[xid] = "bad superblock"
+            for xid, raw in maps:
+                if xid > read and xid not in passed and _apfs_fletcher_ok(raw):
+                    passed[xid] = "no valid superblock"
+            self._notes.append(_apfs_fallback_note(passed, read))
+            self.xid = read
+            return chosen
         self.xid = best_xid
         # a damaged superblock's own transaction is believed only when it is near
-        skipped = [x for x in maps if x > best_xid]
+        skipped = [x for x, raw in maps if x > best_xid and _apfs_fletcher_ok(raw)]
         skipped += [x for x in torn if best_xid < x <= best_xid + max(blocks, 1)]
         if skipped:
             self._notes.append(f"the newest checkpoint superblock, transaction {max(skipped):,}, "
                                f"could not be read, so transaction {best_xid:,} was read, and "
                                f"newer data may exist")
         return best
+
+    def _usable_checkpoint(self, best, best_xid, copies):
+        """(superblock, transaction, {transaction passed over: why}). The newest whose
+        container and volume object maps all pass; failing that the newest whose container
+        map passes; failing that ``best``, whose own error then reports it."""
+        why = self._checkpoint_map_fault(best)
+        if why is None:
+            return best, best_xid, {}
+        passed = {best_xid: why}
+        partial = (best, best_xid) if why == "bad volume map" else None
+        for xid, raw in sorted((c for c in copies if c[0] < best_xid),
+                               key=lambda c: c[0], reverse=True):
+            if xid in passed or not _apfs_fletcher_ok(raw):
+                continue
+            why = self._checkpoint_map_fault(raw)
+            if why is None:
+                return raw, xid, passed
+            passed[xid] = why
+            if why == "bad volume map" and partial is None:
+                partial = (raw, xid)
+        if partial is None:
+            return best, best_xid, {}
+        return (partial[0], partial[1],
+                {xid: text for xid, text in passed.items() if xid > partial[1]})
+
+    def _checkpoint_map_fault(self, nx):
+        """Why a checkpoint's object maps cannot be used, or None. Only the structure of
+        each map object is tested: its checksum, id and type. An object map is not
+        encrypted, so a locked volume answers like any other."""
+        if not self._nx_map_usable(nx):
+            return "bad container map"
+        damage, lost, enc = list(self.damage), self._nodes_lost, dict(self._omap_enc)
+        self._omap_cache = {}
+        try:
+            table = self._read_omap(struct.unpack_from("<Q", nx, 160)[0])
+        except (ValueError, OSError, struct.error):
+            return None                             # the read that follows reports it
+        finally:
+            # a look at a checkpoint that may not be chosen leaves no record behind
+            self.damage[:], self._nodes_lost, self._omap_enc = damage, lost, enc
+            self._omap_cache = {}
+        limit = struct.unpack_from("<Q", nx, 40)[0]
+        count = struct.unpack_from("<I", nx, 180)[0]
+        for i in range(min(count, 100)):
+            block = table.get(struct.unpack_from("<Q", nx, 184 + i * 8)[0])
+            sb = self.block(block) if block is not None else b""
+            if (len(sb) < self.block_size or sb[32:36] != APFS_VOL_MAGIC
+                    or not _apfs_fletcher_ok(sb)):
+                continue                            # not a question about its map
+            oid = struct.unpack_from("<Q", sb, 128)[0]
+            if oid >= limit or self._object_fault(self.block(oid), oid,
+                                                  (APFS_OBJECT_TYPE_OMAP,)) is not None:
+                return "bad volume map"
+        return None
 
     def _nx_map_usable(self, nx):
         """True when the container object map a superblock names passes its checksum and
@@ -29079,15 +29164,31 @@ def _apfs_reader_checks():
         struct.pack_into("<Q", block, 0, _apfs_fletcher(bytes(block)))
         return bytes(block)
 
+    def volume_maps_everywhere(w, index):
+        """Every block any valid checkpoint names as this volume's object map."""
+        oid, out = w.volumes[index][0], set()
+        first = struct.unpack_from("<Q", w._nx, 112)[0]   # pylint: disable=protected-access
+        count = struct.unpack_from("<I", w._nx, 104)[0]   # pylint: disable=protected-access
+        for i in range(count):
+            raw = w.block(first + i)
+            if raw[32:36] != APFS_NX_MAGIC or not _apfs_fletcher_ok(raw):
+                continue
+            table = w._read_omap(struct.unpack_from("<Q", raw, 160)[0])  # pylint: disable=protected-access
+            if oid in table:
+                out.add(struct.unpack_from("<Q", w.block(table[oid]), 128)[0])
+        return out
+
     def one_volume_lost():
-        """A volume whose object map is gone: the container's other volume still reads."""
+        """A volume whose file-system tree root is gone: the container's other volume still
+        reads. An unusable volume map is now read around from an older checkpoint, and
+        clearing every older copy of it can clear blocks the newest checkpoint reuses."""
         if _BDE_AES is None or ewfprobe is None:
             return None
         base = 20480
         with open_image(encrypted_image()) as fh:
             w = ApfsWalker(fh, base)
-            vomap = struct.unpack_from("<Q", w.block(w.volumes[0][1]), 128)[0]
-            view = Patched(fh, [(base + vomap * bs, bytes(bs))])
+            w._open_volume(0)                        # pylint: disable=protected-access
+            view = Patched(fh, [(base + w.fs_root_block * bs, bytes(bs))])
             opened, _found = unlock_apfs(view, passwords=["qnxprobe-apfs-test"])
             w = ApfsWalker(opened, base)
             got = listed(w)
@@ -29159,8 +29260,8 @@ def _apfs_reader_checks():
         """A flagged volume whose object map is gone: that is the cause it must give."""
         raw = bytearray(clean)
         w = flagged(raw)
-        vomap = struct.unpack_from("<Q", w.block(w.volumes[0][1]), 128)[0]
-        raw[vomap * bs:(vomap + 1) * bs] = bytes(bs)
+        for block in volume_maps_everywhere(w, 0):
+            raw[block * bs:(block + 1) * bs] = bytes(bs)
         w = walker(raw)
         note = w.note or ""
         return (w.encryption(0) == "locked" and "object map" in note
@@ -29358,7 +29459,7 @@ def _apfs_reader_checks():
         raw[maps[newest[1]] * bs:(maps[newest[1]] + 1) * bs] = bytes(bs)
         hit = walker(raw)
         note = getattr(hit, "volume_note", None) or ""
-        if (hit.xid != older[0] or not hit.volumes or f"transaction {newest[0]:,}" not in note
+        if (hit.xid != older[0] or not hit.volumes or f"newest found is {newest[0]:,}" not in note
                 or f"transaction {older[0]:,}" not in note or "newer data may exist" not in note):
             return False
         for block in set(maps.values()):
@@ -29368,6 +29469,66 @@ def _apfs_reader_checks():
             return False
         except ValueError as exc:
             return "object map" in str(exc) and not getattr(walker(clean), "volume_note", None)
+
+    def checkpoint_chain(image):
+        """[(xid, block, container map block)] of the valid superblocks, oldest first."""
+        first = struct.unpack_from("<Q", image, 112)[0]
+        count = struct.unpack_from("<I", image, 104)[0]
+        out = [(struct.unpack_from("<Q", image, (first + i) * bs + 16)[0], first + i,
+                struct.unpack_from("<Q", image, (first + i) * bs + 160)[0])
+               for i in range(count)
+               if image[(first + i) * bs + 32:(first + i) * bs + 36] == APFS_NX_MAGIC
+               and _apfs_fletcher_ok(image[(first + i) * bs:(first + i + 1) * bs])]
+        return sorted(out)
+
+    def fallback_note_whole():
+        """The note names a later valid checkpoint map, each skipped superblock and why."""
+        chain = checkpoint_chain(clean)
+        top, next_down = chain[-1], chain[-2]
+        older = next(c for c in reversed(chain[:-2]) if c[2] != next_down[2])
+        raw = bytearray(clean)
+        raw[:bs] = clean[older[1] * bs:(older[1] + 1) * bs]    # block 0 as a live copy has it
+        raw[top[1] * bs:top[1] * bs + 512] = bytes(512)        # only its checkpoint map is left
+        raw[next_down[2] * bs:(next_down[2] + 1) * bs] = bytes(bs)
+        hit = walker(raw)
+        note = getattr(hit, "volume_note", None) or ""
+        many = {n: "bad container map" for n in range(1000, 1400)}
+        many[1400] = "no valid superblock"
+        long_note = _apfs_fallback_note(many, 999) if "_apfs_fallback_note" in globals() else ""
+        return (hit.xid <= older[0] and f"newest found is {top[0]:,}" in note
+                and f"{top[0]:,} (no valid superblock)" in note
+                and f"{next_down[0]:,} (bad container map)" in note
+                and f"transaction {hit.xid:,} was read" in note and "newer data may exist" in note
+                and len(note) <= 240 and len(long_note) <= 240 and "more" in long_note
+                and "1,400" in long_note and "transaction 999 was read" in long_note)
+
+    def volume_map_fallback():
+        """A volume's own object map is unusable at the newest checkpoint."""
+        chain = checkpoint_chain(clean)
+        w = walker(clean)
+        oid = struct.unpack_from("<Q", w._nx, 184)[0]     # pylint: disable=protected-access
+
+        def volume_map(c):
+            table = w._read_omap(c[2])                    # pylint: disable=protected-access
+            return struct.unpack_from("<Q", clean, table[oid] * bs + 128)[0]
+        maps = {c: volume_map(c) for c in chain}
+        top = chain[-1]
+        older = next(c for c in reversed(chain[:-1]) if maps[c] != maps[top])
+        raw = bytearray(clean)
+        raw[maps[top] * bs:(maps[top] + 1) * bs] = bytes(bs)
+        hit = walker(raw)
+        note = getattr(hit, "volume_note", None) or ""
+        if (hit.xid != older[0] or f"newest found is {top[0]:,}" not in note
+                or f"Skipped: {top[0]:,}" not in note or "(bad volume map)" not in note
+                or not listed(hit)):
+            return False
+        for block in set(maps.values()):
+            raw[block * bs:(block + 1) * bs] = bytes(bs)
+        hit = walker(raw)
+        listed(hit)
+        return (hit.xid == top[0] and hit.folders_not_read >= 1
+                and any("object map" in str(d) for d in hit.damage)
+                and walker(clean).xid == top[0] and not walker(clean).volume_note)
 
     def skipped_checkpoint():
         """Block 0 older than the newest checkpoint, whose superblock is then lost."""
@@ -29452,7 +29613,7 @@ def _apfs_reader_checks():
          "same checkpoint", block_zero),
         ("an APFS tree node past the end of the image costs that subtree, not the volume",
          node_past_end),
-        ("an APFS volume whose map is gone does not stop the container's other volume",
+        ("an APFS volume whose tree is gone does not stop the container's other volume",
          one_volume_lost),
         ("an APFS time before 1970 or from 2100 keeps its value, and a zip that cannot hold "
          "it says so", times_kept),
@@ -29486,6 +29647,10 @@ def _apfs_reader_checks():
          previous_size),
         ("an APFS checkpoint whose object map is unusable falls back to the newest usable one "
          "and says so", older_checkpoint),
+        ("an APFS fallback note names the newest found, each one skipped and why, and the "
+         "one read", fallback_note_whole),
+        ("an APFS checkpoint whose volume object map is unusable falls back too, and a volume "
+         "no checkpoint can read is recorded", volume_map_fallback),
         ("a lost newest APFS checkpoint superblock is recorded with the transaction skipped "
          "and the one read", skipped_checkpoint),
         ("an APFS file storing a time of exactly 0 gets a row for its 1980 member date",
