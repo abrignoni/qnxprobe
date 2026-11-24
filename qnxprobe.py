@@ -22392,7 +22392,9 @@ def _zip_time_lost(v, w=None, node=None):
     if v is None or (v == 0 and _zip_zero_is_no_time(w, node)):
         return None
     try:
-        d = datetime.datetime.fromtimestamp(v, datetime.timezone.utc)
+        # fromtimestamp() refuses a time before 1970 on Windows
+        d = (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+             + datetime.timedelta(seconds=v))
     except (OverflowError, OSError, ValueError):
         return f"{v} (outside any date this reader can show)"
     if 1980 <= d.year <= 2107:
