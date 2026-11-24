@@ -273,11 +273,15 @@ counts in (`sector_bytes`), byte offset, partition size, filesystem type, the re
 including `short` (files whose blocks reach past the end of the image), `failed`
 (files that could not be read, which are not in the zip) and, on a
 volume that does, `extends_past_image_by_bytes`. `note` is what the reader says about the
-volume as a whole, when it says anything. Besides ext and F2FS notes, the committed fixtures
-give these: an XFS dirty log, a Btrfs log tree, default subvolume or one device of two,
-ReFS log records that follow the newest checkpoint, an APFS volume left locked, and zstd
-data on a Python without zstd. On a split image `image` names the
-first segment and `image_segments` lists every segment joined, with its byte count;
+volume as a whole, when it says anything: the walker's `volume_note` where it has one, and
+otherwise its `note`. XFS, EFS and SquashFS keep damage out of it: a count of damaged
+structures and the first of them are `damage_recorded` and `damage_first`. On the
+committed fixtures, exported on Python 3.12, `note` gives an F2FS volume cut short or not
+marked as cleanly unmounted, HFS+ files that hold the provenance attribute, an XFS dirty
+log, a Btrfs log tree, default subvolume or one device of two, and zstd data on a Python
+without zstd (Btrfs and SquashFS). The self-test exports the ReFS fixture whose log
+records follow the newest checkpoint, and its `note` says so. On a split image `image`
+names the first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
 For a bare image with no vendor export alongside it, that file is the record
@@ -1214,7 +1218,8 @@ the report) and read as far as the image goes:
   `extends_past_image_by_bytes`, puts the same two numbers and the count of units the image
   does not hold whole in `damage_first`, and counts the volume in `folders_not_read`, so
   the run exits 1. `volumes()` gives the missing bytes as `missing_past_end` and the line
-  as `note`, and the walker has them as `declared_end`, `units_cut` and `damage`. In the
+  as `note`, and the walker has them as `declared_end`, `units_cut` and `damage`. The
+  export's `volumes.json` does not repeat the line as `note`. In the
   report's `FLASH` list the size shown is what the image holds of the partition.
 - A unit's header array is at the end of the unit, so a unit the image cuts has no headers
   and nothing in it is read. A file whose extents all sit in units the image holds whole
@@ -1594,10 +1599,8 @@ next mount) is not replayed. The volume reads as of its last commit, and the not
 log tree is present. `--extract` writes the walker's note to the volume's record in
 `volumes.json` as `note` and prints it as a `NOTE` line; earlier versions left it out of
 that record. A log tree that was not replayed does not change the exit status on its own.
-The same line carries the note of any reader that has one: on the fixtures that adds the
-note of the two locked APFS images, of the XFS image with a dirty log, of the ReFS image
-with pending log records and, on a Python without zstd, of the zstd SquashFS image, with
-nothing else in their exports changed.
+The same line writes the note of every reader: its `volume_note` when it has one, and
+otherwise its `note`.
 
 Validated against images `mkfs.btrfs --rootdir` (btrfs-progs 6.17.1) wrote from one
 source tree, once per compression (none, zlib, zstd, LZO) and once per other checksum
@@ -3128,9 +3131,10 @@ both.
 kernel refuses to mount one that reaches past its device (`fs/squashfs/super.c`). When the
 image holds fewer bytes than that, the volume is still named, provided its superblock
 passes the checks the kernel makes on the superblock alone, even when its root inode is in
-the part that is gone. Its note and its first damage line give the bytes recorded, the
-bytes the image holds, and the tables the superblock's own offsets place in the missing
-part; `volumes.json` carries the shortfall as `extends_past_image_by_bytes`. A folder whose
+the part that is gone. Its note in `volumes()` and its first damage line give the bytes
+recorded, the bytes the image holds, and the tables the superblock's own offsets place in
+the missing part. An export writes that line to `volumes.json` in `damage_first`, not as
+`note`, and carries the shortfall as `extends_past_image_by_bytes`. A folder whose
 inode or listing cannot be read is recorded with what that leaves out and counted in
 `folders_not_read`, and the run exits 1. A fragment table that cannot be read is recorded
 once, and the read of a file that needs it is refused with that reason. Nothing is
@@ -4303,7 +4307,8 @@ What fails is not used, and is counted:
   image (a partition followed by another), nothing past the region is read as the
   volume's.
 
-The count and the first damaged structure appear in the volume's note.
+After a walk, the walker's `note` also gives the count and the first damaged structure.
+Its `volume_note`, which is what an export writes, does not.
 
 **A cut volume.** Each inode, directory block, extent B+tree block or symlink block that
 lies past the end is recorded with what follows from it (an inode: what a folder names by
@@ -4317,9 +4322,9 @@ sector, no file is exported and the run exits 1. File data past the end, with it
 still there, is the `.SHORT` case above and is not counted in `folders_not_read`; no cut
 tried here produced one.
 
-An export writes the note to `volumes.json` as `note`, without the damage sentence, which
-it writes as `damage_recorded` and `damage_first`: a missing end, a dirty log, the
-needsrepair flag, a realtime section.
+In an export, `note` in `volumes.json` holds only what the volume says about itself: a
+missing end, a dirty log, the needsrepair flag, a realtime section. It never gives a count
+of damaged structures; those go to `damage_recorded` and `damage_first`.
 
 **The log is not replayed.** Whether it is clean is decided the way `xfs_db` and
 `xfs_logprint` decide it (libxlog `xlog_is_dirty`): find the log's head by the cycle
