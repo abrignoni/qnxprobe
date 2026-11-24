@@ -257,7 +257,7 @@ volume that does, `extends_past_image_by_bytes`. The record carries as `note` wh
 volume's reader says about the volume once it has been read: the reader's `volume_note`
 when it has one, otherwise its `note`. For a reader with only `note`, that text can differ
 from the `note` `volumes()` gave before the files were read: XFS adds a count of the
-damaged structures it skipped. 1.87 wrote only the F2FS reader's note there. On a split image `image` names the
+damaged structures it skipped. 1.87 wrote no note there. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
