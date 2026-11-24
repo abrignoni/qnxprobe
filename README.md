@@ -378,10 +378,16 @@ with blocks that have no pointer (see "QNX6 superblock choice and damaged volume
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. An exFAT file
 also gets a row when its ValidDataLength differs from its size (`PAST_VALID_DATA`,
 `VALID_DATA_DAMAGED`) or its entry set failed its checksum (`ENTRY_SET_CHECKSUM`). Those three
-are exported and do not change the exit status. Up to eight
+are exported and do not change the exit status. On NTFS it
+also has a `LINK` row per symbolic link and junction, a `RECORD_TORN` row per file read
+from a record that failed its update sequence check, and a `NAMED_STREAM` row per file or
+folder with alternate data streams, counted as `links`, `records_torn` and
+`named_streams`. None of them changes the exit status. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS or HFS+, whose readers use 0 for no time, and
-for the last three for a value out of their range too. F2FS keeps the signed value it
+for ReFS and HFS+ for a value out of their range too. An NTFS
+FILETIME that no date can show gets a `TIME_NOT_HELD` row with the raw value as stored.
+F2FS keeps the signed value it
 stores, so a stored 0 is recorded as 1970-01-01. APFS keeps every stored time. Apple's
 reference gives the field no unset value, so a stored 0 gets a row like any other time
 before 1980, and a time from 2100 to 2107 is the member's date. An F2FS file flagged
@@ -1700,17 +1706,87 @@ Only the unnamed stream is the file's content; the named ones are read separatel
 the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
 `entry()` carries only the modified one, which is what a listing needs.
 
+Symbolic links and junctions are listed as links, with `readlink()` giving the target as
+stored, and are not followed. An extraction counts them in `symlinks_or_special_skipped`
+and gives each a `LINK` row in the exceptions table with its path, kind, stored target and
+three times. A link that holds a named stream keeps the file or folder kind it has on
+disk, so a caller that takes streams from files and folders still reaches the stream; a
+file link of that kind also keeps its empty member.
+
+A stored name is kept as text that a path or SQLite accepts: an unpaired UTF-16 unit
+becomes `%XX` of its stored bytes (`%00%D8` for U+D800), a NUL becomes `%00`, and a `/`
+inside one name becomes `%2F`. A link target is a path, so its `/` stay.
+
+The update sequence protects every 512 bytes of a record on any sector size, so a volume
+on a 4096-byte-sector disk reads like any other, and a record whose sequence count does
+not fit its length is refused. Clusters over 64 KiB, up to the 2 MiB Windows formats, are
+read. An `$MFT` too fragmented for its own record is followed through its
+`$ATTRIBUTE_LIST`, and so is a directory index split over several records.
+
+An image cut short was tested at three points (the last 4 KiB, halfway, and just after the
+boot region) on 13 volumes Windows wrote: each run lost nothing or recorded what it lost.
+A cut that only shortens files names them `.SHORT`, records the ranges and exits 0. A cut
+that loses `$MFT` records or a folder exits 1. The list below says what the reader does when it meets each state. Those
+paths were run on patched copies of the fixtures, so they are not a claim that damage in
+general is detected: a lost sector over the start of an MFT record, for one, can lose that
+file or folder with no record.
+
+- A run past the end of the image, or outside the volume, stays at its own offset as
+  zeros, so nothing after it moves. The member is named `.SHORT-<here>-of-<size>-bytes`,
+  and the missing ranges are in `damage_first`. A compressed unit that is not all there
+  is not inflated, and the count is in file bytes.
+- A file is refused, and recorded as failed, when its run list does not decode, its runs
+  store more clusters than the volume has, or an extension record holding some of its
+  extents cannot be read.
+- A recorded size past the run list is read up to where the runs end and named `.SHORT`,
+  with the reason in the exceptions table. An allocated size that disagrees with the run
+  list is recorded in `damage_first`, and the file is read from its runs.
+- A record whose header is intact but which fails its update sequence check is read as it
+  stands when it still parses, as Linux reads it, and is recorded. If it does not parse, a
+  file's record is a failed file, named by its path.
+- A directory with such a record, or with an index block or entry that cannot be read, is
+  also listed from the records that name it as their parent, and is counted in
+  `folders_not_read`, which makes the exit status 1. When the stride that differs lies
+  wholly past the record's bytes in use, nothing it holds was affected: the record is
+  noted and neither the count nor the exit status changes. `listing()` keeps the subtree
+  under such a record, and counts the directory when the record does not parse.
+- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut through `$MFT` says how many
+  records lie past its end and exits 1. One cut before `$MFT` also exits 1. It gives that
+  count only when `$MFTMirr` is still in the image, and otherwise says the MFT's own record
+  is unreadable. `$Bitmap` is never read past what
+  the volume's clusters need, and clusters whose bitmap could not be read count as in
+  use, so `free_extents()` does not report them free.
+
 Deleted files are recovered separately, from the MFT rather than the directory index.
 `NtfsWalker.deleted_files()` yields every record that is marked free but still names a
 file: its name, size, dates, and whether the content can still be read. A file whose
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
-could find. A non-resident file is recoverable only while every cluster it used is still
-free; once a later file has taken one, `read_deleted()` refuses it rather than hand back
-bytes that now belong to something else, so overwritten data is never presented as the
-file. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
-records that may since have been reused, so a file whose attributes overflowed its record
-is reported as having existed rather than reconstructed from whatever now lives there.
+could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
+used as free, its initialized size is not 0, the image holds every cluster its read
+fetches, and no other record claims one of those clusters. A zero-length non-resident file
+whose initialized size is 0 is still listed as recoverable, and reading it yields no bytes.
+An attribute claims what a read of it would fetch. That stops at the attribute's
+initialized size, except that a compressed attribute is fetched in whole units, so every
+stored cluster of a unit that starts below that size counts, and a claimed cluster can
+start at or past that size. A deleted record claims this for its unnamed stream, its named
+streams and any other non-resident attribute it holds, such as a deleted folder's index or
+a non-resident attribute list. An attribute with an initialized size of 0 claims nothing.
+A record in use claims all of its stored clusters. When a file's read meets another
+record's claim the file is refused, because the volume does not record which wrote last: a later
+log sequence number shows a later update of the record, not of its data. A claim that
+touches only a file's named stream does not refuse its unnamed stream. The `reason` names
+the record the file shares the most with (a live record first), how many of the clusters
+its read uses are shared with that record, and how many other records also share. A
+recoverable compressed file can still fail to decode when it is read, and the read then
+raises `NtfsUnreadable`. A reuse by a file whose own record has since been overwritten leaves no trace, so a recovered
+file's bytes are still a candidate, not a proven copy. A deleted file the overlay filter
+compressed, or a cloud placeholder, is reported as not recoverable, since its content is
+not in its unnamed stream. `$ATTRIBUTE_LIST` is not followed for a deleted record, because
+it points at other records that may since have been reused, so a file whose attributes
+overflowed its record is reported as having existed rather than reconstructed from
+whatever now lives there, with its size shown as unknown (`None`) when the attribute that
+holds it is in an extension record. A freed extension record is not listed as a file.
 
 Validated two ways. A 16 MiB volume written by `mkntfs` and populated through `ntfs-3g`
 carries a resident file, an empty one, a sparse one, a compressed one, one fragmented
@@ -1762,10 +1838,15 @@ for path, node, mode, size, mtime, recorded in walker.listing(streams=True):
         data = b"".join(walker.read_file(node, size))
 ```
 
-Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()`, `--extract`
-and the window's Contents pane are as they were, because a caller that asked for a folder's
-files and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser
-expecting a shortcut. `listing(streams=True)` names each stream `path:stream`, as Windows
+Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()` and the
+window's Contents pane do not return them, because a caller that asked for a folder's files
+and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser expecting
+a shortcut. `--extract` does not write a stream's bytes as a member either, but it does say
+they exist: each file or folder holding streams gets one `NAMED_STREAM` row in the
+exceptions table, with each stream's name and recorded size, the first 16 named and the
+rest counted. The root directory's row has the path `/`. `WofCompressedData` is left out
+of a file the overlay filter backs, since it is that file's own content.
+`listing(streams=True)` names each stream `path:stream`, as Windows
 does, straight after its file, with the file's modified time (NTFS keeps no dates per
 stream); a stream on the root directory is `:stream`. A caller walking the tree instead asks
 `streams(record)` for each entry. `--list` names every stream beside its file at its
