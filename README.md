@@ -4372,9 +4372,32 @@ extracting qnxmount's own committed test images and comparing every name, mode, 
 timestamp, symlink target and byte of content against the tar archive built from the
 same live filesystem, which qnxmount produced on QNX independently of this code: ETFS
 matched 32 of 32 entries, EFS 31 of 31. ETFS has no magic, so it is claimed only when
-the page geometry divides evenly and the `.filetable` carries its fixed reserved names
-at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
-u-boot, boot_fs or ext partitions of the two vehicle images tested.
+the `.filetable`, read in pages of one of the six page sizes tried, carries its fixed
+reserved names at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither
+fired on the u-boot, boot_fs or ext partitions of the two vehicle images tested.
+
+An ETFS image need not be a whole number of pages. Until this version the region also
+had to divide evenly into pages of data plus 16 bytes of transaction record, so an image
+cut anywhere but on a page boundary was "not recognised" and exported nothing, with exit
+0. The two qnxmount volumes with their last 4 KiB removed read so, though the pages
+that cut touches are erased ones (data all 0xFF, transaction code 3, `ETFS_TRANS_FOXES`
+in `fs/etfs.h`). The size test is gone and the reserved-name test stays.
+Such an image is read as the volume it is, and its record in `volumes.json` carries a
+`note` (also printed as `NOTE`) saying the image or region ends inside a page, how many
+bytes of that page are there, and that the page was not read. Whole pages cut off with
+it are not counted: the note speaks for the one partial page only. Checked on the two qnxmount volumes: whole, each still matches the tar its writer
+made on path, size, CRC and modification time (23 and 14 regular files) and exports
+exactly what it did before; cut by 4 KiB, each exports the same members as whole, with
+the note. With the size test gone the reserved names are all that claims a region, so
+the change was also run over 23 raw flash dumps from the test corpus that hold no ETFS:
+none gained an ETFS volume, and each lists the same kinds of volume as before.
+
+ETFS names follow the rule the other readers use, in both places a name is stored (the
+32 bytes of a file entry and the continuation in an extension entry): a byte that is
+not UTF-8 becomes `%XX` of the stored byte, where before it became U+FFFD, and a `/`
+stored inside a name becomes `%2F`, where before it split the name into folders. No
+name in the two qnxmount volumes has either, so this is proven by a self-test row on
+the synthetic volume only.
 
 The EFS layouts are read from qnxmount at commit
 `11c8a7f9ee9b945d584263743f6ea8524e8776d2`. The extent status bits (condition mask 0x70
@@ -4715,8 +4738,9 @@ above are in this README only for now.)
   measured on six vehicle flash images since 1.60 (see "QNX EFS in a raw flash image").
   ETFS keeps its transaction metadata in the NAND spare/out-of-band
   area, so an ETFS volume is only readable if the acquisition captured that spare area;
-  an image that dropped it will not divide into pages and will be reported as not
-  recognised rather than misread.
+  an image that dropped it has no transaction record after each page, so the
+  `.filetable` should not be found and the image should be reported as not recognised;
+  no such image was available to run.
 - **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
   were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
   driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2

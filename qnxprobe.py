@@ -14587,6 +14587,14 @@ def _etfs_scan_transactions(fh, base, pagesize, n, want_fid=None, cap=None):
             break
 
 
+def _etfs_name(raw):
+    """A stored ETFS name, or the part of one an entry holds, as text: up to its first
+    NUL, a byte that is not UTF-8 as %XX of the stored byte, and a "/" stored inside the
+    name as %2F so that it cannot invent a folder."""
+    return (raw.split(b"\x00", 1)[0].decode("utf-8", "qnxprobe-name")
+            .replace("\x00", "%00").replace("/", "%2F"))
+
+
 def _etfs_parse_entry(raw):
     """One 64-byte .filetable entry, or None."""
     if len(raw) < ETFS_ENTRY_SIZE:
@@ -14599,17 +14607,20 @@ def _etfs_parse_entry(raw):
              is_valid=efid != 0xFFFF, body=None, full=None)
     if etype == 0:                                # file entry
         mode, uid, gid, atime, mtime, ctime, size = struct.unpack_from("<7I", raw, 4)
-        name = raw[32:64].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        name = _etfs_name(raw[32:64])
         e["body"] = dict(mode=mode, uid=uid, gid=gid, mtime=mtime,
                          ctime=ctime, size=size, name=name)
     elif etype == 1:                              # extension-name entry
-        e["body"] = dict(name=raw[4:63].split(b"\x00", 1)[0].decode("utf-8", "replace"))
+        e["body"] = dict(name=_etfs_name(raw[4:63]))
     return e
 
 
 class EtfsWalker:
     """Reconstruct an ETFS filesystem by replaying its transactions, then walk
-    it through the shared collect()/extract interface. A node is a file id."""
+    it through the shared collect()/extract interface. A node is a file id.
+
+    ``volume_note`` says so when the region is not a whole number of pages: the
+    bytes after the last whole page are part of one page and are not read."""
 
     root = ETFS_FID_ROOT
 
@@ -14617,6 +14628,7 @@ class EtfsWalker:
         self.fh, self.base, self.bs = fh, base, pagesize
         self.unit = pagesize + ETFS_TRANS_SIZE
         self.n = size // self.unit
+        self.volume_note = _etfs_tail_note(size, pagesize)
         # current page for every (fid, cluster): the highest sequence wins, and
         # for equal sequences the later physical page, matching qnxmount.
         cur = {}
@@ -24411,14 +24423,28 @@ def _etfs_reserved_match(fh, base, pagesize, n, need=3):
     return False
 
 
+def _etfs_tail_note(size, pagesize):
+    """What to say of a region that is not a whole number of pages, or None."""
+    unit = pagesize + ETFS_TRANS_SIZE
+    tail = size % unit
+    if not tail:
+        return None
+    return (f"the image or region ends inside a page: after its {size // unit:,} whole "
+            f"pages of {unit:,} bytes ({pagesize:,} of data and {ETFS_TRANS_SIZE} of "
+            f"transaction record) come {tail:,} bytes that are part of one more page, "
+            f"and that page was not read")
+
+
 def etfs_pagesize(fh, base, size):
     """The ETFS page size for the region, or None. A candidate is accepted only
-    when the region divides evenly into (pagesize + 16)-byte pages AND the
-    .filetable carries its reserved names, so a chance size match is rejected.
+    when the .filetable, read in (pagesize + 16)-byte pages, carries its reserved
+    names at their fixed ids. The region need not be a whole number of pages: an
+    image cut inside its last page is still that volume, and the walker says the
+    page was not read (_etfs_tail_note).
     """
     for P in ETFS_PAGE_SIZES:
         unit = P + ETFS_TRANS_SIZE
-        if size < unit or size % unit != 0:
+        if size < unit:
             continue
         if _etfs_reserved_match(fh, base, P, size // unit):
             return P
@@ -24430,12 +24456,16 @@ def identify_etfs(fh, base, size):
     P = etfs_pagesize(fh, base, size)
     if P is None:
         return None
-    return "etfs", [
+    lines = [
         f"page size    {P:,} bytes data + {ETFS_TRANS_SIZE} bytes transaction",
         f"pages        {size // (P + ETFS_TRANS_SIZE):,}",
         "layout       transaction based, live state replayed from the spare area",
         "reserved     .filetable/.badblks/.counts/.lost+found/.reserved present",
     ]
+    tail = _etfs_tail_note(size, P)
+    if tail:
+        lines.append(f"note         {tail}")
+    return "etfs", lines
 
 
 def identify_efs(fh, base, size):
@@ -41648,7 +41678,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, (F2fsWalker, HfsPlusWalker)) and w.volume_note:
+                            if isinstance(w, (F2fsWalker, HfsPlusWalker, EtfsWalker)) and w.volume_note:
                                 if manifest is not None:
                                     manifest[-1]["note"] = w.volume_note
                                 _say(f"            NOTE {w.volume_note}")
@@ -48563,6 +48593,83 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic ETFS recognised and one file round-tripped: "
               f"kind={kind}")
+
+        # ETFS names, in both places a name is stored: the 32 bytes of a file entry and
+        # the continuation in an extension entry. A byte that is not UTF-8 becomes %XX
+        # of the stored byte and a stored "/" becomes %2F, so two names that differ in
+        # one such byte stay two names, neither invents a folder, and both go into SQLite.
+        try:
+            nt = bytearray(etfs_img)
+            struct.pack_into("<H", nt, 6 * 64, 7)                    # fid 6 continues in fid 7
+            nt[6 * 64 + 32:7 * 64] = b"a\xffb/c".ljust(32, b"\x00")
+            nt[7 * 64:8 * 64] = (struct.pack("<HH", 0x8000, 6) + b"\xfe/x").ljust(64, b"\x00")
+            nt[8 * 64:9 * 64] = (struct.pack("<HH", 0x0000, 0)
+                                 + struct.pack("<7I", 0o100644, 0, 0, 0, 1712000000, 0, 0)
+                                 + b"a\xfdb/c".ljust(32, b"\x00"))
+            ew = walker_for("etfs", io.BytesIO(bytes(nt)), 0, len(nt))
+            et_paths = sorted(e[0] for e in collect(ew, ew.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            edb = sqlite3.connect(":memory:")
+            edb.execute("create table n (name text)")
+            edb.executemany("insert into n values (?)", [(n,) for n in et_paths])
+            ekept = sorted(r[0] for r in edb.execute("select name from n"))
+            edb.close()
+            long_node = dict(ew.listdir(ew.root)).get("a%FFb%2Fc%FE%2Fx")
+            egood = ("a%FFb%2Fc%FE%2Fx" in et_paths and "a%FDb%2Fc" in et_paths
+                     and not any("/" in n or "\ufffd" in n for n in et_paths)
+                     and ekept == et_paths and long_node == 6
+                     and b"".join(ew.read_file(6, len(payload))) == payload)
+            esaid = ", ".join(n for n in et_paths if n.startswith("a"))
+        except Exception as exc:                     # pylint: disable=broad-except
+            egood, esaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not egood:
+            ok = False
+        print(f"  [{'PASS' if egood else 'FAIL'}] ETFS names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, in a file entry and in its extension "
+              f"entry, kept apart and stored in SQLite ({ascii(esaid)[1:-1][:120]})")
+
+        # An ETFS image that ends inside a page. The synthetic volume with one more,
+        # erased, page after it, cut 100 bytes short: no page size divides it. It is
+        # still the volume, with the same members as the whole image, and the export
+        # says the last page was not read. Removed when the row ends, because the
+        # build workflow counts the images left in this folder.
+        def etfs_export(raw):
+            path = os.path.join(d, "etfs_cut_in_page.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = [(i.filename, i.CRC, i.file_size) for i in zf.infolist()
+                            if not i.filename.endswith(".tsv")]
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            erased = etfs_img + b"\xff" * (Pz + ETFS_TRANS_SIZE)
+            wrec, wheld, _wout = etfs_export(erased)
+            trec, theld, tout = etfs_export(erased[:-100])
+            w0, t0 = (wrec[0] if wrec else {}), (trec[0] if trec else {})
+            tgood = (len(wrec) == 1 and w0.get("filesystem") == "etfs" and "note" not in w0
+                     and len(trec) == 1 and t0.get("filesystem") == "etfs"
+                     and theld == wheld and len(theld) >= 1
+                     and t0.get("files") == w0.get("files") and t0.get("short") == 0
+                     and t0.get("failed") == 0 and "damage_recorded" not in t0
+                     and "ends inside a page" in t0.get("note", "")
+                     and f"come {Pz + ETFS_TRANS_SIZE - 100:,} bytes" in t0.get("note", "")
+                     and "that page was not read" in t0.get("note", "")
+                     and "NOTE" in tout and _volumes_not_read(trec) == 0)
+            tsaid = t0.get("note", "not recognised")[:150]
+        except Exception as exc:                     # pylint: disable=broad-except
+            tgood, tsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not tgood:
+            ok = False
+        print(f"  [{'PASS' if tgood else 'FAIL'}] an ETFS image that ends inside a page is "
+              f"still read, with the members of the whole image and a note that the page "
+              f"was not read ({tsaid})")
 
         # A synthetic EFS image: one erase unit whose unit_info sizes it, whose
         # boot record carries the QSSL_F3S signature, and whose header 2
