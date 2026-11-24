@@ -151,7 +151,8 @@ set. It was run on the 12 synthetic self-test images, qnxmount's four reference
 images, a Ford Sync G4 eMMC image (9 volumes) and a BMW MGU image (11 volumes)
 before this was published, and all agreed. A qnx6 found only by the brute scan
 is reported but has no partition to walk, so it appears in the report and not in
-the Contents pane, in the window exactly as on the command line.
+the Contents pane, in the window exactly as on the command line. An export records one
+whose checksum holds as a volume that was not read.
 
 ## Executables
 
@@ -369,7 +370,9 @@ than 255 bytes of UTF-8 keeps its start and a short last extension around a hash
 A filesystem volume with anything to record gets `<volume>.exceptions.tsv` beside its
 folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 `exceptions`. It has one row per file that failed, read short or was renamed
-(`stored_path`, `zip_member`, `issue`, `detail`), and `TIME_NOT_HELD` rows for stored times
+(`stored_path`, `zip_member`, `issue`, `detail`), a `NO_POINTER_ZEROS` row for a qnx6 file
+with blocks that have no pointer (see "QNX6 superblock choice and damaged volumes"), and
+`TIME_NOT_HELD` rows for stored times
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
@@ -733,9 +736,9 @@ holds. Until then it was refused, and a volume whose every superblock looks
 like that was reported as not recognised. The checksum is the one the Linux driver checks,
 `crc32_be` over bytes 8 to 512 compared with `sb_checksum` (fs/qnx6/inode.c), read in the
 superblock's own byte order. The report says why such a copy was taken, under the generation
-it belongs to. Any other inconsistency still refuses the copy, and a checksum that does not
-match is not a new reason to refuse one: a copy with a good clock and a bad checksum reads
-as it did before.
+it belongs to. Any other inconsistency still refuses the copy. A copy with a good clock and
+a bad checksum is not refused outright, but it is read only when no copy of the volume
+passes (see "QNX6 superblock choice and damaged volumes" below).
 
 Measured on the two vehicle images at hand that hold qnx6 volumes (a Ford Sync G4 and a GM
 unit), the checksum holds on all 26 superblock copies qnxprobe probes. On the GM image two
@@ -754,7 +757,102 @@ same volume id. Everything else the container probes is still its own, so a 0x05
 with no EBR chain that holds a qnx6 is still read, and so is one whose boot code parses as
 an EBR naming a logical volume that has no superblock of its own (both shown by the
 self-test only). The walker still reads little-endian qnx6 only;
-a big-endian superblock with no clock is accepted the same way, in the self-test only.
+a big-endian superblock with no clock is accepted the same way, in the self-test only,
+and that volume is then recorded as not read.
+
+## QNX6 superblock choice and damaged volumes
+
+The report and `volumes()` pick the superblock with one function, `qnx6_select()`, so they
+always walk the same one. The Linux driver (`fs/qnx6/inode.c`, v6.12) refuses a volume with a
+failed copy, and of two valid copies takes the higher serial (lines 397-409). This reader
+uses the same checksum and serial tests, and goes on where the driver would stop:
+
+- A copy whose checksum holds beats one that fails, whatever their serials. A failed copy
+  is read only when no copy passes, and the run says so.
+- Only copies with the first superblock's volume id, block size and block count compete.
+  A superblock an earlier, larger format left at the end of a partition is named in the
+  report and not used, even when the live copies fail their checksums. A newer copy with
+  another identity is not read either, and that is recorded.
+- If the first superblock is lost or damaged, the second is still found through the boot
+  header's `b_sblk1` or the first copy's own block count, and has to pass its checksum.
+  When no region of the image has a usable copy, the first 256 MiB are scanned
+  (`--scan-limit`).
+  A superblock found only by that scan is not walked, because one copy on its own does not
+  say where the volume starts. It is recorded as a volume not read, and so is a first
+  superblock that kept its magic with no valid copy found, on a region nothing else claims.
+- The image has to reach the end of the second superblock's area. If it does not, the
+  volume is marked INCOMPLETE, the run says a newer generation may be lost, and it exits 1.
+- The Linux driver refuses a volume unless both superblocks pass. This reader goes on with
+  the one that survives, because it may be all there is. It records that the other area
+  holds no valid copy, that an older generation may have been read and newer data may
+  exist, and it exits 1.
+- With no boot block the data area starts at 0x1000 (lines 335-341 and 374-375). Above 4096
+  bytes per block no source says where it starts, so such a volume is not read. This layout
+  is checked on fixtures only: no real volume without a boot block is at hand.
+- A big-endian volume is recorded as not read, with the reason, so it cannot pass for an
+  empty volume.
+
+**Audi MMI 3G.** The superblock layout the kernel calls `qnx6_mmi_super_block`
+(`include/linux/qnx6_fs.h`, `fs/qnx6/super_mmi.c`) is read: first superblock at byte 0,
+data at 0x1000, no timestamps. The kernel picks this layout with a mount option, so here
+it is tried only on a copy whose checksum holds and whose standard fields do not. It is
+built from the kernel source and has not been tested on a real unit: the only image it has
+read is a fixture written from that same struct.
+
+**Block pointers.** Only ~0 means unused. A stored 0 is block 0, which real volumes use. On
+the nine vehicle volumes at hand, a stored 0 appears only as a top-level Bitmap pointer (on
+six of them in the active generation), no pointer block is all zeros, and every slot past a tree's size is ~0. Each
+slot is judged on its own and zeros are counted per 512-byte sector, a unit an imager can
+zero-fill. A 0 is followed as block 0 only when it is alone in its sector and no other
+sector holds a lone 0 inside the tree's size, because one block cannot be stored twice.
+Pointers past the volume's block count, more than 5 levels, and a pointer back to its own
+pointer block are refused the same way.
+
+**Sparse files.** QNX documents that fs-qnx6 [creates sparse files by default since
+7.1](https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.user_guide/topic/fsystems_QNX6_filesystem.html),
+with a [`nosparse` mount option](https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.utilities/topic/f/fs-qnx6.so.html).
+Those pages do not say how a hole is stored. The Linux driver treats a ~0 inside an indirect
+block as no block, which reads as zeros, and logs an error (`inode.c` lines 145-148). It does
+not test an inode's own 16 pointers (line 135). Here a ~0 at either level inside a file's size
+is read as zeros at full length. The file is not SHORT and the exit code does not change.
+One `NO_POINTER_ZEROS` row in the exceptions table says how many blocks that covers,
+because a sparse hole and a damaged pointer look the same. That ~0 is how QNX stores a hole
+has not been confirmed on a real 7.1 volume: none of the nine volumes at hand has an unused
+pointer inside a file's size.
+
+**What a damaged file looks like.** A file with a block whose pointer is damaged is stored
+as `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is what was really read. A lost block
+before the last block that exists is zeros, so later bytes keep their offsets, and nothing
+is written after the last block that exists. The exceptions table says how many blocks were
+lost and why. A size past what the file's pointers can address, or past the volume's own
+size (QNX counts sparse blocks against free space), is SHORT the same way.
+
+Metadata that cannot be read goes into the walker's `damage` list and `volumes.json`
+(`damage_recorded`, `damage_first`, `folders_not_read`), and a folder not read in full makes
+the run exit 1. A long name that cannot be read becomes `long-name-damaged-inode-<n>-block-<b>`,
+an invalid name length becomes `name-damaged-inode-<n>`, and a slash stored in a name is
+written `%2F`. Name bytes that are not UTF-8 are kept as `%XX`, and a stored NUL as `%00`.
+A long name that fails the checksum in its directory entry is kept and recorded.
+
+A root folder whose first block does not start with `.` and `..` is recorded as a folder not
+read and the run exits 1, because the Linux driver tests those two names on the root and
+refuses the mount (`qnx6_checkroot`). On any other folder it is a counted note with no exit
+change, because no QNX or Linux source requires them first there. An inode a directory names is recorded as damage, with its path, and
+not counted as a special file when its format bits are not a type QNX defines (`sys/stat.h`,
+including `S_IFNAM`), when `QNX6FS_INO_USED` is clear (`sys/fs_qnx6.h`), or when it records
+more than 5 pointer levels.
+
+Two counts are notes and do not change the exit code. The distinct inodes reached are compared
+with the superblock's count in use (`sb_num_inodes` minus `sb_free_inodes`). A shortfall can be
+a lost directory entry, or a file that is open but unlinked on a running device, because QNX
+delays its removal until the last close and no source says how a snapshot counts it. And
+`i_nlink` is compared with the names found, so a hard-link name lost with its sector is
+recorded with the file's surviving path. On all 19 superblock generations of the nine vehicle
+volumes and the QNX-written test image, hard links included, every one of these checks is
+silent.
+
+These checks cover the specific cases named here. They are not a general test for damage: a
+damaged sector can change bytes or names and leave no record.
 
 ## QNX6 free space
 
@@ -3982,7 +4080,10 @@ declines the sector if one is there. As a last resort it also declines any table
 of whose partitions begins inside the image. The boot indicator byte is not used as a
 test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table on it.
 The self-test builds an image of this shape and requires both superblock copies to be
-found and the volume to be listed.
+found and the volume to be listed. A declined table is not read from. When nothing
+recognises the file and each entry with a boot flag of 0x00 or 0x80, a type and a sector
+count starts past the end, `--extract` writes a `volumes.json` record saying so and that
+the file may be a cut disk image, and the run exits 1.
 
 Since 1.31 the GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
 so its byte offset is the logical sector size: 512 on most disks, 4096 on 4Kn drives
@@ -4292,7 +4393,10 @@ above are in this README only for now.)
   the partitions that reach past the end, marks each affected volume `INCOMPLETE` in
   the report and in `volumes.json` (`extends_past_image_by_bytes`), and stores a file
   whose blocks lie past the cut under a name ending `.SHORT-<here>-of-<size>-bytes`,
-  counted as `short` rather than as extracted.
+  counted as `short` rather than as extracted. A partition the table lists that begins
+  at or past the end of the image holds nothing to read: with `--extract` it gets a
+  `volumes.json` record whose `extract_error` gives the listed offset and where the
+  image ends, and the run exits 1.
 - **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
   a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
   sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails

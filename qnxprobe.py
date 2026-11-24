@@ -99,6 +99,11 @@ F = dict(magic=0, checksum=4, serial=8, ctime=16, atime=20, flags=24,
          version1=28, version2=30, volumeid=32, blocksize=48,
          num_inodes=52, free_inodes=56, num_blocks=60, free_blocks=64,
          allocgroup=68)
+# the same in struct qnx6_mmi_super_block, the Audi MMI 3G layout (parse_sb_mmi)
+QNX6_MMI_FIELDS = dict(blocksize=40, num_inodes=44, free_inodes=48, num_blocks=52,
+                       free_blocks=56, Inode=64, Bitmap=144, Longfile=224)
+# where a first superblock can be, from the start of a volume (see sb_slots)
+QNX6_FIRST_SLOTS = (BOOTBLOCK_SIZE, BOOTBLOCK_SIZE + 0xE00, 0, 0xE00)
 
 # A filesystem created before QNX6 existed or far in the future is not real.
 T_MIN = int(datetime.datetime(1995, 1, 1, tzinfo=datetime.timezone.utc).timestamp())
@@ -125,7 +130,10 @@ def sb_slots(fh, base, label, sized_regions):
     for rlabel, rbase, rsize in sized_regions:
         if rbase == base and rsize:
             ends.append(rsize)
-    head = check(fh, base + BOOTBLOCK_SIZE) or check(fh, base)
+    head = check_sb(fh, base + BOOTBLOCK_SIZE)
+    head_at = BOOTBLOCK_SIZE
+    if head is None:
+        head, head_at = check_sb(fh, base), 0
     if head and not head[2]:
         total = head[1]["num_blocks"] * head[1]["blocksize"]
         if 0 < total < (1 << 42):
@@ -142,8 +150,30 @@ def sb_slots(fh, base, label, sized_regions):
             # qnx6_data_start()); the boot header below is.
             second = BOOTBLOCK_SIZE + 0x1000 + total
             rels += [second, second + 0xE00]
+            # With no boot block the first superblock is at byte 0 and the
+            # kernel's expression has no 0x2000 in it (inode.c lines 341 and
+            # 369-371), and the Audi MMI layout reads the same place
+            # (super_mmi.c lines 68-69).
+            if head_at == 0:
+                rels += [0x1000 + total, 0x1000 + total + 0xE00]
+    named = []
+    if head and head[2]:
+        # The first copy kept its magic and failed its checks. Where its own block
+        # count, read in either layout, puts the second copy is worth one look, and a
+        # copy there is taken only if it passes its own checksum.
+        raw = read_at(fh, base + head_at, 512)
+        for at in (F, QNX6_MMI_FIELDS):
+            bs, nb = (struct.unpack_from("<I", raw, at[k])[0] for k in ("blocksize", "num_blocks"))
+            if not (512 <= bs <= 65536 and (bs & (bs - 1)) == 0) or not 0 < nb * bs < (1 << 42):
+                continue
+            start = qnx6_data_start(bs) if head_at else 0x1000
+            for rel in (start + nb * bs, start + nb * bs + 0xE00):
+                other = check_sb(fh, base + rel)
+                if other and other[1]["checksum_ok"] and not other[2]:
+                    named.append(rel)
+    tail = []
     for e in ends:
-        rels += [e - 0x1000, e - 0x200]
+        tail += [e - 0x1000, e - 0x200]
 
     # Where the volume itself records its two superblocks: b_sblk0 and b_sblk1
     # of the boot header (sys/fs_qnx6.h lines 280-286), counted in sectors of
@@ -160,17 +190,24 @@ def sb_slots(fh, base, label, sized_regions):
     # as the first superblock. It finds the second copy when the region-size
     # candidates do not, which the self-test shows for blocks above 4096; that
     # has not been measured on a real volume with blocks above 4096.
-    boot = read_at(fh, base, 16)
-    if head and len(boot) == 16 and boot[:3] == QNX6_BOOT_JMP:
-        sblk0, sblk1 = struct.unpack_from("<II", boot, 8)
-        for unit in (512, 1024, 2048, 4096):
-            if sblk0 * unit == BOOTBLOCK_SIZE:
-                for rel in (sblk1 * unit, sblk1 * unit + 0xE00):
-                    other = check(fh, base + rel)
-                    if other and all(other[1][k] == head[1][k]
-                                     for k in ("volumeid", "blocksize", "num_blocks")):
-                        rels.append(rel)
-                break
+    #
+    # When the first superblock is unreadable there is no identity to compare, so
+    # the place the boot header names is taken only if the copy there passes its
+    # own checksum. When the first superblock fails its checksum, a copy with its
+    # identity is offered too, so a volume with no valid copy still reads its
+    # newest. These go ahead of the region-size candidates: those are where a
+    # stale superblock of an earlier, larger format would be, and qnx6_select()
+    # takes the first valid copy as the reference.
+    trusted = head and not head[2] and head[1]["checksum_ok"]
+    for rel in _qnx6_boot_second(fh, base):
+        other = check_sb(fh, base + rel)
+        if not other:
+            continue
+        if head and _qnx6_identity(other[1]) == _qnx6_identity(head[1]):
+            named.append(rel)
+        elif not trusted and other[1]["checksum_ok"] and not other[2]:
+            named.append(rel)
+    rels += tail + named if trusted else named + tail
 
     seen = set()
     for rel in rels:
@@ -178,6 +215,18 @@ def sb_slots(fh, base, label, sized_regions):
             continue
         seen.add(rel)
         yield base + rel, rel
+
+
+def _qnx6_boot_second(fh, base):
+    """The two offsets, from base, where the boot header's b_sblk1 puts the second
+    superblock area, in the sector size that puts b_sblk0 at 0x2000, or []."""
+    boot = read_at(fh, base, 16)
+    if len(boot) == 16 and boot[:3] == QNX6_BOOT_JMP:
+        sblk0, sblk1 = struct.unpack_from("<II", boot, 8)
+        for unit in (512, 1024, 2048, 4096):
+            if sblk0 * unit == BOOTBLOCK_SIZE:
+                return [sblk1 * unit, sblk1 * unit + 0xE00]
+    return []
 
 
 def report_generations(copies, sized_regions, how_of):
@@ -1257,11 +1306,11 @@ def _logical_slots(fh, regions):
     for label, base, _size in regions:
         if not label.startswith("logical @"):
             continue
-        own = check(fh, base + BOOTBLOCK_SIZE) or check(fh, base)
+        own = check_sb(fh, base + BOOTBLOCK_SIZE) or check_sb(fh, base)
         if not own or own[2]:
             continue
         for off, _rel in sb_slots(fh, base, label, regions):
-            r = check(fh, off)
+            r = check_sb(fh, off)
             if r and r[1]["volumeid"] == own[1]["volumeid"]:
                 out.add(off)
     return out
@@ -1279,7 +1328,174 @@ def check(fh, off):
     return None
 
 
-def parse_mbr(fh):
+def parse_sb_mmi(buf):
+    """The Audi MMI 3G superblock layout, struct qnx6_mmi_super_block in Linux
+    include/linux/qnx6_fs.h (v6.12, lines 117-133), or None.
+
+    It keeps the magic, checksum and serial where the standard layout has them and
+    moves the rest: a 12-byte id at 28, the block size at 40, and the Inode, Bitmap and
+    Longfile root nodes at 64, 144 and 224. It holds no ctime, atime, flags or version,
+    so those keys are 0 and sb["layout"] says why. The kernel selects this layout with
+    a mount option (super_mmi.c), so nothing on disk names it: this is tried only on a
+    copy whose checksum holds and whose standard fields do not (check_sb)."""
+    if struct.unpack_from("<I", buf, 0)[0] != QNX6_MAGIC:
+        return None
+    bs, n_ino, f_ino, n_blk, f_blk = struct.unpack_from("<5I", buf, QNX6_MMI_FIELDS["blocksize"])
+    if not (512 <= bs <= 65536 and (bs & (bs - 1)) == 0) or not n_blk or not n_ino:
+        return None
+    if f_blk > n_blk or f_ino > n_ino:
+        return None
+    checksum = struct.unpack_from("<I", buf, 4)[0]
+    if checksum != qnx6_sb_crc(buf[8:512]):
+        return None
+    return dict(checksum=checksum, serial=struct.unpack_from("<Q", buf, 8)[0], ctime=0, atime=0,
+                flags=0, version1=0, version2=0, volumeid=buf[28:40], blocksize=bs,
+                num_inodes=n_ino, free_inodes=f_ino, num_blocks=n_blk, free_blocks=f_blk,
+                allocgroup=0, checksum_ok=True, layout="mmi")
+
+
+def check_sb(fh, off):
+    """check(), and for a copy whose checksum holds and whose standard fields fail,
+    the Audi MMI 3G layout (parse_sb_mmi). A standard superblock never reaches it."""
+    r = check(fh, off)
+    if r and r[2] and r[1]["checksum_ok"] and r[0] == "little endian":
+        sb = parse_sb_mmi(read_at(fh, off, 512))
+        if sb is not None:
+            return r[0], sb, []
+    return r
+
+
+def _qnx6_identity(sb):
+    """What makes two superblock copies copies of one filesystem."""
+    return sb["volumeid"], sb["blocksize"], sb["num_blocks"]
+
+
+def qnx6_select(fh, base, copies):
+    """Which superblock a qnx6 volume is read from. main() and volumes() both use this,
+    so the report and every tool reading through volumes() walk the same one.
+
+    copies is (offset in the image, endian, sb, reasons it failed) for every magic
+    match of one region, in sb_slots() order: first superblock, then the copy the boot
+    header names, then the rest. Returns None when none is usable, else a dict:
+
+        active      (offset, endian, sb) of the copy to read
+        pool        the copies that competed for that: of this filesystem, and valid
+                    when any is
+        layout      "boot", "noboot" or "mmi", which says where block 0 is
+        volume_end  byte offset, from base, of the end of the second superblock area
+        notes       what an examiner needs to know about the choice, for walker.damage
+        lost        True when the first or second area holds no valid copy of this
+                    filesystem, so a newer generation may exist than the one read
+        others      usable copies that belong to another filesystem, not used
+
+    The kernel mounts a volume only when both superblocks are there and pass their
+    checksums (fs/qnx6/inode.c v6.12, lines 350-354 and 384-395). This reader goes on
+    without one, because what survives may be all an examiner has. ``lost`` is then
+    True: with one area holding no valid copy, nothing shows whether the copy read is
+    the newest, so it is recorded, and the run exits 1 (qnx6_walker). A copy that fails
+    its checksum is used only when no copy passes. The filesystem is the one the first
+    superblock names (the second is computed from its block count, lines 369-371), so
+    only copies with its volume id, block size and block count compete; a superblock of
+    an earlier format left at the end of a partition does not. The highest serial wins
+    (lines 397-409). Among copies with one serial the lowest offset is read.
+
+    A first superblock that fails its checksum still names its filesystem when its
+    fields can be read. A valid copy with another identity then counts as this
+    filesystem's only if it has the same volume id or sits where the first copy or the
+    boot header puts the second superblock. Otherwise it is an earlier format's, and
+    the first copy's filesystem is read, with a note. Any copy passed over that
+    is newer, or valid while the copy read is not, is recorded."""
+    usable = [c for c in copies if not c[3]]
+    if not usable:
+        return None
+    valid = [c for c in usable if c[2]["checksum_ok"]]
+    reference = (valid or usable)[0][2]
+    first = None
+    if base is not None:
+        first = next((c for c in usable if c[0] - base in QNX6_FIRST_SLOTS), None)
+    if valid and first is not None and not first[2]["checksum_ok"]:
+        size_bytes = first[2]["num_blocks"] * first[2]["blocksize"]
+        start = (qnx6_data_start(first[2]["blocksize"]) if first[0] - base >= BOOTBLOCK_SIZE
+                 else 0x1000)
+        places = {start + size_bytes, start + size_bytes + 0xE00, *_qnx6_boot_second(fh, base)}
+        if not any(_qnx6_identity(c[2]) == _qnx6_identity(first[2])
+                   or c[2]["volumeid"] == first[2]["volumeid"] or c[0] - base in places
+                   for c in valid):
+            reference = first[2]
+    mine = [c for c in usable if _qnx6_identity(c[2]) == _qnx6_identity(reference)]
+    pool = [c for c in mine if c[2]["checksum_ok"]] or mine
+    top = max(c[2]["serial"] for c in pool)
+    off, endian, sb, _bad = min((c for c in pool if c[2]["serial"] == top), key=lambda c: c[0])
+
+    notes = []
+    if not sb["checksum_ok"]:
+        notes.append(f"no superblock copy passes its checksum; read from the one at {off:#x} "
+                     f"(serial {top:,}), whose fields may be wrong")
+    else:
+        for c in copies:                # a copy refused on its clock is still this volume's
+            if (_qnx6_identity(c[2]) == _qnx6_identity(reference)
+                    and not c[2]["checksum_ok"] and c[2]["serial"] >= top):
+                notes.append(f"the superblock copy at {c[0]:#x} (serial {c[2]['serial']:,}) "
+                             f"fails its checksum and was not used; read from serial {top:,}")
+
+    others = [c for c in usable if _qnx6_identity(c[2]) != _qnx6_identity(reference)]
+    for c in others:
+        if c[2]["serial"] > top or (c[2]["checksum_ok"] and not sb["checksum_ok"]):
+            notes.append(f"the superblock at {c[0]:#x} (serial {c[2]['serial']:,}) carries another "
+                         f"volume id, block size or block count and was not used; read from "
+                         f"serial {top:,}")
+        elif not c[2]["checksum_ok"] and base is not None and c[0] - base in QNX6_FIRST_SLOTS:
+            notes.append(f"the first superblock at {c[0]:#x} fails its checksum and its volume "
+                         f"id, block size or block count differ from the copy read")
+    if base is not None:
+        for c in copies:
+            if c[3] and not c[2]["checksum_ok"] and c[0] - base in QNX6_FIRST_SLOTS \
+                    and _qnx6_identity(c[2]) != _qnx6_identity(reference):
+                notes.append(f"the first superblock at {c[0]:#x} fails its checks and was not used")
+    if base is None:                    # a brute-scan find: report only, no region to measure
+        return dict(active=(off, endian, sb), pool=pool, layout="boot", notes=notes,
+                    volume_end=None, others=others, lost=False)
+    bs, total = sb["blocksize"], sb["num_blocks"] * sb["blocksize"]
+    rels = {c[0] - base for c in mine}
+    if sb.get("layout") == "mmi":
+        layout = "mmi"
+    elif rels & {BOOTBLOCK_SIZE, BOOTBLOCK_SIZE + 0xE00}:
+        layout = "boot"
+    elif rels & {0, 0xE00}:
+        layout = "noboot"
+    elif (read_at(fh, base, 3) != QNX6_BOOT_JMP and bs <= 0x1000
+          and rels & {0x1000 + total, 0x1000 + total + 0xE00}):
+        layout = "noboot"           # the first copy is gone and a copy sits in either slot
+    else:                           # of the area where a volume with no boot block keeps its
+        layout = "boot"             # second
+    second = (qnx6_data_start(bs) if layout == "boot" else 0x1000) + total
+    good = [c[0] - base for c in mine if c[2]["checksum_ok"]]
+    first_ok = any(rel in QNX6_FIRST_SLOTS for rel in good)
+    second_ok = any(rel not in QNX6_FIRST_SLOTS for rel in good)
+    past_end = len(read_at(fh, base + second, 512)) < 512
+    if past_end:
+        notes.append(f"the second superblock, at {base + second:#x}, is past the end of the "
+                     f"image, so a newer generation than serial {top:,} may be lost")
+    if good and not (first_ok and second_ok) and not (past_end and first_ok):
+        notes.append(f"the {'first' if second_ok else 'second'} superblock area holds no valid "
+                     f"copy, so serial {top:,} was read; it may be an older generation and "
+                     f"newer data may exist")
+    return dict(active=(off, endian, sb), pool=pool, layout=layout, notes=notes,
+                volume_end=second + max(0x1000, bs), others=others,
+                lost=past_end or not (first_ok and second_ok))
+
+
+def qnx6_walker(fh, base, pick):
+    """A Qnx6Walker on what qnx6_select() chose, with its notes as the first damage."""
+    w = Qnx6Walker(fh, base, pick["active"][0] - base, layout=pick["layout"])
+    for line in pick["notes"]:
+        w.note_damage(line)
+    if pick["lost"]:
+        w.count_not_read("superblock")
+    return w
+
+
+def parse_mbr(fh, past_end_too=False):
     mbr = read_at(fh, 0, 512)
     if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
         return None
@@ -1328,9 +1544,25 @@ def parse_mbr(fh):
         size = image_size(fh)
     except (OSError, AttributeError, ValueError):
         size = None
-    if out and size and all(start * SECTOR >= size for _, _, start, _ in out):
+    if out and size and not past_end_too and all(start * SECTOR >= size for _, _, start, _ in out):
         return None
     return out
+
+
+def mbr_starts_past_end(fh, size):
+    """The start LBAs of an MBR-style table parse_mbr declines because nothing it lists
+    begins inside the image, or [].
+
+    Counted are the entries with a boot flag of 0x00 or 0x80, a type and a sector count,
+    and every one of them must start at or past the end. The table is not used for
+    reading. Only a file nothing else recognised should be asked, because boot code can
+    have this shape, so what this finds is reported as what may be a cut disk image."""
+    parsed = parse_mbr(fh, past_end_too=True)
+    if not parsed:
+        return []
+    mbr = read_at(fh, 0, 512)
+    starts = [st for idx, _t, st, _n in parsed if mbr[446 + (idx - 1) * 16] in (0x00, 0x80)]
+    return starts if starts and all(st * SECTOR >= size for st in starts) else []
 
 
 # The GPT header is at LBA 1, the second logical block (UEFI 2.10 section
@@ -1561,6 +1793,17 @@ QNX6_ROOT_INO    = 1
 QNX6_ROOTNODE    = dict(Inode=72, Bitmap=152, Longfile=232)   # offsets inside the superblock
 S_IFDIR, S_IFLNK = 0o040000, 0o120000
 S_IFMT, S_IFREG = 0o170000, 0o100000     # the format bits, and a regular file
+QNX6_NO_PTR = 0xFFFFFFFF                 # an unused block pointer (qnx6.rst lines 65-66)
+QNX6_PTR_MAX_LEVELS = 5                  # include/linux/qnx6_fs.h line 29
+QNX6_SHORT_NAME_MAX, QNX6_LONG_NAME_MAX = 27, 510    # the same header, lines 32-33
+QNX6_DAMAGE_CAP = 1000                   # entries a walker keeps in its damage list
+QNX6_UNUSED = "an unused pointer"        # why a block has no pointer; read as zeros in a file
+QNX6_SECTOR_SLOTS = 128                  # block pointers in one 512-byte sector
+QNX6FS_LFN_CKSUM = 0x100                 # sb_flags: long names carry a checksum (sys/fs_qnx6.h)
+QNX6FS_INO_USED = 0x01                   # i_flags, inode byte 101 (sys/fs_qnx6.h line 38)
+# Every file type QNX defines, sys/stat.h lines 205-212 (RunZeJustin/qnx660 at 47c4158e):
+# FIFO, character device, directory, S_IFNAM (QNX only), block device, regular, link, socket
+QNX6_FILE_TYPES = frozenset((0x1000, 0x2000, 0x4000, 0x5000, 0x6000, 0x8000, 0xA000, 0xC000))
 
 
 def _fmt_time(v):
@@ -1596,117 +1839,505 @@ def _fmt_reading(recorded):
     return f"modified {when} (as stored, {'offset ' + off + ' not applied' if off else 'no zone'})"
 
 
+class Qnx6Unreadable(Exception):
+    """A qnx6 volume this reader cannot walk; the message says why."""
+
+
+def _qnx6_lfn_sum(raw, signed):
+    """qnx6_lfile_checksum() of Linux fs/qnx6/dir.c (v6.12, lines 16-25), with its char
+    read as signed or unsigned."""
+    crc = 0
+    for ch in raw:
+        if signed and ch > 0x7F:
+            ch -= 256
+        crc = (((crc >> 1) + ch) & 0xFFFFFFFF) ^ (0x80000000 if crc & 1 else 0)
+    return crc
+
+
 class Qnx6Walker:
-    def __init__(self, fh, base, sb_off):
+    """List and read one qnx6 volume.
+
+    Block pointers follow Linux fs/qnx6/inode.c (v6.12). Only ~0 means unused
+    (qnx6.rst lines 65-66, qnx6_check_blockptr): stored block 0 is an ordinary block,
+    and real volumes use it (a Bitmap root pointer in the active generation of six of the
+    nine vehicle volumes measured). Each slot is judged on its own, and zeros are counted
+    per 512-byte sector, a unit an imager can zero-fill. A 0 is block 0 only when it is
+    alone in its sector and no other sector holds a lone 0 inside the tree's size, because
+    one block cannot be stored twice. So a zeroed sector costs the slots it covers and leaves a
+    real block 0 in another sector alone. A zero slot past the tree's size is not a
+    pointer. On those nine volumes every slot past a tree's size is ~0 and 0 never
+    appears inside an indirect block.
+
+    A ~0 pointer inside a file's size reads as zeros at full length. The Linux driver
+    does that for a ~0 inside an indirect block (inode.c lines 145-148) and does not test
+    an inode's own 16 pointers (line 135). QNX documents that fs-qnx6 creates sparse files
+    by default since 7.1 and does not document how a hole is stored, so such a block may
+    be a hole or a damaged pointer: the file is not SHORT, and valid_data_note() gives it one exceptions row.
+
+    What cannot be read is recorded in ``damage`` (see damage_lines) and a folder not
+    read in full in ``folders_not_read``. ``layout`` comes from qnx6_select()."""
+
+    # read_file() puts the bytes it could not map into EOF_SHORTFALL and explains them
+    # in run_shortfall(), so extract_to_zip() asks that rather than saying past the end
+    read_file_reports_gaps = True
+
+    def __init__(self, fh, base, sb_off, layout="boot"):
         self.fh, self.base = fh, base
+        self.damage, self.folders_not_read = [], 0
+        self._noted, self._short_dirs, self._ptr_cache = set(), set(), {}
+        self._parent = {}                       # inode -> (directory that named it, name)
+        self._not_entries = set()               # inodes entry() could not give
+        self._names_found, self._listed = {}, set()     # names per inode, directories counted
+        self._nlink = {}                        # non-directory inodes that record several names
+        self._last_read = self._last_holes = None
         sb = read_at(fh, base + sb_off, 512)
-        self.bs = struct.unpack_from("<I", sb, 48)[0]
+        if len(sb) >= 4 and struct.unpack_from(">I", sb, 0)[0] == QNX6_MAGIC:
+            raise Qnx6Unreadable("this qnx6 volume is big-endian, which this reader does not "
+                                 "walk, so none of its files were read")
+        at = QNX6_MMI_FIELDS if layout == "mmi" else dict(F, **QNX6_ROOTNODE)
+        self.bs = struct.unpack_from("<I", sb, at["blocksize"])[0]
+        if not (512 <= self.bs <= 65536 and (self.bs & (self.bs - 1)) == 0):
+            raise Qnx6Unreadable(f"block size {self.bs} is not a power of two in 512..65536")
         self.ptrbits = (self.bs // 4).bit_length() - 1
-        self.blks_off = qnx6_data_start(self.bs) // self.bs
-        self.inode_rn = self._rn(sb, QNX6_ROOTNODE["Inode"])
-        self.long_rn = self._rn(sb, QNX6_ROOTNODE["Longfile"])
+        if layout == "mmi":                     # super_mmi.c line 138
+            self.blks_off = 0x1000 // self.bs
+        elif layout == "noboot":                # inode.c lines 341 and 374-375
+            if self.bs > 0x1000:
+                raise Qnx6Unreadable(f"no boot block and {self.bs}-byte blocks: no source says "
+                                     f"where block 0 is on such a volume, so it was not read")
+            self.blks_off = 0x1000 // self.bs
+        else:
+            self.blks_off = qnx6_data_start(self.bs) // self.bs
+        self.inode_rn = self._rn(sb, at["Inode"])
+        self.long_rn = self._rn(sb, at["Longfile"])
         # what free_extents() reads: sb_num_blocks, sb_free_blocks and the
         # Bitmap root node with its size in bytes
-        self.num_blocks, self.free_blocks = struct.unpack_from("<II", sb, F["num_blocks"])
-        self.bitmap_rn = self._rn(sb, QNX6_ROOTNODE["Bitmap"])
-        self.bitmap_bytes = struct.unpack_from("<Q", sb, QNX6_ROOTNODE["Bitmap"])[0]
+        self.num_blocks, self.free_blocks = struct.unpack_from("<II", sb, at["num_blocks"])
+        self.bitmap_rn = self._rn(sb, at["Bitmap"])
+        self.bitmap_bytes = self.bitmap_rn["size"]
+        # what check_inode_count() and the long-name checksum read. The Audi MMI
+        # layout has no flags and no long-name checksum (dir.c lines 97-101)
+        self.num_inodes, self.free_inodes = struct.unpack_from("<II", sb, at["num_inodes"])
+        self.mmi = layout == "mmi"
+        self.sb_flags = 0 if self.mmi else struct.unpack_from("<I", sb, F["flags"])[0]
 
     @staticmethod
     def _rn(sb, o):
-        return dict(ptr=list(struct.unpack_from("<16I", sb, o + 8)), levels=sb[o + 72])
+        return dict(size=struct.unpack_from("<Q", sb, o)[0],
+                    ptr=list(struct.unpack_from("<16I", sb, o + 8)), levels=sb[o + 72])
+
+    def note_damage(self, line):
+        """Record one thing that could not be read, once, up to QNX6_DAMAGE_CAP."""
+        if line not in self._noted and len(self.damage) < QNX6_DAMAGE_CAP:
+            self._noted.add(line)
+            self.damage.append(line)
 
     def _blk(self, b):
         return read_at(self.fh, self.base + b * self.bs, self.bs)
 
-    def _map(self, ptrs, levels, n):
+    def _ptr_problem(self, ptr):
+        if ptr == QNX6_NO_PTR:
+            return QNX6_UNUSED
+        if ptr >= self.num_blocks:
+            return "a pointer past the end of the volume"
+        return None
+
+    def _pointers(self, blk, level):
+        """The pointers in one indirect block, or (None, why) when it cannot be read.
+        The last block read per level is kept, because a file reads its slots in order
+        and each pass would otherwise decode the block again."""
+        held = self._ptr_cache.get(level)
+        if held is not None and held[0] == blk:
+            return held[1], held[2]
+        buf = self._blk(blk)
+        if len(buf) < 4:
+            vals, why = None, "a pointer block that could not be read"
+        else:                                   # the slots a short read did return still count
+            vals, why = struct.unpack("<%dI" % (len(buf) // 4), buf[:len(buf) // 4 * 4]), None
+        self._ptr_cache[level] = (blk, vals, why)
+        return vals, why
+
+    @staticmethod
+    def _zero_is_block0(slots, i, first, span, need):
+        """Whether the 0 in slot i can be a real pointer to block 0: it is the only 0 in
+        its 512-byte sector, and no other sector holds a lone 0 inside the tree's size."""
+        lone = []
+        for at in range(0, len(slots), QNX6_SECTOR_SLOTS):
+            sector = slots[at:at + QNX6_SECTOR_SLOTS]
+            if sector.count(0) == 1:
+                where = at + sector.index(0)
+                if need is None or first + where * span < need:
+                    lone.append(where)
+        return lone == [i]
+
+    def _slot_problem(self, slots, i, first, span, need):
+        """Why slot i of a pointer block or root node names no block, else None. ``first``
+        is the logical block slot 0 covers, ``span`` the blocks one slot covers and
+        ``need`` the tree's size in blocks, or None when it is not known."""
+        if i >= len(slots):
+            return "a pointer block the image holds only part of"
+        why = self._ptr_problem(slots[i])
+        if why or slots[i]:
+            return why
+        if need is not None and first + i * span >= need:
+            return "a zero pointer past the tree's size"
+        if not self._zero_is_block0(slots, i, first, span, need):
+            return "a zeroed pointer"
+        return None
+
+    def _resolve(self, ptrs, levels, n, need=None):
+        """(device block, None) for logical block n, or (None, why it has none)."""
+        if levels > QNX6_PTR_MAX_LEVELS:
+            return None, f"{levels} pointer levels, more than the {QNX6_PTR_MAX_LEVELS} allowed"
         bitdelta = self.ptrbits * levels
-        mask = (1 << self.ptrbits) - 1
         lp = n >> bitdelta
         if lp > 15:
-            return None
+            return None, "a position past what the pointers address"
+        why = self._slot_problem(ptrs, lp, 0, 1 << bitdelta, need)
+        if why:
+            return None, why
         blk = ptrs[lp] + self.blks_off
-        for _ in range(levels):
-            buf = self._blk(blk)
-            if len(buf) < self.bs:
-                return None
+        path = [blk]
+        for depth in range(levels, 0, -1):
+            first = (n >> (self.ptrbits * depth)) << (self.ptrbits * depth)
+            vals, why = self._pointers(blk, depth)
+            if vals is None:
+                return None, why
             bitdelta -= self.ptrbits
-            ptr = struct.unpack_from("<I", buf, ((n >> bitdelta) & mask) * 4)[0]
-            if ptr in (0, 0xFFFFFFFF):
-                return None
+            slot = (n >> bitdelta) & ((1 << self.ptrbits) - 1)
+            why = self._slot_problem(vals, slot, first, 1 << bitdelta, need)
+            if why:
+                return None, why
+            ptr = vals[slot]
             blk = ptr + self.blks_off
-        return blk
+            if blk in path:
+                return None, "a pointer back to its own pointer block"
+            path.append(blk)
+        return blk, None
+
+    def _map(self, ptrs, levels, n, need=None):
+        return self._resolve(ptrs, levels, n, need)[0]
+
+    def _rn_blocks(self, rn):
+        """A superblock root node's size in blocks."""
+        return (rn["size"] + self.bs - 1) // self.bs
 
     def _tree(self, rn, logical):
-        b = self._map(rn["ptr"], rn["levels"], logical)
+        b = self._map(rn["ptr"], rn["levels"], logical, self._rn_blocks(rn))
         return self._blk(b) if b is not None else None
 
+    def _blocks_to_read(self, levels, need):
+        """How many of a tree's ``need`` blocks to try: no more than its pointers can
+        address and no more than the volume holds, so a damaged size stays bounded."""
+        if levels > QNX6_PTR_MAX_LEVELS:
+            return 0
+        return min(need, 16 << (self.ptrbits * levels), self.num_blocks)
+
     def inode(self, num):
-        byte = (num - 1) * QNX6_INODE_SIZE
-        buf = self._tree(self.inode_rn, byte // self.bs)
-        if not buf:
+        if num < 1:
+            self.note_damage(f"inode {num}: not a valid inode number")
             return None
+        byte = (num - 1) * QNX6_INODE_SIZE
+        b, why = self._resolve(self.inode_rn["ptr"], self.inode_rn["levels"], byte // self.bs,
+                               self._rn_blocks(self.inode_rn))
+        if b is None:
+            self.note_damage(f"inode {num}: not read, the inode table has {why} there")
+            return None
+        buf = self._blk(b)
         raw = buf[byte % self.bs:][:QNX6_INODE_SIZE]
         if len(raw) < QNX6_INODE_SIZE:
+            self.note_damage(f"inode {num}: not read, its table block could not be read")
             return None
         return dict(size=struct.unpack_from("<Q", raw, 0)[0],
                     mtime=struct.unpack_from("<I", raw, 20)[0],
                     mode=struct.unpack_from("<H", raw, 32)[0],
+                    nlink=struct.unpack_from("<H", raw, 34)[0],
                     ptr=list(struct.unpack_from("<16I", raw, 36)),
-                    levels=raw[100])
+                    levels=raw[100], flags=raw[101])
 
-    def _longname(self, blk):
-        buf = self._tree(self.long_rn, blk)
-        if not buf:
-            return "<longname unreadable>"
-        n = struct.unpack_from("<H", buf, 0)[0]
-        return buf[2:2 + min(n, 510)].decode("utf-8", "replace")
+    @staticmethod
+    def _inode_problem(ino):
+        """Why an inode a directory names is not a file, as text, else None. These fields
+        hold on every inode reached on all 19 superblock generations measured. They are a
+        check on what the inode says, and a damaged inode can still pass them."""
+        if ino["mode"] & S_IFMT not in QNX6_FILE_TYPES:
+            return ("is empty (mode 0)" if not ino["mode"]
+                    else f"has no valid file type (mode {ino['mode']:#06x})")
+        if not ino["flags"] & QNX6FS_INO_USED:
+            return "is not marked in use"
+        if ino["levels"] > QNX6_PTR_MAX_LEVELS:
+            return f"records {ino['levels']} pointer levels, more than the {QNX6_PTR_MAX_LEVELS} allowed"
+        return None
+
+    def _path_of(self, num):
+        """The path a walk found this inode at, for a record, or "" for the root."""
+        parts, seen = [], set()
+        while num != self.root and num in self._parent and num not in seen and len(parts) < 64:
+            seen.add(num)
+            num, name = self._parent[num]
+            parts.append(name)
+        return "/".join(reversed(parts))
+
+    def _at(self, num):
+        """The end of a record about this inode: its path, last so a cut keeps the rest."""
+        path = self._path_of(num)
+        return f": {path}" if path else ""
+
+    def _longname(self, blk, de_ino, stored=0):
+        """The long name stored in Longfile block ``blk``. A name that cannot be read
+        becomes a placeholder holding the inode, unique to this entry, and a record.
+
+        ``stored`` is the checksum the directory entry keeps. The kernel compares it and
+        only logs a mismatch (dir.c lines 97-101), so the name is kept and the mismatch
+        recorded. Its char is signed on some builds and unsigned on others, which differ
+        only for bytes above 0x7F, so a name passes if either form matches. A volume that
+        does not set QNX6FS_LFN_CKSUM and stores 0 has no checksum to compare."""
+        name = f"long-name-damaged-inode-{de_ino}-block-{blk}"
+        b, why = self._resolve(self.long_rn["ptr"], self.long_rn["levels"], blk,
+                               self._rn_blocks(self.long_rn))
+        buf = self._blk(b) if b is not None else b""
+        if b is None:
+            why = f"the long-name tree has {why} there"
+        elif len(buf) < 2:
+            why = "its block could not be read"
+        else:
+            n = struct.unpack_from("<H", buf, 0)[0]
+            if 0 < n <= QNX6_LONG_NAME_MAX and 2 + n <= len(buf):
+                raw = buf[2:2 + n]
+                if not self.mmi and (stored or self.sb_flags & QNX6FS_LFN_CKSUM) \
+                        and stored not in (_qnx6_lfn_sum(raw, False), _qnx6_lfn_sum(raw, True)):
+                    self.note_damage(f"inode {de_ino}: the long name in block {blk} does not "
+                                     f"match the checksum in its directory entry, so a byte of "
+                                     f"it may be wrong; the name is kept as stored")
+                return raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+            why = f"it records a length of {n}"           # dir.c lines 90-95
+        self.note_damage(f"inode {de_ino}: long name in block {blk} not read ({why}), "
+                         f"so its entry is named {name}")
+        return name
+
+    def count_not_read(self, what):
+        """Count one thing not read in full in folders_not_read, once per ``what``."""
+        if what not in self._short_dirs:
+            self._short_dirs.add(what)
+            self.folders_not_read += 1
+
+    def _folder_short(self, num, detail):
+        self.count_not_read(num)
+        self.note_damage(f"directory inode {num}: {detail}")
+
+    def check_inode_count(self):
+        """After a walk from the root, two counted notes. Neither changes the exit status.
+
+        The distinct inodes reached against what the superblock counts in use (num_inodes
+        - free_inodes). A shortfall can be a lost directory entry, or an inode that is
+        open but unlinked on a running device: QNX delays its removal until the last close
+        and commits a snapshot meanwhile, and no source says how it is counted then.
+
+        i_nlink against the names found, for inodes recording more than one. A name of a
+        hard link can be lost with its file still reached under another name. Both pairs
+        agree on every superblock generation of the nine vehicle volumes and the
+        QNX-written test image measured, hard links included."""
+        if not self.num_inodes:
+            return
+        used = self.num_inodes - self.free_inodes
+        reached = len(({self.root} | set(self._parent)) - self._not_entries)
+        if reached < used:
+            self.note_damage(f"the superblock counts {used:,} inodes in use and a walk from "
+                             f"the root reached {reached:,}: files may be missing, or an inode "
+                             f"may be open but unlinked")
+        for num, links in self._nlink.items():
+            found = self._names_found.get(num, 0)
+            if found < links:
+                self.note_damage(f"inode {num} records {links:,} names and {found:,} were found, "
+                                 f"so a name may be missing; it is listed at: {self._path_of(num)}")
+
+    @staticmethod
+    def _has_dots(buf):
+        """Whether a directory's first block starts with the names "." and "..", the test
+        the Linux driver makes on the root and refuses the mount without (inode.c
+        qnx6_checkroot, lines 180-200). No QNX or Linux source requires them first in any
+        other directory, so listdir() only notes it there. Every directory on all 19
+        superblock generations measured does start with them."""
+        return (len(buf) >= 2 * QNX6_DIRENT_SIZE and buf[5:8] == b".\0\0"
+                and buf[32 + 5:32 + 8] == b"..\0")
 
     def listdir(self, num):
         ino = self.inode(num)
-        if not ino or not (ino["mode"] & S_IFDIR):
+        if not ino:
+            self._folder_short(num, "its inode could not be read, so nothing in it is listed")
             return []
-        out = []
-        for lb in range((ino["size"] + self.bs - 1) // self.bs):
-            b = self._map(ino["ptr"], ino["levels"], lb)
+        problem = self._inode_problem(ino)
+        if problem:
+            self._folder_short(num, f"its inode {problem}, so nothing in it is listed"
+                                    f"{self._at(num)}")
+            return []
+        if ino["mode"] & S_IFMT != S_IFDIR:
+            return []
+        first_listing = num not in self._listed
+        self._listed.add(num)
+        size = ino["size"]
+        need = (size + self.bs - 1) // self.bs
+        limit = self._blocks_to_read(ino["levels"], need)
+        if limit < need:
+            self._folder_short(num, f"it records {size:,} bytes, more than its "
+                                    f"{ino['levels']}-level pointers or the volume can hold; "
+                                    f"{limit:,} of {need:,} blocks were tried")
+        out, lost = [], {}
+        for lb in range(limit):
+            b, why = self._resolve(ino["ptr"], ino["levels"], lb, need)
             if b is None:
+                lost[why] = lost.get(why, 0) + 1
                 continue
             buf = self._blk(b)
-            for p in range(0, len(buf) - QNX6_DIRENT_SIZE + 1, QNX6_DIRENT_SIZE):
+            if len(buf) < self.bs:
+                lost["a block that could not be read"] = (
+                    lost.get("a block that could not be read", 0) + 1)
+            if lb == 0 and not self._has_dots(buf):
+                if num == self.root:
+                    self._folder_short(num, "the root folder's first block does not start with "
+                                            "valid . and .. entries, so entries may be missing")
+                else:
+                    self.note_damage(f"directory inode {num}: its first block does not start "
+                                     f"with . and ..{self._at(num)}")
+            # the kernel stops at i_size (dir.c last_entry(), lines 38-45 and 142)
+            end = min(len(buf), size - lb * self.bs)
+            for p in range(0, end - QNX6_DIRENT_SIZE + 1, QNX6_DIRENT_SIZE):
                 de_ino = struct.unpack_from("<I", buf, p)[0]
                 de_size = buf[p + 4]
                 if not de_ino or not de_size:
                     continue
+                if self.num_inodes and de_ino > self.num_inodes:
+                    self._folder_short(num, f"an entry names inode {de_ino:,}, past the "
+                                            f"volume's {self.num_inodes:,} inodes, so it is "
+                                            f"not listed")
+                    continue
                 if de_size == 0xFF:
-                    name = self._longname(struct.unpack_from("<I", buf, p + 8)[0])
+                    name = self._longname(*struct.unpack_from("<I", buf, p + 8), de_ino,
+                                          struct.unpack_from("<I", buf, p + 12)[0])
+                elif de_size > QNX6_SHORT_NAME_MAX:
+                    # the kernel takes this for a long name and refuses it (dir.c 76-80)
+                    name = f"name-damaged-inode-{de_ino}"
+                    self.note_damage(f"directory inode {num}: the entry for inode {de_ino} "
+                                     f"records name length {de_size}, which is not valid; "
+                                     f"its entry is named {name}")
                 else:
-                    name = buf[p + 5:p + 5 + min(de_size, 27)].decode("utf-8", "replace")
+                    name = (buf[p + 5:p + 5 + de_size].decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00"))
+                if "/" in name:
+                    self.note_damage(f"directory inode {num}: the name stored for inode {de_ino} "
+                                     f"holds a slash, written as %2F")
+                    name = name.replace("/", "%2F")
                 if name not in (".", ".."):
                     out.append((name, de_ino))
+                    self._parent[de_ino] = (num, name)
+                    if first_listing:
+                        self._names_found[de_ino] = self._names_found.get(de_ino, 0) + 1
+        if lost:
+            self._folder_short(num, f"{sum(lost.values()):,} of its {need:,} blocks were not read ("
+                                    + "; ".join(f"{n:,} with {why}" for why, n in lost.items()) + ")")
         return sorted(out)
 
     def entry(self, num):
         ino = self.inode(num)
-        if not ino:
+        what = "could not be read" if not ino else self._inode_problem(ino)
+        if what:                        # not a file, and not a special file either
+            self._not_entries.add(num)
+            if num in self._parent:
+                self._folder_short(self._parent[num][0],
+                                   f"it names inode {num}, which {what}, so that entry is not "
+                                   f"listed{self._at(num)}")
+            else:
+                self.note_damage(f"inode {num}: {what}, so it is not listed")
             return None
+        if ino["nlink"] > 1 and ino["mode"] & S_IFMT != S_IFDIR:
+            self._nlink[num] = ino["nlink"]
         return ino["mode"], ino["size"], ino["mtime"]
 
     def read_file(self, num, size):
-        """Yield the file's bytes a block at a time. An unmapped block is a
-        hole and is emitted as zeros, so offsets stay correct."""
+        """Yield the file's bytes a block at a time, each at its own offset.
+
+        A block with an unused (~0) pointer is zeros (see the class docstring) and does
+        not make the file short. A block whose pointer is damaged is zeros only when a
+        later block is read, so offsets stay correct, and nothing is written after the
+        last block that exists. Those bytes are added to EOF_SHORTFALL, which makes the
+        file SHORT with the count of what was really read, and run_shortfall() says why.
+        No more blocks are tried than the pointers can address or the volume holds: QNX
+        counts sparse blocks against free space, so a file cannot be larger than that."""
+        self._last_read = self._last_holes = None
+        tally = EOF_SHORTFALL["bytes"]
         ino = self.inode(num)
+        EOF_SHORTFALL["bytes"] = tally          # metadata reads are not this file's bytes
         if not ino:
+            if size:
+                self._last_read = (num, "its inode could not be read")
+                EOF_SHORTFALL["bytes"] += size
             return
-        left = size
-        for lb in range((size + self.bs - 1) // self.bs):
-            b = self._map(ino["ptr"], ino["levels"], lb)
-            buf = self._blk(b) if b is not None else bytes(self.bs)
+        need = (size + self.bs - 1) // self.bs
+        limit = self._blocks_to_read(ino["levels"], need)
+        left, pending, missing, unread, holes, why_count = size, 0, 0, 0, 0, {}
+        for lb in range(limit):
+            take = min(self.bs, left)
+            tally = EOF_SHORTFALL["bytes"]
+            b, why = self._resolve(ino["ptr"], ino["levels"], lb, need)
+            EOF_SHORTFALL["bytes"] = tally      # a pointer block past the end counts below
+            left -= take
+            if b is None and why != QNX6_UNUSED:
+                pending += take
+                missing += take
+                why_count[why] = why_count.get(why, 0) + 1
+                continue
+            if b is None:
+                holes += 1
+                pending += take
+            while pending:
+                part = min(pending, 1 << 20)
+                yield bytes(part)
+                pending -= part
+            if b is None:
+                continue
+            buf = self._blk(b)
+            cut = max(take - len(buf), 0)
+            EOF_SHORTFALL["bytes"] = tally + cut    # only this file's bytes
+            if cut:
+                unread += cut
+                why = "data the image did not return (past its end, or a read error)"
+                why_count[why] = why_count.get(why, 0) + 1
             if len(buf) < self.bs:
                 buf = buf + bytes(self.bs - len(buf))
-            take = min(self.bs, left)
             yield buf[:take]
-            left -= take
-            if left <= 0:
-                return
+        if holes:
+            self._last_holes = (num, holes, need)
+        if left:
+            missing += left
+            why = (f"{ino['levels']} pointer levels, more than the {QNX6_PTR_MAX_LEVELS} allowed"
+                   if ino["levels"] > QNX6_PTR_MAX_LEVELS else
+                   f"a size past what its {ino['levels']}-level pointers or the volume hold")
+            why_count[why] = (left + self.bs - 1) // self.bs
+        if missing or unread:
+            text = ("not read: "
+                    + "; ".join(f"{n:,} block{'' if n == 1 else 's'} with {why}"
+                                for why, n in why_count.items())
+                    + ". Those before the last block read are zeros in the member, and "
+                      "nothing is written after it")
+            self._last_read = (num, text)
+            self.note_damage(f"inode {num}: {size - missing - unread:,} of {size:,} bytes read, {text}")
+            EOF_SHORTFALL["bytes"] += missing
+
+    def run_shortfall(self, num):
+        """Why the last read_file() of this inode came back short, else None."""
+        last = self._last_read
+        return last[1] if last and last[0] == num else None
+
+    def valid_data_note(self, num, _held):
+        """(issue, detail) for a file the last read_file() found ~0 pointers in, else
+        None. It is not a failure and does not change the exit status."""
+        last = self._last_holes
+        if not last or last[0] != num:
+            return None
+        return ("NO_POINTER_ZEROS",
+                f"{last[1]:,} of its {last[2]:,} blocks {'has' if last[1] == 1 else 'have'} no "
+                f"pointer and {'was' if last[1] == 1 else 'were'} read as zeros, "
+                f"which is what either a sparse hole or a damaged pointer looks like")
 
     def free_extents(self, min_bytes=0):
         """[(byte offset, length)] for the runs of space the volume says are free.
@@ -1740,7 +2371,8 @@ class Qnx6Walker:
             return []
         raw = bytearray()
         for lb in range((need + bs - 1) // bs):
-            b = self._map(self.bitmap_rn["ptr"], self.bitmap_rn["levels"], lb)
+            b = self._map(self.bitmap_rn["ptr"], self.bitmap_rn["levels"], lb,
+                          self._rn_blocks(self.bitmap_rn))
             buf = self._blk(b) if b is not None else b""
             if len(buf) < bs:
                 return []
@@ -15165,9 +15797,10 @@ def _run_shortfall(w, node):
 
 def _valid_data_note(w, node, held):
     """(issue, detail) for a file's own row in the exceptions table, else None: an exFAT
-    file whose ValidDataLength differs from its DataLength, or a FAT file whose chain
-    crosses a link the FAT copies disagree on. A list of them for an F2FS file flagged
-    encrypted or whose block count is short. None for any other walker."""
+    file whose ValidDataLength differs from its DataLength, a FAT file whose chain crosses
+    a link the FAT copies disagree on, or a qnx6 file with blocks that have no pointer. A
+    list of them for an F2FS file flagged encrypted or whose block count is short. None
+    for any other walker."""
     report = getattr(w, "valid_data_note", None)
     if report is None:
         return None
@@ -15230,6 +15863,8 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
             out.append((path, ino, size, mtime))
         else:
             out.append((path, ino, None, mtime))     # symlink or special
+    if depth == 0 and num == getattr(w, "root", None) and hasattr(w, "check_inode_count"):
+        w.check_inode_count()                        # a whole volume was just walked
     return out
 
 
@@ -15299,6 +15934,8 @@ def walk_all(w):
 
     for item in walk(w.root, "", 0):
         yield item
+    if hasattr(w, "check_inode_count"):
+        w.check_inode_count()                        # a whole volume was just walked
 
 
 def apply_exclude(entries, exclude):
@@ -16324,7 +16961,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 short += 1
                 written += got
                 cut = None if past_end else chain_shortfall(w, ino)
-                run = (None if cut or (past_end and not isinstance(w, F2fsWalker))
+                run = (None if cut or (past_end and not (isinstance(w, F2fsWalker)
+                                                         or getattr(w, "read_file_reports_gaps", False)))
                        else _run_shortfall(w, ino))
                 if cut:
                     told = (f"{got:,} of {size:,} bytes read, its cluster chain ends after "
@@ -33603,9 +34241,10 @@ def volumes(fh, size=None):
         bitlocker   for a BitLocker volume, locked or opened, BitLocker.facts():
                     its protectors (kind, id, and for a TPM the stored PCRs)
 
-    Brute-scan finds are report-only in main() too (they have no region and so
-    no base to walk), so they are not here either. fh is what open_image()
-    returns; size defaults to image_size(fh).
+    Brute-scan finds are not walked in main() either (they have no region and so
+    no base to walk; an export records one whose checksum holds as a volume not
+    read), so they are not here. fh is what open_image() returns; size defaults
+    to image_size(fh).
     """
     if size is None:
         size = image_size(fh)
@@ -33628,24 +34267,28 @@ def volumes(fh, size=None):
 
     logical_slots = _logical_slots(fh, regions) if containers else set()
     for label, base, rsize in regions:
-        best = None
+        copies = []
         for off, _rel in sb_slots(fh, base, label, regions):
             if label in containers and off in logical_slots:
                 continue
-            r = check(fh, off)
-            if r and not r[2] and (best is None or r[1]["serial"] > best[1]["serial"]):
-                best = (off, r[1])
-        if best is None:
+            r = check_sb(fh, off)
+            if r:
+                copies.append((off, *r))
+        pick = qnx6_select(fh, base, copies)
+        if pick is None:
             continue
+        best = pick["active"][2]
         qnx6_labels.add(label)
         vol = dict(label=label, base=base, size=rsize, lba=base // ss, kind="qnx6",
                    name=names.get(base) or f"lba{base // ss}",
-                   detail=f"serial {best[1]['serial']:,}, "
-                          f"volumeid {best[1]['volumeid'].hex()} (as stored)"
-                          + (f"; {best[1]['clock_note']}" if best[1].get("clock_note") else ""),
-                   missing_past_end=missing.get(base, 0))
+                   detail=f"serial {best['serial']:,}, "
+                          f"volumeid {best['volumeid'].hex()} (as stored)"
+                          + (f"; {best['clock_note']}" if best.get("clock_note") else "")
+                          + "".join(f"; {line}" for line in pick["notes"]),
+                   missing_past_end=(missing.get(base, 0) if base in placed else
+                                     max(missing.get(base, 0), base + pick["volume_end"] - size, 0)))
         try:
-            vol["walker"] = Qnx6Walker(fh, base, best[0] - base)
+            vol["walker"] = qnx6_walker(fh, base, pick)
         except Exception as exc:                        # report it, do not hide it
             vol["note"] = f"could not walk this filesystem: {exc}"
         out.append(vol)
@@ -36084,6 +36727,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 sized_regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
                 vol_names[first * ss] = volume_name(idx, first, name)
 
+        # What a partition table lists, as distinct from the regions added below
+        # (the whole image, a flash filesystem, LUKS data, a logical volume).
+        table_labels = {lab for lab, _st, _rs in sized_regions}
+
         # No partition table at all (a whole-disk filesystem, or a bare region
         # such as an ETFS flash dump) means no regions were recorded. Treat the
         # whole image as one region so it still reaches identify_fs and the
@@ -36170,9 +36817,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 print(f"    {label:<28} {where}")
             print("    A raw image split into numbered segments (.001, .002, ...) has to be")
             print("    joined before it is read; its first segment alone looks like this.")
-            print("    Each volume above is marked INCOMPLETE below, and a file on it that")
-            print("    reaches past the end is counted SHORT and stored under a name that")
-            print("    says how much of it is here, not as an extracted file.")
+
+        marked_incomplete = []
+
+        def mark_incomplete(miss, pad):
+            """Say a volume being extracted reaches past the end of the file."""
+            marked_incomplete.append(miss)
+            print(f"{pad}INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
 
         def missing_past_end(base, declared_end=None):
             """Bytes of the volume at base that lie past the end of the file."""
@@ -36190,49 +36841,40 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             for off, rel in sb_slots(fh, base, label, sized_regions):
                 if label in containers and off in logical_slots:
                     continue                    # the logical volume's own superblock
-                r = check(fh, off)
+                r = check_sb(fh, off)
                 if r:
                     candidates.append((off, f"{label} +0x{rel:x}", *r))
 
-        if not candidates:
-            print(f"  no superblock at the kernel's offsets; brute scanning first"
+        scanned_image = not any(not c[4] for c in candidates)
+        if scanned_image:
+            print(f"  no usable superblock at the kernel's offsets; brute scanning first"
                   f" {scan_limit_mib} MiB ...")
+            probed = {c[0] for c in candidates}
             for off in scan(fh, scan_limit_mib << 20, size):
-                r = check(fh, off)
-                if r:
+                r = check_sb(fh, off)
+                if r and off not in probed:
                     candidates.append((off, "brute scan", *r))
 
         print()
-        # A candidate whose volume id, blocksize and block count match an
-        # already-confirmed superblock in the SAME region is another copy of
-        # that filesystem, not a chance 4-byte hit. Measured on a Ford Sync G4
-        # image: the previous generation of dps_os carries ctime 308 and
-        # atime 1, both unset because the build host had no clock, so a
-        # timestamp heuristic rejects a genuine superblock. Recorded identity
-        # is the stronger signal, so it wins.
+        # qnx6_select() decides, per region, which copy is read and which copies
+        # belong to that filesystem, the same way volumes() does.
         def region(h):
             return h.rsplit(" +0x", 1)[0]
-        good = {}
+        region_base = {lab: b for lab, b, _s in sized_regions}
+        region_size = {lab: s for lab, _b, s in sized_regions}
+        by_region = {}
         for off, how, endian, sb, bad in candidates:
-            if not bad:
-                good.setdefault(region(how), []).append(sb)
-        promoted = 0
-        for i, (off, how, endian, sb, bad) in enumerate(candidates):
-            if not bad:
-                continue
-            for ref in good.get(region(how), []):
-                if (sb["volumeid"] == ref["volumeid"]
-                        and sb["blocksize"] == ref["blocksize"]
-                        and sb["num_blocks"] == ref["num_blocks"]):
-                    candidates[i] = (off, how, endian, sb, [])
-                    promoted += 1
-                    break
-
-        confirmed = [c for c in candidates if not c[4]]
-        rejected  = [c for c in candidates if c[4]]
-        if promoted:
-            print(f"  {promoted} further cop{'y' if promoted==1 else 'ies'} "
-                  f"confirmed by matching volume id, blocksize and block count\n")
+            by_region.setdefault(region(how), []).append((off, endian, sb, bad))
+        picks = {}
+        for key, rows in by_region.items():
+            pick = qnx6_select(fh, region_base.get(key, 0 if key == "image start" else None), rows)
+            if pick is not None:
+                picks[key] = pick
+        confirmed, rejected = [], []
+        for c in candidates:
+            pick = picks.get(region(c[1]))
+            used = pick is not None and any(c[0] == o[0] for o in pick["pool"])
+            (confirmed if used else rejected).append(c)
 
         print(f"  {len(candidates)} magic match(es): "
               f"{len(confirmed)} CONFIRMED, {len(rejected)} rejected as coincidence\n")
@@ -36266,8 +36908,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             for off, endian, sb in copies:
                 g = gens.setdefault(sb["serial"], {"sb": sb, "endian": endian, "at": []})
                 g["at"].append(off)
+            pick = picks[key]
             serials = sorted(gens, reverse=True)
-            act = gens[serials[0]]
+            act = gens[pick["active"][2]["serial"]]
             sb, endian = act["sb"], act["endian"]
             total = sb["num_blocks"] * sb["blocksize"]
 
@@ -36276,20 +36919,32 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                   f"{len(serials)} generation{'' if len(serials)==1 else 's'}\n")
 
             match = ""
-            for rlabel, rbase, rsize in sized_regions:
-                if key.startswith(rlabel) and rsize:
-                    match = (f"   <- {100.0*total/rsize:.1f}% of the "
-                             f"{human(rsize)} partition it sits in")
-                    break
+            if region_size.get(key):
+                match = (f"   <- {100.0*total/region_size[key]:.1f}% of the "
+                         f"{human(region_size[key])} partition it sits in")
 
+            mmi = sb.get("layout") == "mmi"
             print(f"      ACTIVE   serial {sb['serial']:,}   at "
                   + ", ".join(f"0x{o:x}" for o in sorted(act["at"])))
-            print(f"        sb_ctime   {stamp(sb['ctime'])}")
-            print(f"        sb_atime   {stamp(sb['atime'])}")
+            if mmi:
+                print("        layout     Audi MMI 3G (struct qnx6_mmi_super_block): stores no "
+                      "ctime, atime, flags or version")
+            else:
+                print(f"        sb_ctime   {stamp(sb['ctime'])}")
+                print(f"        sb_atime   {stamp(sb['atime'])}")
             if sb.get("clock_note"):
                 print(f"        note       {sb['clock_note']}")
-            print(f"        version    {sb['version1']}.{sb['version2']}   "
-                  f"blocksize {sb['blocksize']:,}   flags 0x{sb['flags']:08x}")
+            for line in pick["notes"]:
+                print(f"        NOTE       {line}")
+            for o, _e, other, _b in pick["others"]:
+                print(f"        not used   superblock at 0x{o:x} (serial {other['serial']:,}) "
+                      f"belongs to another filesystem: its volume id, block size or block count "
+                      f"differs")
+            if mmi:
+                print(f"        blocksize  {sb['blocksize']:,}")
+            else:
+                print(f"        version    {sb['version1']}.{sb['version2']}   "
+                      f"blocksize {sb['blocksize']:,}   flags 0x{sb['flags']:08x}")
             print(f"        volume     {human(total)}  ({sb['num_blocks']:,} blocks, "
                   f"{sb['free_blocks']:,} free){match}")
             print(f"        inodes     {sb['num_inodes']:,} total, "
@@ -36297,14 +36952,16 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                   f"{sb['num_inodes']-sb['free_inodes']:,} used")
             print(f"        volumeid   {sb['volumeid'].hex()}  (as stored)")
 
-            if len(serials) > 1:
-                prev = gens[serials[1]]
+            older = [s for s in serials if s < sb["serial"]]
+            if older:
+                prev = gens[older[0]]
                 pb = prev["sb"]
                 print(f"\n      PREVIOUS serial {pb['serial']:,}   at "
                       + ", ".join(f"0x{o:x}" for o in sorted(prev["at"]))
                       + "   (still on disk)")
-                print(f"        sb_ctime   {stamp(pb['ctime'])}")
-                print(f"        sb_atime   {stamp(pb['atime'])}")
+                if not mmi:
+                    print(f"        sb_ctime   {stamp(pb['ctime'])}")
+                    print(f"        sb_atime   {stamp(pb['atime'])}")
                 if pb.get("clock_note"):
                     print(f"        note       {pb['clock_note']}")
 
@@ -36312,8 +36969,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                 d_ser = sb['serial'] - pb['serial']
                 print(f"        serial       +{d_ser:,}"
                       f"   ({'one commit' if d_ser==1 else str(d_ser)+' commits'})")
-                print(delta_line("sb_ctime", sb['ctime'], pb['ctime']))
-                print(delta_line("sb_atime", sb['atime'], pb['atime']))
+                if not mmi:
+                    print(delta_line("sb_ctime", sb['ctime'], pb['ctime']))
+                    print(delta_line("sb_atime", sb['atime'], pb['atime']))
                 for f, lab in (("free_blocks","block"), ("free_inodes","inode")):
                     d = sb[f] - pb[f]
                     if d == 0:
@@ -36323,8 +36981,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         verb = "freed" if d > 0 else "allocated"
                         print(f"        {f:<12} {d:+,}  ({abs(d):,} {word} {verb})")
 
-            base = next((b for lab, b, _ in sized_regions
-                         if key.startswith(lab)), None)
+            base = region_base.get(key)
             wanted = only is None or only.lower() in key.lower()
             if raid_kind:
                 print("      " + raid_foreign_note(raid_kind, raid_levels, raid_why,
@@ -36335,7 +36992,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             if do_triage and base is not None:
                 encf = (0, 0)
                 try:
-                    tw = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
+                    tw = qnx6_walker(fh, base, pick)
                     encf = sample_encryption(tw)
                 except Exception:
                     pass
@@ -36345,26 +37002,46 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     "qnx6", sb["num_blocks"] * sb["blocksize"], used,
                     sb["serial"], f"{sb['serial']:,} commits, "
                     f"{sb['num_inodes'] - sb['free_inodes']:,} inodes used",
-                    stamp(sb["atime"]).replace(" UTC", ""), encf))
+                    "not stored" if mmi else stamp(sb["atime"]).replace(" UTC", ""), encf))
 
             if do_list and base is not None and wanted:
                 print(f"\n      CONTENTS  (depth {list_depth})")
                 try:
-                    w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
+                    w = qnx6_walker(fh, base, pick)
                     print_tree(w, w.root, 1, list_depth, [list_max])
+                    n_dmg, dmg = damage_lines(w)
+                    if n_dmg:
+                        print(f"        DAMAGE  {n_dmg:,} item(s) recorded while listing"
+                              + (", first:" if dmg else ""))
+                        for line in dmg:
+                            print(f"          {line}")
                 except Exception as exc:
                     print(f"        could not walk this filesystem: {exc}")
+
+            if zf is not None and base is None and key == "brute scan" and wanted and sb["checksum_ok"]:
+                # A superblock whose checksum holds, found only by the scan: it has no
+                # region, and a copy alone does not say whether it is the first or the
+                # second, so where its data starts is not known. It is recorded as a
+                # volume that was not read rather than left out of the export.
+                off0 = pick["active"][0]
+                vol = _zip_names(zf).volume(name_prefix + f"offset{off0}", (".exceptions.tsv",))
+                reason = (f"a qnx6 superblock at byte {off0:,} passes its checksum, but it was found "
+                          f"only by scanning, with no boot header or first superblock to say "
+                          f"where the volume starts, so its files were not read")
+                _say(f"\n        NOT READ: {reason}")
+                _zip_volume_not_read(zf, manifest, vol, image_rec, Qnx6Unreadable(reason),
+                                     offset_bytes=off0, filesystem="qnx6")
 
             if zf is not None and base is not None and wanted:
                 vol = _zip_names(zf).volume(name_prefix + (vol_names.get(base) or f"lba{base // ss}"),
                                             (".exceptions.tsv",))
                 _say(f"\n      EXTRACTING to {extract}  as {vol}/")
                 try:
-                    w = Qnx6Walker(fh, base, sorted(act["at"])[0] - base)
+                    w = qnx6_walker(fh, base, pick)
                     ents = collect(w, w.root)
                     ents, dropped = apply_exclude(ents, exclude)
                     log = []
-                    miss = missing_past_end(base, base + total)
+                    miss = missing_past_end(base, base + pick["volume_end"])
                     issues = []
                     f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
                                                          issues=issues)
@@ -36383,17 +37060,26 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         })
                     _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None else None,
                                            issues)
+                    n_dmg, dmg = damage_lines(w, _ZIP_DAMAGE_KEPT)
+                    if n_dmg and manifest is not None:
+                        manifest[-1]["damage_recorded"] = n_dmg
+                        manifest[-1]["damage_first"] = dmg
+                        if w.folders_not_read:
+                            manifest[-1]["folders_not_read"] = w.folders_not_read
                     if miss and manifest is not None:
                         manifest[-1]["extends_past_image_by_bytes"] = miss
                     print(f"        {f_:,} files, {human(wr)}"
                           + (f", {sk:,} symlinks or special files skipped" if sk else "")
                           + (f", {fa:,} FAILED" if fa else "")
                           + (f", {sh:,} SHORT" if sh else "")
-                          + (f", {dropped:,} excluded" if dropped else ""))
+                          + (f", {dropped:,} excluded" if dropped else "")
+                          + (f", {n_dmg:,} DAMAGED structure(s) recorded" if n_dmg else ""))
                     for line in log[:5]:
                         _say(line)
+                    for line in dmg[:5]:
+                        _say(f"        DAMAGE {line}")
                     if miss:
-                        print(f"        INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                        mark_incomplete(miss, " " * 8)
                 except Exception as exc:
                     _say(f"        could not extract this filesystem: {exc}")
                     _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=base // ss,
@@ -36413,9 +37099,36 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # not turn out to be qnx6 rather than trusting what they claim to be.
         others = [(lab, b, sz) for lab, b, sz in sized_regions
                   if lab not in vols and lab not in protective]
+        whole_unclaimed = False           # the whole image, and no identifier took it
         if others:
             print("  WHAT IS IN THE OTHER PARTITIONS")
+            past_end_recorded = set()    # a hybrid MBR and GPT can list one start twice
             for lab, b, sz in others:
+                if lab in table_labels and b >= size:
+                    # Nothing of it can be identified or walked, so it would leave no
+                    # record and the run would read as complete.
+                    gone = (f"none of this partition is in the image: the partition table "
+                            f"lists it at byte {b:,} and the image ends at byte {size:,}")
+                    if lab in containers:
+                        gone += ("; it is an extended partition, so the logical partitions "
+                                 "inside it cannot be listed")
+                    # the kind volumes() gives it, which --check-discovery compares
+                    print(f"    {lab}   {human(sz)}   ->  "
+                          + ("extended partition container" if lab in containers
+                             else "not recognised"))
+                    print(f"        {gone}")
+                    print()
+                    if (zf is not None and b not in past_end_recorded
+                            and (only is None or only.lower() in lab.lower())):
+                        past_end_recorded.add(b)
+                        vol = _zip_names(zf).volume(
+                            name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                            (".exceptions.tsv",))
+                        _zip_volume_not_read(zf, manifest, vol, image_rec, ValueError(gone),
+                                             lba=b // ss, offset_bytes=b,
+                                             partition_size_bytes=sz, filesystem=None,
+                                             extends_past_image_by_bytes=sz)
+                    continue
                 if lab in containers:
                     print(f"    {lab}   {human(sz)}   ->  extended partition "
                           f"container, holds the logical volumes below")
@@ -36433,6 +37146,33 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     else:
                         kind, lines = "raid member", [note]
                 print(f"    {lab}   {human(sz)}   ->  {kind or 'not recognised'}")
+                # The magic of a first superblock with nothing usable behind it, on a
+                # region nothing else claims, and no valid copy the scan could name.
+                lost = next((c for c in rejected if region(c[1]) == lab
+                             and c[0] - b in QNX6_FIRST_SLOTS), None)
+                scanned = picks.get("brute scan")
+                why = None
+                if not kind and zf is not None and (only is None or only.lower() in lab.lower()):
+                    if lost is not None and not (scanned and scanned["active"][2]["checksum_ok"]
+                                                 and b <= scanned["active"][0] < b + sz):
+                        searched = (f" or in the first {scan_limit_mib} MiB" if scanned_image
+                                    else "")
+                        why = (f"a qnx6 superblock at byte {lost[0]:,} kept its magic and failed "
+                               f"its checks, and no valid copy was found at the places it "
+                               f"names{searched}, so this volume was not read")
+                    elif lost is None and b not in placed and b + BOOTBLOCK_SIZE + 512 > size \
+                            and _qnx6_boot_second(fh, b):
+                        why = (f"a qnx6 boot header at byte {b:,} puts the first superblock at "
+                               f"byte {b + BOOTBLOCK_SIZE:,}, past the end of the image, so this "
+                               f"volume was not read")
+                if why:
+                    print(f"        NOT READ: {why}")
+                    _zip_volume_not_read(
+                        zf, manifest, _zip_names(zf).volume(
+                            name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
+                            (".exceptions.tsv",)),
+                        image_rec, Qnx6Unreadable(why), lba=b // ss, offset_bytes=b,
+                        partition_size_bytes=sz, filesystem="qnx6")
                 opened = getattr(fh, "bitlocker", {}).get(b)
                 if opened is not None:
                     print(f"        {opened.summary()}; what follows is the decrypted volume")
@@ -36486,6 +37226,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                           or (ext_name and only.lower() in ext_name.lower()))
 
                 fat_note = None if kind else _fat_not_read_note(fh, b)
+                whole_unclaimed = whole_unclaimed or (lab == "whole image" and not kind
+                                                      and not fat_note)
                 if fat_note:
                     print(f"        {fat_note}")
                     if zf is not None and wanted:
@@ -36567,7 +37309,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         for line in log[:5]:
                             _say(line)
                         if miss:
-                            print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                            mark_incomplete(miss, " " * 12)
                     except Exception as exc:
                         _say(f"        could not extract: {exc}")
                         _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
@@ -36649,7 +37391,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             for line in dmg[:5]:
                                 _say(f"            DAMAGE {line}")
                             if miss:
-                                print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                                mark_incomplete(miss, " " * 12)
                         except Exception as exc:
                             _say(f"        could not extract: {exc}")
                             _zip_volume_not_read(zf, manifest, vol, image_rec, exc, lba=b // ss,
@@ -36729,7 +37471,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 for line in log[:5]:
                                     _say(line)
                                 if miss:
-                                    print(f"            INCOMPLETE: this volume reaches {human(miss)} past the end of the file")
+                                    mark_incomplete(miss, " " * 12)
                             except Exception as exc:
                                 _say(f"        could not extract: {exc}")
                                 _zip_volume_not_read(zf, manifest, vol, image_rec, exc,
@@ -36738,10 +37480,36 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                      filesystem="qnx_ifs")
                 print()
 
+        # Nothing recognised the file, and its first sector holds a table whose every
+        # entry starts past its end. The table is not read from (parse_mbr declines it).
+        mbr_starts = (mbr_starts_past_end(fh, size) if whole_unclaimed and not confirmed
+                      and not raid_kind and len(sized_regions) == 1 else [])
+        if mbr_starts:
+            said = (f"the first sector has an MBR-style table and its {len(mbr_starts)} "
+                    + ("entry starts" if len(mbr_starts) == 1 else "entries start")
+                    + f" past the end of the file (lowest at LBA {min(mbr_starts):,}, the file "
+                      f"ends at byte {size:,}); none of that data is here, and the file may be "
+                      f"a cut disk image")
+            print(f"  {said}")
+            print()
+            if zf is not None and (only is None or only.lower() in "whole image"):
+                vol = _zip_names(zf).volume(name_prefix + (vol_names.get(0) or "lba0"),
+                                            (".exceptions.tsv",))
+                _zip_volume_not_read(zf, manifest, vol, image_rec, ValueError(said), lba=0,
+                                     offset_bytes=0, partition_size_bytes=size, filesystem=None)
+
+        if marked_incomplete:
+            print("  A volume marked INCOMPLETE above reaches past the end of the file. A file")
+            print("  on it that reaches past the end is counted SHORT and stored under a name")
+            print("  that says how much of it is here, not as an extracted file.")
+            print()
+
         if rejected:
             print(f"  rejected (magic present, fields inconsistent):")
             for off, how, endian, sb, bad in rejected[:6]:
-                print(f"    0x{off:<10x} {how:<28} {bad[0]}")
+                why = (bad[0] if bad else "fails its checksum" if not sb["checksum_ok"]
+                       else "a superblock of another filesystem")
+                print(f"    0x{off:<10x} {how:<28} {why}")
             if len(rejected) > 6:
                 print(f"    ... and {len(rejected)-6} more")
             print()
@@ -39384,7 +40152,7 @@ def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False, clock=True, bad_crc
         when = (1700000000, 1700000000 + serial) if clock else (297, 297)
         struct.pack_into(le + "IIQIIIHH", sb, 0, 0x68191122, 0, serial, *when, 0, 4, 3)
         sb[32:48] = bytes(range(16)[::-1]) if foreign and gen == "new" else bytes(range(16))
-        struct.pack_into(le + "6I", sb, 48, bs, 16, 10, num_blocks, 9, 0)
+        struct.pack_into(le + "6I", sb, 48, bs, 16, 10 if gen == "new" else 11, num_blocks, 9, 0)
         sb[72:152] = rnode(*tables[gen])
         sb[152:232] = rnode(bitmap_bytes, [bitmap_b])
         sb[232:312] = rnode(bs, [longfile_b])
@@ -39406,6 +40174,737 @@ def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False, clock=True, bad_crc
         return sorted((p, k, d) for p, k, d in rows)
     return (bytes(img[:cut]) if cut else bytes(img), tree(True), tree(False),
             [(ds + (bitmap_b + 1) * bs, 9 * bs)])
+
+
+def _qnx6_reader_checks():
+    """The qnx6 reader on damaged and unusual volumes, each built by patching the
+    self-test's own two-generation volume (_qnx6_test_volume) in memory. Each row
+    states what a reader must do and is written so that a reader lacking the behaviour
+    reports a failed row, not a crash."""
+    import contextlib                               # pylint: disable=import-outside-toplevel
+    out = []
+    bs = 4096
+    base, new, old, _runs = _qnx6_test_volume(bs)
+    second = struct.unpack_from("<I", base, 12)[0] * 512
+    first_blk = _Q6_DATA_START_WANT[bs] // bs
+    want = {p: d for p, kind, d in new if kind == "f"}
+    want_old = {p: d for p, kind, d in old if kind == "f"}
+
+    def vols(data):
+        return [v for v in volumes(io.BytesIO(bytes(data)), len(data)) if v["kind"] == "qnx6"]
+
+    def run(data, **options):
+        man, said, zbuf = [], io.StringIO(), io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout, \
+                contextlib.redirect_stdout(said):
+            main("q6.img", extract="(memory)", zf=zout, manifest=man,
+                 image=io.BytesIO(bytes(data)), **options)
+        with zipfile.ZipFile(zbuf) as zin:
+            members = {n.split("/", 1)[-1]: zin.read(n) for n in zin.namelist()
+                       if not n.endswith(".tsv") and n != "volumes.json"}
+            tables = "".join(zin.read(n).decode("utf-8", "replace") for n in zin.namelist()
+                             if n.endswith(".tsv"))
+        return man, members, said.getvalue(), tables
+
+    def files(walker, num=QNX6_ROOT_INO, prefix=""):
+        got = {}
+        for name, child in walker.listdir(num):
+            ent = walker.entry(child)
+            if ent is None:
+                continue
+            if ent[0] & S_IFMT == S_IFDIR:
+                got.update(files(walker, child, prefix + name + "/"))
+            else:
+                got[prefix + name] = b"".join(walker.read_file(child, ent[1]))
+        return got
+
+    def seal(img, at, endian="<"):
+        struct.pack_into(endian + "I", img, at + 4, qnx6_sb_crc(bytes(img[at + 8:at + 512])))
+
+    def inode_at(img, num):
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        byte = (num - 1) * QNX6_INODE_SIZE
+        return w._map(w.inode_rn["ptr"], w.inode_rn["levels"], byte // bs) * bs + byte % bs
+
+    def indirect_at(img, num):
+        return (struct.unpack_from("<I", img, inode_at(img, num) + 36)[0] + first_blk) * bs
+
+    def root_entry(img, stored):
+        at = (struct.unpack_from("<I", img, inode_at(img, 1) + 36)[0] + first_blk) * bs
+        for p in range(at, at + bs, QNX6_DIRENT_SIZE):
+            if img[p + 5:p + 5 + img[p + 4]] == stored and img[p + 4] != 0xFF:
+                return p
+        raise ValueError(stored)
+
+    def row(name, test):
+        try:
+            ok = bool(test())
+        except Exception as exc:                    # pylint: disable=broad-except
+            name, ok = f"{name} ({type(exc).__name__}: {exc})", False
+        out.append((name, ok))
+
+    def walker_damage(v):
+        return getattr(v.get("walker"), "damage", None) or []
+
+    def intact():
+        for size in sorted(_Q6_DATA_START_WANT):
+            img, tree, _o, _r = _qnx6_test_volume(size)
+            found = vols(img)
+            if len(found) != 1 or walker_damage(found[0]) or found[0]["missing_past_end"]:
+                return False
+            if files(found[0]["walker"]) != {p: d for p, kind, d in tree if kind == "f"}:
+                return False
+            collect(found[0]["walker"], found[0]["walker"].root)
+            if walker_damage(found[0]):
+                return False
+            if getattr(found[0]["walker"], "folders_not_read", 0):
+                return False
+        return True
+    row("qnx6: an intact volume at every block size reads whole and records no damage", intact)
+
+    def cut_second():
+        cut = base[:-0x1000]
+        man, got, said, _t = run(cut)
+        v = vols(cut)[0]
+        return (man[0].get("extends_past_image_by_bytes") == 0x1000 and "INCOMPLETE" in said
+                and v["missing_past_end"] == 0x1000 and got == want_old
+                and any("second superblock" in d for d in walker_damage(v)))
+    row("qnx6: an image cut inside the second superblock area says the newest generation "
+        "is out of reach", cut_second)
+
+    def prefix_labels():
+        ident = bytearray(base)
+        for at in (0x2000, second):
+            ident[at + 32:at + 48] = bytes(range(32, 48))
+            seal(ident, at)
+        lba1, lba2 = 4096, 40960
+        nsec = (len(base) + 511) // 512
+        cstart = lba1 - 2048
+        disk = bytearray((lba2 + nsec + 1) * 512)
+        disk[446:462] = (bytes([0, 0, 0, 0, 0x05, 0, 0, 0])
+                         + struct.pack("<II", cstart, lba2 + nsec - cstart))
+        disk[510:512] = b"\x55\xaa"
+        ebr = bytearray(512)
+        ebr[446:462] = bytes([0, 0, 0, 0, 0x4D, 0, 0, 0]) + struct.pack("<II", 2048, nsec)
+        ebr[462:478] = (bytes([0, 0, 0, 0, 0x05, 0, 0, 0])
+                        + struct.pack("<II", lba2 - 2048 - cstart, 2048 + nsec))
+        ebr[510:512] = b"\x55\xaa"
+        disk[cstart * 512:cstart * 512 + 512] = ebr
+        ebr2 = bytearray(512)
+        ebr2[446:462] = bytes([0, 0, 0, 0, 0x4D, 0, 0, 0]) + struct.pack("<II", 2048, nsec)
+        ebr2[510:512] = b"\x55\xaa"
+        disk[(lba2 - 2048) * 512:(lba2 - 2048) * 512 + 512] = ebr2
+        disk[lba1 * 512:lba1 * 512 + len(base)] = base
+        disk[lba2 * 512:lba2 * 512 + len(ident)] = ident
+        man, _got, _s, _t = run(disk)
+        return (sorted(r.get("offset_bytes") for r in man) == [lba1 * 512, lba2 * 512]
+                and all(r["files"] == len(want) for r in man))
+    row("qnx6: logical volumes at LBA 4096 and 40960, one label a prefix of the other, "
+        "are each read from their own start", prefix_labels)
+
+    def crc_ranks():
+        newer = bytearray(base)
+        newer[second + 80] ^= 0x40                  # the newer copy's Inode root pointer
+        older = bytearray(base)
+        older[0x2000 + 9] ^= 0x01                   # the older copy's serial, now 266
+        v1, v2 = vols(newer)[0], vols(older)[0]
+        return ("serial 10," in v1["detail"] and files(v1["walker"]) == want_old
+                and any("fails its checksum" in d for d in walker_damage(v1))
+                and "serial 11," in v2["detail"] and files(v2["walker"]) == want
+                and any("fails its checksum" in d for d in walker_damage(v2)))
+    row("qnx6: a superblock copy that fails its checksum loses to a valid copy, whatever "
+        "its serial, and that is recorded", crc_ranks)
+
+    def first_lost():
+        bad = bytearray(base)
+        bad[0x2000:0x2200] = bytes(512)
+        found = vols(bad + bytes(1 << 20))
+        return len(found) == 1 and "serial 11," in found[0]["detail"] \
+            and files(found[0]["walker"]) == want
+    row("qnx6: with the first superblock lost on a partition larger than the volume, the "
+        "boot header's b_sblk1 still finds the second", first_lost)
+
+    def scan_only():
+        bad = bytearray(base)
+        bad[:0x2200] = bytes(0x2200)                # the boot header and the first copy
+        man, got, said, _t = run(bad + bytes(1 << 20))
+        return (not got and len(man) == 1 and "found only by scanning" in man[0].get("extract_error", "")
+                and man[0]["offset_bytes"] == second and "NOT READ" in said)
+    row("qnx6: a valid superblock found only by the scan is recorded as a volume not read",
+        scan_only)
+
+    def cli_same():
+        bad = bytearray(base)
+        struct.pack_into("<II", bad, second + 16, 297, 297)     # no clock, checksum now wrong
+        man, _g, said, _t = run(bad)
+        return ("ACTIVE   serial 10" in said and man[0]["superblock_serial"] == 10
+                and "serial 10," in vols(bad)[0]["detail"])
+    row("qnx6: the report and volumes() walk the same superblock", cli_same)
+
+    def stale():
+        bad = bytearray(base) + bytes(0x4000)
+        at = len(bad) - 0x1000
+        bad[at:at + 512] = base[second:second + 512]
+        bad[at + 32:at + 48] = bytes(range(64, 80))
+        struct.pack_into("<Q", bad, at + 8, 900)
+        seal(bad, at)
+        v = vols(bad)[0]
+        return "serial 11," in v["detail"] and files(v["walker"]) == want
+    row("qnx6: a superblock of another filesystem at the end of the partition does not "
+        "compete", stale)
+
+    noboot = bytearray(base[0x2000:])
+
+    def no_boot():
+        v = vols(noboot)[0]
+        return "serial 11," in v["detail"] and files(v["walker"]) == want
+    row("qnx6: a volume with no boot block reads from 0x1000 (fs/qnx6/inode.c)", no_boot)
+
+    def no_boot_second_slot():
+        img = bytearray(noboot)                     # newer copy in the second area's other slot
+        s2 = second - 0x2000
+        older = bytes(img[0:512])
+        img[s2 + 0xE00:s2 + 0xE00 + 512] = bytes(img[s2:s2 + 512])
+        img[s2:s2 + 512] = older
+        img[0:512] = bytes(512)                     # the first copy lost
+        v = vols(img)[0]
+        return ("serial 11," in v["detail"] and files(v["walker"]) == want
+                and not any("past the end" in d for d in walker_damage(v)))
+    row("qnx6: a volume with no boot block whose newest copy is in the second area's other "
+        "slot still reads from 0x1000", no_boot_second_slot)
+
+    def as_mmi():
+        img = bytearray(noboot)
+        for at in (0, second - 0x2000):
+            std = bytes(img[at:at + 512])
+            sb = bytearray(512)
+            sb[:16] = std[:16]
+            sb[28:40] = std[32:44]
+            sb[40:60] = std[48:68]
+            sb[64:304] = std[72:312]
+            img[at:at + 512] = sb
+            seal(img, at)
+        return img
+
+    def mmi():
+        img = as_mmi()
+        v = vols(img)[0]
+        man, got, said, _t = run(img)
+        return ("serial 11," in v["detail"] and files(v["walker"]) == want and got == want
+                and man[0]["superblock_serial"] == 11 and "Audi MMI" in said)
+    row("qnx6: the Audi MMI 3G superblock layout (struct qnx6_mmi_super_block) is read", mmi)
+
+    def big_endian():
+        img = bytearray(base)
+        for at in (0x2000, second):
+            sb = bytes(img[at:at + 512])
+            struct.pack_into(">I", img, at, struct.unpack_from("<I", sb, 0)[0])
+            struct.pack_into(">Q", img, at + 8, struct.unpack_from("<Q", sb, 8)[0])
+            struct.pack_into(">III", img, at + 16, *struct.unpack_from("<III", sb, 16))
+            struct.pack_into(">HH", img, at + 28, *struct.unpack_from("<HH", sb, 28))
+            struct.pack_into(">6I", img, at + 48, *struct.unpack_from("<6I", sb, 48))
+            for o in (72, 152, 232):
+                struct.pack_into(">Q16I", img, at + o, *struct.unpack_from("<Q16I", sb, o))
+            seal(img, at, ">")
+        v = vols(img)[0]
+        man, got, _s, _t = run(img)
+        return ("walker" not in v and "big-endian" in v.get("note", "")
+                and "big-endian" in man[0].get("extract_error", "") and not got)
+    row("qnx6: a big-endian volume is recorded as not read rather than empty", big_endian)
+
+    def zero_ptr_block():
+        bad = bytearray(base)
+        at = indirect_at(bad, 5)
+        bad[at:at + bs] = bytes(bs)
+        man, got, _s, tables = run(bad)
+        return (man[0]["short"] == 1 and "big.bin" not in got
+                and any(n.startswith("big.bin.SHORT-0-of-") for n in got) and "zeroed pointer" in tables)
+    row("qnx6: a pointer block of zeros is damage, not a file of zeros", zero_ptr_block)
+
+    def part_zeroed_file():
+        bad = bytearray(base)
+        at = indirect_at(bad, 5)
+        bad[at + 5 * 4:at + 8 * 4] = bytes(12)      # slots 5, 6 and 7 of 20
+        man, got, _s, tables = run(bad)
+        name = f"big.bin.SHORT-{17 * bs}-of-{20 * bs}-bytes"
+        data = got.get(name, b"")
+        return (man[0]["short"] == 1 and len(data) == 20 * bs and "3 blocks with a zeroed pointer" in tables
+                and all(data[i * bs:(i + 1) * bs] == want["big.bin"][i * bs:(i + 1) * bs]
+                        for i in range(20) if i not in (5, 6, 7))
+                and data[5 * bs:8 * bs] == bytes(3 * bs))
+    row("qnx6: a partly zeroed pointer block still delivers every intact slot and records "
+        "the ones it lost", part_zeroed_file)
+
+    def part_zeroed_inode_tree():
+        img = bytearray(base)
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        spare = w.num_blocks - 1                    # a free block becomes the inode tree's top
+        at = (spare + first_blk) * bs
+        table = struct.unpack_from("<I", img, second + 72 + 8)[0]
+        slots = [table] + [0xFFFFFFFF] * (bs // 4 - 1)
+        slots[100:228] = [0] * 128                  # one sector of slots past the table's size
+        img[at:at + bs] = struct.pack("<%dI" % (bs // 4), *slots)
+        struct.pack_into("<I", img, second + 72 + 8, spare)
+        img[second + 72 + 72] = 1
+        seal(img, second)
+        v = vols(img)[0]
+        return files(v["walker"]) == want and not walker_damage(v)
+    row("qnx6: zero slots past the inode table's size cost no file", part_zeroed_inode_tree)
+
+    def sparse():
+        img = bytearray(base)
+        at = indirect_at(img, 5)
+        for slot in (5, 19):                        # a hole inside the file and one at its tail
+            struct.pack_into("<I", img, at + slot * 4, 0xFFFFFFFF)
+        man, got, _s, tables = run(img)
+        known = bytearray(want["big.bin"])
+        known[5 * bs:6 * bs] = bytes(bs)
+        known[19 * bs:20 * bs] = bytes(bs)
+        rows = [ln for ln in tables.splitlines() if "NO_POINTER_ZEROS" in ln]
+        return (got.get("big.bin") == bytes(known) and man[0]["short"] == 0
+                and not man[0].get("folders_not_read") and not man[0].get("damage_recorded")
+                and len(rows) == 1 and "2 of its 20 blocks have no pointer" in rows[0]
+                and "sparse hole or a damaged pointer" in rows[0])
+    row("qnx6: a ~0 pointer inside a file's size reads as zeros at full length, is not SHORT, "
+        "and gets one exceptions row", sparse)
+
+    def block_zero():
+        img = bytearray(base)
+        at = indirect_at(img, 5)
+        struct.pack_into("<I", img, at, 0)          # logical block 0 is stored block 0
+        v = vols(img)[0]
+        got = files(v["walker"])["big.bin"]
+        return got[:bs] == want["sub/small.txt"].ljust(bs, b"\x00") and got[bs:] == want["big.bin"][bs:]
+    row("qnx6: a stored pointer of 0 inside an indirect block is block 0", block_zero)
+
+    def lost_metadata():
+        bad = bytearray(base)
+        at = inode_at(bad, 3)
+        bad[at:at + QNX6_INODE_SIZE] = bytes(QNX6_INODE_SIZE)
+        man, got, _s, _t = run(bad)
+        sub = bytearray(base)
+        struct.pack_into("<I", sub, inode_at(sub, 2) + 36, 0xFFFFFFFF)
+        man2, _g, _s, _t = run(sub)
+        return ("sub/small.txt" not in got and man[0]["symlinks_or_special_skipped"] == 0
+                and man[0].get("damage_recorded", 0) >= 1 and man[0].get("folders_not_read") == 1
+                and man2[0].get("folders_not_read") == 1 and man2[0].get("damage_recorded", 0) >= 1)
+    row("qnx6: a lost inode or directory block is recorded, and an empty inode is not a "
+        "special file", lost_metadata)
+
+    def long_name():
+        bad = bytearray(base)
+        w = Qnx6Walker(io.BytesIO(bytes(bad)), 0, second)
+        at = w._map(w.long_rn["ptr"], w.long_rn["levels"], 0) * bs
+        bad[at:at + bs] = bytes(bs)
+        man, got, _s, _t = run(bad)
+        held = [n for n in got if "inode-4" in n]
+        return (len(held) == 1 and got[held[0]] == want["a_file_whose_name_is_longer_than_27_bytes.txt"]
+                and man[0].get("damage_recorded", 0) >= 1)
+    row("qnx6: a damaged long name becomes a placeholder holding the inode, with a record",
+        long_name)
+
+    def size_past_map():
+        bad = bytearray(base)
+        struct.pack_into("<Q", bad, inode_at(bad, 5), 30 * bs)
+        man, got, _s, tables = run(bad)
+        past = bytearray(base)                      # a level-0 file: 16 pointers, 17 blocks
+        struct.pack_into("<Q", past, inode_at(past, 3), 17 * bs)
+        man2, got2, _s, tables2 = run(past)
+        small = want["sub/small.txt"].ljust(bs, b"\x00") + bytes(15 * bs)
+        return (got.get("big.bin") == want["big.bin"] + bytes(10 * bs) and man[0]["short"] == 0
+                and "10 of its 30 blocks have no pointer" in tables
+                and man2[0]["short"] == 1 and "past its end" not in tables2
+                and got2.get(f"sub/small.txt.SHORT-{16 * bs}-of-{17 * bs}-bytes") == small
+                and "15 of its 17 blocks have no pointer" in tables2)
+    row("qnx6: a size past the mapped blocks reads as zeros up to what the pointers address, "
+        "with a row, and is SHORT past that", size_past_map)
+
+    def huge():
+        bad = bytearray(base)
+        struct.pack_into("<Q", bad, inode_at(bad, 5), 1 << 40)
+        w = Qnx6Walker(io.BytesIO(bytes(bad)), 0, second)
+        total, most = 0, w.num_blocks * bs
+        for chunk in w.read_file(5, 1 << 40):
+            total += len(chunk)
+            if total > most:
+                return False
+        sub = bytearray(base)
+        struct.pack_into("<Q", sub, inode_at(sub, 2), 1 << 31)
+        w2 = Qnx6Walker(io.BytesIO(bytes(sub)), 0, second)
+        names = [n for n, _i in w2.listdir(2)]
+        return total == most and names == ["small.txt"] and getattr(w2, "folders_not_read", 0) == 1
+    row("qnx6: a damaged size cannot run a file or directory read past its pointers", huge)
+
+    def past_volume():
+        bad = bytearray(base) + b"FOREIGN!" * (bs // 8)
+        blk = (len(base) // bs) - first_blk
+        struct.pack_into("<I", bad, inode_at(bad, 3) + 36, blk)
+        man, got, _s, _t = run(bad)
+        return (man[0]["short"] == 1 and not any(b"FOREIGN" in d for d in got.values()))
+    row("qnx6: a pointer past the volume's block count is not followed", past_volume)
+
+    def names():
+        import sqlite3                              # pylint: disable=import-outside-toplevel
+        img = bytearray(base)
+        # the two stored names differ only in the byte that does not decode
+        for stored, raw in ((b"deep.bin", b"deep\xe9bin"), (b"big.bin", b"deep\xe8bin")):
+            p = root_entry(img, stored)
+            img[p + 4] = len(raw)
+            img[p + 5:p + 5 + len(raw)] = raw
+        v = vols(img)[0]
+        listed = [n for n, _i in v["walker"].listdir(1)]
+        db = sqlite3.connect(":memory:")
+        db.execute("create table t (n text primary key)")
+        db.executemany("insert into t values (?)", [(n,) for n in listed])
+        return "deep%E9bin" in listed and "deep%E8bin" in listed \
+            and db.execute("select count(*) from t").fetchone()[0] == len(listed)
+    row("qnx6: a stored name that is not UTF-8 keeps its bytes as %XX, stays distinct and "
+        "goes into SQLite", names)
+
+    def past_isize():
+        img = bytearray(base)
+        root = inode_at(img, 1)
+        size = struct.unpack_from("<Q", img, root)[0]
+        last = max(p for p in range(0, size, QNX6_DIRENT_SIZE) if img[(
+            struct.unpack_from("<I", img, root + 36)[0] + first_blk) * bs + p + 4])
+        struct.pack_into("<Q", img, root, last)
+        listed = [n for n, _i in Qnx6Walker(io.BytesIO(bytes(img)), 0, second).listdir(1)]
+        return "big.bin" not in listed and "deep.bin" in listed
+    row("qnx6: directory entries past the directory's size are not listed", past_isize)
+
+    def levels_and_loop():
+        lv = bytearray(base)
+        lv[inode_at(lv, 5) + 100] = 255
+        man, got, _s, _tables = run(lv)
+        loop = bytearray(base)
+        at = indirect_at(loop, 5)
+        struct.pack_into("<I", loop, at + 3 * 4, at // bs - first_blk)
+        man2, got2, _s, tables2 = run(loop)
+        return (not any(n.startswith("big.bin") for n in got) and man[0].get("folders_not_read") == 1
+                and any("255 pointer levels" in d and d.endswith(": big.bin")
+                        for d in man[0]["damage_first"])
+                and man2[0]["short"] == 1 and "big.bin" not in got2 and "own pointer block" in tables2)
+    row("qnx6: impossible pointer levels and a pointer back to its own block are refused",
+        levels_and_loop)
+
+    def entry_shapes():
+        img = bytearray(base)
+        img[root_entry(img, b"deep.bin") + 4] = 40
+        p = root_entry(img, b"big.bin")
+        img[p + 4] = 3
+        img[p + 5:p + 8] = b"a/b"
+        v = vols(img)[0]
+        listed = [n for n, _i in v["walker"].listdir(1)]
+        return "name-damaged-inode-6" in listed and "a%2Fb" in listed \
+            and not any("/" in n or "\x00" in n for n in listed) and len(walker_damage(v)) == 2
+    row("qnx6: an invalid name length and a stored slash are recorded and cannot change "
+        "the path", entry_shapes)
+
+    def live_over_stale():
+        bad = bytearray(base) + bytes(0x4000)
+        at = len(bad) - 0x1000
+        bad[at:at + 512] = base[second:second + 512]
+        bad[at + 32:at + 48] = bytes(range(64, 80))
+        struct.pack_into("<Q", bad, at + 8, 900)
+        seal(bad, at)
+        for off in (0x2000, second):
+            bad[off + 400] ^= 0xFF                  # both live copies fail, their fields hold
+        v = vols(bad)[0]
+        man, got, _s, _t = run(bad)
+        return ("serial 11," in v["detail"] and files(v["walker"]) == want and got == want
+                and any("0x%x" % at in d and "not used" in d for d in walker_damage(v))
+                and man[0].get("damage_recorded", 0) >= 2)
+    row("qnx6: with both live copies failing, a valid superblock of an earlier format is not "
+        "read in their place, and that is recorded", live_over_stale)
+
+    def first_id_damaged():
+        bad = bytearray(base)
+        bad[0x2000 + 32] ^= 0xFF                    # the first copy's volume id, CRC now wrong
+        v = vols(bad)[0]
+        return ("serial 11," in v["detail"] and files(v["walker"]) == want
+                and any("first superblock" in d and "differ" in d for d in walker_damage(v)))
+    row("qnx6: a valid second copy wins over a first copy with a damaged volume id, with a "
+        "record", first_id_damaged)
+
+    def never_silent():
+        std = bytearray(base)
+        std[0:16] = bytes(16)
+        std[0x2000 + 4:0x2000 + 512] = bytes(508)   # magic kept, the rest gone
+        nob = bytearray(noboot)
+        nob[4:512] = bytes(508)
+        for img in (std, nob):
+            man, got, said, _t = run(img + bytes(1 << 20))
+            if got or len(man) != 1 or "found only by scanning" not in man[0].get("extract_error", ""):
+                return False
+            man, got, said, _t = run(img + bytes(1 << 20), scan_limit_mib=0)
+            if got or len(man) != 1 or "kept its magic" not in man[0].get("extract_error", ""):
+                return False
+        m = as_mmi()
+        m[200] ^= 0xFF                              # the first MMI copy fails its checksum
+        man, got, _s, _t = run(m + bytes(1 << 20))
+        return got == want and man[0]["superblock_serial"] == 11 and man[0].get("damage_recorded", 0) >= 1
+    row("qnx6: a damaged first superblock on a larger partition is read from its second copy "
+        "or recorded as not read, never silently empty", never_silent)
+
+    def mmi_logical():
+        vol = bytes(as_mmi())
+        nsec = (len(vol) + 511) // 512
+        cstart, gap = 2048, 63
+        disk = bytearray((cstart + gap + nsec) * 512)
+        disk[446:462] = bytes([0, 0, 0, 0, 0x05, 0, 0, 0]) + struct.pack("<II", cstart, gap + nsec)
+        disk[510:512] = b"\x55\xaa"
+        ebr = bytearray(512)
+        ebr[446:462] = bytes([0, 0, 0, 0, 0x83, 0, 0, 0]) + struct.pack("<II", gap, nsec)
+        ebr[510:512] = b"\x55\xaa"
+        disk[cstart * 512:cstart * 512 + 512] = ebr
+        disk[(cstart + gap) * 512:(cstart + gap) * 512 + len(vol)] = vol
+        found = vols(disk)
+        return (len(found) == 1 and found[0]["label"].startswith("logical")
+                and files(found[0]["walker"]) == want)
+    row("qnx6: an MMI logical volume is not listed a second time on its extended container",
+        mmi_logical)
+
+    def nul_names():
+        img = bytearray(base)
+        p = root_entry(img, b"deep.bin")
+        img[p + 5 + 4] = 0                          # deep\0bin
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        at = w._map(w.long_rn["ptr"], w.long_rn["levels"], 0) * bs
+        img[at + 2 + 3] = 0
+        listed = [n for n, _i in Qnx6Walker(io.BytesIO(bytes(img)), 0, second).listdir(1)]
+        return "deep%00bin" in listed and "a_f%00le_whose_name_is_longer_than_27_bytes.txt" in listed \
+            and not any("\x00" in n for n in listed)
+    row("qnx6: a NUL stored in a short or long name is written %00", nul_names)
+
+    def newer_other_id():
+        img = bytearray(base)
+        img[second + 32:second + 48] = bytes(range(80, 96))
+        seal(img, second)
+        v = vols(img)[0]
+        return ("serial 10," in v["detail"] and files(v["walker"]) == want_old
+                and any("serial 11" in d and "not used" in d for d in walker_damage(v)))
+    row("qnx6: a newer copy with another volume id is ignored, and that is recorded",
+        newer_other_id)
+
+    def block_of(img, num):
+        return (struct.unpack_from("<I", img, inode_at(img, num) + 36)[0] + first_blk) * bs
+
+    def dir_sector():
+        bad = bytearray(base)
+        at = block_of(bad, 1)
+        bad[at:at + 512] = bytes(512)
+        man, got, _s, _t = run(bad)
+        sub_dir = bytearray(base)
+        at = block_of(sub_dir, 2)
+        sub_dir[at:at + 512] = bytes(512)
+        man2, got2, _s, _t = run(sub_dir)
+        linked = bytearray(base)                    # a hard link is one inode with two names
+        at = block_of(linked, 1) + 6 * QNX6_DIRENT_SIZE
+        linked[at:at + QNX6_DIRENT_SIZE] = struct.pack("<IB", 3, 8) + b"hard.txt".ljust(27, b"\0")
+        man3, got3, _s, _t = run(linked)
+        return (not got and man[0].get("folders_not_read") == 1
+                and any("counts 6 inodes" in d and "reached 1:" in d for d in man[0]["damage_first"])
+                and "sub/small.txt" not in got2 and not man2[0].get("folders_not_read")
+                and _volumes_not_read(man2) == 0
+                and any("does not start with . and .." in d and d.endswith(": sub")
+                        for d in man2[0]["damage_first"])
+                and any("counts 6 inodes" in d and "reached 5:" in d for d in man2[0]["damage_first"])
+                and got3.get("hard.txt") == want["sub/small.txt"] and not man3[0].get("damage_recorded")
+                and not man3[0].get("folders_not_read"))
+    row("qnx6: a zeroed root sector exits 1, a zeroed sector of another folder gets counted "
+        "notes and exit 0, and a hard link does not trip the count", dir_sector)
+
+    def unlinked_inode():
+        img = bytearray(base)                       # in use, with no directory entry
+        p = root_entry(img, b"big.bin")
+        img[p:p + QNX6_DIRENT_SIZE] = bytes(QNX6_DIRENT_SIZE)
+        man, got, _s, _t = run(img)
+        keep = {k: v for k, v in want.items() if k != "big.bin"}
+        return (got == keep and not man[0].get("folders_not_read") and _volumes_not_read(man) == 0
+                and any("counts 6 inodes" in d and "open but unlinked" in d
+                        for d in man[0]["damage_first"]))
+    row("qnx6: an inode in use with no name is a counted note and does not change the exit "
+        "status", unlinked_inode)
+
+    def dots_gone():
+        img = bytearray(base)
+        at = block_of(img, 2)
+        img[at:at + 2 * QNX6_DIRENT_SIZE] = bytes(2 * QNX6_DIRENT_SIZE)     # the rest survives
+        man, got, _s, _t = run(img)
+        root = bytearray(base)
+        at = block_of(root, 1)
+        root[at:at + 2 * QNX6_DIRENT_SIZE] = bytes(2 * QNX6_DIRENT_SIZE)
+        man2, got2, _s, _t = run(root)
+        return (got == want and not man[0].get("folders_not_read")
+                and _volumes_not_read(man) == 0
+                and any("does not start with . and .." in d and d.endswith(": sub")
+                        for d in man[0]["damage_first"])
+                and not any("could not be read" in d for d in man[0]["damage_first"])
+                and got2 == want and man2[0].get("folders_not_read") == 1
+                and any("root folder's first block does not start" in d
+                        and "entries may be missing" in d for d in man2[0]["damage_first"]))
+    row("qnx6: a first block without . and .. is a note on a folder and a folder not read "
+        "only on the root, as the kernel tests it", dots_gone)
+
+    def noise_type():
+        unused = bytearray(base)                    # a valid type, not marked in use
+        at = inode_at(unused, 3)
+        struct.pack_into("<H", unused, at + 32, 0x1000 | 0o644)
+        unused[at + 101] = 0
+        man, got, _s, _t = run(unused)
+        deep = bytearray(base)                      # a valid type, impossible levels
+        at = inode_at(deep, 3)
+        struct.pack_into("<H", deep, at + 32, 0xA000 | 0o777)
+        deep[at + 100] = 200
+        man2, got2, _s, _t = run(deep)
+        return all("sub/small.txt" not in g and m[0]["symlinks_or_special_skipped"] == 0
+                   and m[0].get("folders_not_read") == 1
+                   and any(d.endswith(": sub/small.txt") for d in m[0]["damage_first"])
+                   for m, g in ((man, got), (man2, got2)))
+    row("qnx6: an inode not marked in use or with impossible levels is damage, named in the "
+        "record and not counted as special", noise_type)
+
+    def lost_link_name():
+        img = bytearray(base)
+        struct.pack_into("<H", img, inode_at(img, 3) + 34, 2)
+        at = block_of(img, 1) + 512                 # the second name, alone in its sector
+        img[at:at + QNX6_DIRENT_SIZE] = struct.pack("<IB", 3, 8) + b"hardlink".ljust(27, b"\0")
+        man, got, _s, _t = run(img)
+        cut = bytearray(img)
+        cut[at:at + 512] = bytes(512)
+        man2, got2, _s, _t = run(cut)
+        return (got.get("hardlink") == want["sub/small.txt"] and not man[0].get("damage_recorded")
+                and "hardlink" not in got2 and got2.get("sub/small.txt") == want["sub/small.txt"]
+                and not man2[0].get("folders_not_read") and _volumes_not_read(man2) == 0
+                and any("inode 3 records 2 names and 1 were found" in d
+                        and d.endswith("sub/small.txt") for d in man2[0]["damage_first"]))
+    row("qnx6: a hard-link name lost with its sector is a note naming the inode and the "
+        "file's other path", lost_link_name)
+
+    def not_scanned_wording():
+        lost = bytearray(base)
+        lost[0:16] = bytes(16)
+        lost[0x2000 + 4:0x2000 + 512] = bytes(508)
+        lost = bytes(lost) + bytes(1 << 20)
+        one, two = 2048, 2048 + (len(base) + 511) // 512 + 8
+        disk = bytearray(two * 512 + len(lost) + 4096)
+        for i, (lba, data) in enumerate(((one, base), (two, lost))):
+            nsec = (len(data) + 511) // 512
+            disk[446 + 16 * i:462 + 16 * i] = (bytes([0, 0, 0, 0, 0xB1, 0, 0, 0])
+                                               + struct.pack("<II", lba, nsec))
+            disk[lba * 512:lba * 512 + len(data)] = data
+        disk[510:512] = b"\x55\xaa"
+        man, _g, _s, _t = run(disk)
+        errors = [r.get("extract_error", "") for r in man if r.get("extract_error")]
+        return (len(errors) == 1 and "kept its magic" in errors[0]
+                and "at the places it names, so" in errors[0] and "MiB" not in errors[0])
+    row("qnx6: the not-read record names a scan only when the scan ran", not_scanned_wording)
+
+    def area_lost():
+        for at, serial, known, area in ((second, 10, want_old, "second"), (0x2000, 11, want, "first")):
+            bad = bytearray(base)
+            bad[at:at + 512] = bytes(512)
+            man, got, _s, _t = run(bad)
+            if not (got == known and man[0]["superblock_serial"] == serial
+                    and man[0].get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                    and any(f"{area} superblock area holds no valid copy" in d
+                            and "older generation" in d and "newer data may exist" in d
+                            for d in man[0]["damage_first"])):
+                return False
+        man, _g, _s, _t = run(base)
+        return not man[0].get("damage_recorded") and _volumes_not_read(man) == 0
+    row("qnx6: with no valid copy in one superblock area the survivor is read, the possible "
+        "loss of newer data is recorded, and the run exits 1", area_lost)
+
+    def bad_type():
+        bad = bytearray(base)
+        struct.pack_into("<H", bad, inode_at(bad, 3) + 32, 0xFFFF)
+        man, got, _s, _t = run(bad)
+        named = bytearray(base)                     # S_IFNAM is a real QNX type
+        struct.pack_into("<H", named, inode_at(named, 3) + 32, 0x5000 | 0o644)
+        man2, _g, _s, _t = run(named)
+        return ("sub/small.txt" not in got and man[0]["symlinks_or_special_skipped"] == 0
+                and man[0].get("folders_not_read") == 1
+                and any("no valid file type" in d for d in man[0]["damage_first"])
+                and man2[0]["symlinks_or_special_skipped"] == 1
+                and not man2[0].get("damage_recorded"))
+    row("qnx6: an inode with no valid file type is damage, not a special file, and S_IFNAM "
+        "stays a special file", bad_type)
+
+    def cut_exit():
+        man, got, _s, _t = run(base[:second])
+        return got == want_old and _volumes_not_read(man) == 1
+    row("qnx6: an image whose newest superblock lies past its end exits 1", cut_exit)
+
+    def cut_in_boot_block():
+        man, got, said, _t = run(base[:0x1000])
+        return (not got and len(man) == 1 and _volumes_not_read(man) == 1
+                and "past the end of the image" in man[0].get("extract_error", "")
+                and "NOT READ" in said)
+    row("qnx6: an image cut inside the boot block is recorded as a volume not read",
+        cut_in_boot_block)
+
+    def ff_dir_sector():
+        bad = bytearray(base)
+        at = block_of(bad, 1)
+        bad[at:at + 512] = b"\xff" * 512
+        man, got, _s, _t = run(bad)
+        lines = man[0].get("damage_first") or []
+        return (not got and man[0].get("folders_not_read") == 1
+                and any("past the volume's" in d for d in lines)
+                and not any("long name" in d or "listed as" in d for d in lines))
+    row("qnx6: a 0xFF directory sector gets one true record, not a name for an entry it then "
+        "says is not listed", ff_dir_sector)
+
+    def part_pointer_block():
+        at = indirect_at(base, 5)
+
+        class Cut(io.BytesIO):                      # the image ends half way through it
+            def read(self, n=-1):
+                pos = self.tell()
+                data = super().read(n)
+                return data[:bs // 2] if pos == at and n == bs else data
+        w = Qnx6Walker(Cut(bytes(base)), 0, second)
+        got = b"".join(w.read_file(5, len(want["big.bin"])))
+        return got == want["big.bin"] and w.run_shortfall(5) is None
+    row("qnx6: the slots a cut pointer block still holds are delivered", part_pointer_block)
+
+    def zero_per_sector():
+        img = bytearray(base)
+        at = indirect_at(img, 5)
+        struct.pack_into("<I", img, at, 0)          # slot 0 really is stored block 0
+        img[at + 512:at + 1024] = bytes(512)        # a zeroed sector of slots past the size
+        got = files(vols(img)[0]["walker"])["big.bin"]
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        ptrs = list(struct.unpack_from("<16I", img, inode_at(img, 5) + 36))
+        return (got[:bs] == want["sub/small.txt"].ljust(bs, b"\x00")
+                and got[bs:] == want["big.bin"][bs:]
+                and w._resolve(ptrs, 1, 128, 129) == (None, "a zeroed pointer"))
+    row("qnx6: zeros are counted per sector, so a zeroed sector leaves a real block 0 in "
+        "another sector and is not itself read as block 0", zero_per_sector)
+
+    def long_checksum():
+        img = bytearray(base)
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        at = w._map(w.long_rn["ptr"], w.long_rn["levels"], 0) * bs
+        img[at + 2 + 3] ^= 0x01
+        w = Qnx6Walker(io.BytesIO(bytes(img)), 0, second)
+        listed = [n for n, _i in w.listdir(1)]
+        changed = bytes(img[at + 2:at + 2 + 45]).decode()
+        return (changed in listed and not w.folders_not_read
+                and any("does not match the checksum" in d for d in w.damage))
+    row("qnx6: a long name that fails its checksum is kept and recorded", long_checksum)
+
+    def gap_wording():
+        bad = bytearray(base)
+        at = indirect_at(bad, 5)
+        struct.pack_into("<I", bad, at + 11 * 4, 0xFFFFFF00)
+        _m, _g, _s, tables = run(bad)
+        return ("1 block with a pointer past the end of the volume" in tables
+                and "the rest has no block" not in tables and "are zeros in the member" in tables)
+    row("qnx6: the record for a lost block in the middle of a file says what the member holds",
+        gap_wording)
+    return out
 
 
 def _gpt_test_image(ss, volume, first_lba, name, type_guid, used=True):
@@ -41664,6 +43163,77 @@ def self_test():
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
+        # A disk cut after its first partition: the second is listed by the table
+        # and none of it is in the file. It gets a record and counts as not read,
+        # and the first exports as it does alone. The image is removed when the
+        # row ends, because the build workflow counts the images left in this folder.
+        p2_lba = 2048 + -(-len(q4) // SECTOR)
+        cut_disk = bytearray(p2_lba * SECTOR)
+        for slot, (first, count) in enumerate(((2048, p2_lba - 2048), (p2_lba, 64))):
+            ent = bytearray(16)
+            ent[4] = 0x4d
+            struct.pack_into("<II", ent, 8, first, count)
+            cut_disk[446 + slot * 16:462 + slot * 16] = ent
+        cut_disk[510:512] = b"\x55\xaa"
+        cut_disk[2048 * SECTOR:2048 * SECTOR + len(q4)] = q4
+        p2_path = os.path.join(d, "second_partition_cut.img")
+        p2_man, p2_buf = [], io.StringIO()
+        p2_zip = io.BytesIO()
+        try:
+            with open(p2_path, "wb") as out:
+                out.write(cut_disk)
+            with zipfile.ZipFile(p2_zip, "w") as zf, contextlib.redirect_stdout(p2_buf):
+                main(p2_path, extract="x.zip", zf=zf, manifest=p2_man)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(p2_path)
+        p2_rec = p2_man[1] if len(p2_man) == 2 else {}
+        cond = (len(p2_man) == 2 and p2_man[0].get("files") == 4
+                and p2_man[0].get("short") == 0 and not p2_man[0].get("extract_error")
+                and _volumes_not_read(p2_man) == 1
+                and p2_rec.get("offset_bytes") == p2_lba * SECTOR
+                and p2_rec.get("extends_past_image_by_bytes") == 64 * SECTOR
+                and p2_rec.get("files") == 0
+                and (p2_rec.get("extract_error") or "").startswith(
+                    "none of this partition is in the image: the partition table lists it "
+                    f"at byte {p2_lba * SECTOR:,} and the image ends at byte {len(cut_disk):,}")
+                and "INCOMPLETE" not in p2_buf.getvalue())
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a partition that begins past the end of a cut "
+              f"disk gets a record, counts as not read, and no volume is said to be marked "
+              f"INCOMPLETE")
+
+        # A file cut just after its MBR: nothing recognises it and its one entry starts
+        # past the end. The same sector with its entries zeroed is not a table.
+        cut_mbr = bytearray(512)
+        cut_mbr[446:462] = b"\x80" + bytes(3) + b"\x83" + bytes(3) + struct.pack("<II", 2048, 4096)
+        cut_mbr[510:512] = b"\x55\xaa"
+        blank_mbr = bytearray(512)
+        blank_mbr[510:512] = b"\x55\xaa"
+        cut_mans = []
+        mbr_path = os.path.join(d, "cut_after_mbr.img")
+        try:
+            for sector in (cut_mbr, blank_mbr):
+                with open(mbr_path, "wb") as out:
+                    out.write(sector)
+                cut_mans.append([])
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(mbr_path, extract="x.zip", zf=zf, manifest=cut_mans[-1])
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(mbr_path)
+        cond = (len(cut_mans[0]) == 1 and _volumes_not_read(cut_mans[0]) == 1
+                and cut_mans[0][0]["extract_error"].startswith(
+                    "the first sector has an MBR-style table and its 1 entry starts past the "
+                    "end of the file (lowest at LBA 2,048, the file ends at byte 512)")
+                and cut_mans[1] == [])
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a file cut after its MBR gets a record saying "
+              f"what was found, and a 0x55AA sector with no entries gets none")
+
         # A split image, joined by the reader. FTK Imager and its peers write a
         # raw image as numbered segments, and since 1.13 a run on any one of
         # them reads the whole set. The qnx4 fixture behind an MBR, cut into
@@ -43752,11 +45322,19 @@ def self_test():
                 q6_clock_problems.append(f"{_bs}: an unset clock with a bad checksum is accepted")
             if [v for v in volumes(io.BytesIO(_bad), len(_bad)) if v["kind"] == "qnx6"]:
                 q6_clock_problems.append(f"{_bs}: volumes() lists the bad-checksum volume")
-            # a good clock with a bad checksum is read as before: the checksum
-            # is not a new reason to refuse
-            _r = check(io.BytesIO(_qnx6_test_volume(_bs, bad_crc=True)[0]), 0x2000)
+            # a good clock with a bad checksum is still a candidate: the checksum is
+            # not a reason to refuse a volume with no better copy, but qnx6_select()
+            # ranks every valid copy above it (see _qnx6_reader_checks)
+            _img = _qnx6_test_volume(_bs, bad_crc=True)[0]
+            _r = check(io.BytesIO(_img), 0x2000)
             if not (_r and not _r[2] and not _r[1]["checksum_ok"]):
                 q6_clock_problems.append(f"{_bs}: a bad checksum alone now rejects")
+            # and with no copy that passes, the newest failed copy is read and says so
+            _vols = [v for v in volumes(io.BytesIO(_img), len(_img)) if v["kind"] == "qnx6"]
+            if not (len(_vols) == 1 and "serial 11," in _vols[0]["detail"]
+                    and "no superblock copy passes its checksum" in _vols[0]["detail"]
+                    and any("no superblock copy passes" in d for d in _vols[0]["walker"].damage)):
+                q6_clock_problems.append(f"{_bs}: no valid copy, and the one read does not say so")
         # the same superblock stored big-endian, checksum read in that order
         _sbb = bytearray(512)
         struct.pack_into(">IIQIIIHH", _sbb, 0, 0x68191122, 0, 7, 297, 297, 0, 4, 3)
@@ -44030,8 +45608,9 @@ def self_test():
                  not q6_size_problems),
                 ("a qnx6 superblock whose clock was never set is accepted with a note "
                  "when its checksum (crc32_be, checked against zlib and CRC-32/CKSUM) "
-                 "holds, little and big endian, still refused when it does not, and a "
-                 "bad checksum alone is no reason to refuse"
+                 "holds, little and big endian, and still refused when it does not; with "
+                 "a good clock and no copy that passes, the newest failed copy is read "
+                 "and says so"
                  + "".join(f"; {p}" for p in q6_clock_problems),
                  not q6_clock_problems),
                 ("an extended container is not listed as the qnx6 of its own logical "
@@ -44133,6 +45712,11 @@ def self_test():
             lvm_checks += _refs_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
+        # qnx6 on damaged and unusual volumes, patched from the self-test's own volume.
+        try:
+            lvm_checks += _qnx6_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the qnx6 reader checks ran ({type(exc).__name__}: {exc})", False)]
         # decmpfs: LZVN and LZFSE streams from Apple's encoder, and APFS and HFS+
         # volumes macOS wrote and read back (tools/make_decmpfs_streams.py,
         # tools/make_decmpfs_fixture.py).
@@ -45032,8 +46616,12 @@ def self_test():
         vol_checks = (
             ("volumes() names the qnx6 behind an MBR by its partition and LBA",
              a, [("qnx6", "p1_lba2048", True, 0)]),
-            ("volumes() names a whole-image big-endian qnx6 lba0",
-             b, [("qnx6", "lba0", True, 0)]),
+            # a big-endian volume is named and not walked; its superblock declares
+            # 1,020 blocks of 4096, so with no boot block it ends at 0x1000 + 1,020 *
+            # 4096 + 0x1000, which is 4,120,576 bytes past this 64 KiB file
+            ("volumes() names a whole-image big-endian qnx6 lba0, with no walker and "
+             "what the file lacks of it",
+             b, [("qnx6", "lba0", False, 4120576)]),
             ("volumes() reports an unrecognised image as one region without a walker",
              c, [("not recognised", "lba0", False, 0)]),
             ("volumes() recognises a synthetic FAT32 boot sector",
