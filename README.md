@@ -376,7 +376,8 @@ with blocks that have no pointer (see "QNX6 superblock choice and damaged volume
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
-time, and for the last four for a value out of their range too. F2FS keeps the signed value
+time, and NTFS, HFS+ and APFS for a value out of their range too. The ReFS reader keeps a
+stored time past that range, so it gets its row (see [ReFS](#refs)). F2FS keeps the signed value
 it stores, so a stored 0 is recorded as 1970-01-01. An F2FS file flagged encrypted gets an
 `ENCRYPTED` row, which does not change the exit status.
 
@@ -2070,8 +2071,26 @@ listed as links with `readlink()` giving their target, and are not followed. Alt
 streams are listed by `named_streams(node)` and read through `stream_ref(node, name)`,
 including a stream on a directory.
 
+A name is stored as UTF-16 and need not be valid UTF-16: Windows 11 wrote file and folder
+names holding an unpaired surrogate on a test volume here. Such a unit is shown as `%XX` of
+its two stored bytes in stored order (U+D800 is `%00%D8`), so two stored names stay two and
+no name holds a surrogate. Before this the unit became U+FFFD, and two of that volume's
+files, whose names differ only in such a unit, came out under one name with the second
+renamed `.dup-2`. A stream's name is read the same way, a NUL is
+written `%00` and a `/` inside a name `%2F`; no volume to hand stores any of those three,
+so they are checked on rows the self-test builds. A literal `%` is not escaped, so a file
+really named `a%00%D8` reads the same as one whose name ends in U+D800. A link's target and
+the volume label are not entry names and are still decoded with U+FFFD for such a unit.
+
 ReFS keeps four times per file, as NTFS does. `stamps(node)` gives created, modified and
-accessed in Unix seconds, like `NtfsWalker.stamps`; `filetimes(node)` gives all four
+accessed in Unix seconds, like `NtfsWalker.stamps`, except that a stored time from
+9999-12-31 23:59:59 on is kept as its number of seconds where the NTFS reader gives 0.
+Windows 11 stored modified times of 9999-12-31 23:59:59, of a FILETIME near year 11998 and
+of the largest positive 64-bit value on the same test volume, and each used to read as no
+time, so its member showed 1980-01-01 with no `TIME_NOT_HELD` row. Each now gets that row,
+with the seconds. A stored 0 reads as no time, and so does a time stored exactly at
+1970-01-01 00:00:00 UTC, which converts to 0.
+`filetimes(node)` gives all four
 FILETIMEs as stored, with the change time, to the 100 ns. A file's times come from its own
 record. The name row of a moved or linked file keeps a copy that ReFS refreshes only when
 that name is opened, so it can be older, and two names of one file can disagree; the record
@@ -2098,9 +2117,18 @@ seconds after its files were written, and its checkpoint predates every one of t
         checkpoint   clock 20 at cluster 1,570,928, written as ReFS 3.14
         log          16 metadata log records follow the newest checkpoint. Windows applies
                      them when it mounts the volume; this reader does not, so it shows the
-                     volume as of that checkpoint, and what changed after it is missing or
-                     older here
+                     volume as of that checkpoint: newer files and newer content may exist,
+                     and are missing or older here
 ```
+
+`--extract` writes the same sentence as the volume's `note` in `volumes.json` and prints it
+as a `NOTE` line; before this it was on the console only and the zip said nothing. The exit
+status does not change. On a second test volume, given 20 more files and one overwrite and
+detached at once, 25 log records follow the checkpoint. Windows lists 50 files on it
+outside `System Volume Information` once it has mounted it again; the export holds 30 of
+them, none of the 20, and the earlier content of the overwritten one. The note is the only
+record of that in the zip. When the log's control page is not found the report says the
+count is not known, and that case is still on the console only.
 
 Its root lists empty here, which is what its checkpoint holds; the six files Windows hashed
 on that volume while it was mounted are in the log only. If you see this line, image the volume as it is and do not mount it first:
@@ -2159,16 +2187,19 @@ files. The first test volume's log held the machine security identifier of the W
 computer that wrote it in 2 records; its three machine numbers are replaced with 1-2-3 and
 those records' check values recomputed, which the tool prints.
 
-The self-test runs nineteen ReFS checks on these. Ten use the volumes as Windows wrote them,
+The self-test runs twenty-two ReFS checks on these. Eleven use the volumes as Windows wrote them,
 or broken on purpose: the listing and every field above, the hashes, the streams, the
-deleted paths, the 16 log records, one letter of one name changed in a directory page
+deleted paths, the 16 log records, the note an export of that volume writes, one letter of
+one name changed in a directory page
 (reported, that page's rows left out), a boot sector saying 2.x (refused), and a byte
-changed in a log record (the count stops before it). Nine check one rule each on the
+changed in a log record (the count stops before it). Eleven check one rule each on the
 fixture or on records the self-test builds: `stamps()` in Unix seconds; an unwritten run
 and bytes past the valid length reading as zeros; container arithmetic, a run crossing a
 container, a compressed container and containers that cannot be where the table says; a
 directory's change time from its name row; a snapshot not listed as a stream, and snapshots
-read newest first; short snapshot rows, overlapping extents, a 2^60-byte stream, an
+read newest first; names holding an unpaired surrogate, listed, put into SQLite and exported;
+modified times a zip cannot hold, each with its row; short snapshot rows, overlapping
+extents, a 2^60-byte stream, an
 encrypted file, a gap in a file not marked sparse and extents past the allocation; a page
 named twice in one table, a cached page asked for under another digest or checksum kind, and
 the damage cap; directory rows naming the root or a directory named elsewhere; and versions

@@ -15733,9 +15733,10 @@ def _zip_time(v):
 def _zip_zero_is_no_time(w, node):
     """True when this walker's mtime of 0 stands for no time rather than a stored 0.
     FAT and exFAT answer 0 always (their readings come through collect()). The NTFS,
-    ReFS, HFS+ and APFS converters answer 0 for unset or out of range. Btrfs answers 0
-    for a file named by its directory whose inode item is gone. F2FS keeps the signed
-    value it stores, so its 0 is 1970-01-01."""
+    HFS+ and APFS converters answer 0 for unset or out of range. The ReFS one answers 0
+    for unset and for a time stored exactly at the Unix epoch, and keeps the rest. Btrfs
+    answers 0 for a file named by its directory whose inode item is gone. F2FS keeps the
+    signed value it stores, so its 0 is 1970-01-01."""
     if isinstance(w, (Fat32Walker, ExfatWalker, NtfsWalker, RefsWalker, HfsPlusWalker,
                       ApfsWalker)):
         return True
@@ -19951,6 +19952,38 @@ def _refs_self_checksum(page, cluster, desc_off, desc_len):
     return _refs_digest_matches(kind, digest, bytes(body))
 
 
+def _refs_name(raw):
+    """One stored name, UTF-16LE, as text. Windows 11 stores a name holding an unpaired
+    surrogate as it was given, so such a unit is real: it becomes %XX of its two stored
+    bytes (U+D800 is %00%D8), where a replacement character would make two stored names
+    one. A NUL becomes %00 and a / inside the name %2F, so the text is one path component
+    that SQLite and a file path accept. A literal % is not escaped."""
+    return raw.decode("utf-16-le", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
+# The first FILETIME tick of year 10000, which no date here can show.
+REFS_FILETIME_YEAR_10000 = (253402300800 + NTFS_EPOCH_DELTA) * 10_000_000
+
+
+def _refs_time(v):
+    """A FILETIME from a ReFS record as Unix seconds, 0 for a stored 0, which is unset.
+
+    ntfs_time() answers 0 for a value past its range as well, and an export reads 0 as no
+    time, so a file Windows stamped 9999-12-31 23:59:59 or later showed 1980-01-01 with
+    nothing recorded. This keeps every other stored value, so the export records the ones
+    a zip cannot hold (_zip_time_lost). Within ntfs_time()'s range the two give the same
+    number. A tick in the last second of year 9999 stays below year 10000, which the float
+    division alone would round up to. A stored time exactly at 1970-01-01 00:00:00 UTC
+    still converts to 0 and reads as unset.
+    """
+    if not v:
+        return 0
+    sec = v / 10_000_000 - NTFS_EPOCH_DELTA
+    if v < REFS_FILETIME_YEAR_10000:
+        sec = min(sec, 253402300800.0 - 2 ** -15)
+    return sec
+
+
 def _refs_node(buf, hoff, where="a node"):
     """(level, flags, [(key, value, row flags)]) of the B+ tree node whose
     header is at hoff in buf.
@@ -20036,7 +20069,8 @@ class RefsWalker:
     (mode S_IFLNK, target from readlink()), hard links (each name lists the one
     record). Not read, and refused with a reason rather than guessed: a stream
     record laid out other than as ReFS 3.14 writes it. ``note`` says when the metadata log
-    holds changes newer than the checkpoint, which are not applied.
+    holds changes newer than the checkpoint, which are not applied; an export writes it
+    as the volume's ``note`` in volumes.json.
     """
 
     root = REFS_ROOT_DIR
@@ -20102,8 +20136,8 @@ class RefsWalker:
                 f"{self.logged:,} metadata log "
                 f"{'records follow' if self.logged != 1 else 'record follows'} "
                 "the newest checkpoint. Windows applies them when it mounts the volume; "
-                "this reader does not, so it shows the volume as of that checkpoint, and "
-                "what changed after it is missing or older here")
+                "this reader does not, so it shows the volume as of that checkpoint: newer "
+                "files and newer content may exist, and are missing or older here")
         self.note = "; ".join(notes) or None
 
     def _hurt(self, what):
@@ -20363,7 +20397,7 @@ class RefsWalker:
         d = self._dir(node.dir)
         got = d.names.get(node.key)
         if got is None:
-            raise RefsDamage(f"no name row for {node.key.decode('utf-16-le', 'replace')!r} "
+            raise RefsDamage(f"no name row for {_refs_name(node.key)!r} "
                              f"in directory {node.dir:#x}")
         return got
 
@@ -20398,7 +20432,7 @@ class RefsWalker:
         oid = node if isinstance(node, int) else self._link_dir(node)
         out = []
         for key, (kf, val) in self._dir(oid).names.items():
-            name = key.decode("utf-16-le", "replace")
+            name = _refs_name(key)
             if self._is_dir_row(kf, val):
                 child = struct.unpack_from("<Q", val, 8)[0]
                 # A directory has one name: a row naming the root, the
@@ -20590,7 +20624,7 @@ class RefsWalker:
         for marker, atype, key, value in attrs:
             if atype == 0xB0 and marker == 0x80000002 and len(value) >= 0x28:
                 if struct.unpack_from("<H", value, 0x10)[0] == 0:
-                    out[key[0x10:].decode("utf-16-le", "replace")] = value
+                    out[_refs_name(key[0x10:])] = value
         return out, attrs
 
     def _stream_owner(self, ref):
@@ -20803,10 +20837,11 @@ class RefsWalker:
         return tuple(times)
 
     def stamps(self, node):
-        """(created, modified, accessed) in Unix seconds, 0 where unset, as
-        NtfsWalker.stamps gives them."""
+        """(created, modified, accessed) in Unix seconds, 0 where unset. A stored
+        time from 9999-12-31 23:59:59 on is kept as its number of seconds
+        (_refs_time), where NtfsWalker.stamps gives 0 for it."""
         c, m, _ch, a = self.filetimes(node)
-        return ntfs_time(c), ntfs_time(m), ntfs_time(a)
+        return _refs_time(c), _refs_time(m), _refs_time(a)
 
     def inode(self, node):
         return node
@@ -20827,10 +20862,10 @@ class RefsWalker:
                 return None
             if kf == 2 and len(val) >= 0x40:            # an index entry: size +0x38, times +0x10
                 return (0o100644, struct.unpack_from("<Q", val, 0x38)[0],
-                        ntfs_time(struct.unpack_from("<Q", val, 0x18)[0]))
+                        _refs_time(struct.unpack_from("<Q", val, 0x18)[0]))
             if kf == 1 and len(val) >= 0x60:            # its own record: size +0x58, times +0x28
                 return (0o100644, struct.unpack_from("<Q", val, 0x58)[0],
-                        ntfs_time(self._times_of(val)[1]))
+                        _refs_time(self._times_of(val)[1]))
         return None
 
     @staticmethod
@@ -20838,20 +20873,20 @@ class RefsWalker:
         if isinstance(node, RefsStreamRef):
             return f"{RefsWalker._name_of(node.file)}:{node.name}"
         if isinstance(node, RefsEntry):
-            return f"{node.key.decode('utf-16-le', 'replace')!r} in directory {node.dir:#x}"
+            return f"{_refs_name(node.key)!r} in directory {node.dir:#x}"
         return f"directory {node:#x}"
 
     def _entry(self, node):
         if isinstance(node, int):
             if node not in self.objects:
                 raise RefsDamage("no row in the object table")
-            return (S_IFDIR | 0o755, 0, ntfs_time(self.filetimes(node)[1]))
+            return (S_IFDIR | 0o755, 0, _refs_time(self.filetimes(node)[1]))
         if isinstance(node, RefsStreamRef):
             rec = self._stream_owner(node)
             stream = self._named_stream(rec, node.name)
-            return (0o100644, stream[1], ntfs_time(self._times_of(rec)[1]))
+            return (0o100644, stream[1], _refs_time(self._times_of(rec)[1]))
         got = self._kind(node)
-        mtime = ntfs_time(self.filetimes(node)[1])
+        mtime = _refs_time(self.filetimes(node)[1])
         if got[0] == "link":
             return (S_IFLNK | 0o777, len(got[1].encode("utf-8")), mtime)
         return (0o100644, self._main_stream(got[1])[1], mtime)
@@ -21220,6 +21255,12 @@ class _RefsSparseImage:
             if start == off and length == n:
                 return self.data[at:at + n]
         raise ValueError("no such run")
+
+    def __enter__(self):                # main() reads an open image inside a with
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
     def seek(self, off, whence=0):
         self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
@@ -32974,6 +33015,73 @@ def _refs_unit_checks(img, w, got, known):
                 named == ["one"]
                 and [e[2] for e in w._extents(merged[3], merged[4])] == [0x2222]))  # pylint: disable=protected-access
 
+    # Names and times as Windows 11 stored them on a volume it wrote (unpaired
+    # surrogates; 9999-12-31 23:59:59, a FILETIME of 3281000000000000000 and the
+    # largest one), put on rows of the fixture's times folder and exported.
+    import sqlite3
+    odd = RefsWalker(img, 0)
+    plain = got["times/fixed.txt"][1]
+    kf, val = odd._row(plain)  # pylint: disable=protected-access
+    folder = odd._dir(plain.dir)  # pylint: disable=protected-access
+    lone = ["pair_\ud800x.txt", "pair_\ud801x.txt", "rev_\udc00\ud800.txt", "end_\ud800"]
+    lone_raw = [n.encode("utf-16-le", "surrogatepass") for n in lone]
+    lone_want = ["pair_%00%D8x.txt", "pair_%01%D8x.txt", "rev_%00%DC%00%D8.txt", "end_%00%D8"]
+    far = (("t9999", 2650467743990000000), ("tlast", 2650467743999999999),
+           ("t12000", 3281000000000000000), ("tmax", 0x7FFFFFFFFFFFFFFF), ("tunset", 0))
+    for raw in lone_raw:
+        folder.names[raw] = (kf, val)
+    for name, filetime in far:
+        folder.names[name.encode("utf-16-le")] = (kf, val[:0x30] + struct.pack("<Q", filetime)
+                                                  + val[0x38:])
+    by_key = {node.key: (name, node) for name, node in odd.listdir(plain.dir)
+              if isinstance(node, RefsEntry)}
+    lone_got = [by_key[raw][0] for raw in lone_raw]
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("create table t (n text primary key)")
+        db.executemany("insert into t values (?)", [(n,) for n in lone_got])
+        in_db = db.execute("select count(*) from t").fetchone()[0]
+    except (sqlite3.Error, UnicodeError):
+        in_db = -1
+    finally:
+        db.close()
+    issues = []
+    with zipfile.ZipFile(io.BytesIO(), "w") as zout:
+        extract_to_zip(zout, odd, "v", collect(odd, plain.dir, "times"), [], issues=issues)
+        members = {i.filename: tuple(i.date_time) for i in zout.infolist()}
+    two = [_refs_attr_key(0x80000002, 0xB0, 5, n.encode("utf-16-le", "surrogatepass"))
+           for n in ("s\ud800", "s\ud801")]
+    streams = list(odd._named(_refs_test_record([(two[0], ads), (two[1], ads)]))[0])  # pylint: disable=protected-access
+    folder.names[b"n\x00\x00\x00/\x00"] = (kf, val)       # after the export: a NUL and a /
+    inside = [name for name, node in odd.listdir(plain.dir)
+              if isinstance(node, RefsEntry) and node.key == b"n\x00\x00\x00/\x00"]
+    out.append(("a name Windows stored with an unpaired surrogate is listed with that unit as "
+                "%XX of its two stored bytes; two such names stay two, go into SQLite and "
+                "are exported under those names with none renamed; two such stream names stay "
+                "two; a NUL is %00 and a / inside a name %2F",
+                lone_got == lone_want and in_db == len(lone)
+                and all(f"v/times/{n}" in members for n in lone_want)
+                and not [r for r in issues if r[2] == "RENAMED"]
+                and streams == ["s%00%D8", "s%01%D8"] and inside == ["n%00%2F"]))
+    rows = {r[0]: r[3] for r in issues if r[2] == "TIME_NOT_HELD"}
+    kept = {name: odd.entry(by_key[name.encode("utf-16-le")][1])[2] for name, _f in far}
+    rows_of = ("t9999", "tlast", "t12000", "tmax")
+    # The row's text is the seconds, then the date where this platform's clock
+    # functions can form one, so only the seconds are compared.
+    out.append(("a modified time of 9999-12-31 23:59:59, of the last tick of that year and of "
+                "two FILETIMEs past year 9999 is kept by entry() and stamps() and gets a "
+                "TIME_NOT_HELD row in an export that gives its seconds; an unset time and "
+                "one a zip holds get none",
+                sorted(rows) == ["times/t12000", "times/t9999", "times/tlast", "times/tmax"]
+                and all(rows[f"times/{n}"].startswith(f"stored time {kept[n]} ") for n in rows_of)
+                and kept["t9999"] == 253402300799.0
+                and 253402300799 < kept["tlast"] < 253402300800
+                and kept["t12000"] == 316455526400.0 and kept["tmax"] > 9e11
+                and kept["tunset"] == 0
+                and all(odd.stamps(by_key[n.encode("utf-16-le")][1])[1] == kept[n] for n, _f in far)
+                and all(members.get(f"v/times/{n}") == (1980, 1, 1, 0, 0, 0) for n, _f in far)
+                and odd.entry(plain) == w.entry(plain)))
+
     # Damaged and hostile records.
     broken = []
     shorted = _refs_test_record([(data(0x1000, 0x1001), _refs_test_stream([], 10)),
@@ -33211,6 +33319,22 @@ def _refs_fixture_checks():
                 kind == "refs" and wd.logged == 16 and wd.note is not None
                 and any(line.startswith("log          16 metadata log records") for line in ident)
                 and wd.listdir(wd.root) == []))
+    import contextlib
+    man, said = [], io.StringIO()
+    with zipfile.ZipFile(io.BytesIO(), "w") as zout, contextlib.redirect_stdout(said):
+        main("refs-dirty", extract="(memory)", zf=zout, manifest=man, image=dirty)
+    noted = (man[0].get("note") or "") if len(man) == 1 else ""
+    out.append(("an export of that volume puts the same in the note of its volumes.json record: "
+                "16 log records follow the checkpoint, Windows applies them when it mounts the "
+                "volume, this reader does not, and newer files and content may exist; the "
+                "clean fixture's walker has no note",
+                noted == wd.note
+                and noted.startswith("16 metadata log records follow the newest checkpoint")
+                and "Windows applies them when it mounts the volume" in noted
+                and "this reader does not" in noted
+                and "newer files and newer content may exist" in noted
+                and "NOTE 16 metadata log records" in said.getvalue()
+                and w.note is None))
 
     # Broken on purpose: each must be reported, not read past.
     # One letter of one name in a leaf page of the 2,500-entry directory: the
@@ -37378,6 +37502,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 if manifest is not None:
                                     manifest[-1]["note"] = w.volume_note
                                 _say(f"            NOTE {w.volume_note}")
+                            if isinstance(w, RefsWalker) and w.note:
+                                # log records the checkpoint read here does not hold
+                                if manifest is not None:
+                                    manifest[-1]["note"] = w.note
+                                _say(f"            NOTE {w.note}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
