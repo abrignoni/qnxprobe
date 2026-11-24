@@ -4486,8 +4486,12 @@ with 4096-byte logical sectors and an MBR, each holding one NTFS volume (one wit
 and one with 4 KiB file records). Before, neither listed a volume. Now each lists its
 NTFS volume at the byte its entry names, and the export of the whole disk holds the same
 members, with the same CRC, size and date, as the export of that partition's bytes
-copied out and read alone as a bare volume; the VHDX of the first, which states its
-sector size, reads the same as its raw image. This rule finds the volume and nothing
+copied out and read alone as a bare volume. The VHDX of the first, which states its
+sector size, lists the same volume at the same byte (262,144), and all 1,409 files in
+the listing Windows made match on path, size and SHA-256 from the VHDX as from the raw
+image. The two exports are not identical: 5 of their 1,430 members, all NTFS system
+files, differ in CRC or date, because the raw image and the VHDX are not the same bytes
+(they differ in 21 4-KiB sectors inside the volume). This rule finds the volume and nothing
 more: what is exported from it is the NTFS reader's work. The self-test builds the MBR case in memory around an exFAT boot sector: the volume at
 16 x 4096, at 16 x 512, at both (512 is kept) and at neither (512 is kept). Not run on
 real data: an EWF acquisition of such a disk, any filesystem other than NTFS on one, and
