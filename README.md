@@ -1276,6 +1276,23 @@ Hard links are one file under several names, and the names the inode records for
 (`INODE_REF` and, for a file with many names in one directory, `INODE_EXTREF`) are read
 by `links()`.
 
+A stored name is bytes, and Btrfs does not require them to be UTF-8. A byte that does not
+decode is listed as `%XX` of the stored byte, in uppercase hex (a name stored as `caf`,
+byte `0xE9`, `.txt` is `caf%E9.txt`), a NUL as `%00` and a `/` inside one name as `%2F`,
+so a listed name never holds a surrogate and is text SQLite and a file path accept. A
+literal `%` is not escaped, so two stored names can come to spell the same; both stay
+listed, each with its own inode. A symlink target gets the same `%XX` for bytes that are
+not UTF-8 and keeps its slashes. Earlier versions returned a lone surrogate for such a
+byte, and `--extract` then spelled the member with the UTF-8 form of that surrogate
+(`caf%ED%B3%A9.txt`).
+
+An inode's four times are read as signed 64-bit seconds with nanoseconds, the way the
+kernel hands them to `stat()`, so a time before 1970 is a negative number in `entry()`
+and `times()`. A zip holds no date before 1980, so `--extract` gives such a file a
+`TIME_NOT_HELD` row with the stored number and its date. Earlier versions read the
+seconds unsigned, and the row for a file stamped 1901 carried
+`18446744071562067968` and no date.
+
 Subvolumes and snapshots are **directories**, where the top-level tree links them, the
 way the kernel and `btrfs restore -s` present them. A link the root tree has no matching
 `ROOT_REF` for (a snapshot's view of a subvolume nested in the subvolume it copied) is
@@ -1325,7 +1342,12 @@ before it was unmounted is inside the free space reported.
 
 A log tree (changes `fsync`'d after the last commit, which the kernel replays at the
 next mount) is not replayed. The volume reads as of its last commit, and the note says a
-log tree is present.
+log tree is present. `--extract` writes the walker's note to the volume's record in
+`volumes.json` as `note` and prints it as a `NOTE` line; earlier versions left it out of
+that record. A log tree that was not replayed does not change the exit status on its own.
+The same line carries the note of any reader that has one: on the fixtures that adds the
+note of the two locked APFS images, of the XFS image with a dirty log, and, on a Python
+without zstd, of the zstd SquashFS image, with nothing else in their exports changed.
 
 Validated against images `mkfs.btrfs --rootdir` (btrfs-progs 6.17.1) wrote from one
 source tree, once per compression (none, zlib, zstd, LZO) and once per other checksum
@@ -1353,14 +1375,30 @@ the top level, and two deleted files. All 17 of its files match the sha256 taken
 the mount, and all 27 entries match `lstat()` through the mount to the nanosecond.
 `btrfs-logtree` was copied after an `fsync` and before the next commit: the note says its
 log tree is present, the file committed before it is listed, and the file only the log
-holds is not.
+holds is not. Its export exits 0 with that note in `volumes.json`. Exports of the other
+fixtures carry their notes the same way: one device of two (`btrfs-raid1-dev2`), a
+default subvolume other than the top level (`btrfs-sha256`, `btrfs-live`), and zstd on a
+Python without it (`btrfs-zstd` and `btrfs-live` on 3.12). The mirror superblock and
+striped chunk sentences reach the record through the same line and were not run through
+an export.
+
+Names and times were measured on one more volume `mkfs.btrfs --rootdir` (btrfs-progs
+6.17.1) wrote, which is not kept as a fixture: 15 files, among them a Latin-1 file name,
+a folder whose name is two bytes that are not UTF-8, and modification times of
+-2147483648, -1, 0 and six later ones, four of them at the ends of what a zip holds. All
+15 files export with the sha256 of their source; the two names are members `caf%E9.txt` and
+`%FF%FE_dir/inside.txt`; and the rows for the two times before 1970 give
+`-2147483648 (1901-12-13 20:45:52 UTC)` and `-1 (1969-12-31 23:59:59 UTC)`. Names that
+are not UTF-8 and times before 1970 written by the kernel on a mounted volume were not
+measured.
 
 The self-test also breaks one rule at a time in copies of these images, each in memory
 with its checksum rewritten so the break reaches the check under test: a node that
 points at itself, a generation, a first key and a filesystem id that do not match, a
 leaf that claims more items than fit, a directory entry whose inode is missing, a
-changed `DIR_ITEM` name, a subvolume entry for itself, a `ROOT_REF` too short for its
-name, an inline extent with the wrong size, an inode size past the largest file, broken
+changed `DIR_ITEM` name, names holding a byte that is not UTF-8, a NUL and a slash, a
+symlink target holding such a byte, modification times before 1970, a subvolume entry
+for itself, a `ROOT_REF` too short for its name, an inline extent with the wrong size, an inode size past the largest file, broken
 superblocks, LZO segments with sector padding, zlib streams with a wrong adler32 and
 compressed extents past 128 KiB. Each is recorded or refused as described above.
 
@@ -4294,6 +4332,8 @@ header, item, key pointer               btrfs_tree.h:482-497, 549-580
 chunk item, stripe, profile bits        btrfs_tree.h:629-663, 1154-1185
 logical to physical                     kernel-shared/volumes.c:2093-2313, 2577-2666
 root, inode, dir and ref items          btrfs_tree.h:853-982
+inode times are signed seconds          linux include/uapi/linux/btrfs_tree.h:876-879,
+                                          fs/btrfs/inode.c:4094-4102, include/linux/fs.h:1629-1630
 file extent item, compression types     btrfs_tree.h:1063-1119, kernel-shared/compression.h:108-111
 reading a file's extents                cmds/restore.c:292-471, 617-760
 LZO framing in an extent                linux fs/btrfs/lzo.c:24-59, 429-546
@@ -4625,8 +4665,8 @@ above are in this README only for now.)
   (the space they held is reported free), extended attributes are not reported, and zstd
   needs Python 3.14. An inode size is refused only past the largest file Btrfs allows
   (2^63 - 1 bytes); a size below that and far past the data is read as the hole it is.
-  This reader has been run only on the fixtures named under Btrfs above, none of them
-  from a real device.
+  This reader has been run only on the fixtures and the one more `mkfs.btrfs` volume
+  named under Btrfs above, none of them from a real device.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries

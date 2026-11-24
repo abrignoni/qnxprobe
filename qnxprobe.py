@@ -21164,7 +21164,7 @@ class BtrfsWalker:
         r = None
         if found is not None:
             key, data = found
-            mtime = struct.unpack_from("<Q", data, 136)[0]
+            mtime = struct.unpack_from("<q", data, 136)[0]
             r = dict(generation=struct.unpack_from("<Q", data, 160)[0],
                      root_dirid=struct.unpack_from("<Q", data, 168)[0],
                      bytenr=struct.unpack_from("<Q", data, 176)[0],
@@ -21181,7 +21181,13 @@ class BtrfsWalker:
 
     def inode(self, node):
         """The INODE_ITEM of a node, parsed (btrfs_tree.h:872-899), or None
-        when there is none. An item that is not 160 bytes, a mode with bits
+        when there is none. Each time's seconds are read signed: the field is
+        a __le64 (linux include/uapi/linux/btrfs_tree.h:876-879) that the
+        kernel hands to inode_set_atime(), inode_set_mtime() and
+        inode_set_ctime() (fs/btrfs/inode.c:4094-4102), whose seconds are a
+        time64_t (include/linux/fs.h:1629-1630, 1663-1664), so a time before
+        1970 is a negative number here as it is for stat(). An item that is
+        not 160 bytes, a mode with bits
         outside the type, set-id, sticky and permission bits (both as
         check_inode_item refuses, linux fs/btrfs/tree-checker.c:1141-1174),
         or a size past the largest file the kernel allows (super.c:963)
@@ -21201,7 +21207,7 @@ class BtrfsWalker:
             if size > BTRFS_MAX_FILE_SIZE:
                 raise BtrfsUnreadable(f"inode {ino} of tree {tree} records size {size:,}, past "
                                       f"the largest file btrfs allows ({BTRFS_MAX_FILE_SIZE:,})")
-            t = {name: struct.unpack_from("<QI", d, at)
+            t = {name: struct.unpack_from("<qI", d, at)
                  for name, at in (("atime", 112), ("ctime", 124), ("mtime", 136),
                                   ("otime", 148))}
             return dict(size=size, nbytes=nbytes, nlink=nlink, uid=uid, gid=gid, mode=mode,
@@ -21312,7 +21318,10 @@ class BtrfsWalker:
             if name in seen:
                 continue
             seen.add(name)
-            text = name.decode("utf-8", "surrogateescape")
+            # One stored name: bytes that are not UTF-8 become %XX, and a NUL
+            # or a slash, which no path can carry inside a name, %00 and %2F.
+            text = (name.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+                    .replace("/", "%2F"))
             if loc[1] == BTRFS_ROOT_ITEM_KEY:
                 child = loc[0]
                 if child == tree:
@@ -21468,7 +21477,9 @@ class BtrfsWalker:
         # the target's length either way.
         data = b"".join(btrfs_extent_bytes(self.extents(node), ino_item["size"],
                                            self.read_logical, self.sectorsize))
-        return data.decode("utf-8", "surrogateescape")
+        # A target is a path, so its slashes stay; only bytes that are not
+        # UTF-8 are escaped.
+        return data.decode("utf-8", "qnxprobe-name")
 
     # -- the volume -------------------------------------------------------------
     def default_subvolume(self):
@@ -34740,6 +34751,80 @@ def _btrfs_self_checks():
                     "first stripe, reads its trees from its own copies", ok))
     section("btrfs-convert and btrfs-raid1-dev2", convert_and_raid)
 
+    def names_and_times():
+        # Copies of btrfs-none changed in memory, each block's checksum rewritten.
+        # mkfs.btrfs --rootdir writes a name byte that is not UTF-8 and a time
+        # before 1970 as given to it (measured on btrfs-progs 6.17.1).
+        w0, l0 = walk(none_raw)
+        raw = bytearray(none_raw)
+        rootdir = w0.root & _M64
+        index = {}
+        for k, d in w0._tree_items(BTRFS_FS_TREE_OBJECTID,          # pylint: disable=protected-access
+                                   (rootdir, BTRFS_DIR_INDEX_KEY, 0),
+                                   (rootdir, BTRFS_DIR_INDEX_KEY, _M64)):
+            index[bytes(d[30:30 + struct.unpack_from("<H", d, 27)[0]])] = k
+
+        def put(key, at, data):
+            leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID, key)
+            _btrfs_edit_block(raw, w0, leaf, lambda b: b.__setitem__(
+                slice(do + at, do + at + len(data)), data))
+
+        # Two stored names that differ, one with a byte that is not UTF-8 and
+        # one that spells that byte's escape; a third with a NUL and a slash.
+        put(index[b"text_700k.txt"], 30, b"t\xe9xt_700k.txt")
+        put(index[b"random_100k.bin"], 30, b"t%E9xt_700k.txt")
+        put(index[b"small_2000.txt"], 30, b"sm/ll\x002000.txt")
+        # A symlink's inline target (21 bytes into its extent item) with such a byte.
+        put((l0["link_abs"][0] & _M64, BTRFS_EXTENT_DATA_KEY, 0), 21, b"/\xe9tc/")
+        for name, sec in (("tiny.txt", -1), ("empty.bin", -2147483648)):
+            put((l0[name][0] & _M64, BTRFS_INODE_ITEM_KEY, 0), 136, struct.pack("<q", sec))
+        w = BtrfsWalker(io.BytesIO(bytes(raw)), 0)
+        names = w.listdir(w.root)
+        twins = [n for t, n in names if t == "t%E9xt_700k.txt"]
+        paths = [p for p, *_r in walk_all(w)]
+        files = [e[0] for e in collect(w, w.root)]
+        stored = True
+        try:
+            import sqlite3                                      # pylint: disable=import-outside-toplevel
+        except ImportError:
+            sqlite3 = None
+        if sqlite3 is not None:                                 # a name has to be storable as it is
+            db = sqlite3.connect(":memory:")
+            try:
+                db.execute("create table t (name text)")
+                db.executemany("insert into t values (?)", [(p,) for p in paths])
+                stored = db.execute("select count(*) from t where name = ?",
+                                    ("t%E9xt_700k.txt",)).fetchone()[0] == 2
+            except (sqlite3.Error, UnicodeError):
+                stored = False
+            db.close()
+        text_ok = True
+        try:
+            for p in paths:
+                p.encode("utf-8")
+        except UnicodeError:
+            text_ok = False
+        out.append(("a name byte that is not UTF-8 is listed as %XX of the stored byte, two stored "
+                    "names that then spell the same stay two entries with two inodes, a stored "
+                    "NUL and slash are %00 and %2F, and every path is text SQLite stores",
+                    len(twins) == 2 and len(set(twins)) == 2
+                    and files.count("t%E9xt_700k.txt") == 2
+                    and "sm%2Fll%002000.txt" in files and len(names) == len(w0.listdir(w0.root))
+                    and len(paths) == len(l0) and text_ok and stored and not w.damage))
+        got = dict(names)
+        out.append(("a symlink target with a byte that is not UTF-8 reads with that byte as %XX "
+                    "and its slashes kept", w.readlink(got["link_abs"]) == "/%E9tc/hostname"))
+        t_ok = True
+        for name, sec in (("tiny.txt", -1), ("empty.bin", -2147483648)):
+            node = got[name]
+            lost = _zip_time_lost(w.entry(node)[2], w, node) or ""
+            t_ok = (t_ok and w.entry(node)[2] == sec and w.times(node)["modified"] == (sec, 0)
+                    and lost.startswith(f"{sec} ("))
+        out.append(("a modification time before 1970 is read as the negative seconds the inode "
+                    "stores (-1 and -2147483648), by entry() and times(), and the text for a time "
+                    "a zip cannot hold carries that number", t_ok))
+    section("names and times before 1970", names_and_times)
+
     # The fixtures only root can make (tools/make_btrfs_root_fixtures.sh): a
     # volume the kernel wrote, with holes, preallocated and punched extents,
     # reflinks, partly overwritten compressed extents, snapshots and deleted
@@ -34821,6 +34906,45 @@ def _btrfs_self_checks():
                     "file committed before it is listed, and the file only the log holds is not",
                     w is not None and "log tree is present" in (w.note or "")
                     and "committed.txt" in got and "fsynced.txt" not in got))
+        label = ("btrfs-logtree: an export writes that note to the volume's record in "
+                 "volumes.json, exits 0, and holds the committed file alone")
+        if getattr(sys, "frozen", False):
+            out.append((label + " (not run: a packaged build cannot launch the script)", None))
+            return
+        import shutil                                           # pylint: disable=import-outside-toplevel
+        import subprocess                                       # pylint: disable=import-outside-toplevel
+        import tempfile                                         # pylint: disable=import-outside-toplevel
+        # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+        # the export names its own files and removes them itself.
+        work = tempfile.mkdtemp(prefix="qnxprobe-btrfs-")
+        stem = os.path.join(work, f"btrfs-check-{uuid.uuid4().hex}")
+        src, dest = stem + ".raw", stem + ".zip"
+        try:
+            with open(src, "wb") as fh:                         # zero runs are left as holes
+                for at in range(0, len(raw), 1 << 20):
+                    piece = raw[at:at + (1 << 20)]
+                    if piece.count(0) != len(piece):
+                        fh.seek(at)
+                        fh.write(piece)
+                fh.truncate(len(raw))
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), src,
+                                   "--extract", dest], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=240, check=False)
+            with zipfile.ZipFile(dest) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+                members = sorted(n.split("/", 1)[-1] for n in zin.namelist()
+                                 if n != "volumes.json")
+            out.append((label, done.returncode == 0 and members == ["committed.txt"]
+                        and rec.get("note") == w.note and "log tree is present" in rec["note"]
+                        and "NOTE " + w.note in done.stdout.decode("utf-8", "replace")))
+        finally:
+            for leftover in (src, dest):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
     if not os.path.isfile(os.path.join(here, "btrfs-logtree.img.gz")):
         out.append(("btrfs-logtree (a log tree not yet replayed) not checked: its fixture is "
                     "made by tools/make_btrfs_root_fixtures.sh, which needs root", None))
@@ -40567,10 +40691,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, F2fsWalker) and w.volume_note:
+                            wnote = w.volume_note if hasattr(w, "volume_note") else getattr(w, "note", None)
+                            if wnote:
                                 if manifest is not None:
-                                    manifest[-1]["note"] = w.volume_note
-                                _say(f"            NOTE {w.volume_note}")
+                                    manifest[-1]["note"] = wnote
+                                _say(f"            NOTE {wnote}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
