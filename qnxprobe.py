@@ -33138,6 +33138,18 @@ def _xfs_record_checks(v5k, v4):
         "not replayed and that files and content may be missing or older, and exits 0; the "
         "clean volume's record has no note", dirty_log)
 
+    def damage_only():
+        base = XfsWalker(_XfsPatchedImage(v5k), 0)
+        at = base.inode_offset(dict(base.listdir(base.root))["hello.txt"])
+        got = _xfs_exported(v5k, [(at + 60, bytes([v5k[at + 60] ^ 0x01]))])
+        if got is None:
+            return None
+        rec = got[1] or {}
+        return (rec.get("damage_recorded") == 1 and "note" not in rec
+                and any("fails its CRC" in d for d in rec.get("damage_first", [])))
+    row("an export of an XFS volume with a damaged inode and nothing else to say records the "
+        "damage as damage_recorded and damage_first, and writes no note", damage_only)
+
     def cut_after_superblock():
         cut = bytes(v4[:512])
         found = identify_xfs(_XfsPatchedImage(cut), 0, len(cut))
@@ -39497,8 +39509,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
                             # what the walker says about the volume as a whole: its
-                            # volume_note when it keeps one apart from its damage
-                            wnote = getattr(w, "volume_note", None) or getattr(w, "note", None)
+                            # volume_note when it keeps one apart from its damage, and
+                            # then never its note, which can carry the damage
+                            wnote = w.volume_note if hasattr(w, "volume_note") else getattr(w, "note", None)
                             if wnote:
                                 if manifest is not None:
                                     manifest[-1]["note"] = wnote
