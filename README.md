@@ -1010,8 +1010,9 @@ If the descriptor area holds a later transaction than the newest superblock that
 its checksum, the older checkpoint is read, as it should be after an interrupted write,
 and `note` in `volumes.json` names both transactions and says newer data may exist. If the
 newest superblock passes its checksum and its container object map, or the object map of one
-of its volumes, does not pass its checksum, id and type, the newest older checkpoint whose
-maps all pass is read. `note` then gives the one read, the newest found, and each
+of its volumes, cannot be used (its address is at or past the container's block count, its
+block is not wholly in the image, or it fails its checksum, id or type), the newest older
+checkpoint whose maps all pass is read. `note` then gives the one read, the newest found, and each
 transaction skipped with the reason, with a count when the list is long. If no checkpoint
 passes for every volume, the newest whose container map passes is read and each volume it
 cannot read is recorded. If no container map passes, the map's error is recorded and the

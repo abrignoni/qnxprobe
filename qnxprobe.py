@@ -7861,11 +7861,13 @@ class ApfsWalker:
         that is noted and the read goes on.
 
         A newest superblock whose container object map, or the object map of one of its
-        volumes, fails its checksum, id or type cannot be read whole, so the newest older
-        checkpoint whose maps all pass is used, and noted. With none, the newest checkpoint
-        whose container map passes is used and each volume it cannot read is recorded.
-        With no such checkpoint the newest stays and the map's own error is reported.
-        Nothing else moves the read to an older checkpoint.
+        volumes, cannot be used cannot be read whole: the map's address is at or past the
+        container's block count, its block is not wholly in the image, or it fails its
+        checksum, object id or type. The newest older checkpoint whose maps all pass is
+        then used, and noted. With none, the newest checkpoint whose container map passes
+        is used and each volume it cannot read is recorded. With no such checkpoint the
+        newest stays and the map's own error is reported. Nothing else moves the read to
+        an older checkpoint.
         """
         best, best_xid = head, struct.unpack_from("<Q", head, 16)[0]
         base = struct.unpack_from("<Q", head, 112)[0]
@@ -7938,8 +7940,9 @@ class ApfsWalker:
 
     def _checkpoint_map_fault(self, nx):
         """Why a checkpoint's object maps cannot be used, or None. Only the structure of
-        each map object is tested: its checksum, id and type. An object map is not
-        encrypted, so a locked volume answers like any other."""
+        each map object is tested: that its address is below the container's block count,
+        that its block is wholly in the image, and its checksum, id and type. An object
+        map is not encrypted, so a locked volume answers like any other."""
         if not self._nx_map_usable(nx):
             return "bad container map"
         damage, lost, enc = list(self.damage), self._nodes_lost, dict(self._omap_enc)
@@ -7967,8 +7970,9 @@ class ApfsWalker:
         return None
 
     def _nx_map_usable(self, nx):
-        """True when the container object map a superblock names passes its checksum and
-        holds the expected object id and type."""
+        """True when the container object map a superblock names lies below the
+        container's block count, is wholly in the image, passes its checksum and holds
+        the expected object id and type."""
         oid = struct.unpack_from("<Q", nx, 160)[0]
         if oid >= struct.unpack_from("<Q", nx, 40)[0]:
             return False
