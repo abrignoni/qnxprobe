@@ -42274,7 +42274,11 @@ def _hfs_reader_checks():
             with zipfile.ZipFile(target) as zf:
                 rec = json.loads(zf.read("volumes.json"))["volumes"][0]
         return rec.get("extends_past_image_by_bytes") == len(img) - len(img) // 2
-    row("HFS+: a cut unpartitioned volume records how much of it is missing", declared_end)
+    if getattr(sys, "frozen", False):                # the row runs this script as a command
+        print("  [SKIP] HFS+: a cut unpartitioned volume records how much of it is missing: "
+              "this platform or build cannot run it")
+    else:
+        row("HFS+: a cut unpartitioned volume records how much of it is missing", declared_end)
 
     def lost_overflow():
         v, _a, b = fragmented()
