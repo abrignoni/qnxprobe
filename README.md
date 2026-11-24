@@ -253,7 +253,9 @@ The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
 (files that could not be read, which are not in the zip) and, on a
-volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
+volume that does, `extends_past_image_by_bytes`. When a volume's reader has something to
+say about the volume as a whole, the text `volumes()` gives as its `note`, the record
+carries it as `note`; 1.87 wrote only the F2FS reader's note there. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -2613,10 +2615,43 @@ directory nodes. Both byte orders are read.
 Every node is scanned and its header CRC checked. A node the filesystem has marked
 obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
 `check_node_data` does, so an older copy of that data shows through where one exists; the
-report counts the nodes dropped, and a name whose inode is left with no readable node is
-not listed, and counted too. For
+report counts the nodes dropped. For
 each name the newest version wins and a newer entry with inode 0 unlinks it; each file
 takes its mode, owner and times from its newest inode node and is cut to that node's size.
+
+A name is stored as bytes with no encoding. Bytes that are not UTF-8 are listed as `%XX`,
+a stored NUL as `%00` and a slash inside one name as `%2F`. A link target is decoded the
+same way and keeps its slashes. Two stored names that come out as the same text stay two
+entries. 1.87 listed such a name with a surrogate character, which SQLite refuses.
+
+The report counts the names linked from the root. A name in a directory the root does not
+reach is counted apart and not listed: the kernel's mount pass removes an inode no name
+links, and a directory's children with it (`fs/jffs2/build.c`). A region with nothing cut
+from it can hold such names, so they are a count in the report and not a record of loss.
+
+JFFS2 records no size and no count of its own, so a region that holds only part of a
+filesystem reads as a smaller one. What the region itself shows is recorded:
+
+- **The region ends inside a node** (a header whose CRC holds and a length that runs past
+  the end of the region). The volume's `damage_first` in `volumes.json` says so, with
+  `folders_not_read`, and the run exits 1.
+- **A file's data nodes do not cover its size.** JFFS2 writes a hole as a node, so a range
+  no node covers is missing, not a hole. The member is
+  `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is the bytes its nodes hold. Nothing
+  is written after the last byte a node holds, and a missing range before that is zeros
+  so later bytes keep their offsets. The exceptions table says where. The volume's damage
+  counts such files and the run exits 1. 1.87 wrote the missing range as zeros in a
+  member of full size, with no record.
+- **A name's inode has no readable node.** It is a `FAILED` row, the volume's `note`
+  counts it, and the run exits 1. A name in a directory the root does not reach has no
+  path to put in a row, so it is counted in the note and in the damage.
+
+None of these appears on the nine fixtures read whole. A region cut where no node is
+split, with every name it still holds complete, has nothing to record and reads as a
+smaller filesystem with exit 0: that is the case for a kernel-written image stopped
+before the block holding its root names. Only cuts were tested. The fixtures were stopped
+at three points each (4 KiB before the end, half way, and after the first node); other
+damage was not tested.
 The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
 8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
 properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),

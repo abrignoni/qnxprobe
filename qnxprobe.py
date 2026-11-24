@@ -14196,6 +14196,20 @@ def nand_views(fh, base, size):
 #     node of its own
 #   a node whose data fails its CRC is        fs/jffs2/readinode.c
 #     obsolete, and older data shows through    check_node_data
+#   a dirent name is bytes (__u8 name[]),     include/uapi/linux/jffs2.h:111-126
+#     with no encoding
+#   a name whose inode has no node is         fs/jffs2/build.c:68-76
+#     dropped at mount, and an inode no name    jffs2_build_inode_pass1, and
+#     links is removed with what is under it    132-146, 242-303 (pass 2); the root
+#     (the root starts with one link)           fs/jffs2/scan.c:988-989
+#   a regular file whose fragments stop       fs/jffs2/readinode.c:1246-1253
+#     before the newest node's isize is         (the kernel warns and cuts the
+#     shorter than that node says; a range      size), fs/jffs2/read.c:174-190
+#     inside it that no node covers reads as
+#     zeros there
+#   a node is written into the space free     fs/jffs2/nodemgmt.c:358-490
+#     in one erase block, so it never           jffs2_do_reserve_space
+#     crosses into the next
 #
 # Kernel crc32() is crc32_le with seed 0 and no inversion, which is zlib's
 # crc32 with its pre- and post-inversion undone.
@@ -14300,6 +14314,12 @@ class Jffs2Unreadable(Exception):
     """JFFS2 content this reader cannot hand back; the message says why."""
 
 
+def _jffs2_name(raw):
+    """A stored dirent name as text. The name is bytes with no encoding, so a stretch
+    that is not UTF-8 becomes %XX of its bytes, a NUL %00 and a slash %2F."""
+    return raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
 def _jffs2_accurate(raw, e):
     """A node's bytes with the ACCURATE bit of its node type set again, as they
     were when its CRCs were computed: jffs2_mark_node_obsolete clears only
@@ -14400,11 +14420,28 @@ def jffs2_decompress(compr, src, dsize):
                           "is not read here")
 
 
+JFFS2_DAMAGE_CAP = 1000
+
+
 class Jffs2Walker:
     """List and read a JFFS2 filesystem by scanning every node in the region.
-    A node is an inode number; the root is inode 1."""
+    A node is an inode number; the root is inode 1.
+
+    JFFS2 records no size and no count of its own, so a region that holds only part
+    of a filesystem reads as a smaller one. What the region itself shows is missing is
+    recorded: ``damage`` (see damage_lines) says when the region ends inside a node,
+    when a file's size is not covered by its readable data nodes, and when a name in a
+    directory the root does not reach has an inode with no readable node, and
+    ``folders_not_read`` counts those findings; ``note`` counts every name whose inode
+    has no readable node, and ``unread_entries()`` lists the ones the root reaches.
+    ``linked`` is the number of names the root reaches and ``unreached`` the number in
+    directories it does not reach. A region cut between two nodes, with every name it
+    still holds complete, shows none of this and reads as a smaller filesystem."""
 
     root = JFFS2_ROOT_INO
+    # read_file() counts the bytes no node holds in EOF_SHORTFALL and run_shortfall()
+    # says where they are, so extract_to_zip() asks that rather than saying past the end
+    read_file_reports_gaps = True
 
     def __init__(self, fh, base, size=None, endian=None, nand_fallback=True):
         self.fh, self.base = fh, base
@@ -14435,9 +14472,12 @@ class Jffs2Walker:
             if best[2] is not None:
                 self.__dict__.update(best[2].__dict__)
         self._resolved = {}
+        self._survey()
 
     def _reset(self):
         self.inodes = collections.defaultdict(list)   # ino -> [inode node records]
+        # Names are kept as the bytes stored and turned into text only where they are
+        # handed out, so two different stored names are never one key.
         self.dirents = collections.defaultdict(dict)  # pino -> {name: (version, ino, type, mctime)}
         self.stats = collections.Counter()
         # For recover_deleted(): every dirent the scan read, and where each node
@@ -14449,6 +14489,8 @@ class Jffs2Walker:
         # dirent sits, region-relative (in the spare-stripped view on NAND).
         self.cleanmarkers = []                        # offset
         self.dirent_nodes = []                        # (offset, pino, version, ino, dtype, name, mctime)
+        # Headers whose CRC holds and whose node the region is too short to hold.
+        self.cut_nodes = []                           # (offset, totlen), the first few
 
     def _scan(self):
         """Walk the region a 4 MiB chunk at a time, checking every 4-byte
@@ -14488,7 +14530,14 @@ class Jffs2Walker:
         if magic != JFFS2_MAGIC:
             return 0
         check = struct.pack(e + "HHI", magic, ntype | JFFS2_ACCURATE, totlen)
-        if _kcrc32(check) != hcrc or totlen < 12 or totlen > self.size - off:
+        if _kcrc32(check) != hcrc or totlen < 12:
+            return 0
+        if totlen > self.size - off:
+            # The header vouches for a node the region does not hold to its end. The
+            # scan goes on from the next 4 bytes, as it always has.
+            self.stats["cut"] += 1
+            if len(self.cut_nodes) < 16:
+                self.cut_nodes.append((off, totlen))
             return 0
         if self.endian is None:
             self.endian = e
@@ -14512,7 +14561,7 @@ class Jffs2Walker:
         return padded
 
     def _parse_dirent(self, off, totlen, e, obsolete=False):
-        """(pino, version, ino, mctime, dtype, name) for a dirent whose CRCs
+        """(pino, version, ino, mctime, dtype, name as stored) for a dirent whose CRCs
         hold, else None. The header CRC is checked by the caller. An obsolete
         node's CRCs were computed with the ACCURATE bit still set, which the
         kernel cleared afterwards, so it is set again before they are checked."""
@@ -14527,7 +14576,7 @@ class Jffs2Walker:
         if (_kcrc32(raw[:32]) != node_crc or len(name) < nsize
                 or _kcrc32(name) != name_crc or 40 + nsize > totlen):
             return None
-        return pino, version, ino, mctime, dtype, name.decode("utf-8", "surrogateescape")
+        return pino, version, ino, mctime, dtype, bytes(name)
 
     def _dirent(self, off, totlen, e):
         d = self._parse_dirent(off, totlen, e)
@@ -14608,8 +14657,167 @@ class Jffs2Walker:
         out = []
         for name, (_ver, target, _t, _m) in self.dirents.get(ino, {}).items():
             if target and target != ino:
-                out.append((name, target))
+                out.append((_jffs2_name(name), target))
         return sorted(out)
+
+    # -- what the region shows is missing -------------------------------------
+    def _held(self, ino, isize):
+        """The byte ranges below ``isize`` that this inode's data nodes cover, merged
+        and in order, as [[start, end], ...]. The kernel writes a hole as a node too
+        (fs/jffs2/fs.c:123-127 jffs2_do_setattr, fs/jffs2/file.c:142-174
+        jffs2_write_begin), so a range no node covers is missing, not a hole."""
+        spans = sorted((n["doff"], min(n["doff"] + n["dsize"], isize))
+                       for n in self.inodes.get(ino, ()) if n["dsize"] and n["doff"] < isize)
+        out = []
+        for a, b in spans:
+            if out and a <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return out
+
+    def _gap(self, ino, size=None):
+        """(bytes no node holds, ranges they are in, where the first starts, where the
+        last byte a node holds ends) for a regular file's first ``size`` bytes, the
+        whole file by default; None when its nodes cover them all."""
+        latest = self._latest(ino)
+        if latest is None or latest["mode"] & S_IFMT != S_IFREG:
+            return None
+        want = latest["isize"] if size is None else min(size, latest["isize"])
+        held = self._held(ino, latest["isize"])
+        gaps, at = [], 0
+        for a, b in held:
+            if a >= want:
+                break
+            if a > at:
+                gaps.append((at, a))
+            at = max(at, b)
+        if at < want:
+            gaps.append((at, want))
+        if not gaps:
+            return None
+        return (sum(b - a for a, b in gaps), len(gaps), gaps[0][0],
+                held[-1][1] if held else 0)
+
+    def run_shortfall(self, ino):
+        """Why read_file() gave fewer bytes than the file's size, as text, else None."""
+        gap = self._gap(ino)
+        if gap is None:
+            return None
+        missing, count, first, end = gap
+        tail = self._latest(ino)["isize"] - end
+        if not end:
+            return ("no readable node in the region holds any of its bytes, so the member "
+                    "is empty")
+        if tail == missing:
+            return (f"its readable data nodes stop at byte {end:,} and none in the region "
+                    f"holds the {tail:,} bytes after that, so the member ends there")
+        told = (f"no readable node in the region holds {missing:,} bytes of it, in {count:,} "
+                f"range{'' if count == 1 else 's'}, the first from byte {first:,}: ")
+        if not tail:
+            return told + ("those bytes are zeros in the member, so the bytes after them "
+                           "keep their offsets")
+        return told + (f"the {missing - tail:,} before byte {end:,}, where its readable "
+                       f"data nodes stop, are zeros in the member, and the member ends there")
+
+    def _note_damage(self, line):
+        if len(self.damage) < JFFS2_DAMAGE_CAP:
+            self.damage.append(line)
+
+    def _survey(self):
+        """Walk the tree from the root once and record what the region shows is missing.
+
+        The names the root reaches are counted in ``linked``. The kernel's mount pass
+        removes an inode no name links, and a directory's children with it, so names in a
+        directory the root does not reach are not part of the filesystem it mounts: they
+        are counted in ``unreached`` and not listed. A reached name whose inode has no
+        readable node goes to unread_entries(), and a reached regular file whose data
+        nodes do not cover its size is counted for ``damage``."""
+        self.damage, self.folders_not_read = [], 0
+        self.linked = self.unreached = self._unread_unreached = 0
+        self._unread = []
+        if self.stats["cut"]:
+            off, totlen = self.cut_nodes[0]
+            more = self.stats["cut"] - 1
+            where = ("of the region with its spare bytes stripped" if self.nand
+                     else "of the region")
+            self.folders_not_read += 1
+            self._note_damage(
+                f"the region ends inside a node: its header at byte {off:,} {where} records "
+                f"{totlen:,} bytes and {self.size - off:,} are there, so the image stops "
+                f"before this filesystem does. That node was not read, and nothing stored "
+                f"after it is in the image"
+                + (f" ({more:,} more such header{'' if more == 1 else 's'} inside it)"
+                   if more else ""))
+        reached, stack, checked = {self.root}, [(self.root, "")], set()
+        gap_files = gap_bytes = 0
+        while stack:
+            ino, path = stack.pop()
+            for raw, (_ver, target, _t, _m) in self.dirents.get(ino, {}).items():
+                if not target or target == ino:
+                    continue
+                self.linked += 1
+                name = _jffs2_name(raw)
+                full = f"{path}/{name}" if path else name
+                ent = self.entry(target)
+                if ent is None:
+                    self._unread.append((full, target))
+                    continue
+                fmt = ent[0] & S_IFMT
+                if fmt == S_IFDIR:
+                    if target not in reached:
+                        reached.add(target)
+                        stack.append((target, full))
+                elif fmt == S_IFREG and target not in checked:
+                    checked.add(target)
+                    gap = self._gap(target)
+                    if gap is not None:
+                        gap_files += 1
+                        gap_bytes += gap[0]
+        self._unread.sort()
+        for pino, ents in self.dirents.items():
+            if pino in reached:
+                continue
+            for _ver, target, _t, _m in ents.values():
+                if target and target != pino:
+                    self.unreached += 1
+                    self._unread_unreached += self.entry(target) is None
+        if self._unread_unreached:
+            # a reached one is a FAILED row of the export; these have no path to name
+            one = self._unread_unreached == 1
+            self.folders_not_read += 1
+            self._note_damage(
+                f"{self._unread_unreached:,} name{'' if one else 's'} in a directory the root "
+                f"does not reach lead{'s' if one else ''} to an inode with no readable node "
+                f"in this region. No row names {'it' if one else 'them'}, because "
+                f"{'it has' if one else 'they have'} no path")
+        if gap_files:
+            one = gap_files == 1
+            self.folders_not_read += 1
+            self._note_damage(
+                f"{gap_files:,} file{' records' if one else 's record'} a size "
+                f"{'its' if one else 'their'} data nodes do not cover: no readable node in "
+                f"the region holds {gap_bytes:,} bytes of {'it' if one else 'them'}. An export "
+                f"marks each such file SHORT")
+
+    @property
+    def note(self):
+        """What the reader says about the volume as a whole, without the damage, or None."""
+        away = self._unread_unreached
+        count = len(self._unread) + away
+        if not count:
+            return None
+        one = count == 1
+        return (f"{count:,} name{' leads' if one else 's lead'} to an inode with no readable "
+                f"node in this region, so {'it is' if one else 'they are'} not listed or "
+                f"exported"
+                + (f"; {away:,} of them {'is' if away == 1 else 'are'} in a directory the "
+                   f"root does not reach" if away else ""))
+
+    def unread_entries(self):
+        """[(path, inode)] of every name the root reaches whose inode has no readable
+        node. collect() passes over these, so the export records them from here."""
+        return list(self._unread)
 
     def _data(self, node):
         raw = read_at(self.fh, self.base + node["off"] + 68, node["csize"])
@@ -14619,22 +14827,36 @@ class Jffs2Walker:
 
     def readlink(self, ino):
         latest = self._latest(ino)
-        return self._data(latest).decode("utf-8", "surrogateescape") if latest else ""
+        if not latest:
+            return ""
+        # a path, so its slashes stay; bytes that are not UTF-8 become %XX
+        return self._data(latest).decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
 
     def read_file(self, ino, size):
         """The file rebuilt from every data node, oldest version first so a
-        newer range overwrites an older one; unwritten ranges are holes."""
+        newer range overwrites an older one.
+
+        A range below the file's size that no node covers is not content. Nothing is
+        yielded after the last byte a node holds, which is where the kernel puts the end
+        of such a file, and a range missing before that is zeros so later bytes keep
+        their offsets. The bytes no node holds are added to EOF_SHORTFALL, which makes
+        the file SHORT with the count of what the nodes hold, and run_shortfall() says
+        where they are."""
         latest = self._latest(ino)
         if latest is None or latest["mode"] & S_IFMT != S_IFREG:
             return
         isize = latest["isize"]
-        buf = bytearray(isize)
+        held = self._held(ino, isize)
+        buf = bytearray(held[-1][1] if held else 0)
         for node in sorted(self.inodes[ino], key=lambda n: n["version"]):
             if not node["dsize"] or node["doff"] >= isize:
                 continue
             data = self._data(node)
             end = min(node["doff"] + node["dsize"], isize)
             buf[node["doff"]:end] = data[:end - node["doff"]].ljust(end - node["doff"], b"\0")
+        gap = self._gap(ino, size)
+        if gap is not None:
+            EOF_SHORTFALL["bytes"] += gap[0]
         view = memoryview(buf)[:min(size, isize)]
         for i in range(0, len(view), 1 << 20):
             yield bytes(view[i:i + (1 << 20)])
@@ -14788,8 +15010,8 @@ class Jffs2Walker:
             gap = isize - sum(covered)
             if len({n["version"] for n in recs}) != len(recs):
                 gap = gap or isize or 1
-            _v, pino, name = named.get(ino, (0, None, ""))
-            e = FlashDeletedFile("jffs2", ino, name, pino, paths.get(pino), isize,
+            _v, pino, name = named.get(ino, (0, None, b""))
+            e = FlashDeletedFile("jffs2", ino, _jffs2_name(name), pino, paths.get(pino), isize,
                                  latest["mode"], latest["mtime"], gap, recs, self)
             if gap and len({n["version"] for n in recs}) != len(recs):
                 e.reason = "the inode number was used by more than one file"
@@ -14976,26 +15198,30 @@ def identify_jffs2(fh, base, size=None):
     if not (s["inode"] or s["dirent"]):
         return None
     comps = sorted(k[6:] for k, v in s.items() if k.startswith("compr_") and v)
-    live = sum(1 for ents in w.dirents.values() for v in ents.values() if v[1])
-    orphans = sum(1 for ents in w.dirents.values() for v in ents.values()
-                  if v[1] and v[1] not in w.inodes and not w.dirents.get(v[1]))
     lines = [
         f"byte order   {'little' if w.endian == '<' else 'big'} endian",
     ] + ([f"NAND         a raw dump: {w.nand[0]}-byte pages each followed by {w.nand[1]} "
           "spare bytes, read with the spare stripped"] if w.nand else []) + [
         f"nodes        {s['valid']:,} with a valid header: {s['inode']:,} inode, "
         f"{s['dirent']:,} directory entry, {s['obsolete']:,} marked obsolete",
-        f"entries      {live:,} names currently linked, {len(w.inodes):,} inodes "
-        "with data nodes",
+        f"entries      {w.linked:,} name{'' if w.linked == 1 else 's'} linked from the root, "
+        f"{len(w.inodes):,} inodes with data nodes",
         f"compression  {', '.join(comps) if comps else 'none used'}",
     ]
     if s["bad"]:
         lines.append(f"damaged      {s['bad']:,} nodes whose header CRC held but whose body "
                      f"or data CRC did not ({s['data CRC failures']:,} data); dropped, as the "
                      "kernel drops them")
-    if orphans:
-        lines.append(f"note         {orphans:,} linked names lead to an inode with no readable "
-                     "node; they are not listed")
+    if w.unreached:
+        one = w.unreached == 1
+        lines.append(f"note         {w.unreached:,} more name{' is' if one else 's are'} in a "
+                     f"directory the root does not reach and {'is' if one else 'are'} not listed "
+                     "(the kernel's mount pass removes an inode no name links, and a "
+                     "directory's children with it: fs/jffs2/build.c)")
+    if w.note:
+        lines.append(f"note         {w.note}")
+    for line in damage_lines(w)[1]:
+        lines.append(f"damage       {line}")
     unread = [c for c in comps if c not in ("none", "zero", "rtime", "zlib", "lzo", "lzma")]
     if unread:
         lines.append(f"note         {', '.join(unread)} compressed data is not read here")
@@ -39228,6 +39454,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                "folder neither is anything under it", 1)
                                               for p, i, _s, _m in unread)
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
+                            elif isinstance(w, Jffs2Walker):
+                                # a name whose inode has no readable node is not in the list either
+                                unread, undropped = apply_exclude(
+                                    [(p, i, None, None) for p, i in w.unread_entries()], exclude)
+                                dropped += undropped
+                                fa += len(unread)
+                                issues.extend((p, "", "FAILED", f"its inode ({i:,}) has no "
+                                               "readable node in this region, so it is not "
+                                               "exported, and if it is a folder neither is "
+                                               "anything under it", 1)
+                                              for p, i, _s, _m in unread)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -39245,10 +39482,11 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, F2fsWalker) and w.volume_note:
+                            volume_note = getattr(w, "note", None)
+                            if volume_note:          # any walker that has one to give
                                 if manifest is not None:
-                                    manifest[-1]["note"] = w.volume_note
-                                _say(f"            NOTE {w.volume_note}")
+                                    manifest[-1]["note"] = volume_note
+                                _say(f"            NOTE {volume_note}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             print(f"            {f_:,} files, {human(wr)}"
@@ -39885,6 +40123,280 @@ def _f2fs_marker_check(image_gz):
         if i >= 0 and runs[i][0] <= off < runs[i][0] + runs[i][1]:
             in_free += 1
     return has_bit, len(blocks), in_free
+
+
+def _jffs2_reader_checks():
+    """[(label, passed or None for a skip)] for what the JFFS2 reader says about names
+    that are not UTF-8, a region that holds only part of a filesystem, and names the
+    root does not reach. The cut regions are the committed mkfs.jffs2 fixtures stopped
+    at half their length, held against the same fixtures read whole. The other images
+    are a few nodes written here from the layouts cited above the reader, because no
+    committed fixture holds those names or those directories."""
+    import gzip
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    import zlib
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    stems = ("jffs2-le-zlib", "jffs2-be-zlib", "jffs2-le-lzo", "jffs2-le-lzma", "jffs2-le-rtime",
+             "jffs2-le-none", "jffs2-le-sum", "jffs2-nor-history", "jffs2-nand-history")
+    absent = [n for n in stems if not os.path.isfile(os.path.join(here, n + ".img.gz"))]
+    if absent:
+        return [(f"the JFFS2 fixtures are not beside this script ({', '.join(absent)}), so "
+                 "the JFFS2 reader's names and records were not checked", None)]
+
+    def fixture(stem):
+        with gzip.open(os.path.join(here, stem + ".img.gz"), "rb") as gz:
+            return gz.read()
+
+    def walker(raw):
+        return Jffs2Walker(io.BytesIO(raw), 0, len(raw))
+
+    def node(ntype, body):
+        head = struct.pack("<HHI", JFFS2_MAGIC, ntype, 12 + len(body))
+        raw = head + struct.pack("<I", _kcrc32(head)) + body
+        return raw + b"\xff" * (-len(raw) % 4)
+
+    def dirent(pino, version, ino, name, dtype=8):                  # 8: DT_REG, 4: DT_DIR
+        body = struct.pack("<IIIIBBH", pino, version, ino, 0, len(name), dtype, 0)
+        head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_DIRENT, 40 + len(name))
+        head += struct.pack("<I", _kcrc32(head))
+        return node(JFFS2_DIRENT, body + struct.pack("<II", _kcrc32(head + body), _kcrc32(name))
+                    + name)
+
+    def inode(ino, version, data, offset=0, isize=None, mode=S_IFREG | 0o644):
+        body = struct.pack("<IIIHHIIIIIIIBBH", ino, version, mode, 0, 0,
+                           offset + len(data) if isize is None else isize, 0, 0, 0, offset,
+                           len(data), len(data), 0, 0, 0)
+        head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_INODE, 68 + len(data))
+        head += struct.pack("<I", _kcrc32(head))
+        return node(JFFS2_INODE, body + struct.pack("<II", _kcrc32(data), _kcrc32(head + body))
+                    + data)
+
+    def block(*nodes):
+        blk = node(JFFS2_CLEANMARKER, b"") + b"".join(nodes)
+        return blk + b"\xff" * (-len(blk) % 4096)
+
+    def export(raw):
+        """(exit status, the volume's record, exceptions rows, {member: (crc, size)}) from
+        a real --extract, or None in a packaged build."""
+        if getattr(sys, "frozen", False):
+            return None
+        # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+        # each export names its own files and removes them itself.
+        work = tempfile.mkdtemp(prefix="qnxprobe-jffs2-")
+        stem = os.path.join(work, f"jffs2-check-{uuid.uuid4().hex}")
+        image, out = stem + ".img", stem + ".zip"
+        try:
+            with open(image, "wb") as fh:
+                fh.write(raw)
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), image,
+                                   "--extract", out], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=240, check=False)
+            with zipfile.ZipFile(out) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+                rows = []
+                for name in zin.namelist():
+                    if name.endswith(".exceptions.tsv"):
+                        rows += [ln.split("\t") for ln in
+                                 zin.read(name).decode("utf-8", "replace").splitlines()[1:]]
+                members = {i.filename.split("/", 1)[-1]: (i.CRC, i.file_size)
+                           for i in zin.infolist() if "/" in i.filename}
+            return done.returncode, rec, rows, members
+        finally:
+            for leftover in (image, out):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
+
+    def content(w):
+        """{path: bytes} of every regular file the walker lists."""
+        return {p: b"".join(w.read_file(n, sz)) for p, n, sz, _m in collect(w, w.root)
+                if sz is not None}
+
+    def quiet(w):
+        return not w.damage and not w.folders_not_read and w.note is None \
+            and not w.unread_entries()
+
+    out = []
+
+    def row(label, check):
+        try:
+            result = check()
+        except Exception as exc:                     # pylint: disable=broad-except
+            label += f" (raised {type(exc).__name__}: {str(exc)[:60]})"
+            result = False
+        out.append((label, result if result is None else bool(result)))
+
+    def names():
+        raw = block(dirent(1, 1, 2, b"caf\xe9.txt"), inode(2, 1, b"one"),
+                    dirent(1, 2, 3, b"caf%E9.txt"), inode(3, 1, b"two"),
+                    dirent(1, 3, 4, b"ln", 10),
+                    inode(4, 1, b"to/caf\xe9.txt", mode=S_IFLNK | 0o777))
+        w = walker(raw)
+        listed = w.listdir(w.root)
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute("create table t (name text)")
+            db.executemany("insert into t values (?)", [(n,) for n, _i in listed])
+            stored = [r[0] for r in db.execute("select name from t order by rowid")]
+        finally:
+            db.close()
+        if (listed != [("caf%E9.txt", 2), ("caf%E9.txt", 3), ("ln", 4)]
+                or stored != [n for n, _i in listed] or len(w.dirents[1]) != 3
+                or [b"".join(w.read_file(i, 3)) for i in (2, 3)] != [b"one", b"two"]
+                or w.readlink(4) != "to/caf%E9.txt" or not quiet(w)):
+            return False
+        got = export(raw)
+        if got is None:
+            return True
+        rc, rec, _rows, members = got
+        return (rc == 0 and rec["files"] == 2 and "note" not in rec
+                and sorted(members.values()) == sorted([(zlib.crc32(b"one"), 3),
+                                                        (zlib.crc32(b"two"), 3)])
+                and not any(0xD800 <= ord(c) <= 0xDFFF for m in members for c in m))
+
+    def whole():
+        counts = []
+        for stem in stems:
+            w = walker(fixture(stem))
+            if not quiet(w) or w.stats["cut"] or w.unreached:
+                return False
+            counts.append(w.linked)
+        got = export(fixture("jffs2-nor-history"))
+        return (counts == [319] * 7 + [13, 13]
+                and (got is None or (got[0] == 0 and "note" not in got[1]
+                                     and "damage_recorded" not in got[1]
+                                     and "folders_not_read" not in got[1] and not got[2])))
+
+    def cut_in_a_node():
+        raw = fixture("jffs2-le-zlib")
+        full = content(walker(raw))
+        half = raw[:len(raw) // 2]
+        w = walker(half)
+        held = content(w)
+        unread = w.unread_entries()
+        if not (w.stats["cut"] == 1 and w.folders_not_read == 1 and len(w.damage) == 1
+                and "ends inside a node" in w.damage[0] and len(unread) == 1
+                and "1 name leads" in (w.note or "") and 0 < len(held) < len(full)
+                and all(full[p] == data for p, data in held.items())):
+            return False
+        got = export(half)
+        if got is None:
+            return True
+        rc, rec, rows, members = got
+        failed = [r for r in rows if r[2] == "FAILED"]
+        return (rc == 1 and rec.get("folders_not_read") == 1 and rec.get("damage_recorded") == 1
+                and "ends inside a node" in rec["damage_first"][0]
+                and "no readable node" in (rec.get("note") or "")
+                and rec["failed"] == 1 and rec["files"] == len(held) == len(members)
+                and len(failed) == 1 and failed[0][0] == unread[0][0]
+                and "no readable node" in failed[0][3]
+                and all(members.get(p) == (zlib.crc32(data), len(data))
+                        for p, data in held.items()))
+
+    def cut_through_a_file():
+        raw = fixture("jffs2-le-none")
+        full = content(walker(raw))
+        half = raw[:len(raw) // 2]
+        got = export(half)
+        if got is not None and (got[0] != 1 or got[1]["short"] != 1
+                                or got[1].get("folders_not_read") != 2):
+            return False
+        w = walker(half)
+        short = {p: (n, sz) for p, n, sz, _m in collect(w, w.root)
+                 if sz is not None and w.run_shortfall(n)}
+        if len(short) != 1:
+            return False
+        (path, (ino, size)), = short.items()
+        before = EOF_SHORTFALL["bytes"]
+        data = b"".join(w.read_file(ino, size))
+        lost = EOF_SHORTFALL["bytes"] - before
+        if not (0 < len(data) < size == len(full[path]) and data == full[path][:len(data)]
+                and lost == size - len(data) and w.folders_not_read == 2
+                and any("do not cover" in d for d in w.damage)):
+            return False
+        if got is None:
+            return True
+        _rc, _rec, rows, members = got
+        member = f"{path}.SHORT-{len(data)}-of-{size}-bytes"
+        told = [r for r in rows if r[2] == "SHORT"]
+        return (members.get(member) == (zlib.crc32(data), len(data)) and path not in members
+                and len(told) == 1 and told[0][0] == path
+                and f"{len(data):,} of {size:,} bytes read" in told[0][3]
+                and "none in the region holds" in told[0][3])
+
+    def gap_inside():
+        # nodes for bytes 0 to 3 and 8 to 11 of a 12-byte file, and none for 4 to 7
+        raw = block(dirent(1, 1, 2, b"gap.bin"), inode(2, 1, b"abcd"),
+                    inode(2, 2, b"ijkl", offset=8),
+                    dirent(1, 2, 3, b"whole.bin"), inode(3, 1, b"abcd"),
+                    inode(3, 2, b"efgh", offset=4), inode(3, 3, b"ijkl", offset=8))
+        w = walker(raw)
+        before = EOF_SHORTFALL["bytes"]
+        data = b"".join(w.read_file(2, 12))
+        lost = EOF_SHORTFALL["bytes"] - before
+        whole_file = b"".join(w.read_file(3, 12))
+        if not (data == b"abcd\0\0\0\0ijkl" and lost == 4 and whole_file == b"abcdefghijkl"
+                and EOF_SHORTFALL["bytes"] - before == 4 and w.run_shortfall(3) is None
+                and "first from byte 4" in w.run_shortfall(2) and w.folders_not_read == 1):
+            return False
+        got = export(raw)
+        if got is None:
+            return True
+        rc, rec, rows, members = got
+        return (rc == 1 and rec["short"] == 1 and rec["files"] == 1
+                and members.get("gap.bin.SHORT-8-of-12-bytes") == (zlib.crc32(data), 12)
+                and members.get("whole.bin") == (zlib.crc32(b"abcdefghijkl"), 12)
+                and [r[0] for r in rows if r[2] == "SHORT"] == ["gap.bin"])
+
+    def unreached():
+        # inode 5 is a directory holding one name, and no name leads to it
+        raw = block(dirent(1, 1, 2, b"a"), inode(2, 1, b"one"),
+                    inode(5, 1, b"", mode=S_IFDIR | 0o755), dirent(5, 1, 6, b"x"),
+                    inode(6, 1, b"six"))
+        w = walker(raw)
+        lines = identify_jffs2(io.BytesIO(raw), 0, len(raw))[1]
+        if not (any("1 name linked from the root" in ln for ln in lines)
+                and any("1 more name is in a directory the root does not reach" in ln
+                        for ln in lines)):
+            return False
+        return (w.linked == 1 and w.unreached == 1 and quiet(w)
+                and [p for p, _n, _s, _m in collect(w, w.root)] == ["a"])
+
+    def unreached_without_a_node():
+        # the same, with no node for inode 6: a name with no path to put in a row
+        raw = block(dirent(1, 1, 2, b"a"), inode(2, 1, b"one"),
+                    inode(5, 1, b"", mode=S_IFDIR | 0o755), dirent(5, 1, 6, b"x"))
+        w = walker(raw)
+        if "1 of them is in a directory the root does not reach" not in (
+                getattr(w, "note", None) or ""):
+            return False
+        return (w.linked == 1 and w.unreached == 1 and not w.unread_entries()
+                and w.folders_not_read == 1 and "does not reach" in w.damage[0])
+
+    row("JFFS2: a name that is not UTF-8 is listed with %XX for its bytes and goes into SQLite, "
+        "a stored name spelling the same text stays a second entry, and a link target "
+        "keeps its slashes", names)
+    row("JFFS2: the nine fixtures read whole record no damage, no note and no failed or short "
+        "file, and every name is linked from the root (319 on each mkfs.jffs2 image, 13 on "
+        "each kernel-written one)", whole)
+    row("JFFS2: a region that ends inside a node says so and exits 1, the name whose inode is "
+        "past the cut is a FAILED row and counted in the volume's note, and every file still "
+        "exported has the bytes of the whole image", cut_in_a_node)
+    row("JFFS2: a file whose data nodes stop before its size is SHORT with the bytes its "
+        "nodes hold and nothing after them, where it was full size with zeros", cut_through_a_file)
+    row("JFFS2: a range inside a file that no node covers is zeros in a SHORT member that "
+        "counts only the bytes held, and a file whose nodes cover it is not SHORT", gap_inside)
+    row("JFFS2: names are counted from the root, and a name in a directory the root does not "
+        "reach is counted apart and not listed", unreached)
+    row("JFFS2: a name the root does not reach whose inode has no node is recorded as damage "
+        "and in the note", unreached_without_a_node)
+    return out
 
 
 def _f2fs_reader_checks():
@@ -48131,6 +48643,11 @@ def self_test():
             lvm_checks += _f2fs_reader_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the F2FS reader checks ran ({type(exc).__name__}: {exc})", False)]
+        # JFFS2 names, cut regions and names the root does not reach.
+        try:
+            lvm_checks += _jffs2_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the JFFS2 reader checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
             if cond is None:
                 print(f"  [SKIP] {label}")
