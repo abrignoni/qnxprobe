@@ -3520,8 +3520,17 @@ class Fat32Walker:
                 break
             part = read_at(self.fh, self._cluster_off(cur), cb)
             if len(part) < cb:
-                out += part
                 stop = f"the image ends inside cluster {cur:#x}"
+                if not n:
+                    out += part
+                else:
+                    # A later cluster is only assumed to be this folder's, so what the image
+                    # holds of it passes the same tests as a whole one, in complete slots.
+                    # A "." slot never continues a folder, whatever the cut left after it.
+                    slots = part[:len(part) // 32 * 32]
+                    if (slots and slots[:32] != blank and slots[:11] != _FAT_DOT_NAMES[0]
+                            and _fat_dir_cluster_ok(slots)):
+                        out += slots
                 break
             if n and part[:32] == blank:
                 ended = True                         # a cluster that opens with the end marker
@@ -38539,6 +38548,27 @@ def _fat_reader_checks():
                 return False
         return True
 
+    def cut_inside_a_later_cluster():
+        def listed(later, held):
+            lab = deleted_folder_lab(later.ljust(512, b"\x00"))
+            w = lab.walker(lab.img[:lab.off(21) + held])
+            names = [d.name for d in w.deleted_files() if not d.is_dir]
+            return names, "the image ends inside cluster 0x15" in damage(w)
+
+        mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x11" * 64
+        other = b"".join(bytes(s) for s in (short(b".          ", 0x10, 21),
+                                            short(b"..         ", 0x10, 0),
+                                            short(b"OTHERDIRBIN", first=70, size=1)))
+        blank = bytes(32) + bytes(short(b"AFTERENDBIN", first=70, size=1))
+        for later, held in ((b"hello world", 64), (mp4, 64), (other, 96), (blank, 64)):
+            names, said = listed(later, held)
+            if len(names) != 14 or not all(n.startswith("KID") for n in names) or not said:
+                return False
+        real = b"".join(bytes(short(b"LATER%03dBIN" % k, first=70 + k, size=1)) for k in range(3))
+        names, said = listed(real, 74)               # two whole slots and part of a third
+        return (said and len(names) == 16 and "LATER000.BIN" in names
+                and "LATER001.BIN" in names and "LATER002.BIN" not in names)
+
     def low_word_zero_or_one():
         lab = Lab(32, 70000, keep=65600)
         lab.root([short(b"\xe5ERO    BIN", first=0, size=4),
@@ -39046,6 +39076,9 @@ def _fat_reader_checks():
                             "and MP4 data opening with zeros is not its end marker"),
         (content_is_not_entries, "text, MP4 and HEIC bytes after a deleted folder's first "
                                  "cluster are not listed as its entries"),
+        (cut_inside_a_later_cluster, "a deleted FAT folder's run cut inside a later cluster keeps "
+                                     "only complete slots that read as folder entries, and "
+                                     "records the cut"),
         (low_word_zero_or_one, "a deleted FAT32 file or folder with a low word of 0 or 1 is "
                                "placed when one cluster fits, and an empty file has no cluster"),
         (dot_candidate_is_free, "a deleted FAT32 folder is never placed at a live folder's "
