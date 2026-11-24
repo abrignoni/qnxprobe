@@ -2620,6 +2620,82 @@ second version. The report names the older copies:
         note         2 eraseblock(s): an older copy of a block, not the one read
 ```
 
+A UBI volume name and a UBIFS file name are stored bytes. A byte that is not UTF-8 is shown
+as `%XX` of the stored byte, a NUL as `%00`, and a `/` stored inside one name as `%2F`, so a
+volume `ubinize` named `data/vol` is listed as `data%2Fvol`, one volume, and not as a folder
+`data` holding `vol`. No name holds a surrogate, two stored names that differ stay
+different, and a literal `%` is not escaped. Up to 1.87 a volume name lost such a byte to
+U+FFFD and a file name carried a surrogate, which the zip spelled as three escaped bytes
+(`caf%ED%B3%A9.txt` for a stored `caf<E9>.txt`, now `caf%E9.txt`). A symbolic link's target
+is not a name and is returned as it was.
+
+UBIFS stores an inode's seconds as a signed 64-bit number, and the kernel reads them that
+way (`ubifs_iget`). Up to 1.87 they were read unsigned, and a file dated 1960 came out as
+18446744073393932416. It is now -315619200 in the walker and in the file's `TIME_NOT_HELD` row.
+
+Both were checked on five images `mkfs.ubifs` and `ubinize` 2.3.0 wrote from one tree of
+16 files, six copies of the tree in all: three file and folder names with bytes that are
+not UTF-8, a 1960 time, and UBI volumes named `data/vol` and `caf<E9>`. Each copy matches
+its 16 source hashes under the new names, and the static volume named `caf<E9>` matches its
+hash as `caf%E9`.
+
+What a cut or damaged image could not give is recorded in the walker's `damage` list, which
+an export writes to `volumes.json` as `damage_recorded` and `damage_first`. Each record of
+something lost counts in `folders_not_read`, so the run exits 1. A record that begins
+`note:` states something found that loses nothing, and does not count.
+
+- **The data ends inside an eraseblock.** Only whole eraseblocks are read. When that
+  eraseblock's headers are in the image the record names the logical eraseblock and the
+  volume it held. One that is blank, or that holds an older copy of a block read from
+  elsewhere, is a note.
+- **A static volume with fewer eraseblocks than it records.** Every eraseblock of a static
+  volume records how many the volume uses, and the kernel marks a volume short of them as
+  corrupted (`init_volumes`). It is exported up to the first missing eraseblock as a
+  `SHORT` member, and nothing is put where the missing one was. Its size is the recorded
+  one when the header of its last eraseblock is in the image. When it is not, nothing else
+  records where the data ends, so the size shown is the most the volume can hold, and the
+  record and the file's `SHORT` row both say so. A static volume with no eraseblock at all
+  is listed as an empty file with a note: UBI keeps a static volume's size only in its
+  eraseblocks, so an empty volume and one whose eraseblocks are gone look the same, and the
+  kernel takes it to be empty.
+- **A volume table that does not read.** Each volume number with mapped eraseblocks is
+  listed as `vol<number>`, and the record says its name, type and padding are not known.
+- **A volume that opens as UBIFS or SquashFS and cannot be read as one** is exported as one
+  file of its raw bytes, and the record says its files are not listed.
+- **A NAND dump that ends inside a page.** Its whole pages are read with the spare
+  stripped, and the record gives the bytes left over.
+- **UBIFS index nodes that do not read.** Their count is recorded. What they indexed is not
+  known, so files and folders can be missing, and a block of a listed file can read as
+  zeros, the way a hole does. Directory entry nodes that do not read are counted the same
+  way.
+- **A name whose inode node does not read** is a `FAILED` row in the exceptions table.
+  Up to 1.87 the file was left out with no record.
+- **A journal that was not replayed.** The log's first eraseblock always opens with the
+  commit start node of the current commit, and the kernel does not mount a volume without
+  it (`replay_log_leb`, `ubifs_replay_journal`). When that eraseblock holds no node, or
+  opens with another one, the record says what was written since the last commit is
+  missing from the listing.
+
+Measured on the seven fixtures, each cut 4 KiB before its end and at half its size. Cut by
+4 KiB, the five `ubinize` images export the 416 files of their two filesystem volumes
+unchanged and the raw static volume as `kernel.SHORT-126976-of-150000-bytes` (130816 on the
+NOR image), with two records and exit 1. The bare UBIFS image, whose last 4 KiB are blank
+(0xFF), exports all 410 files with exit 0. The NAND dump with spare bytes exports all 12
+files and records the 128 bytes of a page left over, with exit 1. Cut in half, the five
+`ubinize` images and the bare UBIFS image each record one index node that does not read,
+list no file of the UBIFS volume and exit 1, and the NAND dump records the journal that was
+not replayed and exits 1. Uncut, all seven export as before with no record. On a NAND dump
+from a real device, one of ten UBIFS volumes has 10 index nodes and 1 directory entry node
+that do not read and 6 names whose inode does not read. It now carries two records and six
+more `FAILED` rows.
+
+A cut that falls between two eraseblocks leaves no part of one behind, so it shows only
+through what is then missing: one of the halved `ubinize` images and the halved NAND dump
+are cut that way, and are recorded by the index node and by the log. A static volume whose
+eraseblocks are all gone is then only a note. A file cut inside its first eraseblock is not
+recognised as UBI or UBIFS at all: cut to 128, 576, 2,112 and 4,096 bytes, the fixtures
+gave an empty export and exit 0.
+
 ### YAFFS1 and YAFFS2
 
 NAND filesystems with no superblock: every page carries its tags in its spare bytes, and
