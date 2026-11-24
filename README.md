@@ -553,7 +553,8 @@ never touches the rest.
 
 `collect()` returns the regular files in tree order, which is what an extraction
 needs. Something that wants **everything**, directories included, should ask
-`walk_all()` instead, because it takes a faster route where one exists.
+`walk_all()` instead, because it takes a faster route where one exists. `collect()` and
+the tree walk of `walk_all()` go as deep as the volume does and enter each folder once.
 
 ```python
 for path, node, mode, size, mtime, recorded in q.walk_all(walker):
@@ -3083,7 +3084,9 @@ Version 4.0 is read. The 1.x to 3.x layouts, and their big-endian `sqsh` form, a
 recognised and reported but not walked. A volume is claimed only when its superblock
 passes the checks the kernel makes before it mounts one (a block size that agrees with its
 own log, a compression id the format defines) and its root inode reads back as a
-directory.
+directory. Two cases are named without a root inode that reads, and recorded as not read:
+a volume whose decompressor this Python lacks, and an image cut short of the bytes its
+superblock records (both below).
 
 Every compressor mksquashfs offers is read: gzip, xz (including a BCJ filter), the legacy
 lzma format, LZO, LZ4 and, on Python 3.14 or later, zstd. Files split into blocks, files
@@ -3096,6 +3099,63 @@ agree with `unsquashfs -lln` on every image. The tree includes random bytes that
 4 KiB-block image stores uncompressed because they did not shrink, a file shaped to reach
 an LZ decoder's rarer instructions, a directory of 600 entries (more than one directory
 header and metadata block) and a 255-byte name.
+
+**Names.** SquashFS stores a name as the bytes Linux gave it, and the kernel copies them
+without decoding (`fs/squashfs/dir.c`). A stretch of a name that is not UTF-8 is written as
+`%XX` of its stored bytes (a name stored as `a`, byte `0x80`, `b.txt` is `a%80b.txt`), and a
+name never holds a surrogate. A literal `%` is not escaped, so a file really named
+`caf%E9.txt` can match an escaped one, and the duplicate handling keeps both. A `/` or a
+NUL inside one name would be written `%2F` or `%00`; that is not exercised, because a Linux
+file name holds neither and no fixture does. A symlink's target is a path, so its `/`
+separators stay and only bytes that are not UTF-8 are written as `%XX`. Checked on an image
+mksquashfs wrote from 20 entries, 10 of them with a path that is not UTF-8
+(`tools/make_squashfs_odd_fixture.sh`): every name matches the source tree's bytes under
+this rule and goes into SQLite, and the 18 files match their hashes.
+
+**A Python without the decompressor.** gzip is read with Python's `zlib` module, xz and
+the legacy lzma format with its `lzma` module, and zstd with `compression.zstd`, which
+Python has from 3.14. LZO and LZ4 are decoded by qnxprobe's own code, so nothing can be
+missing for them. When the running Python does not have the module a volume needs, the
+volume is still identified and its note names the module. mksquashfs compresses the
+metadata as well unless told not to, so the root folder cannot be read: an export records
+that in `volumes.json` as `folders_not_read` and a damage line that names the module,
+writes no file for the volume, and exits 1. A volume that uses another compressor still
+reads. This is tested for zstd on Python 3.10 and 3.12, which do not have it, and for
+`lzma` and `zlib` by making the import fail, because every Python at hand was built with
+both.
+
+**An image cut short.** The superblock records how many bytes the volume uses, and the
+kernel refuses to mount one that reaches past its device (`fs/squashfs/super.c`). When the
+image holds fewer bytes than that, the volume is still named, provided its superblock
+passes the checks the kernel makes on the superblock alone, even when its root inode is in
+the part that is gone. Its note and its first damage line give the bytes recorded, the
+bytes the image holds, and the tables the superblock's own offsets place in the missing
+part; `volumes.json` carries the shortfall as `extends_past_image_by_bytes`. A folder whose
+inode or listing cannot be read is recorded with what that leaves out and counted in
+`folders_not_read`, and the run exits 1. A fragment table that cannot be read is recorded
+once, and the read of a file that needs it is refused with that reason. Nothing is
+recovered.
+
+A SquashFS volume holds its file data first, then the inode table, the directory table and
+the smaller tables (the layout in the kernel's `Documentation/filesystems/squashfs.rst`),
+so a cut that reaches file data also takes the root folder, and no file is listed. Checked
+at three cut points (the last 4 KiB, halfway, just after the inode table) on 36 volumes
+mksquashfs wrote: 76 of the 108 cuts list nothing and exit 1 with those records. 26 took
+only tables this reader does not use (the export, id and extended attribute tables): every
+file still reads, the record says what is missing, and the exit status stays 0. 2 fell in
+the padding after the volume's end, where nothing is missing. 4 left a file of 0 bytes,
+which has no superblock to name, so nothing is recorded for it. A folder read only in part
+is recorded by the same code, but no cut tested reached that state.
+
+**Folder depth.** Folders are read at every level. `collect()` and the tree walk of
+`walk_all()`, which every reader's export and listing go through, used to stop below 64
+levels and say nothing: an image mksquashfs wrote with a chain of folders 70 levels deep
+exported 64 of its 70 files and exited 0. Both now keep their own stack of the folders they
+are inside, go as deep as the volume does, and enter each folder once, which is what ends
+a loop. That image (`tools/make_squashfs_deep_fixture.sh`) now exports 70 of 70 files that
+match the source tree. The change is in code every reader shares, so the self-test also
+holds `collect()` against a walk that calls itself on an ext4 and a FAT16 fixture, and
+walks a chain of 3,000 folders that loops back on itself.
 
 ### JFFS2
 
@@ -5153,7 +5213,8 @@ above are in this README only for now.)
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
   the reason as the volume's note, so the report, the window and a LEAPP run log say why
-  it lists nothing. In UBIFS each file whose data
+  it lists nothing, and an export records the volume as not read and exits 1 (see
+  [SquashFS](#squashfs)). In UBIFS each file whose data
   is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
   were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
   JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is

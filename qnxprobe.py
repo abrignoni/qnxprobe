@@ -18126,6 +18126,12 @@ def lz4_block_decompress(src, limit=None):
 # on, so a listing that comes back empty says why wherever the volume is shown.
 SQUASHFS_NO_ZSTD_NOTE = ("zstd compressed; this Python has no zstd (3.14 adds it), so "
                          "the listing may be short and no file can be read")
+# The same for xz and the legacy lzma format (the lzma module) and for gzip
+# (zlib). Both are in the standard library, lzma since 3.3, and both are left
+# out when Python is built without the C library behind them.
+SQUASHFS_NO_MODULE_NOTE = ("{0} compressed; this Python has no {1} module (the standard "
+                           "library carries it unless Python was built without {2}), so "
+                           "the listing may be short and no file can be read")
 
 
 def _zstd_module():
@@ -18173,7 +18179,9 @@ def zstd_decompress(src):
 # ---------------------------------------------------------------------------
 SQUASHFS_MAGIC = 0x73717368
 SQFS_METADATA_SIZE = 8192
+SQFS_DAMAGE_KEPT = 1000                 # entries kept in a walker's damage list
 SQFS_INVALID_FRAG = 0xFFFFFFFF
+SQFS_INVALID_BLK = 0xFFFFFFFFFFFFFFFF   # a table the volume does not have (squashfs_fs.h:40)
 SQFS_COMP = {1: "gzip", 2: "lzma", 3: "lzo", 4: "xz", 5: "lz4", 6: "zstd"}
 SQFS_TYPE_MODE = {1: S_IFDIR, 2: S_IFREG, 3: S_IFLNK, 4: 0o060000, 5: 0o020000,
                   6: 0o010000, 7: 0o140000, 8: S_IFDIR, 9: S_IFREG, 10: S_IFLNK,
@@ -18189,6 +18197,36 @@ class SquashfsUnreadable(Exception):
     says which and why."""
 
 
+# What a read of SquashFS metadata raises when it cannot give the bytes back.
+_SQFS_READ_ERRORS = (SquashfsUnreadable, DecompressError, struct.error)
+# The standard library module each compressor is decoded with, and the C library
+# a Python build needs for it. LZO (3) and LZ4 (5) are decoded by this file's own
+# code and zstd (6) is asked for through _zstd_module().
+_SQFS_MODULE = {1: ("zlib", "zlib"), 2: ("lzma", "liblzma"), 4: ("lzma", "liblzma")}
+
+
+def _sqfs_absent_module(comp):
+    """(module, C library) when the standard library module that decodes
+    compression id ``comp`` is not in this Python, else None."""
+    module, library = _SQFS_MODULE.get(comp, (None, None))
+    if module is None:
+        return None
+    try:
+        __import__(module)
+    except ImportError:
+        return module, library
+    return None
+
+
+def _sqfs_no_decompressor(comp):
+    """Why this Python cannot decompress SquashFS compression id ``comp``, as
+    text that names the module and which Python has it, else None."""
+    if comp == 6:
+        return None if _zstd_module() is not None else SQUASHFS_NO_ZSTD_NOTE
+    absent = _sqfs_absent_module(comp)
+    return SQUASHFS_NO_MODULE_NOTE.format(SQFS_COMP[comp], *absent) if absent else None
+
+
 def _sqfs_decompress(comp, data, limit):
     """Turn one compressed SquashFS block back into its bytes. The wrappers are
     fs/squashfs/{zlib,xz,lzo,lz4,zstd}_wrapper.c: gzip is a zlib stream with its
@@ -18199,38 +18237,62 @@ def _sqfs_decompress(comp, data, limit):
     the header's 8-byte size field with the real size; its own decoder puts the
     "unknown" value (all 0xFF) back before decoding and keeps that many bytes
     (squashfs-tools/lzma_xz_wrapper.c lzma_compress and lzma_uncompress, at
-    708c59ae), and so does this."""
-    import lzma, zlib
+    708c59ae), and so does this.
+
+    Each module is imported where its compressor is met, so a Python built
+    without one still reads the volumes that do not use it, and a volume that
+    does says which module is absent instead of stopping the run."""
+    if comp == 3:
+        return lzo1x_decompress(data, limit)
+    if comp == 5:
+        return lz4_block_decompress(data, limit)
+    if comp == 6:
+        return zstd_decompress(data)
+    if comp not in _SQFS_MODULE:
+        raise DecompressError(f"compression id {comp} is not one SquashFS defines")
     try:
         if comp == 1:
-            return zlib.decompress(data)
-        if comp == 4:
-            return lzma.decompress(data, format=lzma.FORMAT_XZ)
-        if comp == 2:
+            import zlib
+            try:
+                return zlib.decompress(data)
+            except zlib.error as exc:
+                raise DecompressError(f"gzip: {exc}") from None
+        import lzma
+        try:
+            if comp == 4:
+                return lzma.decompress(data, format=lzma.FORMAT_XZ)
             if len(data) < 13:
                 raise DecompressError("lzma block shorter than its header")
             want = struct.unpack_from("<I", data, 5)[0]
             out = lzma.decompress(data[:5] + b"\xff" * 8 + data[13:],
                                   format=lzma.FORMAT_ALONE)
             return out[:want]
-        if comp == 3:
-            return lzo1x_decompress(data, limit)
-        if comp == 5:
-            return lz4_block_decompress(data, limit)
-        if comp == 6:
-            return zstd_decompress(data)
-    except (zlib.error, lzma.LZMAError) as exc:
-        raise DecompressError(f"{SQFS_COMP.get(comp)}: {exc}") from None
-    raise DecompressError(f"compression id {comp} is not one SquashFS defines")
+        except lzma.LZMAError as exc:
+            raise DecompressError(f"{SQFS_COMP[comp]}: {exc}") from None
+    except ImportError:
+        module, library = _SQFS_MODULE[comp]
+        raise DecompressError(f"{SQFS_COMP[comp]} needs the standard library's {module} "
+                              f"module (in a Python built with {library}); this Python "
+                              "does not carry it") from None
 
 
 class SquashfsWalker:
     """List and read a SquashFS 4.0 image. A node is an inode reference (the
     metadata block's offset in the inode table, shifted left 16, plus the byte
     offset inside it), which is what a directory entry records, so a hard link
-    is one node reached by two names."""
+    is one node reached by two names.
 
-    def __init__(self, fh, base):
+    What could not be read is recorded in ``damage`` (see damage_lines), the
+    first 1,000 entries of it, and ``folders_not_read`` counts the folders whose
+    inode or listing could not be read in full. Nothing is recovered.
+
+    ``size`` is the byte length of the region the volume sits in.
+    ``declared_end`` is where the superblock says the volume ends. When the
+    image stops before that, ``missing`` is how many bytes short it is, and
+    ``damage`` and ``note`` say so and name the tables the superblock places
+    past that point."""
+
+    def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
         sb = read_at(fh, base, 96)
         if len(sb) < 96 or struct.unpack_from("<I", sb, 0)[0] != SQUASHFS_MAGIC:
@@ -18251,12 +18313,94 @@ class SquashfsWalker:
         self._meta = {}
         self._ids = None
         self._frag_index = None
+        self._frag_error = None
+        self.damage, self._damage_seen = [], set()
+        self.folders_not_read, self._not_read = 0, set()
+        self._folder_names, self._folder_parents = {}, {}
+        self.declared_end = base + self.bytes_used
+        self.held = self._held(size)
+        self.missing = max(self.bytes_used - self.held, 0) if self.held is not None else 0
+        self._cut = self._cut_text() if self.missing else None
+        if self._cut:
+            self._damaged(self._cut)
         # Many small files share one fragment block, so the last few blocks are
         # kept decompressed, as the kernel's fragment cache does (super.c,
         # SQUASHFS_CACHED_FRAGMENTS).
         self._frags = collections.OrderedDict()
 
     root = property(lambda self: self.root_ref)
+
+    # -- what could not be read ----------------------------------------------
+    def _held(self, size):
+        """How many bytes of the volume can be read: what the image holds from
+        ``base`` on, since no read stops at the region's end. A volume read
+        through a map sits past the image's own end (LvmImage); for it, or when
+        the image cannot say how long it is, the region's length is the answer,
+        and None when that is not known either."""
+        try:
+            end = image_size(self.fh)
+        except (OSError, ValueError, TypeError, AttributeError):
+            end = None
+        if isinstance(end, int) and self.base < end:
+            return end - self.base
+        return size
+
+    def _cut_text(self):
+        """What a volume longer than the image says: how much is missing, and the
+        tables the superblock's own offsets place wholly or partly in it, which
+        need not be all that is lost. The inode table runs up to the directory
+        table. Each of the fragment, export and id tables is found through a
+        list of pointers at the offset the superblock gives, written after the
+        blocks it points to (id.c:88-94, fragment.c:79-81), so the table is
+        whole only when that list is. Where the directory table ends is not in
+        the superblock, so it is named only when it begins past the cut. The
+        xattr table is named when its 16-byte header is not all here."""
+        held, gone = self.held, []
+        if self.dir_table > held:
+            gone.append("inode")
+        if self.dir_table >= held:
+            gone.append("directory")
+        for name, start, entries, width in (("fragment", self.frag_table, self.fragments, 16),
+                                            ("export", self.lookup_table, self.inodes, 8),
+                                            ("id", self.id_table, self.no_ids, 4)):
+            pointers = -(-entries * width // SQFS_METADATA_SIZE) * 8
+            if entries and start != SQFS_INVALID_BLK and start + pointers > held:
+                gone.append(name)
+        if self.xattr_table != SQFS_INVALID_BLK and self.xattr_table + 16 > held:
+            gone.append("xattr")
+        text = (f"the superblock records {self.bytes_used:,} bytes and the image holds "
+                f"{held:,} of them, so the last {self.missing:,} bytes are missing")
+        if gone:
+            text += ("; by its offsets they include all or part of the "
+                     + (" and ".join(filter(None, [", ".join(gone[:-1]), gone[-1]])))
+                     + (" tables" if len(gone) > 1 else " table"))
+        return text
+
+    def _damaged(self, what):
+        if what not in self._damage_seen and len(self.damage) < SQFS_DAMAGE_KEPT:
+            self._damage_seen.add(what)
+            self.damage.append(what)
+
+    def _folder_path(self, ref):
+        """A folder's path from the names it was listed under, "" for the root."""
+        parts, hops = [], 0
+        while ref != self.root_ref and ref in self._folder_names and hops < 4096:
+            parts.append(self._folder_names[ref])
+            ref = self._folder_parents.get(ref)
+            hops += 1
+        return "/".join(reversed(parts))
+
+    def _folder_part(self, ref, found):
+        """Record a folder that was not listed in full, counted once per folder.
+        damage_lines() keeps 240 characters of a line, so the folder's path goes last."""
+        if ref == self.root_ref:
+            self._damaged(f"the root folder {found}")
+        else:
+            self._damaged(f"a folder {found}: "
+                          f"{self._folder_path(ref) or f'inode reference {ref:#x}'}")
+        if ref not in self._not_read:
+            self._not_read.add(ref)
+            self.folders_not_read += 1
 
     # -- metadata ----------------------------------------------------------
     def _meta_block(self, pos):
@@ -18318,7 +18462,15 @@ class SquashfsWalker:
     def _fragment(self, index):
         """(start, stored_size_word) for a fragment table entry."""
         if self._frag_index is None:
-            self._frag_index = self._table(self.frag_table, self.fragments, 16)
+            if self._frag_error is None:
+                try:
+                    self._frag_index = self._table(self.frag_table, self.fragments, 16)
+                except _SQFS_READ_ERRORS as exc:
+                    self._frag_error = f"the fragment table could not be read ({exc})"
+                    self._damaged(f"{self._frag_error}, so no file that ends in a shared "
+                                  "fragment can be read to its end")
+            if self._frag_index is None:
+                raise SquashfsUnreadable(self._frag_error)
         if index >= self.fragments:
             raise SquashfsUnreadable(f"fragment {index} is beyond the table")
         start, size = struct.unpack_from("<QI", self._frag_index, index * 16)
@@ -18380,33 +18532,40 @@ class SquashfsWalker:
     def entry(self, ref):
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS:
             return None
         return ino["mode"], ino["size"], ino["mtime"]
 
     def readlink(self, ref):
+        """A symlink's target as stored, a path and not one name: bytes that are not
+        UTF-8 come back as %XX, and its "/" separators are left as they are."""
         ino = self.inode(ref)
-        return ino.get("target", b"").decode("utf-8", "surrogateescape")
+        return ino.get("target", b"").decode("utf-8", "qnxprobe-name")
 
     @property
     def note(self):
-        """Why this volume cannot be read on this Python, or None. listdir()
-        answers an empty list when its directory table cannot be decompressed,
-        so volumes() carries this beside the volume to say why."""
-        if self.comp == 6 and _zstd_module() is None:
-            return SQUASHFS_NO_ZSTD_NOTE
-        return None
+        """Why this volume cannot be read on this Python, and how much of it the
+        image does not hold, or None. listdir() answers an empty list when its
+        directory table cannot be read, so volumes() carries this beside the
+        volume to say why."""
+        parts = [_sqfs_no_decompressor(self.comp), self._cut]
+        return "; ".join(p for p in parts if p) or None
 
     def listdir(self, ref):
+        """[(name, node)] for a folder. A folder that cannot be read, or can be
+        read only in part, answers what was read and is recorded in ``damage``
+        and counted in ``folders_not_read``."""
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS as exc:
+            self._folder_part(ref, f"could not be read ({exc}), so nothing in it is listed "
+                                   "or exported")
             return []
         if ino["type"] not in (1, 8):
             return []
         out = []
         pos, off = self.dir_table + ino["dir_start"], ino["dir_off"]
-        left = ino["size"] - 3                       # "." and ".." are not stored
+        total = left = ino["size"] - 3               # "." and ".." are not stored
         try:
             while left > 0:
                 hdr, pos, off = self._meta_read(pos, off, 12)
@@ -18416,15 +18575,29 @@ class SquashfsWalker:
                     raise SquashfsUnreadable("directory header counts more than 256")
                 for _ in range(count + 1):
                     ent, pos, off = self._meta_read(pos, off, 8)
-                    ioff, _delta, _dtype, nlen = struct.unpack("<HhHH", ent)
+                    ioff, _delta, dtype, nlen = struct.unpack("<HhHH", ent)
                     if nlen + 1 > 256:
                         raise SquashfsUnreadable("directory entry name over 256 bytes")
                     name, pos, off = self._meta_read(pos, off, nlen + 1)
                     left -= 8 + nlen + 1
-                    out.append((name.decode("utf-8", "surrogateescape"),
-                                (start << 16) | ioff))
-        except (SquashfsUnreadable, DecompressError, struct.error):
-            pass                                     # report what was read
+                    # the kernel copies the name's bytes and never decodes them
+                    # (fs/squashfs/dir.c), so a stretch that is not UTF-8 is %XX
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
+                    child = (start << 16) | ioff
+                    out.append((name, child))
+                    if dtype == 1 and child not in self._folder_names:
+                        # the entry's own type field says it is a folder, so a
+                        # record about it can give its path
+                        self._folder_names[child], self._folder_parents[child] = name, ref
+        except _SQFS_READ_ERRORS as exc:             # report what was read
+            if out:
+                self._folder_part(ref, f"was listed in part: {len(out):,} entries were read "
+                                       f"and the last {left:,} of its {total:,} listing bytes "
+                                       f"could not be ({exc}), so entries are missing")
+            else:
+                self._folder_part(ref, f"could not be listed ({exc}), so nothing in it is "
+                                       "listed or exported")
         return out
 
     # -- file data ---------------------------------------------------------
@@ -18477,6 +18650,14 @@ def identify_squashfs(fh, base, size=None):
     a power of two in 4 KiB..1 MiB that agrees with block_log, its compression
     id is one the format defines, and its root inode reads back as a
     directory, the checks super.c applies before it will mount.
+
+    A volume whose root inode cannot be read is still named when its
+    superblock passes the checks super.c makes on the superblock alone (the
+    ones above, a root inode offset inside a metadata block, the inode table
+    before the directory table: super.c:232-289 and 441) and records more
+    bytes than the image holds, with the end of the inode table past what is
+    here. That is an image cut short, which the kernel refuses to mount
+    (super.c:256-261); naming it lets an export record what is missing.
     """
     sb = read_at(fh, base, 96)
     if len(sb) < 32:
@@ -18494,16 +18675,17 @@ def identify_squashfs(fh, base, size=None):
             "contents     a pre-4.0 layout, reported here but not walked; the Linux "
             "kernel's own driver refuses them too (fs/squashfs/super.c)"]
     try:
-        w = SquashfsWalker(fh, base)
+        w = SquashfsWalker(fh, base, size)
     except SquashfsUnreadable:
         return None
     if w.comp not in SQFS_COMP:
         return None
+    root_read = True
     try:
         root = w.inode(w.root)
         root_ok = root["type"] in (1, 8)
     except (SquashfsUnreadable, DecompressError, struct.error, ValueError):
-        root_ok = False
+        root_ok = root_read = False
     flags = [name for bit, name in SQFS_FLAGS if w.flags >> bit & 1]
     lines = [
         "version      4.0",
@@ -18516,13 +18698,18 @@ def identify_squashfs(fh, base, size=None):
     ]
     if flags:
         lines.append("flags        " + ", ".join(flags))
-    if size is not None and w.bytes_used > size:
+    here = min(n for n in (size, w.held, w.bytes_used) if n is not None)
+    if w.bytes_used > here:
         lines.append(f"note         the image records {human(w.bytes_used)} but the region "
-                     f"holds {human(size)}, so its end is missing")
-    if w.comp == 6 and _zstd_module() is None:
-        lines.append("note         " + SQUASHFS_NO_ZSTD_NOTE)
+                     f"holds {human(here)}, so its end is missing")
+    no_module = _sqfs_no_decompressor(w.comp)
+    if no_module:
+        lines.append("note         " + no_module)
     if not root_ok:
-        if w.comp == 6 and _zstd_module() is None:
+        if no_module:
+            return "squashfs", lines
+        if (not root_read and w.missing and w.dir_table > w.held
+                and (w.root_ref & 0xFFFF) <= SQFS_METADATA_SIZE):
             return "squashfs", lines
         return None
     return "squashfs", lines
@@ -21547,34 +21734,52 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
     FAT and exFAT are those: they hold a wall-clock reading and no zone, so
     ``mtime`` above stays zero for them and the readings arrive here as text
     instead, where nothing downstream can put a zone on them.
+
+    Every level under the inode is walked, however deep: the walk keeps its
+    own stack of the folders it is inside, so its depth is not Python's. A
+    folder is listed once, when it is first reached, and a folder already in
+    ``seen`` is not entered again, which is what ends a loop.
     """
     if seen is None:
-        seen, out = set(), []
-    if depth > 64 or num in seen:
+        seen = set()
+    if out is None:
+        out = []
+    records = times is not None and hasattr(w, "listdir_records")
+
+    def listing(node):
+        if records:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    if num in seen:
         return out
     seen.add(num)
-    if times is not None and hasattr(w, "listdir_records"):
-        listing = w.listdir_records(num)
-    else:
-        listing = [(name, ino, None) for name, ino in w.listdir(num)]
-    for name, ino, recorded in listing:
-        ent = w.entry(ino)
-        if not ent:
-            continue
-        mode, size, mtime = ent
-        path = f"{prefix}/{name}" if prefix else name
-        if times is not None and recorded:
-            kept = {k: v for k, v in recorded.items() if v}
-            if kept:
-                times[path] = kept
-        if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
-            if getattr(w, "note_folder", None) is not None and w.note_folder(path, ino):
-                out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
-            collect(w, ino, path, depth + 1, seen, out, times)
-        elif (mode & 0o170000) == 0o100000:          # regular files only
-            out.append((path, ino, size, mtime))
+    stack = [(prefix, listing(num))]                 # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
+            ent = w.entry(ino)
+            if not ent:
+                continue
+            mode, size, mtime = ent
+            path = f"{prefix}/{name}" if prefix else name
+            if times is not None and recorded:
+                kept = {k: v for k, v in recorded.items() if v}
+                if kept:
+                    times[path] = kept
+            if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
+                if getattr(w, "note_folder", None) is not None and w.note_folder(path, ino):
+                    out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
+                if ino not in seen:
+                    seen.add(ino)
+                    stack.append((path, listing(ino)))
+                    break                            # its entries come before the rest of this one's
+            elif (mode & 0o170000) == 0o100000:      # regular files only
+                out.append((path, ino, size, mtime))
+            else:
+                out.append((path, ino, None, mtime))     # symlink or special
         else:
-            out.append((path, ino, None, mtime))     # symlink or special
+            stack.pop()
     if depth == 0 and num == getattr(w, "root", None) and hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
     return out
@@ -21610,6 +21815,9 @@ def walk_all(w):
     mode rather than by ``mode & S_IFDIR``, which is also true of a block
     device, whose format bits share that one. The JFFS2 fixtures carry a block
     device, which the looser test would have walked into as a directory.
+
+    The generic route walks every level, as ``collect()`` does, on a stack of
+    its own, and enters a folder once.
     """
     fast = getattr(w, "listing", None)
     if fast is not None:
@@ -21620,33 +21828,33 @@ def walk_all(w):
     if prime is not None:
         prime()
     records = hasattr(w, "listdir_records")
-    seen = set()
 
-    def walk(node, prefix, depth):
-        if depth > 64:
-            return
-        key = (w.walk_key(node) if hasattr(w, "walk_key")
-               else node[0] if isinstance(node, tuple) else node)
-        if key in seen:
-            return
-        seen.add(key)
+    def listing(node):
         if records:
-            listing = w.listdir_records(node)
-        else:
-            listing = [(name, ino, None) for name, ino in w.listdir(node)]
-        for name, ino, recorded in listing:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    def key(node):
+        return (w.walk_key(node) if hasattr(w, "walk_key")
+                else node[0] if isinstance(node, tuple) else node)
+
+    seen = {key(w.root)}
+    stack = [("", listing(w.root))]                  # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
             ent = w.entry(ino)
             if not ent:
                 continue
             mode, size, mtime = ent
             path = f"{prefix}/{name}" if prefix else name
             yield (path, ino, mode, size, mtime, recorded)
-            if mode & S_IFMT == S_IFDIR:
-                for item in walk(ino, path, depth + 1):
-                    yield item
-
-    for item in walk(w.root, "", 0):
-        yield item
+            if mode & S_IFMT == S_IFDIR and key(ino) not in seen:
+                seen.add(key(ino))
+                stack.append((path, listing(ino)))
+                break                                # its entries come before the rest of this one's
+        else:
+            stack.pop()
     if hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
 
@@ -27200,7 +27408,7 @@ def walker_for(kind, fh, base, size=None):
     if kind == "QNX IFS boot image":
         return IfsWalker(fh, base)
     if kind == "squashfs":
-        return SquashfsWalker(fh, base)
+        return SquashfsWalker(fh, base, size)
     if kind == "xfs":
         return XfsWalker(fh, base, size)
     if kind == "btrfs":
@@ -41960,8 +42168,10 @@ def flash_regions(fh, size):
     """[(label, base, size)] for the flash filesystems found inside an image
     with no partition table, in image order. Only aligned offsets are tried:
 
-      SquashFS  "hsqs" whose superblock and root inode read (identify_squashfs);
-                its extent is the bytes_used it records, rounded up to 4 KiB
+      SquashFS  "hsqs" whose superblock and root inode read, or whose superblock
+                reaches past the end of the image (identify_squashfs); its extent
+                is the bytes_used it records, rounded up to 4 KiB, or what the
+                image holds of that
       UBI       an erase counter header whose CRC holds; its extent runs over
                 the following eraseblocks that carry a header of the same
                 image_seq or are erased
@@ -52173,6 +52383,334 @@ def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False, clock=True, bad_crc
             [(ds + (bitmap_b + 1) * bs, 9 * bs)])
 
 
+def _squashfs_reader_checks():
+    """[(label, passed or None for a skip)] for the SquashFS reader, on volumes
+    mksquashfs 4.7.5 wrote and unsquashfs read back (tools/make_squashfs_*.sh), each
+    held against a list made from its source tree. Each row runs on its own, so one
+    that raises is one FAIL that names the exception and the rest still run."""
+    import contextlib                               # pylint: disable=import-outside-toplevel
+    import gzip                                     # pylint: disable=import-outside-toplevel
+    import hashlib                                  # pylint: disable=import-outside-toplevel
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    out = []
+
+    def load(name):
+        """A fixture's bytes, gunzipped when it is an image, or None when it is absent."""
+        full = os.path.join(here, name)
+        if not os.path.isfile(full):
+            return None
+        with (gzip.open(full, "rb") if name.endswith(".gz") else open(full, "rb")) as fh:
+            return fh.read()
+
+    def export(data):
+        """The export of one image through main(): (volume records, {stored path: member
+        bytes}, {stored path: member name} from the exceptions table, what was printed)."""
+        man, said, zbuf = [], io.StringIO(), io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout, \
+                contextlib.redirect_stdout(said):
+            main("squashfs.img", extract="(memory)", zf=zout, manifest=man,
+                 image=io.BytesIO(bytes(data)))
+        with zipfile.ZipFile(zbuf) as zin:
+            members = {n.split("/", 1)[-1]: zin.read(n) for n in zin.namelist()
+                       if not n.endswith(".tsv") and n != "volumes.json"}
+        return man, members, said.getvalue()
+
+    def row(name, test):
+        try:
+            got = test()
+            ok = None if got is None else bool(got)
+        except Exception as exc:                    # pylint: disable=broad-except
+            name, ok = f"{name} ({type(exc).__name__}: {exc})", False
+        out.append((name, ok))
+
+    def stored_names():
+        image, listing = load("squashfs-odd.img.gz"), load("squashfs-odd.src.json")
+        if image is None or listing is None:
+            return None
+        import sqlite3                              # pylint: disable=import-outside-toplevel
+
+        def rule(raw):
+            """One stored name as the name rule gives it, worked out a byte at a time."""
+            text, at = "", 0
+            while at < len(raw):
+                for width in (1, 2, 3, 4):
+                    try:
+                        text += raw[at:at + width].decode("utf-8")
+                        at += width
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    text += f"%{raw[at]:02X}"
+                    at += 1
+            return text
+
+        rows = json.loads(listing)
+        for r in rows:
+            r["raw"] = bytes.fromhex(r["path_hex"])
+            r["path"] = "/".join(rule(part) for part in r["raw"].split(b"/"))
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        walked = [(path, node) for path, node, *_rest in walk_all(w)]
+        db = sqlite3.connect(":memory:")
+        db.execute("create table names (name text)")
+        db.executemany("insert into names values (?)", [(path,) for path, _node in walked])
+        apart = db.execute("select count(*) from names where name in ('a%80b.txt', 'a%81b.txt', "
+                           "'%82leading.txt', 'dir%E9', '%FF%FE%FD.bin')").fetchone()[0]
+        link = next(r for r in rows if r["kind"] == "symlink")
+        target = w.readlink(dict(walked)[link["path"]])
+        man, members, _said = export(image)
+        files = [r for r in rows if r["kind"] == "file"]
+        digest = {name: hashlib.sha256(data).hexdigest() for name, data in members.items()}
+        by_raw = {r["raw"]: r["sha256"] for r in files}
+        # a file really named caf%E9.txt and the one stored as caf<E9>.txt come out under
+        # one name, and the export keeps both (the second as .dup-2)
+        return (sorted(path for path, _node in walked) == sorted(r["path"] for r in rows)
+                and sum(1 for r in rows if r["path"].encode("utf-8") != r["raw"]) == 10
+                and apart == 5 and target == rule(bytes.fromhex(link["target_hex"])) == "target%E9"
+                and digest.get("a%80b.txt") == by_raw[b"a\x80b.txt"]
+                and digest.get("a%81b.txt") == by_raw[b"a\x81b.txt"]
+                and digest.get("dir%E9/inner0.txt") == by_raw[b"dir\xe9/inner0.txt"]
+                and sorted(digest.values()) == sorted(by_raw.values())
+                and man[0]["files"] == len(files) and not man[0]["failed"])
+    row("SquashFS: a stored name that is not UTF-8 comes back with those bytes as %XX and no "
+        "surrogate, goes into SQLite, and is the zip member's name; two names that differ in "
+        "one such byte stay apart; a symlink's target is read the same way", stored_names)
+
+    def not_read(run, module):
+        """Whether an export recorded its one volume as not read for want of ``module``."""
+        man, members, _said = run
+        rec = man[0] if man else {}
+        first = (rec.get("damage_first") or [""])[0]
+        return (not members and len(man) == 1 and rec.get("filesystem") == "squashfs"
+                and rec.get("files") == 0 and rec.get("folders_not_read") == 1
+                and rec.get("damage_recorded") == 1 and len(first) <= 240
+                and first.startswith("the root folder could not be read") and module in first
+                and _volumes_not_read(man) == 1)
+
+    def whole(run):
+        man, members, _said = run
+        return (len(members) == 612 and len(man) == 1 and man[0]["files"] == 612
+                and not man[0].get("damage_recorded") and not man[0].get("folders_not_read")
+                and not man[0]["failed"] and _volumes_not_read(man) == 0)
+
+    def without_zstd():
+        image = load("squashfs-zstd.img.gz")
+        if image is None:
+            return None
+        names = globals()
+        real = names["_zstd_module"]
+        try:
+            names["_zstd_module"] = lambda: None     # as on a Python older than 3.14
+            absent = export(image)
+        finally:
+            names["_zstd_module"] = real
+        said = (absent[0][0].get("damage_first") or [""])[0] if absent[0] else ""
+        if not (not_read(absent, "zstd") and "3.14" in said):
+            return False
+        return real() is None or whole(export(image))
+    row("SquashFS: a zstd volume on a Python with no zstd module is recorded as not read, "
+        "with a folder not read and a line that names zstd and Python 3.14, and counts for "
+        "the exit status; where zstd is present it reads whole with no record", without_zstd)
+
+    def without_module():
+        images = {c: load(f"squashfs-{c}.img.gz") for c in ("xz", "lzma", "gzip")}
+        if None in images.values():
+            return None
+
+        def absent(module, test):
+            """test() with "import <module>" failing, as on a Python built without it."""
+            held = sys.modules.get(module)
+            sys.modules[module] = None
+            try:
+                return test()
+            finally:
+                if held is None:
+                    del sys.modules[module]
+                else:
+                    sys.modules[module] = held
+
+        def no_lzma():
+            notes = {c: [v.get("note") for v in volumes(io.BytesIO(d), len(d))]
+                     for c, d in images.items()}
+            return {c: export(d) for c, d in images.items()}, notes
+
+        def no_zlib():
+            w = SquashfsWalker(io.BytesIO(images["gzip"]), 0)
+            return (w.listdir(w.root) == [] and w.folders_not_read == 1
+                    and "zlib module" in w.damage[0] and "zlib module" in (w.note or ""))
+
+        runs, notes = absent("lzma", no_lzma)
+        return (not_read(runs["xz"], "lzma module") and not_read(runs["lzma"], "lzma module")
+                and all("lzma module" in (notes[c][0] or "") for c in ("xz", "lzma"))
+                and whole(runs["gzip"]) and notes["gzip"] == [None]
+                and absent("zlib", no_zlib) and whole(export(images["xz"])))
+    row("SquashFS: with Python's lzma module absent, an xz and a legacy lzma volume are each "
+        "recorded as not read by a line and a note that name the module, and a gzip volume "
+        "still reads whole; a gzip volume without zlib is recorded the same way",
+        without_module)
+
+    def cut_images():
+        packed, stored = load("squashfs-gzip.img.gz"), load("squashfs-none.img.gz")
+        if packed is None or stored is None:
+            return None
+
+        def cut(image, keep):
+            """What an export of the first ``keep`` bytes records, and whether it is true."""
+            used = struct.unpack_from("<Q", image, 40)[0]
+            man, members, said = export(image[:keep])
+            rec = man[0] if len(man) == 1 else {}
+            lines = rec.get("damage_first") or []
+            found = volumes(io.BytesIO(image[:keep]), keep)
+            said_so = (rec.get("filesystem") == "squashfs"
+                       and rec.get("extends_past_image_by_bytes") == used - keep
+                       and "INCOMPLETE" in said and all(len(ln) <= 240 for ln in lines)
+                       and bool(lines) and lines[0].startswith(
+                           f"the superblock records {used:,} bytes and the image holds "
+                           f"{keep:,} of them, so the last {used - keep:,} bytes are missing")
+                       and len(found) == 1 and found[0]["kind"] == "squashfs"
+                       and (found[0].get("note") or "") == lines[0])
+            return said_so, rec, lines, members, man
+
+        def nothing_listed(image, keep, how):
+            said_so, rec, lines, members, man = cut(image, keep)
+            return (said_so and not members and rec["files"] == 0
+                    and rec.get("folders_not_read") == 1 and rec.get("damage_recorded") == 2
+                    and lines[1].startswith(f"the root folder could not be {how} (")
+                    and "so nothing in it is listed or exported" in lines[1]
+                    and _volumes_not_read(man) == 1)
+
+        for image in (packed, stored):
+            if not whole(export(image)) or volumes(io.BytesIO(image), len(image))[0].get("note"):
+                return False
+        after_inodes = [struct.unpack_from("<Q", image, 72)[0] for image in (packed, stored)]
+        # the last 4 KiB of the stored image hold only tables this reader does not use
+        # (export, id, xattr), so every file is still read and the record says what is gone
+        said_so, rec, lines, members, man = cut(stored, len(stored) - 4096)
+        _man, all_members, _said = export(stored)
+        tail_only = (said_so and members == all_members and rec["files"] == 612
+                     and rec.get("damage_recorded") == 1 and not rec.get("folders_not_read")
+                     and lines[0].endswith("the export, id and xattr tables")
+                     and _volumes_not_read(man) == 0)
+        # A caller that holds nodes from the whole image asks the cut one for them: the
+        # inode table is all there, the tables after it are not.
+        full = SquashfsWalker(io.BytesIO(packed), 0)
+        nodes = {path: node for path, node, *_rest in walk_all(full)}
+        short = SquashfsWalker(io.BytesIO(packed[:after_inodes[0]]), 0)
+        folder, small = nodes["dir/sub/deeper"], nodes["small.txt"]
+        listed, refused = short.listdir(folder), []
+        for _again in range(2):
+            try:
+                b"".join(short.read_file(small, full.entry(small)[1]))
+            except SquashfsUnreadable as exc:
+                refused.append(str(exc))
+        asked = (full._folder_path(folder) == "dir/sub/deeper" and not full.damage
+                 and listed == [] and short.folders_not_read == 1
+                 and short.damage[1].startswith("a folder could not be listed (")
+                 and short.damage[1].endswith(f": inode reference {folder:#x}")
+                 and len(refused) == 2 and len(short.damage) == 3
+                 and all(r.startswith("the fragment table could not be read (") for r in refused)
+                 and short.damage[2].startswith(refused[0])
+                 and "no file that ends in a shared fragment" in short.damage[2])
+        return (tail_only and asked
+                and nothing_listed(packed, len(packed) - 4096, "listed")
+                and nothing_listed(packed, len(packed) // 2, "read")
+                and nothing_listed(packed, after_inodes[0], "listed")
+                and nothing_listed(stored, len(stored) // 2, "read")
+                and nothing_listed(stored, after_inodes[1], "listed"))
+    row("SquashFS: an image cut short of what its superblock records is still named and its "
+        "record says how much is missing: cut in half, just after the inode table, or (a gzip "
+        "image) by its last 4 KiB, the root folder is recorded as not read and counts for "
+        "the exit status; an image that lost only tables this reader does not use still "
+        "reads every file; a folder and a fragment table past the cut are recorded when "
+        "they are asked for", cut_images)
+
+    def every_level():
+        image, sums = load("squashfs-deep.img.gz"), load("squashfs-deep.src.sha256")
+        if image is None or sums is None:
+            return None
+        want = dict(reversed(line.split("  ", 1)) for line in sums.decode("utf-8").splitlines())
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        read = {path: hashlib.sha256(b"".join(w.read_file(node, size))).hexdigest()
+                for path, node, size, _mtime in collect(w, w.root)}
+        walked = [path for path, *_rest in walk_all(SquashfsWalker(io.BytesIO(image), 0))]
+        man, members, _said = export(image)
+        return (len(want) == 70 and max(path.count("/") for path in want) == 70
+                and read == want and len(walked) == 140 and set(want) <= set(walked)
+                and {path: hashlib.sha256(data).hexdigest()
+                     for path, data in members.items()} == want
+                and man[0]["files"] == 70 and not man[0].get("damage_recorded")
+                and _volumes_not_read(man) == 0)
+    row("SquashFS: a chain of folders 70 levels deep that mksquashfs wrote is listed and "
+        "exported at every level, 70 of 70 files matching the source tree", every_level)
+
+    def any_depth():
+        class Chain:
+            """A walker over ``depth`` folders, each inside the one before with one file
+            beside it. The last folder also names the root and its own parent, a loop."""
+            root = 0
+
+            def __init__(self, depth):
+                self.depth = depth
+
+            def listdir(self, node):
+                if node < 0:
+                    return []
+                out = [("file.txt", -node - 1)]
+                if node + 1 < self.depth:
+                    return out + [("d", node + 1)]
+                return out + [("back", 0), ("up", max(node - 1, 0))]
+
+            def entry(self, node):
+                return (S_IFREG | 0o644, 1, 0) if node < 0 else (S_IFDIR | 0o755, 0, 0)
+
+        def plain(w, node, prefix, seen, times):
+            """The files under a folder by a walk that calls itself, as collect() did."""
+            if node in seen:
+                return []
+            seen.add(node)
+            out = []
+            listing = (w.listdir_records(node) if times else
+                       [(name, child, None) for name, child in w.listdir(node)])
+            for name, child, _recorded in listing:
+                ent = w.entry(child)
+                if not ent:
+                    continue
+                path = f"{prefix}/{name}" if prefix else name
+                if ent[0] & S_IFMT == S_IFDIR:
+                    out += plain(w, child, path, seen, times)
+                else:
+                    out.append((path, child, ent[1] if ent[0] & S_IFMT == S_IFREG else None,
+                                ent[2]))
+            return out
+
+        depth = 3000                                 # three times Python's own limit
+        files = collect(Chain(depth), 0)
+        every = list(walk_all(Chain(depth)))
+        if not (len(files) == depth == len({path for path, *_rest in files})
+                and files[-1][0] == "d/" * (depth - 1) + "file.txt"
+                and len(every) == 2 * depth + 1):
+            return False
+        for name, times in (("ext4-sparse.img.gz", False), ("fat16-fixture.img.gz", False),
+                            ("fat16-fixture.img.gz", True)):
+            image = load(name)
+            if image is None:
+                return None
+            w = next(v["walker"] for v in volumes(io.BytesIO(image), len(image))
+                     if v.get("walker") is not None)
+            want = plain(w, w.root, "", set(), times)
+            if not want or collect(w, w.root, times={} if times else None) != want:
+                return False
+            if sorted(p for p, *_r in walk_all(w) if p in {x[0] for x in want}) \
+                    != sorted(x[0] for x in want):
+                return False
+        return True
+    row("collect() and walk_all() walk every level and enter a folder once: a chain of "
+        "3,000 folders that loops back on itself gives each of its 3,000 files once, and on "
+        "an ext4 and a FAT16 volume collect() lists what a walk that calls itself lists, in "
+        "its order", any_depth)
+    return out
+
+
 def _qnx6_reader_checks():
     """The qnx6 reader on damaged and unusual volumes, each built by patching the
     self-test's own two-generation volume (_qnx6_test_volume) in memory. Each row
@@ -57928,6 +58466,11 @@ def self_test():
             lvm_checks += _refs_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
+        # SquashFS names, and what a volume that cannot be read in full records.
+        try:
+            lvm_checks += _squashfs_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the SquashFS reader checks ran ({type(exc).__name__}: {exc})", False)]
         # qnx6 on damaged and unusual volumes, patched from the self-test's own volume.
         try:
             lvm_checks += _qnx6_reader_checks()
