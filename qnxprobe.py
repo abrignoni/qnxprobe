@@ -6152,6 +6152,7 @@ APFS_OMAP_KEYROLLING                    = 0x8
 APFS_OMAP_VAL_ENCRYPTED                 = 0x4
 
 APFS_INO_EXT_TYPE_DSTREAM = 8   # the extended field holding a file's size
+APFS_INO_EXT_TYPE_PREV_FSIZE = 5   # the size to truncate back to (reference, page 111)
 # What says how much of a file the volume stores (Apple File System Reference:
 # j_inode_flags, the inode's extended fields and j_dstream_t). The data stream
 # field holds the size and then alloced_size, and for a sparse file alloced_size
@@ -7832,11 +7833,17 @@ class ApfsWalker:
         later transaction than the superblock chosen means the newest superblock was
         lost or never finished, and the older one is still the right one to read, so
         that is noted and the read goes on.
+
+        A newest superblock whose container object map block fails its checksum, id or
+        type cannot be read at all, so the newest older checkpoint whose map passes is
+        used, and noted. With none, the newest stays and the map's own error is reported.
+        Nothing else moves the read to an older checkpoint.
         """
         best, best_xid = head, struct.unpack_from("<Q", head, 16)[0]
         base = struct.unpack_from("<Q", head, 112)[0]
         blocks = struct.unpack_from("<I", head, 104)[0]
         maps, torn = [], []
+        copies = [(best_xid, head)]
         for i in range(min(blocks, 512)):
             raw = self.block(base + i)
             if len(raw) < 40:
@@ -7849,11 +7856,21 @@ class ApfsWalker:
                 continue
             if raw[32:36] != APFS_NX_MAGIC or otype != APFS_OBJECT_TYPE_NX_SUPERBLOCK:
                 continue
+            copies.append((xid, raw))
             if xid > best_xid:
                 if _apfs_fletcher_ok(raw):
                     best, best_xid = raw, xid
                 else:
                     torn.append(xid)
+        if not self._nx_map_usable(best):
+            for xid, raw in sorted((c for c in copies if c[0] < best_xid),
+                                   key=lambda c: c[0], reverse=True):
+                if _apfs_fletcher_ok(raw) and self._nx_map_usable(raw):
+                    self._notes.append(f"the newest checkpoint, transaction {best_xid:,}, names "
+                                       f"a container object map that cannot be used, so "
+                                       f"transaction {xid:,} was read, and newer data may exist")
+                    self.xid = xid
+                    return raw
         self.xid = best_xid
         # a damaged superblock's own transaction is believed only when it is near
         skipped = [x for x in maps if x > best_xid]
@@ -7863,6 +7880,14 @@ class ApfsWalker:
                                f"could not be read, so transaction {best_xid:,} was read, and "
                                f"newer data may exist")
         return best
+
+    def _nx_map_usable(self, nx):
+        """True when the container object map a superblock names passes its checksum and
+        holds the expected object id and type."""
+        oid = struct.unpack_from("<Q", nx, 160)[0]
+        if oid >= struct.unpack_from("<Q", nx, 40)[0]:
+            return False
+        return self._object_fault(self.block(oid), oid, (APFS_OBJECT_TYPE_OMAP,)) is None
 
     def _ephemeral(self, oid):
         """The block an ephemeral object sits in, or None.
@@ -8127,16 +8152,48 @@ class ApfsWalker:
 
         The size lives in an extended field rather than in the inode's fixed
         part, and the private id is what the file's extents are keyed by, which
-        is not always the object id itself.
+        is not always the object id itself. An inode holding a previous size smaller
+        than the stored one answers with the previous size (_previous_size).
         """
         val = self._inode(oid)
         if not val or len(val) < 92:
             return 0, oid
         private = struct.unpack_from("<Q", val, 8)[0]
-        fields = _apfs_xfields(val, 92)
-        blob = fields.get(APFS_INO_EXT_TYPE_DSTREAM)
-        size = struct.unpack_from("<Q", blob, 0)[0] if blob and len(blob) >= 8 else 0
-        return size, (private or oid)
+        saved = self._previous_size(val)
+        return (self._stored_size(val) if saved is None else saved), (private or oid)
+
+    @staticmethod
+    def _stored_size(val):
+        """The size in the inode's data stream field."""
+        blob = _apfs_xfields(val, 92).get(APFS_INO_EXT_TYPE_DSTREAM)
+        return struct.unpack_from("<Q", blob, 0)[0] if blob and len(blob) >= 8 else 0
+
+    def _previous_size(self, val):
+        """INO_EXT_TYPE_PREV_FSIZE when it is below the stored size, else None. Apple File
+        System Reference, 2020-06-22, page 111: "If it's set on an inode, truncate the file
+        back to the size contained in this field." A value at or above the stored size has
+        nothing to truncate."""
+        if not val or len(val) < 92:
+            return None
+        blob = _apfs_xfields(val, 92).get(APFS_INO_EXT_TYPE_PREV_FSIZE)
+        if not blob or len(blob) < 8:
+            return None
+        saved = struct.unpack_from("<Q", blob, 0)[0]
+        return saved if saved < self._stored_size(val) else None
+
+    def valid_data_note(self, node, held):                  # pylint: disable=unused-argument
+        """(issue, detail) for the exceptions table when a file was exported at its
+        previous size rather than its stored size, else None."""
+        oid = self._select(node) if node != APFS_CONTAINER else None
+        val = self._inode(oid) if oid is not None else None
+        saved = self._previous_size(val)
+        if saved is None or self._decmpfs_of(oid, val):
+            return None
+        return ("PREVIOUS_SIZE",
+                f"the inode holds a previous size of {saved:,} bytes and a stored size of "
+                f"{self._stored_size(val):,} bytes. Apple's reference says to truncate the file "
+                f"back to the previous size, so the member stops there. Any bytes stored past "
+                f"it were not exported and remain in the image")
 
     def _read_fext(self, sb, label="this volume"):
         """{stream id: [(logical, block, length)]} from a sealed volume's own
@@ -8557,6 +8614,8 @@ class ApfsWalker:
                                  + (f", so its {held:,} uncompressed bytes are not read"
                                     if held else ""))
         want = stream_size if size is None else min(size, stream_size or size)
+        if self._previous_size(val) is not None:
+            want = min(want, stream_size)
         # A file that says it holds bytes and has no extent anywhere must not
         # read as an empty file. On a sealed volume the extents live in their
         # own tree, and if that tree is not found this is the shape the failure
@@ -13735,7 +13794,8 @@ def _run_shortfall(w, node):
 
 def _valid_data_note(w, node, held):
     """(issue, detail) when an exFAT file's ValidDataLength differs from its DataLength,
-    else None. None for any other walker."""
+    or an APFS file was exported at its previous size, else None. None for any other
+    walker."""
     report = getattr(w, "valid_data_note", None)
     if report is None:
         return None
@@ -14636,8 +14696,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     """Write <volume>.exceptions.tsv when a filesystem volume has anything to record,
     and name it in the volume's record with a count per kind. A file that failed,
     read short, was renamed or lost its time is otherwise not recorded in the zip. The
-    two ValidDataLength counts appear only when not zero and do not change the exit
-    status."""
+    two ValidDataLength counts and the APFS previous-size count appear only when not zero
+    and do not change the exit status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -14656,7 +14716,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                "renamed": counts["RENAMED"],
                "time_not_held": counts["TIME_NOT_HELD"]}
     for key, issue in (("past_valid_data", "PAST_VALID_DATA"),
-                       ("valid_data_damaged", "VALID_DATA_DAMAGED")):
+                       ("valid_data_damaged", "VALID_DATA_DAMAGED"),
+                       ("previous_size", "PREVIOUS_SIZE")):
         if counts[issue]:                            # neither is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
@@ -14674,6 +14735,8 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     if name and not quiet:
         valid = ", each exFAT file whose ValidDataLength differs from its size" if (
             counts["PAST_VALID_DATA"] or counts["VALID_DATA_DAMAGED"]) else ""
+        if counts["PREVIOUS_SIZE"]:
+            valid += ", each APFS file exported at its previous size"
         _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
              f"hold: {name}")
 
@@ -29251,6 +29314,61 @@ def _apfs_reader_checks():
         behind = live[:bs] + clean[bs:16 * bs] + live[16 * bs:]
         return identify_fs(_io.BytesIO(behind), 0, len(behind))[0] == "btrfs"
 
+    def previous_size():
+        """An inode with INO_EXT_TYPE_PREV_FSIZE added to its extended fields."""
+        w = walker(clean)
+        path, node, oid, size = a_file(w)
+        whole = b"".join(w.read_file(node, size))
+        val = w._inode(oid)                          # pylint: disable=protected-access
+        count, used = struct.unpack_from("<HH", val, 92)
+        end = 96 + count * 4
+        for i in range(count):
+            length = struct.unpack_from("<H", val, 96 + i * 4 + 2)[0]
+            end += length + (-length % 8)
+        saved = size - 1234
+        w._inodes[oid] = (val[:92] + struct.pack("<HH", count + 1, used + 12)  # pylint: disable=protected-access
+                          + val[96:96 + count * 4] + struct.pack("<BBH", 5, 0, 8)
+                          + val[96 + count * 4:end] + struct.pack("<Q", saved))
+        if w.entry(node)[1] != saved or b"".join(w.read_file(node, size)) != whole[:saved]:
+            return False
+        name, body, rows = export(w, path, node, saved)
+        row = [r for r in rows if r[2] == "PREVIOUS_SIZE"]
+        rec = {}
+        with zipfile.ZipFile(_io.BytesIO(), "w") as zf:
+            _zip_record_exceptions(zf, "v", rec, rows, quiet=True)
+        return (".SHORT-" not in name and body == whole[:saved] and len(row) == 1
+                and f"{saved:,}" in row[0][3] and f"{size:,}" in row[0][3]
+                and "not exported" in row[0][3] and "remain in the image" in row[0][3]
+                and rec["exceptions"].get("previous_size") == 1
+                and walker(clean).valid_data_note(node, size) is None)
+
+    def older_checkpoint():
+        """The newest superblock is valid and the object map block it names is not."""
+        w = walker(clean)
+        first = struct.unpack_from("<Q", w._nx, 112)[0]   # pylint: disable=protected-access
+        count = struct.unpack_from("<I", w._nx, 104)[0]   # pylint: disable=protected-access
+        copies = sorted((struct.unpack_from("<Q", clean, (first + i) * bs + 16)[0], first + i)
+                        for i in range(count)
+                        if clean[(first + i) * bs + 32:(first + i) * bs + 36] == APFS_NX_MAGIC
+                        and _apfs_fletcher_ok(clean[(first + i) * bs:(first + i + 1) * bs]))
+        maps = {at: struct.unpack_from("<Q", clean, at * bs + 160)[0] for _x, at in copies}
+        newest = copies[-1]
+        older = next(c for c in reversed(copies[:-1]) if maps[c[1]] != maps[newest[1]])
+        raw = bytearray(clean)
+        raw[maps[newest[1]] * bs:(maps[newest[1]] + 1) * bs] = bytes(bs)
+        hit = walker(raw)
+        note = getattr(hit, "volume_note", None) or ""
+        if (hit.xid != older[0] or not hit.volumes or f"transaction {newest[0]:,}" not in note
+                or f"transaction {older[0]:,}" not in note or "newer data may exist" not in note):
+            return False
+        for block in set(maps.values()):
+            raw[block * bs:(block + 1) * bs] = bytes(bs)
+        try:
+            walker(raw)
+            return False
+        except ValueError as exc:
+            return "object map" in str(exc) and not getattr(walker(clean), "volume_note", None)
+
     def skipped_checkpoint():
         """Block 0 older than the newest checkpoint, whose superblock is then lost."""
         w = walker(clean)
@@ -29364,6 +29482,10 @@ def _apfs_reader_checks():
          "checkpoint copies, and is not read from them", bare_first_sector),
         ("a bare APFS container with an all-zero block 0 reads every file from a checkpoint "
          "copy", zero_block_bare),
+        ("an APFS file holding a previous size is exported at it, with both sizes in a row",
+         previous_size),
+        ("an APFS checkpoint whose object map is unusable falls back to the newest usable one "
+         "and says so", older_checkpoint),
         ("a lost newest APFS checkpoint superblock is recorded with the transaction skipped "
          "and the one read", skipped_checkpoint),
         ("an APFS file storing a time of exactly 0 gets a row for its 1980 member date",

@@ -1008,11 +1008,20 @@ used exactly as before.
 
 If the descriptor area holds a later transaction than the newest superblock that passes
 its checksum, the older checkpoint is read, as it should be after an interrupted write,
-and `note` in `volumes.json` names both transactions and says newer data may exist. A
+and `note` in `volumes.json` names both transactions and says newer data may exist. If the
+newest superblock passes its checksum and the container object map it names does not pass
+its checksum, id and type, the newest older checkpoint whose map passes is read, with the
+same kind of `note`. If none passes, the map's error is recorded and the run exits 1. A
 volume superblock that fails its checksum is named in `damage_first`, because its name and
 other fields may be wrong. A `com.apple.decmpfs` attribute of type 0x80000001, which xnu's
 `bsd/sys/decmpfs.h` names `DATALESS_CMPFS_TYPE`, on a file not flagged compressed is
 counted in `note`, not as damage, and the data stream is read as stored.
+
+An inode can hold a previous size (`INO_EXT_TYPE_PREV_FSIZE`), and Apple's reference, page
+111, says to truncate the file back to it. When it is below the stored size, the file is
+listed and exported at the previous size, and a `PREVIOUS_SIZE` row in the exceptions table
+gives both sizes and says any bytes stored past it were not exported and remain in the
+image. It is counted as `previous_size` in `exceptions` and does not change the exit status.
 
 These checks cover the structures named above and were run on a limited set of damaged
 images, so they do not show that every damaged sector is detected. File content on an
