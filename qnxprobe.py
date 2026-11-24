@@ -2185,6 +2185,12 @@ class _F2fsNodeLost(Exception):
         self.past_end, self.span = past_end, span
 
 
+class _F2fsChild(int):
+    """A node id as one folder entry names it. It is the number everywhere, and its identity
+    lets entry() find that entry's record when a file has several links."""
+    __slots__ = ()
+
+
 class _F2fsBadCluster(Exception):
     """One compressed cluster cannot be decoded. The rest of the file does not depend on it."""
 
@@ -2666,6 +2672,7 @@ class F2fsWalker:
             ix = 0
         base = extra // 4                                   # offset_in_addr
         addrs_in_inode = (self.def_addrs - base) - ix       # ADDRS_PER_INODE
+        addr_room = addrs_in_inode                          # before any cluster alignment
         apb = self.addrs_per_block
         # F2FS_FITS_IN_INODE: i_crtime ends 20 bytes past i_addr, i_compress_flag 36
         crtime = (struct.unpack_from("<Q", b, 372)[0]
@@ -2685,7 +2692,8 @@ class F2fsWalker:
             nid=nid, raw=b, mode=mode, advise=b[2], inline=i_inline,
             size=struct.unpack_from("<Q", b, 16)[0], flags=flags,
             atime=struct.unpack_from("<Q", b, 32)[0], mtime=struct.unpack_from("<Q", b, 48)[0],
-            crtime=crtime, base=base, addrs_in_inode=addrs_in_inode, apb=apb,
+            crtime=crtime, base=base, addrs_in_inode=addrs_in_inode, addr_room=addr_room,
+            apb=apb,
             iaddr_off=360 + base * 4, cluster=cluster, algo=algo, cflag=cflag, bad_log=bad_log)
 
     def _load_inode(self, nid):
@@ -2701,6 +2709,9 @@ class F2fsWalker:
         ino = self._parse_inode(b, nid)
         if ino["mode"] & S_IFMT not in F2FS_FILE_TYPES:      # inode.c f2fs_iget: -EIO
             raise _F2fsNodeLost(f"its inode records an invalid file type ({ino['mode']:#o})")
+        if ino["addr_room"] < 1:
+            raise _F2fsNodeLost("its extra attribute and inline xattr lengths do not fit its "
+                                "address area")
         return ino
 
     def inode(self, nid):
@@ -3011,11 +3022,9 @@ class F2fsWalker:
     def entry(self, nid):
         self._reached.add(nid)
         ctx = None
-        held = self._pending.get(nid)
-        if held:
-            ctx = held.pop()
-            if not held:
-                del self._pending[nid]
+        held = self._pending.pop(id(nid), None)
+        if held is not None and held[0] is nid:
+            ctx = held[1:]
         try:
             ino = self._load_inode(nid)
         except _F2fsNodeLost as exc:
@@ -3028,7 +3037,8 @@ class F2fsWalker:
             return None
         if ino["mode"] & S_IFMT == S_IFDIR:
             self._dirs_seen.add(nid)
-        if ctx is not None and ino["mode"] & S_IFMT == S_IFDIR:
+        if ctx is not None and ino["mode"] & S_IFMT == S_IFDIR and nid not in self._folder_names:
+            # a walk enters a folder once, under the first entry that names it
             self._folder_names[nid], self._folder_parents[nid] = ctx[1], ctx[0]
         if ctx is not None and ctx[2] and ctx[2] != F2FS_FILE_TYPES[ino["mode"] & S_IFMT]:
             self._damaged(f"{ctx[1]!r} in folder node {ctx[0]:,}: the folder entry says file "
@@ -3162,11 +3172,11 @@ class F2fsWalker:
         if self._encrypted(ino):
             self._encrypted_folders.add(nid)
         raw = self._raw_entries(nid, ino)
-        named = [(self._stored_name(n), c, t) for n, c, t in raw]
+        named = [(self._stored_name(n), _F2fsChild(c), t) for n, c, t in raw]
         if len(self._pending) > 1 << 20:                 # names no caller asked about
             self._pending.clear()
         for name, child, kind in named:
-            self._pending.setdefault(child, []).append((nid, name, kind))
+            self._pending[id(child)] = (child, nid, name, kind)
         return sorted((name, child) for name, child, _kind in named)
 
     def _read_compressed(self, ino, size):
@@ -37916,6 +37926,69 @@ def _f2fs_reader_checks():
                     and "newer content may be absent" in (w.volume_note or ""))
         return with_edits(free_v, [(at, bytes(tail))], check)
 
+    def inode_lengths():
+        w0 = walker(free_v)
+        nid = plain_file(w0)
+        path = next(p for p, v in files(w0).items() if v[0] == nid)
+        got = export(free_v, inode_edits(free_v, w0, nid, [(362, struct.pack("<H", 1000))]))
+        if got is None:
+            return None
+        rc, rec, rows, members = got
+        return (rc == 1 and path not in members and rec["files"] == len(want_free) - 1
+                and any(r[0] == path and r[2] == "FAILED" for r in rows)
+                and any("do not fit" in d for d in rec.get("damage_first", ())))
+
+    def link_record():
+        """Two folder entries for one node. Each call to entry() must use the record of the
+        entry the caller is on, for a file-type record and for a folder's reported path."""
+        def dentry_at(img, w, name):
+            root = w.inode(w.root)
+            inline = root["inline"] & F2FS_INLINE_DENTRY
+            at = name_at(img, w, w.root, name.encode())
+            base = at // BS * BS + (root["iaddr_off"] + 4 if inline else 0)
+            span = 4 * (root["addrs_in_inode"] - 1) if inline else BS
+            _nr, _bm, doff, foff = w._dentry_geom(span)      # pylint: disable=protected-access
+            return base + doff + (at - base - foff) // 8 * 11
+
+        w0 = walker(free_v)
+        plain = [(n, c, dentry_at(free_v, w0, n)) for n, c in w0.listdir(w0.root)
+                 if w0.entry(c) and w0.entry(c)[0] & S_IFMT == S_IFREG and len(n) >= 4
+                 and n.isascii()]
+        first, second = next((x, y) for i, x in enumerate(plain) for y in plain[i + 1:]
+                             if x[2] < y[2])
+        edits = [(second[2] + 4, struct.pack("<I", int(first[1]))), (second[2] + 10, bytes([7]))]
+
+        def one_entry():
+            w = walker(free_v)
+            listed = dict(w.listdir(w.root))
+            w.entry(listed[first[0]])                    # this link's type agrees
+            if w.damage:
+                return False
+            w.entry(listed[second[0]])
+            return len(w.damage) == 1 and repr(second[0]) in w.damage[0]
+        if not with_edits(free_v, edits, one_entry):
+            return False
+
+        w1 = walker(full)
+        named = [(n, c, dentry_at(full, w1, n)) for n, c in w1.listdir(w1.root)
+                 if n.isascii() and len(n) >= 3]
+        kinds = {c: w1.entry(c)[0] & S_IFMT for _n, c, _a in named}
+        walked, other = next((x, y) for i, x in enumerate(named) for y in named[i + 1:]
+                             if x[2] < y[2] and kinds[x[1]] == S_IFDIR and kinds[y[1]] == S_IFREG
+                             and any(w1.entry(c)[0] & S_IFMT == S_IFREG
+                                     for _m, c in w1.listdir(x[1])))
+        child_name, child = next((m, c) for m, c in w1.listdir(walked[1])
+                                 if w1.entry(c)[0] & S_IFMT == S_IFREG)
+        edits = [(other[2] + 4, struct.pack("<I", int(walked[1]))), (other[2] + 10, bytes([2])),
+                 (w1.resolve(child) * BS, bytes(BS))]
+
+        def folder_path():
+            w = walker(full)
+            collect(w, w.root)
+            paths = [p for p, _n in w.unread_entries()]
+            return f"{walked[0]}/{child_name}" in paths and f"{other[0]}/{child_name}" not in paths
+        return with_edits(full, edits, folder_path)
+
     def encrypted():
         w0 = walker(free_v)
         path, (nid, size) = next((p, v) for p, v in sorted(files(w0).items())
@@ -37986,6 +38059,10 @@ def _f2fs_reader_checks():
         lambda: dnode_sector(full))
     row("F2FS block count: a zero sector in a kernel-written LZ4 file's direct node names the "
         "file, exit 1", lambda: dnode_sector(lz4, "compressible.bin"))
+    row("F2FS inode lengths: an inode whose lengths do not fit its address area is a FAILED row "
+        "naming the file, and the other files export", inode_lengths)
+    row("F2FS links: entry() uses the record of the folder entry the caller is on, for a type "
+        "record and a folder's path", link_record)
     row("F2FS encryption: a flagged file is exported as stored to the end of its block, with "
         "its logical size in an ENCRYPTED row, a counted note and exit 0 (flag only: nothing "
         "is decrypted)", encrypted)
