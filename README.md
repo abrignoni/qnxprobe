@@ -376,8 +376,9 @@ with blocks that have no pointer (see "QNX6 superblock choice and damaged volume
 a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
-time, and NTFS, HFS+ and APFS for a value out of their range too. The ReFS reader keeps a
-stored time past that range, so it gets its row (see [ReFS](#refs)). F2FS keeps the signed value
+time, and for the last four for a value out of their range too. A ReFS time its reader
+answers 0 for while the volume stores one gets its row all the same, with the FILETIME as
+stored (see [ReFS](#refs)). F2FS keeps the signed value
 it stores, so a stored 0 is recorded as 1970-01-01. An F2FS file flagged encrypted gets an
 `ENCRYPTED` row, which does not change the exit status.
 
@@ -2083,13 +2084,16 @@ really named `a%00%D8` reads the same as one whose name ends in U+D800. A link's
 the volume label are not entry names and are still decoded with U+FFFD for such a unit.
 
 ReFS keeps four times per file, as NTFS does. `stamps(node)` gives created, modified and
-accessed in Unix seconds, like `NtfsWalker.stamps`, except that a stored time from
-9999-12-31 23:59:59 on is kept as its number of seconds where the NTFS reader gives 0.
-Windows 11 stored modified times of 9999-12-31 23:59:59, of a FILETIME near year 11998 and
-of the largest positive 64-bit value on the same test volume, and each used to read as no
-time, so its member showed 1980-01-01 with no `TIME_NOT_HELD` row. Each now gets that row,
-with the seconds. A stored 0 reads as no time, and so does a time stored exactly at
-1970-01-01 00:00:00 UTC, which converts to 0.
+accessed in Unix seconds, like `NtfsWalker.stamps`, and 0 for a time that is unset or from
+9999-12-31 23:59:59 on, as `entry()` does for the modified time. Windows 11 stored modified
+times of 9999-12-31 23:59:59, of a FILETIME near year 11998 and of the largest positive
+64-bit value on the same test volume. Each reads as 0, which an export took for no time, so
+its member showed 1980-01-01 with no `TIME_NOT_HELD` row. `entry()` and `stamps()` still
+answer 0 for them, and `RefsWalker.mtime_not_held(node)` now gives the export the stored
+value, so each gets its row, as `FILETIME <ticks>` followed by the date to the 100 ns or by
+"outside any date this reader can show". A time stored exactly at 1970-01-01 00:00:00 UTC
+also converts to 0 and gets its row the same way; no volume to hand stores one, so that is
+checked on a row the self-test builds. Only the modified time has such a record.
 `filetimes(node)` gives all four
 FILETIMEs as stored, with the change time, to the 100 ns. A file's times come from its own
 record. The name row of a moved or linked file keeps a copy that ReFS refreshes only when

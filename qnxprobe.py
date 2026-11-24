@@ -15733,10 +15733,9 @@ def _zip_time(v):
 def _zip_zero_is_no_time(w, node):
     """True when this walker's mtime of 0 stands for no time rather than a stored 0.
     FAT and exFAT answer 0 always (their readings come through collect()). The NTFS,
-    HFS+ and APFS converters answer 0 for unset or out of range. The ReFS one answers 0
-    for unset and for a time stored exactly at the Unix epoch, and keeps the rest. Btrfs
-    answers 0 for a file named by its directory whose inode item is gone. F2FS keeps the
-    signed value it stores, so its 0 is 1970-01-01."""
+    ReFS, HFS+ and APFS converters answer 0 for unset or out of range. Btrfs answers 0
+    for a file named by its directory whose inode item is gone. F2FS keeps the signed
+    value it stores, so its 0 is 1970-01-01."""
     if isinstance(w, (Fat32Walker, ExfatWalker, NtfsWalker, RefsWalker, HfsPlusWalker,
                       ApfsWalker)):
         return True
@@ -15751,6 +15750,15 @@ def _zip_zero_is_no_time(w, node):
 def _zip_time_lost(v, w=None, node=None):
     """The stored time as text when a zip cannot hold it, else None. None also when
     no time exists (_zip_zero_is_no_time)."""
+    if v == 0:
+        report = getattr(w, "mtime_not_held", None)
+        if report is not None:
+            try:
+                shown = report(node)
+            except Exception:                        # pylint: disable=broad-except
+                shown = None
+            if shown:
+                return shown
     if v is None or (v == 0 and _zip_zero_is_no_time(w, node)):
         return None
     try:
@@ -19965,23 +19973,14 @@ def _refs_name(raw):
 REFS_FILETIME_YEAR_10000 = (253402300800 + NTFS_EPOCH_DELTA) * 10_000_000
 
 
-def _refs_time(v):
-    """A FILETIME from a ReFS record as Unix seconds, 0 for a stored 0, which is unset.
-
-    ntfs_time() answers 0 for a value past its range as well, and an export reads 0 as no
-    time, so a file Windows stamped 9999-12-31 23:59:59 or later showed 1980-01-01 with
-    nothing recorded. This keeps every other stored value, so the export records the ones
-    a zip cannot hold (_zip_time_lost). Within ntfs_time()'s range the two give the same
-    number. A tick in the last second of year 9999 stays below year 10000, which the float
-    division alone would round up to. A stored time exactly at 1970-01-01 00:00:00 UTC
-    still converts to 0 and reads as unset.
-    """
-    if not v:
-        return 0
-    sec = v / 10_000_000 - NTFS_EPOCH_DELTA
-    if v < REFS_FILETIME_YEAR_10000:
-        sec = min(sec, 253402300800.0 - 2 ** -15)
-    return sec
+def _refs_filetime_shown(raw):
+    """A stored FILETIME as text for a record, to the tick and with no float in the way:
+    the ticks, then the date, or that no date here can show it."""
+    if raw >= REFS_FILETIME_YEAR_10000:
+        return f"FILETIME {raw} (outside any date this reader can show)"
+    whole, ticks = divmod(raw, 10_000_000)
+    when = datetime.datetime(1601, 1, 1) + datetime.timedelta(seconds=whole)
+    return f"FILETIME {raw} ({when:%Y-%m-%d %H:%M:%S}.{ticks:07d} UTC)"
 
 
 def _refs_node(buf, hoff, where="a node"):
@@ -20837,11 +20836,21 @@ class RefsWalker:
         return tuple(times)
 
     def stamps(self, node):
-        """(created, modified, accessed) in Unix seconds, 0 where unset. A stored
-        time from 9999-12-31 23:59:59 on is kept as its number of seconds
-        (_refs_time), where NtfsWalker.stamps gives 0 for it."""
+        """(created, modified, accessed) in Unix seconds, 0 where unset, as
+        NtfsWalker.stamps gives them."""
         c, m, _ch, a = self.filetimes(node)
-        return _refs_time(c), _refs_time(m), _refs_time(a)
+        return ntfs_time(c), ntfs_time(m), ntfs_time(a)
+
+    def mtime_not_held(self, node):
+        """The stored modified time as text when it is not 0 and entry() answers 0 for it:
+        a FILETIME from 9999-12-31 23:59:59 on, or one at the Unix epoch. None otherwise.
+        An export asks this for a time of 0 (_zip_time_lost), so such a file gets its
+        TIME_NOT_HELD row while entry() and stamps() go on answering 0 for it. Raises as
+        filetimes() does when the record does not check out."""
+        raw = self.filetimes(node)[1]
+        if not raw or ntfs_time(raw):
+            return None
+        return _refs_filetime_shown(raw)
 
     def inode(self, node):
         return node
@@ -20862,10 +20871,10 @@ class RefsWalker:
                 return None
             if kf == 2 and len(val) >= 0x40:            # an index entry: size +0x38, times +0x10
                 return (0o100644, struct.unpack_from("<Q", val, 0x38)[0],
-                        _refs_time(struct.unpack_from("<Q", val, 0x18)[0]))
+                        ntfs_time(struct.unpack_from("<Q", val, 0x18)[0]))
             if kf == 1 and len(val) >= 0x60:            # its own record: size +0x58, times +0x28
                 return (0o100644, struct.unpack_from("<Q", val, 0x58)[0],
-                        _refs_time(self._times_of(val)[1]))
+                        ntfs_time(self._times_of(val)[1]))
         return None
 
     @staticmethod
@@ -20880,13 +20889,13 @@ class RefsWalker:
         if isinstance(node, int):
             if node not in self.objects:
                 raise RefsDamage("no row in the object table")
-            return (S_IFDIR | 0o755, 0, _refs_time(self.filetimes(node)[1]))
+            return (S_IFDIR | 0o755, 0, ntfs_time(self.filetimes(node)[1]))
         if isinstance(node, RefsStreamRef):
             rec = self._stream_owner(node)
             stream = self._named_stream(rec, node.name)
-            return (0o100644, stream[1], _refs_time(self._times_of(rec)[1]))
+            return (0o100644, stream[1], ntfs_time(self._times_of(rec)[1]))
         got = self._kind(node)
-        mtime = _refs_time(self.filetimes(node)[1])
+        mtime = ntfs_time(self.filetimes(node)[1])
         if got[0] == "link":
             return (S_IFLNK | 0o777, len(got[1].encode("utf-8")), mtime)
         return (0o100644, self._main_stream(got[1])[1], mtime)
@@ -33017,7 +33026,8 @@ def _refs_unit_checks(img, w, got, known):
 
     # Names and times as Windows 11 stored them on a volume it wrote (unpaired
     # surrogates; 9999-12-31 23:59:59, a FILETIME of 3281000000000000000 and the
-    # largest one), put on rows of the fixture's times folder and exported.
+    # largest one), put on rows of the fixture's times folder and exported. The last
+    # tick of year 9999 and the Unix epoch are the edges of what entry() answers 0 for.
     import sqlite3
     odd = RefsWalker(img, 0)
     plain = got["times/fixed.txt"][1]
@@ -33027,7 +33037,8 @@ def _refs_unit_checks(img, w, got, known):
     lone_raw = [n.encode("utf-16-le", "surrogatepass") for n in lone]
     lone_want = ["pair_%00%D8x.txt", "pair_%01%D8x.txt", "rev_%00%DC%00%D8.txt", "end_%00%D8"]
     far = (("t9999", 2650467743990000000), ("tlast", 2650467743999999999),
-           ("t12000", 3281000000000000000), ("tmax", 0x7FFFFFFFFFFFFFFF), ("tunset", 0))
+           ("t12000", 3281000000000000000), ("tmax", 0x7FFFFFFFFFFFFFFF),
+           ("tepoch", 116444736000000000), ("tunset", 0))
     for raw in lone_raw:
         folder.names[raw] = (kf, val)
     for name, filetime in far:
@@ -33065,22 +33076,21 @@ def _refs_unit_checks(img, w, got, known):
                 and streams == ["s%00%D8", "s%01%D8"] and inside == ["n%00%2F"]))
     rows = {r[0]: r[3] for r in issues if r[2] == "TIME_NOT_HELD"}
     kept = {name: odd.entry(by_key[name.encode("utf-16-le")][1])[2] for name, _f in far}
-    rows_of = ("t9999", "tlast", "t12000", "tmax")
-    # The row's text is the seconds, then the date where this platform's clock
-    # functions can form one, so only the seconds are compared.
-    out.append(("a modified time of 9999-12-31 23:59:59, of the last tick of that year and of "
-                "two FILETIMEs past year 9999 is kept by entry() and stamps() and gets a "
-                "TIME_NOT_HELD row in an export that gives its seconds; an unset time and "
-                "one a zip holds get none",
-                sorted(rows) == ["times/t12000", "times/t9999", "times/tlast", "times/tmax"]
-                and all(rows[f"times/{n}"].startswith(f"stored time {kept[n]} ") for n in rows_of)
-                and kept["t9999"] == 253402300799.0
-                and 253402300799 < kept["tlast"] < 253402300800
-                and kept["t12000"] == 316455526400.0 and kept["tmax"] > 9e11
-                and kept["tunset"] == 0
-                and all(odd.stamps(by_key[n.encode("utf-16-le")][1])[1] == kept[n] for n, _f in far)
+    dated = {"t9999": "9999-12-31 23:59:59.0000000 UTC", "tlast": "9999-12-31 23:59:59.9999999 UTC",
+             "t12000": "outside any date this reader can show",
+             "tmax": "outside any date this reader can show",
+             "tepoch": "1970-01-01 00:00:00.0000000 UTC"}
+    out.append(("a modified time of 9999-12-31 23:59:59, of the last tick of that year, of two "
+                "FILETIMEs past year 9999 and of the Unix epoch reads as 0 from entry() and "
+                "stamps(), and gets a TIME_NOT_HELD row in an export that gives the FILETIME as "
+                "stored; an unset time and one a zip holds get none",
+                sorted(rows) == sorted(f"times/{n}" for n in dated)
+                and all(rows[f"times/{n}"].startswith(f"stored time FILETIME {raw} ({dated[n]})")
+                        for n, raw in far if n in dated)
+                and all(kept[n] == 0 for n, _f in far)
+                and all(odd.stamps(by_key[n.encode("utf-16-le")][1])[1] == 0 for n, _f in far)
                 and all(members.get(f"v/times/{n}") == (1980, 1, 1, 0, 0, 0) for n, _f in far)
-                and odd.entry(plain) == w.entry(plain)))
+                and odd.entry(plain) == w.entry(plain) and w.entry(plain)[2] > 0))
 
     # Damaged and hostile records.
     broken = []
