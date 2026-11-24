@@ -2525,6 +2525,18 @@ agree with `unsquashfs -lln` on every image. The tree includes random bytes that
 an LZ decoder's rarer instructions, a directory of 600 entries (more than one directory
 header and metadata block) and a 255-byte name.
 
+**Names.** SquashFS stores a name as the bytes Linux gave it, and the kernel copies them
+without decoding (`fs/squashfs/dir.c`). A stretch of a name that is not UTF-8 is written as
+`%XX` of its stored bytes (a name stored as `a`, byte `0x80`, `b.txt` is `a%80b.txt`), and a
+name never holds a surrogate. A literal `%` is not escaped, so a file really named
+`caf%E9.txt` can match an escaped one, and the duplicate handling keeps both. A `/` or a
+NUL inside one name would be written `%2F` or `%00`; that is not exercised, because a Linux
+file name holds neither and no fixture does. A symlink's target is a path, so its `/`
+separators stay and only bytes that are not UTF-8 are written as `%XX`. Checked on an image
+mksquashfs wrote from 20 entries, 10 of them with a path that is not UTF-8
+(`tools/make_squashfs_odd_fixture.sh`): every name matches the source tree's bytes under
+this rule and goes into SQLite, and the 18 files match their hashes.
+
 ### JFFS2
 
 A log-structured filesystem with no superblock: the filesystem is whatever nodes the

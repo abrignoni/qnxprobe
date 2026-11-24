@@ -12786,8 +12786,10 @@ class SquashfsWalker:
         return ino["mode"], ino["size"], ino["mtime"]
 
     def readlink(self, ref):
+        """A symlink's target as stored, a path and not one name: bytes that are not
+        UTF-8 come back as %XX, and its "/" separators are left as they are."""
         ino = self.inode(ref)
-        return ino.get("target", b"").decode("utf-8", "surrogateescape")
+        return ino.get("target", b"").decode("utf-8", "qnxprobe-name")
 
     @property
     def note(self):
@@ -12822,7 +12824,10 @@ class SquashfsWalker:
                         raise SquashfsUnreadable("directory entry name over 256 bytes")
                     name, pos, off = self._meta_read(pos, off, nlen + 1)
                     left -= 8 + nlen + 1
-                    out.append((name.decode("utf-8", "surrogateescape"),
+                    # the kernel copies the name's bytes and never decodes them
+                    # (fs/squashfs/dir.c), so a stretch that is not UTF-8 is %XX
+                    out.append((name.decode("utf-8", "qnxprobe-name")
+                                .replace("\x00", "%00").replace("/", "%2F"),
                                 (start << 16) | ioff))
         except (SquashfsUnreadable, DecompressError, struct.error):
             pass                                     # report what was read
@@ -40176,6 +40181,101 @@ def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False, clock=True, bad_crc
             [(ds + (bitmap_b + 1) * bs, 9 * bs)])
 
 
+def _squashfs_reader_checks():
+    """[(label, passed or None for a skip)] for the SquashFS reader, on volumes
+    mksquashfs 4.7.5 wrote and unsquashfs read back (tools/make_squashfs_*.sh), each
+    held against a list made from its source tree. Each row runs on its own, so one
+    that raises is one FAIL that names the exception and the rest still run."""
+    import contextlib                               # pylint: disable=import-outside-toplevel
+    import gzip                                     # pylint: disable=import-outside-toplevel
+    import hashlib                                  # pylint: disable=import-outside-toplevel
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    out = []
+
+    def load(name):
+        """A fixture's bytes, gunzipped when it is an image, or None when it is absent."""
+        full = os.path.join(here, name)
+        if not os.path.isfile(full):
+            return None
+        with (gzip.open(full, "rb") if name.endswith(".gz") else open(full, "rb")) as fh:
+            return fh.read()
+
+    def export(data):
+        """The export of one image through main(): (volume records, {stored path: member
+        bytes}, {stored path: member name} from the exceptions table, what was printed)."""
+        man, said, zbuf = [], io.StringIO(), io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout, \
+                contextlib.redirect_stdout(said):
+            main("squashfs.img", extract="(memory)", zf=zout, manifest=man,
+                 image=io.BytesIO(bytes(data)))
+        with zipfile.ZipFile(zbuf) as zin:
+            members = {n.split("/", 1)[-1]: zin.read(n) for n in zin.namelist()
+                       if not n.endswith(".tsv") and n != "volumes.json"}
+        return man, members, said.getvalue()
+
+    def row(name, test):
+        try:
+            got = test()
+            ok = None if got is None else bool(got)
+        except Exception as exc:                    # pylint: disable=broad-except
+            name, ok = f"{name} ({type(exc).__name__}: {exc})", False
+        out.append((name, ok))
+
+    def stored_names():
+        image, listing = load("squashfs-odd.img.gz"), load("squashfs-odd.src.json")
+        if image is None or listing is None:
+            return None
+        import sqlite3                              # pylint: disable=import-outside-toplevel
+
+        def rule(raw):
+            """One stored name as the name rule gives it, worked out a byte at a time."""
+            text, at = "", 0
+            while at < len(raw):
+                for width in (1, 2, 3, 4):
+                    try:
+                        text += raw[at:at + width].decode("utf-8")
+                        at += width
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    text += f"%{raw[at]:02X}"
+                    at += 1
+            return text
+
+        rows = json.loads(listing)
+        for r in rows:
+            r["raw"] = bytes.fromhex(r["path_hex"])
+            r["path"] = "/".join(rule(part) for part in r["raw"].split(b"/"))
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        walked = [(path, node) for path, node, *_rest in walk_all(w)]
+        db = sqlite3.connect(":memory:")
+        db.execute("create table names (name text)")
+        db.executemany("insert into names values (?)", [(path,) for path, _node in walked])
+        apart = db.execute("select count(*) from names where name in ('a%80b.txt', 'a%81b.txt', "
+                           "'%82leading.txt', 'dir%E9', '%FF%FE%FD.bin')").fetchone()[0]
+        link = next(r for r in rows if r["kind"] == "symlink")
+        target = w.readlink(dict(walked)[link["path"]])
+        man, members, _said = export(image)
+        files = [r for r in rows if r["kind"] == "file"]
+        digest = {name: hashlib.sha256(data).hexdigest() for name, data in members.items()}
+        by_raw = {r["raw"]: r["sha256"] for r in files}
+        # a file really named caf%E9.txt and the one stored as caf<E9>.txt come out under
+        # one name, and the export keeps both (the second as .dup-2)
+        return (sorted(path for path, _node in walked) == sorted(r["path"] for r in rows)
+                and sum(1 for r in rows if r["path"].encode("utf-8") != r["raw"]) == 10
+                and apart == 5 and target == rule(bytes.fromhex(link["target_hex"])) == "target%E9"
+                and digest.get("a%80b.txt") == by_raw[b"a\x80b.txt"]
+                and digest.get("a%81b.txt") == by_raw[b"a\x81b.txt"]
+                and digest.get("dir%E9/inner0.txt") == by_raw[b"dir\xe9/inner0.txt"]
+                and sorted(digest.values()) == sorted(by_raw.values())
+                and man[0]["files"] == len(files) and not man[0]["failed"])
+    row("SquashFS: a stored name that is not UTF-8 comes back with those bytes as %XX and no "
+        "surrogate, goes into SQLite, and is the zip member's name; two names that differ in "
+        "one such byte stay apart; a symlink's target is read the same way", stored_names)
+    return out
+
+
 def _qnx6_reader_checks():
     """The qnx6 reader on damaged and unusual volumes, each built by patching the
     self-test's own two-generation volume (_qnx6_test_volume) in memory. Each row
@@ -45712,6 +45812,11 @@ def self_test():
             lvm_checks += _refs_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
+        # SquashFS names, and what a volume that cannot be read in full records.
+        try:
+            lvm_checks += _squashfs_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the SquashFS reader checks ran ({type(exc).__name__}: {exc})", False)]
         # qnx6 on damaged and unusual volumes, patched from the self-test's own volume.
         try:
             lvm_checks += _qnx6_reader_checks()
