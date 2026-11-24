@@ -1965,8 +1965,9 @@ def _fmt_time(v):
     if v is None:
         return ""
     try:
-        return datetime.datetime.fromtimestamp(
-            v, datetime.timezone.utc).strftime("%Y-%m-%d")
+        # fromtimestamp() refuses a time before 1970 on Windows
+        return (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                + datetime.timedelta(seconds=v)).strftime("%Y-%m-%d")
     except (OverflowError, OSError, ValueError):
         return "-"
 
@@ -56445,6 +56446,17 @@ def self_test():
             print(f"  [FAIL] QNX6_MAGIC is 0x{QNX6_MAGIC:08x}, expected 0x68191122")
             print("\n  SELF-TEST FAILED. Do not trust results from this build.")
             return 1
+
+        # a time before 1970 is a date on every platform (Windows' fromtimestamp()
+        # refuses one), in the listing and in a TIME_NOT_HELD row
+        shown = (_fmt_time(-315619200), _zip_time_lost(-315619200))
+        if shown[0] == "1960-01-01" and "(1960-01-01 00:00:00 UTC)" in (shown[1] or ""):
+            print("  [PASS] a time before 1970 is shown as its date in the listing and in "
+                  "a TIME_NOT_HELD row")
+        else:
+            print(f"  [FAIL] a time before 1970 is shown as its date in the listing and in "
+                  f"a TIME_NOT_HELD row (gave {shown})")
+            ok = False
 
         # positive 1: MBR, little endian, superblock at partition + 0x2000,
         # with fully consistent fields
