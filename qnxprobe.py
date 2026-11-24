@@ -1764,16 +1764,92 @@ def parse_apm(fh):
     return out if types and types[0] == "Apple_partition_map" else []
 
 
-def disk_sector_size(fh):
-    """The logical sector size partition LBAs on this image count: the one a
-    valid GPT was found at, else 512. The legacy and protective MBR count the
-    same logical blocks (UEFI 2.10 Table 5.2, SizeInLBA "in LBA units of logical
-    blocks"; Table 5.4, the protective StartingLBA is 1, "the LBA of the GPT
-    Partition Header"), so this is the unit for both tables."""
-    gpt = parse_gpt(fh)
+def container_sector_size(fh):
+    """The logical sector size the image's container states, 512 or 4096, or None
+    when it states none. A VHDX states it in its metadata (LogicalSectorSize) and an
+    EWF acquisition as its bytes per sector (the volume section of an E01 or S01, the
+    device information of an Ex01). A raw file states none. Only these two kinds are
+    asked: for the others ewfprobe's sector size is 512 whenever the container holds
+    no value, which cannot be told from a stated 512."""
+    vhdx = getattr(fh, "vhdx", None)
+    stated = vhdx.get("logical_sector_size") if isinstance(vhdx, dict) else None
+    if stated is None and getattr(fh, "format", None) in ("EWF-E01", "EWF-S01", "EWF2-Ex01"):
+        stated = getattr(fh, "sector_size", None)
+    return stated if stated in GPT_SECTOR_SIZES else None
+
+
+def _volume_starts_at(fh, base, mbr_type):
+    """True when what an MBR entry of this type names begins at byte ``base``, judged
+    by the volume's own first structure and by nothing a partition table says: a FAT,
+    exFAT, NTFS, ReFS or BitLocker boot sector, an ext, XFS, Btrfs, F2FS or qnx6
+    superblock, a LUKS header, or, for an extended partition, the 0x55AA of its first EBR. Each is
+    a fixed signature at a fixed offset from the start, so the test costs a few small
+    reads and can run before any filesystem is identified."""
+    b = read_at(fh, base, 512)
+    if len(b) < 512:
+        return False
+    if mbr_type in EXT_PARTITION_TYPES:
+        return b[510:512] == b"\x55\xaa"
+    if b[510:512] == b"\x55\xaa" and (
+            b[3:11] in (b"EXFAT   ", NTFS_OEM, BDE_SIGNATURE)
+            or b[82:90] in (b"FAT32   ", b"TFAT32  ")
+            or b[54:62] in (b"FAT16   ", b"FAT12   ", b"FAT     ", b"TFAT16  ")):
+        return True
+    if b[3:11] == REFS_FS_NAME and b[0x10:0x14] == REFS_FSRS:
+        return True
+    if b[:6] == LUKS_MAGIC:
+        return True
+    if b[:4] == b"XFSB" and struct.unpack_from(">I", b, 4)[0] in (
+            512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
+        return True
+    q6 = check(fh, base + BOOTBLOCK_SIZE)
+    if q6 and not q6[2]:
+        return True
+    sb = read_at(fh, base + EXT_SB_OFF, 1024)
+    if len(sb) == 1024:
+        if (_e(sb, "magic", 2) == EXT_MAGIC and _e(sb, "log_block_size") <= 6
+                and _e(sb, "blocks_count")):
+            return True
+        if struct.unpack_from("<I", sb, 0)[0] == F2FS_MAGIC:
+            return True
+    return read_at(fh, base + BTRFS_SUPER_OFF + 64, 8) == BTRFS_MAGIC
+
+
+def tables_sector_size(fh, gpt, parts):
+    """The logical sector size, in bytes, that the LBAs of this image's partition
+    tables count. ``gpt`` is what parse_gpt() gave and ``parts`` what parse_mbr() gave.
+
+    A valid GPT names it: the size its header was found at (UEFI 2.10 Table 5.2,
+    SizeInLBA "in LBA units of logical blocks"; Table 5.4, the protective StartingLBA
+    is 1, "the LBA of the GPT Partition Header", so the MBR beside a GPT counts the
+    same blocks). An MBR alone states no sector size, and a disk with 4096-byte
+    logical sectors counts its entries in those. So with no GPT: the size the
+    container states is used when it states one (container_sector_size); otherwise
+    the entries are tried at 512 bytes and, only when none of them leads to a volume
+    there, at 4096, and the first size at which an entry's own boot sector or
+    superblock checks is kept (_volume_starts_at). With no table, or when nothing
+    checks at either size, the answer is 512, as it always was."""
     # An empty table is falsy: a valid GPT with no used entry still names the
     # sector size, so the test is for no table, not for no entries.
-    return gpt.sector_size if gpt is not None else SECTOR
+    if gpt is not None:
+        return gpt.sector_size
+    if not parts:
+        return SECTOR
+    stated = container_sector_size(fh)
+    if stated is not None:
+        return stated
+    for ss in GPT_SECTOR_SIZES:
+        if any(_volume_starts_at(fh, st * ss, t) for _idx, t, st, _cnt in parts):
+            return ss
+    return SECTOR
+
+
+def disk_sector_size(fh):
+    """The logical sector size partition LBAs on this image count: the one a
+    valid GPT was found at, else the one its MBR's entries are read at
+    (tables_sector_size), else 512."""
+    gpt = parse_gpt(fh)
+    return tables_sector_size(fh, gpt, None if gpt is not None else parse_mbr(fh))
 
 
 # ---------------------------------------------------------------------------
@@ -16920,6 +16996,33 @@ class Qnx4Walker:
 
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
+        # ``damage`` lists what could not be read, for damage_lines(), and
+        # ``folders_not_read`` counts the folders whose listing is known to be short.
+        self.damage, self.folders_not_read, self._not_read = [], 0, set()
+        # Where the volume ends, from the .bitmap file: one bit per block
+        # (fs/qnx4/inode.c qnx4_statfs, f_blocks = BitMap->di_size * 8). The size is in
+        # whole bytes, so the last byte may cover fewer than eight blocks: the end used
+        # is the lowest the size allows, one block into the last byte, so that a whole
+        # volume is never said to reach past the end of its image.
+        self.declared_end = None
+        sb = read_at(fh, base + QNX4_BLOCK, QNX4_DIRENT)
+        if len(sb) == QNX4_DIRENT:
+            bitmap = _qnx4_bitmap_entry(fh, base, *struct.unpack_from("<II", sb, 20))
+            bsize = struct.unpack_from("<I", bitmap, 16)[0] if bitmap else 0
+            if bsize:
+                self.declared_end = base + ((bsize - 1) * 8 + 1) * QNX4_BLOCK
+
+    def _lost(self, folder, line):
+        """Record something of a folder that could not be read, once per line, and count
+        the folder in folders_not_read, once, because names in it may be missing."""
+        if line in self._not_read:
+            return
+        self._not_read.add(line)
+        if len(self.damage) < 1000:
+            self.damage.append(line)
+        if ("folder", folder) not in self._not_read:
+            self._not_read.add(("folder", folder))
+            self.folders_not_read += 1
 
     def _raw(self, num):
         blk, ndx = divmod(num, 8)
@@ -16981,6 +17084,10 @@ class Qnx4Walker:
                 buf = read_at(self.fh, self.base + sbnum * QNX4_BLOCK,
                               QNX4_BLOCK)
                 if len(buf) < QNX4_BLOCK:
+                    self._lost(num, f"a directory block could not be read in full (block "
+                                    f"{sbnum + 1:,}, {len(buf)} of {QNX4_BLOCK} bytes), so the "
+                                    f"folder's entries from byte {done:,} of its {size:,} on "
+                                    f"are not listed: the folder with inode {num:,}")
                     break
                 for ix in range(8):
                     e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
@@ -16993,8 +17100,15 @@ class Qnx4Walker:
                     else:
                         name = e[0:16].split(b"\x00")[0]
                         child = sbnum * 8 + ix
-                    name = name.decode("utf-8", "replace")
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
                     if name not in (".", ".."):
+                        if e[63] & QNX4_F_LINK and self._raw(child) is None:
+                            self._lost(num, f"the inode entry a name points to could not be "
+                                            f"read (block {iblk:,}, entry {e[52]}), so what it "
+                                            f"names is not exported and its size and dates are "
+                                            f"not known, in the folder with inode {num:,}: "
+                                            f"{name!r}")
                         out.append((name, child))
                 done += QNX4_BLOCK
         return out
@@ -17020,6 +17134,23 @@ class Qnx4Walker:
             left -= avail
 
 
+def _qnx4_bitmap_entry(fh, base, first_blk, first_sz):
+    """The ".bitmap" inode entry of the root directory whose first extent is first_sz
+    blocks from block first_blk (1-based), or None: the search fs/qnx4/inode.c
+    qnx4_checkroot() makes, over that extent only."""
+    if not (1 <= first_blk and 1 <= first_sz <= 65536):
+        return None
+    for j in range(first_sz):
+        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
+        if len(buf) < QNX4_BLOCK:
+            return None
+        for ix in range(8):
+            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
+            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
+                return e
+    return None
+
+
 def identify_qnx4(fh, base, size=None):
     """Return ("qnx4", lines) if a QNX4 filesystem starts at base, else None.
 
@@ -17035,20 +17166,7 @@ def identify_qnx4(fh, base, size=None):
     if (struct.unpack_from("<H", sb, 50)[0] & 0o170000) != S_IFDIR:
         return None
     first_blk, first_sz = struct.unpack_from("<II", sb, 20)
-    if not (1 <= first_blk and 1 <= first_sz <= 65536):
-        return None
-    bitmap = None
-    for j in range(first_sz):
-        buf = read_at(fh, base + (first_blk - 1 + j) * QNX4_BLOCK, QNX4_BLOCK)
-        if len(buf) < QNX4_BLOCK:
-            break
-        for ix in range(8):
-            e = buf[ix * QNX4_DIRENT:(ix + 1) * QNX4_DIRENT]
-            if e[0:8] == b".bitmap\x00":                 # strcmp in checkroot
-                bitmap = e
-                break
-        if bitmap:
-            break
+    bitmap = _qnx4_bitmap_entry(fh, base, first_blk, first_sz)
     if bitmap is None:
         return None
     bsize = struct.unpack_from("<I", bitmap, 16)[0]      # .bitmap di_size, bytes
@@ -17140,6 +17258,14 @@ def _etfs_scan_transactions(fh, base, pagesize, n, want_fid=None, cap=None):
             break
 
 
+def _etfs_name(raw):
+    """A stored ETFS name, or the part of one an entry holds, as text: up to its first
+    NUL, a byte that is not UTF-8 as %XX of the stored byte, and a "/" stored inside the
+    name as %2F so that it cannot invent a folder."""
+    return (raw.split(b"\x00", 1)[0].decode("utf-8", "qnxprobe-name")
+            .replace("\x00", "%00").replace("/", "%2F"))
+
+
 def _etfs_parse_entry(raw):
     """One 64-byte .filetable entry, or None."""
     if len(raw) < ETFS_ENTRY_SIZE:
@@ -17152,17 +17278,20 @@ def _etfs_parse_entry(raw):
              is_valid=efid != 0xFFFF, body=None, full=None)
     if etype == 0:                                # file entry
         mode, uid, gid, atime, mtime, ctime, size = struct.unpack_from("<7I", raw, 4)
-        name = raw[32:64].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        name = _etfs_name(raw[32:64])
         e["body"] = dict(mode=mode, uid=uid, gid=gid, mtime=mtime,
                          ctime=ctime, size=size, name=name)
     elif etype == 1:                              # extension-name entry
-        e["body"] = dict(name=raw[4:63].split(b"\x00", 1)[0].decode("utf-8", "replace"))
+        e["body"] = dict(name=_etfs_name(raw[4:63]))
     return e
 
 
 class EtfsWalker:
     """Reconstruct an ETFS filesystem by replaying its transactions, then walk
-    it through the shared collect()/extract interface. A node is a file id."""
+    it through the shared collect()/extract interface. A node is a file id.
+
+    ``volume_note`` says so when the region is not a whole number of pages: the
+    bytes after the last whole page are part of one page and are not read."""
 
     root = ETFS_FID_ROOT
 
@@ -17170,6 +17299,7 @@ class EtfsWalker:
         self.fh, self.base, self.bs = fh, base, pagesize
         self.unit = pagesize + ETFS_TRANS_SIZE
         self.n = size // self.unit
+        self.volume_note = _etfs_tail_note(size, pagesize)
         # current page for every (fid, cluster): the highest sequence wins, and
         # for equal sequences the later physical page, matching qnxmount.
         cur = {}
@@ -18815,6 +18945,20 @@ def nand_views(fh, base, size):
 #     node of its own
 #   a node whose data fails its CRC is        fs/jffs2/readinode.c
 #     obsolete, and older data shows through    check_node_data
+#   a dirent name is bytes (__u8 name[]),     include/uapi/linux/jffs2.h:111-126
+#     with no encoding
+#   a name whose inode has no node is         fs/jffs2/build.c:68-76
+#     dropped at mount, and an inode no name    jffs2_build_inode_pass1, and
+#     links is removed with what is under it    132-146, 242-303 (pass 2); the root
+#     (the root starts with one link)           fs/jffs2/scan.c:988-989
+#   a regular file whose fragments stop       fs/jffs2/readinode.c:1246-1253
+#     before the newest node's isize is         (the kernel warns and cuts the
+#     shorter than that node says; a range      size), fs/jffs2/read.c:174-190
+#     inside it that no node covers reads as
+#     zeros there
+#   a node is written into the space free     fs/jffs2/nodemgmt.c:358-490
+#     in one erase block, so it never           jffs2_do_reserve_space
+#     crosses into the next
 #
 # Kernel crc32() is crc32_le with seed 0 and no inversion, which is zlib's
 # crc32 with its pre- and post-inversion undone.
@@ -18923,6 +19067,12 @@ class Jffs2Unreadable(Exception):
     """JFFS2 content this reader cannot hand back; the message says why."""
 
 
+def _jffs2_name(raw):
+    """A stored dirent name as text. The name is bytes with no encoding, so a stretch
+    that is not UTF-8 becomes %XX of its bytes, a NUL %00 and a slash %2F."""
+    return raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
 def _jffs2_accurate(raw, e):
     """A node's bytes with the ACCURATE bit of its node type set again, as they
     were when its CRCs were computed: jffs2_mark_node_obsolete clears only
@@ -19023,11 +19173,29 @@ def jffs2_decompress(compr, src, dsize):
                           "is not read here")
 
 
+JFFS2_DAMAGE_CAP = 1000
+
+
 class Jffs2Walker:
     """List and read a JFFS2 filesystem by scanning every node in the region.
-    A node is an inode number; the root is inode 1."""
+    A node is an inode number; the root is inode 1.
+
+    JFFS2 records no size and no count of its own, so a region that holds only part
+    of a filesystem reads as a smaller one. What the region itself shows is missing is
+    recorded: ``damage`` (see damage_lines) says when the region ends inside a node,
+    when a file's size is not covered by its readable data nodes, and when a name in a
+    directory the root does not reach has an inode with no readable node, and
+    ``folders_not_read`` counts those findings; ``note`` counts the names in folders the
+    root does not reach and every name whose inode has no readable node, and
+    ``unread_entries()`` lists the ones of those the root reaches.
+    ``linked`` is the number of names the root reaches and ``unreached`` the number in
+    directories it does not reach. A region cut between two nodes, with every name it
+    still holds complete, shows none of this and reads as a smaller filesystem."""
 
     root = JFFS2_ROOT_INO
+    # read_file() counts the bytes no node holds in EOF_SHORTFALL and run_shortfall()
+    # says where they are, so extract_to_zip() asks that rather than saying past the end
+    read_file_reports_gaps = True
 
     def __init__(self, fh, base, size=None, endian=None, nand_fallback=True):
         self.fh, self.base = fh, base
@@ -19058,9 +19226,12 @@ class Jffs2Walker:
             if best[2] is not None:
                 self.__dict__.update(best[2].__dict__)
         self._resolved = {}
+        self._survey()
 
     def _reset(self):
         self.inodes = collections.defaultdict(list)   # ino -> [inode node records]
+        # Names are kept as the bytes stored and turned into text only where they are
+        # handed out, so two different stored names are never one key.
         self.dirents = collections.defaultdict(dict)  # pino -> {name: (version, ino, type, mctime)}
         self.stats = collections.Counter()
         # For recover_deleted(): every dirent the scan read, and where each node
@@ -19072,6 +19243,8 @@ class Jffs2Walker:
         # dirent sits, region-relative (in the spare-stripped view on NAND).
         self.cleanmarkers = []                        # offset
         self.dirent_nodes = []                        # (offset, pino, version, ino, dtype, name, mctime)
+        # Headers whose CRC holds and whose node the region is too short to hold.
+        self.cut_nodes = []                           # (offset, totlen), the first few
 
     def _scan(self):
         """Walk the region a 4 MiB chunk at a time, checking every 4-byte
@@ -19111,7 +19284,14 @@ class Jffs2Walker:
         if magic != JFFS2_MAGIC:
             return 0
         check = struct.pack(e + "HHI", magic, ntype | JFFS2_ACCURATE, totlen)
-        if _kcrc32(check) != hcrc or totlen < 12 or totlen > self.size - off:
+        if _kcrc32(check) != hcrc or totlen < 12:
+            return 0
+        if totlen > self.size - off:
+            # The header vouches for a node the region does not hold to its end. The
+            # scan goes on from the next 4 bytes, as it always has.
+            self.stats["cut"] += 1
+            if len(self.cut_nodes) < 16:
+                self.cut_nodes.append((off, totlen))
             return 0
         if self.endian is None:
             self.endian = e
@@ -19135,7 +19315,7 @@ class Jffs2Walker:
         return padded
 
     def _parse_dirent(self, off, totlen, e, obsolete=False):
-        """(pino, version, ino, mctime, dtype, name) for a dirent whose CRCs
+        """(pino, version, ino, mctime, dtype, name as stored) for a dirent whose CRCs
         hold, else None. The header CRC is checked by the caller. An obsolete
         node's CRCs were computed with the ACCURATE bit still set, which the
         kernel cleared afterwards, so it is set again before they are checked."""
@@ -19150,7 +19330,7 @@ class Jffs2Walker:
         if (_kcrc32(raw[:32]) != node_crc or len(name) < nsize
                 or _kcrc32(name) != name_crc or 40 + nsize > totlen):
             return None
-        return pino, version, ino, mctime, dtype, name.decode("utf-8", "surrogateescape")
+        return pino, version, ino, mctime, dtype, bytes(name)
 
     def _dirent(self, off, totlen, e):
         d = self._parse_dirent(off, totlen, e)
@@ -19231,8 +19411,177 @@ class Jffs2Walker:
         out = []
         for name, (_ver, target, _t, _m) in self.dirents.get(ino, {}).items():
             if target and target != ino:
-                out.append((name, target))
+                out.append((_jffs2_name(name), target))
         return sorted(out)
+
+    # -- what the region shows is missing -------------------------------------
+    def _held(self, ino, isize):
+        """The byte ranges below ``isize`` that this inode's data nodes cover, merged
+        and in order, as [[start, end], ...]. The kernel writes a hole as a node too
+        (fs/jffs2/fs.c:123-127 jffs2_do_setattr, fs/jffs2/file.c:142-174
+        jffs2_write_begin), so a range no node covers is missing, not a hole."""
+        spans = sorted((n["doff"], min(n["doff"] + n["dsize"], isize))
+                       for n in self.inodes.get(ino, ()) if n["dsize"] and n["doff"] < isize)
+        out = []
+        for a, b in spans:
+            if out and a <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return out
+
+    def _gap(self, ino, size=None):
+        """(bytes no node holds, ranges they are in, where the first starts, where the
+        last byte a node holds ends) for a regular file's first ``size`` bytes, the
+        whole file by default; None when its nodes cover them all."""
+        latest = self._latest(ino)
+        if latest is None or latest["mode"] & S_IFMT != S_IFREG:
+            return None
+        want = latest["isize"] if size is None else min(size, latest["isize"])
+        held = self._held(ino, latest["isize"])
+        gaps, at = [], 0
+        for a, b in held:
+            if a >= want:
+                break
+            if a > at:
+                gaps.append((at, a))
+            at = max(at, b)
+        if at < want:
+            gaps.append((at, want))
+        if not gaps:
+            return None
+        return (sum(b - a for a, b in gaps), len(gaps), gaps[0][0],
+                held[-1][1] if held else 0)
+
+    def run_shortfall(self, ino):
+        """Why read_file() gave fewer bytes than the file's size, as text, else None."""
+        gap = self._gap(ino)
+        if gap is None:
+            return None
+        missing, count, first, end = gap
+        tail = self._latest(ino)["isize"] - end
+        if not end:
+            return ("no readable node in the region holds any of its bytes, so the member "
+                    "is empty")
+        if tail == missing:
+            return (f"its readable data nodes stop at byte {end:,} and none in the region "
+                    f"holds the {tail:,} bytes after that, so the member ends there")
+        told = (f"no readable node in the region holds {missing:,} bytes of it, in {count:,} "
+                f"range{'' if count == 1 else 's'}, the first from byte {first:,}: ")
+        if not tail:
+            return told + ("those bytes are zeros in the member, so the bytes after them "
+                           "keep their offsets")
+        return told + (f"the {missing - tail:,} before byte {end:,}, where its readable "
+                       f"data nodes stop, are zeros in the member, and the member ends there")
+
+    def _note_damage(self, line):
+        if len(self.damage) < JFFS2_DAMAGE_CAP:
+            self.damage.append(line)
+
+    def _survey(self):
+        """Walk the tree from the root once and record what the region shows is missing.
+
+        The names the root reaches are counted in ``linked``. The kernel's mount pass
+        removes an inode no name links, and a directory's children with it, so names in a
+        directory the root does not reach are not part of the filesystem it mounts: they
+        are counted in ``unreached`` and not listed. A reached name whose inode has no
+        readable node goes to unread_entries(), and a reached regular file whose data
+        nodes do not cover its size is counted for ``damage``."""
+        self.damage, self.folders_not_read = [], 0
+        self.linked = self.unreached = self._unread_unreached = 0
+        self._unread = []
+        if self.stats["cut"]:
+            off, totlen = self.cut_nodes[0]
+            more = self.stats["cut"] - 1
+            where = ("of the region with its spare bytes stripped" if self.nand
+                     else "of the region")
+            self.folders_not_read += 1
+            self._note_damage(
+                f"the region ends inside a node: its header at byte {off:,} {where} records "
+                f"{totlen:,} bytes and {self.size - off:,} are there. That node was not read, "
+                f"and anything this filesystem stored after it is not in the region"
+                + (f" ({more:,} more such header{'' if more == 1 else 's'} inside it)"
+                   if more else ""))
+        reached, stack, checked = {self.root}, [(self.root, "")], set()
+        gap_files = gap_bytes = 0
+        while stack:
+            ino, path = stack.pop()
+            for raw, (_ver, target, _t, _m) in self.dirents.get(ino, {}).items():
+                if not target or target == ino:
+                    continue
+                self.linked += 1
+                name = _jffs2_name(raw)
+                full = f"{path}/{name}" if path else name
+                ent = self.entry(target)
+                if ent is None:
+                    self._unread.append((full, target))
+                    continue
+                fmt = ent[0] & S_IFMT
+                if fmt == S_IFDIR:
+                    if target not in reached:
+                        reached.add(target)
+                        stack.append((target, full))
+                elif fmt == S_IFREG and target not in checked:
+                    checked.add(target)
+                    gap = self._gap(target)
+                    if gap is not None:
+                        gap_files += 1
+                        gap_bytes += gap[0]
+        self._unread.sort()
+        for pino, ents in self.dirents.items():
+            if pino in reached:
+                continue
+            for _ver, target, _t, _m in ents.values():
+                if target and target != pino:
+                    self.unreached += 1
+                    self._unread_unreached += self.entry(target) is None
+        if self._unread_unreached:
+            # a reached one is a FAILED row of the export; these have no path to name
+            one = self._unread_unreached == 1
+            self.folders_not_read += 1
+            self._note_damage(
+                f"{self._unread_unreached:,} name{'' if one else 's'} in a directory the root "
+                f"does not reach lead{'s' if one else ''} to an inode with no readable node "
+                f"in this region. No row names {'it' if one else 'them'}, because "
+                f"{'it has' if one else 'they have'} no path")
+        if gap_files:
+            one = gap_files == 1
+            self.folders_not_read += 1
+            self._note_damage(
+                f"{gap_files:,} file{' records' if one else 's record'} a size "
+                f"{'its' if one else 'their'} data nodes do not cover: no readable node in "
+                f"the region holds {gap_bytes:,} bytes of {'it' if one else 'them'}. An export "
+                f"marks each such file SHORT")
+
+    @property
+    def volume_note(self):
+        """What the reader says about the volume as a whole, without the damage, or None.
+        Names in a folder the root does not reach are a count here and nothing more: a
+        region with nothing cut from it can hold them."""
+        parts = []
+        if self.unreached:
+            one = self.unreached == 1
+            parts.append(f"{self.unreached:,} name{' is' if one else 's are'} in a folder the "
+                         f"root does not reach: {'its' if one else 'their'} parent folder has "
+                         f"no entry the root reaches, and {'it is' if one else 'they are'} "
+                         f"not exported")
+        away = self._unread_unreached
+        count = len(self._unread) + away
+        if count:
+            one = count == 1
+            parts.append(f"{count:,} name{' leads' if one else 's lead'} to an inode with no "
+                         f"readable node in this region, so {'it is' if one else 'they are'} "
+                         f"not listed or exported"
+                         + (f"; {away:,} of them {'is' if away == 1 else 'are'} in a directory "
+                            f"the root does not reach" if away else ""))
+        return "; ".join(parts) or None
+
+    note = volume_note
+
+    def unread_entries(self):
+        """[(path, inode)] of every name the root reaches whose inode has no readable
+        node. collect() passes over these, so the export records them from here."""
+        return list(self._unread)
 
     def _data(self, node):
         raw = read_at(self.fh, self.base + node["off"] + 68, node["csize"])
@@ -19242,22 +19591,36 @@ class Jffs2Walker:
 
     def readlink(self, ino):
         latest = self._latest(ino)
-        return self._data(latest).decode("utf-8", "surrogateescape") if latest else ""
+        if not latest:
+            return ""
+        # a path, so its slashes stay; bytes that are not UTF-8 become %XX
+        return self._data(latest).decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
 
     def read_file(self, ino, size):
         """The file rebuilt from every data node, oldest version first so a
-        newer range overwrites an older one; unwritten ranges are holes."""
+        newer range overwrites an older one.
+
+        A range below the file's size that no node covers is not content. Nothing is
+        yielded after the last byte a node holds, which is where the kernel puts the end
+        of such a file, and a range missing before that is zeros so later bytes keep
+        their offsets. The bytes no node holds are added to EOF_SHORTFALL, which makes
+        the file SHORT with the count of what the nodes hold, and run_shortfall() says
+        where they are."""
         latest = self._latest(ino)
         if latest is None or latest["mode"] & S_IFMT != S_IFREG:
             return
         isize = latest["isize"]
-        buf = bytearray(isize)
+        held = self._held(ino, isize)
+        buf = bytearray(held[-1][1] if held else 0)
         for node in sorted(self.inodes[ino], key=lambda n: n["version"]):
             if not node["dsize"] or node["doff"] >= isize:
                 continue
             data = self._data(node)
             end = min(node["doff"] + node["dsize"], isize)
             buf[node["doff"]:end] = data[:end - node["doff"]].ljust(end - node["doff"], b"\0")
+        gap = self._gap(ino, size)
+        if gap is not None:
+            EOF_SHORTFALL["bytes"] += gap[0]
         view = memoryview(buf)[:min(size, isize)]
         for i in range(0, len(view), 1 << 20):
             yield bytes(view[i:i + (1 << 20)])
@@ -19411,8 +19774,8 @@ class Jffs2Walker:
             gap = isize - sum(covered)
             if len({n["version"] for n in recs}) != len(recs):
                 gap = gap or isize or 1
-            _v, pino, name = named.get(ino, (0, None, ""))
-            e = FlashDeletedFile("jffs2", ino, name, pino, paths.get(pino), isize,
+            _v, pino, name = named.get(ino, (0, None, b""))
+            e = FlashDeletedFile("jffs2", ino, _jffs2_name(name), pino, paths.get(pino), isize,
                                  latest["mode"], latest["mtime"], gap, recs, self)
             if gap and len({n["version"] for n in recs}) != len(recs):
                 e.reason = "the inode number was used by more than one file"
@@ -19599,26 +19962,24 @@ def identify_jffs2(fh, base, size=None):
     if not (s["inode"] or s["dirent"]):
         return None
     comps = sorted(k[6:] for k, v in s.items() if k.startswith("compr_") and v)
-    live = sum(1 for ents in w.dirents.values() for v in ents.values() if v[1])
-    orphans = sum(1 for ents in w.dirents.values() for v in ents.values()
-                  if v[1] and v[1] not in w.inodes and not w.dirents.get(v[1]))
     lines = [
         f"byte order   {'little' if w.endian == '<' else 'big'} endian",
     ] + ([f"NAND         a raw dump: {w.nand[0]}-byte pages each followed by {w.nand[1]} "
           "spare bytes, read with the spare stripped"] if w.nand else []) + [
         f"nodes        {s['valid']:,} with a valid header: {s['inode']:,} inode, "
         f"{s['dirent']:,} directory entry, {s['obsolete']:,} marked obsolete",
-        f"entries      {live:,} names currently linked, {len(w.inodes):,} inodes "
-        "with data nodes",
+        f"entries      {w.linked:,} name{'' if w.linked == 1 else 's'} linked from the root, "
+        f"{len(w.inodes):,} inodes with data nodes",
         f"compression  {', '.join(comps) if comps else 'none used'}",
     ]
     if s["bad"]:
         lines.append(f"damaged      {s['bad']:,} nodes whose header CRC held but whose body "
                      f"or data CRC did not ({s['data CRC failures']:,} data); dropped, as the "
                      "kernel drops them")
-    if orphans:
-        lines.append(f"note         {orphans:,} linked names lead to an inode with no readable "
-                     "node; they are not listed")
+    if w.note:                 # the names the root does not reach are counted here
+        lines.append(f"note         {w.note}")
+    for line in damage_lines(w)[1]:
+        lines.append(f"damage       {line}")
     unread = [c for c in comps if c not in ("none", "zero", "rtime", "zlib", "lzo", "lzma")]
     if unread:
         lines.append(f"note         {', '.join(unread)} compressed data is not read here")
@@ -19645,6 +20006,11 @@ def identify_jffs2(fh, base, size=None):
 #     whose data CRC fails
 #   a static volume's LEB holds data_size     drivers/mtd/ubi/attach.c,
 #     bytes; an unmapped LEB reads as 0xFF      drivers/mtd/ubi/eba.c
+#   a static volume with fewer LEBs than its  drivers/mtd/ubi/vtbl.c:593-616
+#     used_ebs is marked corrupted; one with    init_volumes
+#     no LEB at all is taken to be empty
+#   a volume name is name_len bytes with no   drivers/mtd/ubi/vtbl.c:234-247
+#     NUL among them; nothing else is checked   vtbl_check
 #
 # The PEB size is recorded nowhere; it is the distance between EC headers.
 # ---------------------------------------------------------------------------
@@ -19658,6 +20024,15 @@ UBI_CONTAINER = (1 << 63) - 1
 
 class UbiUnreadable(Exception):
     """A UBI structure this reader cannot use; the message says which."""
+
+
+# Every eraseblock of a UBI device opens with an erase counter header, and the volume
+# table is kept twice, in two eraseblocks. A region with one such header and no second
+# one is therefore part of a UBI image, and its eraseblock size cannot be measured.
+UBI_ONE_HEADER = ("an erase counter header whose CRC holds opens it and no second one "
+                  "follows, so at most one eraseblock of a UBI image is here ({size:,} "
+                  "bytes): its eraseblock size is not known, and the volume table and the "
+                  "volumes cannot be read")
 
 
 def _ubi_crc(data):
@@ -19770,7 +20145,12 @@ def ubi_peb_size(fh, base, size):
 
 
 class UbiImage:
-    """The PEB map and volume table of a UBI image at `base`."""
+    """The PEB map and volume table of a UBI image at `base`.
+
+    ``damage`` says what the image could not give and ``lost`` counts the entries of it
+    that mean data is missing (an entry starting "note:" is not one). ``partial`` is the
+    VID header of an eraseblock the data ends inside, when it reads: that eraseblock is
+    not mapped, and its header is kept only for what it records."""
 
     def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
@@ -19780,12 +20160,15 @@ class UbiImage:
         if ec0 is None:
             raise UbiUnreadable("no UBI erase counter header at the start")
         self.vid_off, self.data_off, self.image_seq, _ = ec0
-        self.peb = ubi_peb_size(fh, base, size) or size
+        found = ubi_peb_size(fh, base, size)
+        self.peb_known, self.peb = found is not None, found or size
         if not (0 < self.vid_off < self.peb and 0 < self.data_off < self.peb):
-            raise UbiUnreadable("EC header offsets do not fit the eraseblock")
+            raise UbiUnreadable("EC header offsets do not fit the eraseblock" if found
+                                else UBI_ONE_HEADER.format(size=size))
         self.leb_size = self.peb - self.data_off
         self.npebs = size // self.peb
         self.stats = collections.Counter()
+        self.damage, self.lost, self.partial = [], 0, None
         cands = collections.defaultdict(list)
         for p in range(self.npebs):
             at = base + p * self.peb
@@ -19822,7 +20205,66 @@ class UbiImage:
                 if len(vids) - i - 1:
                     self.stats["an older copy of a block, not the one read"] += len(vids) - i - 1
                 break
+        self._ends_inside(size)
         self.volumes = self._volume_table()
+
+    def _ends_inside(self, size):
+        """Record an eraseblock the data ends inside. Only whole eraseblocks are mapped,
+        so this one is not read; its headers, when they are there, say what it held."""
+        tail = size - self.npebs * self.peb
+        if tail <= 0:
+            return
+        at = self.base + self.npebs * self.peb
+        head = read_at(self.fh, at, min(tail, 64))
+        if not head or head[:4] != UBI_EC_MAGIC[:len(head[:4])]:
+            # Not an eraseblock of UBI: blank flash holds nothing, anything else is noted.
+            blank = True
+            for pos in range(0, tail, 1 << 20):
+                chunk = read_at(self.fh, at + pos, min(1 << 20, tail - pos))
+                if chunk.strip(b"\xff") or not chunk:
+                    blank = False
+                    break
+            if not blank:
+                self.damage.append(f"note: the UBI data is followed by {tail:,} bytes that are not "
+                                   f"a whole eraseblock ({self.peb:,} bytes) and do not open with "
+                                   "a UBI erase counter header; they are not read as UBI")
+            return
+        said = (f"the UBI data ends {tail:,} bytes into an eraseblock of {self.peb:,} bytes, "
+                "which is not read")
+        ec = _ubi_ec(head)
+        if ec is None:
+            self.lost += 1
+            self.damage.append(f"{said}: its erase counter header does not read, so what it "
+                               "held is not known")
+            return
+        if ec[2] != self.image_seq:
+            self.damage.append(f"note: {said}; it carries another image sequence number, so "
+                               "it is not an eraseblock of this UBI image")
+            return
+        raw = read_at(self.fh, at + ec[0], 64) if ec[0] + 64 <= tail else b""
+        vid = _ubi_vid(raw)
+        if vid is None:
+            if raw == b"\xff" * 64:
+                self.damage.append(f"note: {said}; its volume header is blank, as a free "
+                                   "eraseblock's is")
+                return
+            self.lost += 1
+            self.damage.append(f"{said}: its volume header does not read, so what it held is "
+                               "not known")
+            return
+        self.partial = vid
+        what = (f"logical eraseblock {vid['lnum']} of "
+                + ("the volume table" if vid["vol_id"] == UBI_LAYOUT_VOL
+                   else f"volume {vid['vol_id']}"))
+        have = self.map.get((vid["vol_id"], vid["lnum"]))
+        if have is not None and have["sqnum"] > vid["sqnum"]:
+            self.damage.append(f"note: {said}; it holds an older copy of {what}, and the newer "
+                               "copy is the one read")
+            return
+        self.lost += 1
+        self.damage.append(f"{said}: it holds " + (
+            f"the newest copy of {what}, so an older copy is read in its place"
+            if have is not None else f"{what}, so that block is missing from what is read"))
 
     def _data_ok(self, vid):
         data = read_at(self.fh, vid["data_at"], vid["data_size"])
@@ -19847,7 +20289,8 @@ class UbiImage:
                 reserved, align, data_pad, vtype, upd, nlen = struct.unpack_from(">IIIBBH", rec, 0)
                 if not reserved:
                     continue
-                name = rec[16:16 + min(nlen, 127)].decode("utf-8", "replace")
+                name = (rec[16:16 + min(nlen, 127)].decode("utf-8", "qnxprobe-name")
+                        .replace("\x00", "%00").replace("/", "%2F"))
                 vols.append(dict(id=i, name=name, type=vtype, reserved=reserved,
                                  data_pad=data_pad, update_marker=upd,
                                  flags=rec[144]))
@@ -19865,7 +20308,14 @@ class UbiImage:
 
 class UbiVolumeView:
     """One UBI volume read as a flat file: LEB n at n * usable LEB size, an
-    unmapped LEB as 0xFF, a static volume ending where its data ends."""
+    unmapped LEB as 0xFF, a static volume ending where its data ends.
+
+    A static volume records how many LEBs it uses (used_ebs, in every VID header) and
+    its last LEB records where the data ends. When fewer are here than it records, the
+    kernel marks the volume corrupted (vtbl.c init_volumes), and ``short`` is
+    (LEBs here, LEBs recorded, whether the size is recorded): a read then stops at the
+    first LEB that is missing and nothing is put in its place. With the last LEB's
+    header gone the size is the most those LEBs can hold."""
 
     def __init__(self, ubi, vol):
         self.ubi, self.vol = ubi, vol
@@ -19873,10 +20323,15 @@ class UbiVolumeView:
         lebs = {k[1]: v for k, v in ubi.map.items() if k[0] == vol["id"]}
         self.lebs = lebs
         self.name = vol["name"]
-        if vol["type"] == 2 and lebs:
-            used = next(iter(lebs.values()))["used_ebs"]
-            last = lebs.get(used - 1)
+        self.short = None
+        cut = ubi.partial if ubi.partial and ubi.partial["vol_id"] == vol["id"] else None
+        if vol["type"] == 2 and (lebs or cut):
+            used = (next(iter(lebs.values())) if lebs else cut)["used_ebs"]
+            last = lebs.get(used - 1) or (cut if cut and cut["lnum"] == used - 1 else None)
             self.size = (used - 1) * self.leb + (last["data_size"] if last else self.leb)
+            held = sum(1 for n in range(used) if n in lebs)
+            if held < used:
+                self.short = (held, used, last is not None)
         else:
             self.size = ((max(lebs) + 1) if lebs else 0) * self.leb
         self._pos = 0
@@ -19900,6 +20355,8 @@ class UbiVolumeView:
             take = min(self.leb - off, end - pos)
             vid = self.lebs.get(lnum)
             if vid is None:
+                if self.short:
+                    break
                 out += b"\xff" * take
             else:
                 chunk = read_at(self.ubi.fh, vid["data_at"] + off, take)
@@ -19916,7 +20373,14 @@ class UbiWalker:
     SquashFS is walked as that filesystem under the volume's name; any other
     volume (a kernel, a device tree, an environment) is one regular file of
     the volume's bytes. A node carries the volume index in its top bits and
-    the inner filesystem's own node below them."""
+    the inner filesystem's own node below them.
+
+    ``damage`` lists what could not be read, here and in each volume's own
+    filesystem, and ``folders_not_read`` counts the entries of it that mean data is
+    missing: an eraseblock the data ends inside, a dump that ends inside a NAND page,
+    a volume table that does not read, a static volume with fewer eraseblocks than it
+    records, and a volume that opens as a filesystem and could not be read as one.
+    ``unread_entries()`` names the files whose inode a UBIFS volume could not read."""
 
     root = UBI_CONTAINER
 
@@ -19924,6 +20388,7 @@ class UbiWalker:
         if size is None:
             size = image_size(fh) - base
         self.ubi, self.nand = UbiImage(fh, base, size), None
+        self._damage, self._lost = [], 0
         # On a raw NAND dump the spare bytes after each page shift everything
         # past an eraseblock's first page. The EC and VID headers may still read
         # (a VID header in a 512-byte subpage lies inside the first page), but
@@ -19939,12 +20404,47 @@ class UbiWalker:
                 if trial.vtbl_ok:
                     self.ubi, self.nand = trial, (page, spare)
                     break
+        # A dump that ends inside a page is a whole number of pages in no geometry.
+        # Each is tried again over the whole pages that are there, and the part of a
+        # page after them is recorded as not read.
+        if not self.ubi.vtbl_ok:
+            for page, spare in YAFFS_GEOMETRIES:
+                rest = size % (page + spare)
+                if not rest or size < page + spare:
+                    continue
+                view = NandDataView(fh, base, size, page, spare)
+                try:
+                    trial = UbiImage(view, 0, view.size)
+                except UbiUnreadable:
+                    continue
+                if trial.vtbl_ok:
+                    self.ubi, self.nand = trial, (page, spare)
+                    self._lose(f"the dump is not a whole number of NAND pages ({page} data "
+                               f"bytes and {spare} spare bytes each): its last {rest:,} bytes "
+                               "are part of a page and are not read")
+                    break
+        if not self.ubi.peb_known:
+            raise UbiUnreadable(UBI_ONE_HEADER.format(size=size))
+        if not self.ubi.vtbl_ok:
+            self._lose("the UBI volume table does not read, so the volumes' names, types and "
+                       "padding are not known: each volume number with mapped eraseblocks is "
+                       "read as vol<number>, up to its highest mapped eraseblock, with no "
+                       "padding taken off")
         self.inner = []                        # (volume, view, walker or None, note)
         for vol in self.ubi.volumes:
             view = self.ubi.volume_view(vol)
+            if view.short:
+                self._lose(self._short_text(view, True))
+            elif vol["type"] == 2 and not view.lebs:
+                self._damage.append(
+                    f"note: static volume {vol['id']} has no eraseblock here and is listed "
+                    "as an empty file; UBI records a static volume's size only in its "
+                    "eraseblocks, so an empty volume and one whose eraseblocks are missing "
+                    f"look the same: {vol['name']}")
             walker, kind = None, "raw"
             head = view.read(8) if view.size else b""
             view.seek(0)
+            what = ("SquashFS" if head[:4] == b"hsqs" else "UBIFS")
             try:
                 if head[:4] == b"hsqs":
                     walker, kind = SquashfsWalker(view, 0), "squashfs"
@@ -19952,7 +20452,74 @@ class UbiWalker:
                     walker, kind = UbifsWalker(view, 0), "ubifs"
             except Exception as exc:          # a volume that will not open is a file
                 walker, kind = None, f"raw ({type(exc).__name__}: {exc})"
+                self._lose(f"volume {vol['id']} opens as {what} and could not be read as it "
+                           f"({str(exc)[:70]}), so it is exported as one file of its raw bytes "
+                           f"and none of the files in it are listed: {vol['name']}")
             self.inner.append((vol, view, walker, kind))
+        # The volume table alone. ubinize writes a dynamic volume with no data as no
+        # eraseblock at all, and the kernel reads it as empty, so this is a note: an
+        # empty device and one whose volumes' eraseblocks were cut away look the same.
+        if self.ubi.vtbl_ok and self.inner and not any(view.lebs for _v, view, _w, _k
+                                                       in self.inner):
+            self._damage.append(
+                f"note: the volume table lists {len(self.inner):,} volume(s) and no "
+                f"eraseblock of any of them is here, in {self.ubi.npebs:,} eraseblock(s): "
+                "each is listed as an empty file; a volume written with no data and one "
+                "whose eraseblocks are missing look the same")
+
+    def _lose(self, what):
+        """Record something that could not be read, counted in folders_not_read."""
+        self._damage.append(what)
+        self._lost += 1
+
+    @staticmethod
+    def _short_text(view, named):
+        """What a static volume short of its eraseblocks holds, for the volume's record
+        (with its number and name) and for its file's own SHORT row (without)."""
+        held, used, sized = view.short
+        rest = ", so it is read only up to the first one that is missing"
+        if not sized:
+            rest += (f"; the last one records where the data ends, so {view.size:,} bytes is "
+                     "the most it can hold and not a recorded size")
+        if named:
+            return (f"static volume {view.vol['id']} has {held:,} of the {used:,} eraseblocks "
+                    f"it records{rest}: {view.vol['name']}")
+        return f"{held:,} of the {used:,} eraseblocks this static volume records are here{rest}"
+
+    @property
+    def damage(self):
+        out = list(self.ubi.damage) + list(self._damage)
+        for vol, _view, walker, _kind in self.inner:
+            out.extend(f"volume {vol['id']}: {line}"
+                       for line in getattr(walker, "damage", None) or ())
+        return out
+
+    @property
+    def folders_not_read(self):
+        return (self.ubi.lost + self._lost
+                + sum(getattr(walker, "folders_not_read", 0) or 0
+                      for _vol, _view, walker, _kind in self.inner))
+
+    def unread_entries(self):
+        """[(path, inode number)] of every name in a volume's filesystem whose inode could
+        not be read, with the path given the way this walker lists it."""
+        out = []
+        for vol, _view, walker, _kind in self.inner:
+            report = getattr(walker, "unread_entries", None)
+            if report is not None:
+                top = vol["name"] or f"vol{vol['id']}"
+                out.extend((f"{top}/{path}", node) for path, node in report())
+        return out
+
+    def run_shortfall(self, node):
+        """Why a static volume listed as a file read short, as text, else None."""
+        if node == UBI_CONTAINER:
+            return None
+        i, _inner = self._split(node)
+        _vol, view, walker, _kind = self.inner[i]
+        if walker is None and view.short:
+            return self._short_text(view, False)
+        return None
 
     def _split(self, node):
         return node >> UBI_NODE_SHIFT, node & ((1 << UBI_NODE_SHIFT) - 1)
@@ -20033,8 +20600,9 @@ def identify_ubi(fh, base, size=None):
         size = image_size(fh) - base
     try:
         w = UbiWalker(fh, base, size)
-    except UbiUnreadable:
-        return None
+    except UbiUnreadable as exc:
+        # The header's CRC holds, so this is UBI; the export records why it is not read.
+        return "ubi", [f"damaged      {exc}"]
     _remember_walker(fh, base, size, "ubi", w)
     u = w.ubi
     if not u.stats["mapped"]:
@@ -20085,6 +20653,12 @@ def identify_ubi(fh, base, size=None):
 #   data node compression: LZO1X, raw deflate fs/ubifs/compress.c,
 #     (the kernel's "deflate"), zstd            crypto/deflate.c
 #   a missing data block is a hole            fs/ubifs/file.c read_block
+#   an inode's seconds are read as signed     fs/ubifs/super.c:141-145 ubifs_iget
+#     64-bit, so a time before 1970 is held
+#   the log's first LEB always opens with the fs/ubifs/replay.c:1006-1030
+#     commit start node of the current         replay_log_leb, and 1203-1217
+#     commit; the kernel does not mount         ubifs_replay_journal
+#     without it
 # ---------------------------------------------------------------------------
 UBIFS_MAGIC = 0x06101831
 UBIFS_BIT_REPAIR_NOTE = ("bit errors   {n:,} node(s){where} failed their CRC by one flipped bit "
@@ -20134,17 +20708,30 @@ def _ubifs_truncate(blocks, old, new):
         del blocks[blk]
 
 
+def _ubifs_name(raw):
+    """One stored name as text: bytes that are not UTF-8 as %XX, a NUL as %00 and a
+    slash as %2F, so a name is never a surrogate and never invents a folder."""
+    return raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F")
+
+
 class UbifsWalker:
     """List and read a UBIFS volume: the committed index, with the journal
     replayed over it. The volume is a flat file of LEBs (a UBI volume view, or
-    the output of mkfs.ubifs itself); a node is an inode number."""
+    the output of mkfs.ubifs itself); a node is an inode number.
+
+    ``damage`` lists the index nodes and directory entry nodes that did not read and a
+    journal that could not be replayed, and each one counts in ``folders_not_read``,
+    because what an unread index node or an unreplayed journal held is not known: names,
+    inodes and data blocks alike. ``unread_entries()`` names the entries whose inode
+    node could not be read."""
 
     root = 1
 
-    def __init__(self, fh, base):
+    def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
         self.leb_size = 0                      # LEB 0 is read before the size is known
         self.stats = collections.Counter()
+        self.damage, self.folders_not_read = [], 0
         self.bit_repairs = set()               # (lnum, offs) of nodes read with one bit restored
         sb = self._node(0, 0)
         if sb is None or sb[20] != UBIFS_SB_NODE:
@@ -20160,12 +20747,39 @@ class UbifsWalker:
             raise UbifsUnreadable("implausible LEB size")
         self.master = self._master()
         if self.master is None:
-            raise UbifsUnreadable("no master node reads in LEB 1 or 2")
+            total = self.leb_cnt * self.leb_size
+            raise UbifsUnreadable("no master node reads in LEB 1 or 2" + (
+                f": the superblock records {self.leb_cnt:,} eraseblocks of {self.leb_size:,} "
+                f"bytes, and {total - size:,} of those {total:,} bytes lie past the end of "
+                "the image" if size is not None and total > size else ""))
         self.inodes, self.data, self.dents = {}, collections.defaultdict(dict), \
             collections.defaultdict(dict)
         self._walk_index()
         self._replay()
         self._ino_cache = {}
+        lost = self.stats["unreadable index nodes"]
+        if lost:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"{lost:,} index node(s) did not read, so the names, inodes and data blocks "
+                "they index are not known here: files and folders may be missing, and a block "
+                "of a listed file may read as zeros, as a hole does")
+        why = ("holds no node, and the kernel requires the current commit's start node there"
+               if self.stats["log head with no node"] else
+               "does not open with the current commit's start node, which the kernel requires"
+               if self.stats["log does not open with this commit"] else None)
+        if why:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"the journal was not replayed: the log's first eraseblock (LEB "
+                f"{self.master['log_lnum']:,}) {why}, so what was written since the last "
+                "commit is not listed")
+        lost = self.stats["unreadable directory entries"]
+        if lost:
+            self.folders_not_read += 1
+            self.damage.append(
+                f"{lost:,} directory entry node(s) the index points to did not read, so "
+                "those names are not listed and neither is anything under them")
 
     # -- nodes ---------------------------------------------------------------
     def _node(self, lnum, offs, length=None, want=None):
@@ -20304,7 +20918,7 @@ class UbifsWalker:
     def _dent(raw):
         target = struct.unpack_from("<Q", raw, 40)[0]
         dtype, nlen = raw[49], struct.unpack_from("<H", raw, 50)[0]
-        return target, dtype, raw[56:56 + nlen].decode("utf-8", "surrogateescape")
+        return target, dtype, bytes(raw[56:56 + nlen])       # as stored: _ubifs_name() shows it
 
     # -- the journal ---------------------------------------------------------
     def _replay(self):
@@ -20315,6 +20929,8 @@ class UbifsWalker:
         for _ in range(self.log_lebs):
             nodes = self._scan_leb(lnum, 0)
             if not nodes:
+                if cs_sqnum is None:
+                    self.stats["log head with no node"] += 1
                 break
             if cs_sqnum is None:
                 first = nodes[0][1]
@@ -20382,7 +20998,7 @@ class UbifsWalker:
         raw = self._node(loc[0], loc[1], loc[2], UBIFS_INO_NODE) if loc else None
         if raw is None:
             return None
-        size, _at, _ct, mtime = struct.unpack_from("<QQQQ", raw, 48)
+        size, _at, _ct, mtime = struct.unpack_from("<Qqqq", raw, 48)
         nlink, uid, gid, mode, flags, dlen = struct.unpack_from("<IIIIII", raw, 92)
         ino = dict(size=size, mtime=mtime, nlink=nlink, uid=uid, gid=gid, mode=mode,
                    flags=flags, data=raw[160:160 + dlen])
@@ -20397,11 +21013,32 @@ class UbifsWalker:
         return ino["mode"], ino["size"], ino["mtime"]
 
     def listdir(self, inum):
-        return sorted((name, t) for name, (t, _dt) in self.dents.get(inum, {}).items())
+        # two stored names that show as the same text keep the order of their bytes
+        return [(shown, t) for shown, _raw, t in sorted(
+            (_ubifs_name(name), name, t) for name, (t, _dt) in self.dents.get(inum, {}).items())]
+
+    def unread_entries(self):
+        """[(path, inode number)] of every name whose inode node could not be read, or
+        that the index holds no inode for. collect() passes over these, so the export
+        records them from here."""
+        out, stack, seen = [], [(self.root, "", 0)], set()
+        while stack:
+            inum, prefix, depth = stack.pop()
+            if inum in seen or depth > 64:
+                continue
+            seen.add(inum)
+            for name, child in self.listdir(inum):
+                path = f"{prefix}/{name}" if prefix else name
+                ino = self._ino(child)
+                if ino is None:
+                    out.append((path, child))
+                elif ino["mode"] & S_IFMT == S_IFDIR:
+                    stack.append((child, path, depth + 1))
+        return sorted(out)
 
     def readlink(self, inum):
         ino = self._ino(inum)
-        return ino["data"].decode("utf-8", "surrogateescape") if ino else ""
+        return ino["data"].decode("utf-8", "qnxprobe-name") if ino else ""
 
     def read_file(self, inum, size):
         ino = self._ino(inum)
@@ -20458,13 +21095,13 @@ class UbifsWalker:
                     parent = self._key(raw, 24)[0]
                     target, _dtype, name = self._dent(raw)
                     if target and target not in self.inodes:
-                        names[target].append((sq, parent, name))
+                        names[target].append((sq, parent, _ubifs_name(name)))
                     continue
                 inum = struct.unpack_from("<I", raw, 24)[0]
                 if inum in self.inodes:
                     continue
                 if t == UBIFS_INO_NODE:
-                    size, _at, _ct, mtime = struct.unpack_from("<QQQQ", raw, 48)
+                    size, _at, _ct, mtime = struct.unpack_from("<Qqqq", raw, 48)
                     nlink, _uid, _gid, mode, flags = struct.unpack_from("<IIIII", raw, 92)
                     inos[inum].append((sq, nlink, size, mtime, mode, flags))
                 elif t == UBIFS_DATA_NODE:
@@ -20534,12 +21171,22 @@ def identify_ubifs(fh, base, size=None):
     if len(head) < 24 or struct.unpack_from("<I", head, 0)[0] != UBIFS_MAGIC \
             or head[20] != UBIFS_SB_NODE:
         return None
-    try:
-        w = UbifsWalker(fh, base)
-    except UbifsUnreadable:
-        return None
     if size is None:
         size = image_size(fh) - base
+    try:
+        w = UbifsWalker(fh, base, size)
+    except UbifsUnreadable as exc:
+        # A superblock node whose CRC holds, of a volume that reaches past the end of
+        # the region, is a cut UBIFS volume; the export records why it is not read.
+        nlen = struct.unpack_from("<I", head, 16)[0]
+        raw = read_at(fh, base, nlen) if 124 <= nlen <= 1 << 20 else b""
+        if len(raw) < nlen or not raw or _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+            return None
+        leb_size, leb_cnt = struct.unpack_from("<II", raw, 36)
+        if not 4096 <= leb_size <= 16 << 20 or leb_cnt * leb_size <= size:
+            return None
+        return "ubifs", [f"format       {human(leb_size)} LEBs, {leb_cnt:,} in use",
+                         f"damaged      {exc}"]
     _remember_walker(fh, base, size, "ubifs", w)
     return "ubifs", ubifs_lines(w)
 
@@ -20566,7 +21213,7 @@ def ubifs_lines(w):
     if w.flags & UBIFS_FLG_AUTHENTICATION:
         lines.append("note         authenticated volume; hashes are not checked here")
     for k in ("unreadable index nodes", "unreadable directory entries",
-              "log does not open with this commit"):
+              "log does not open with this commit", "log head with no node"):
         if w.stats[k]:
             lines.append(f"damaged      {w.stats[k]:,} {k}")
     if w.bit_repairs:
@@ -21846,7 +22493,9 @@ def _zip_time_lost(v, w=None, node=None):
     if v is None or (v == 0 and _zip_zero_is_no_time(w, node)):
         return None
     try:
-        d = datetime.datetime.fromtimestamp(v, datetime.timezone.utc)
+        # fromtimestamp() refuses a time before 1970 on Windows
+        d = (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+             + datetime.timedelta(seconds=v))
     except (OverflowError, OSError, ValueError):
         return f"{v} (outside any date this reader can show)"
     if 1980 <= d.year <= 2107:
@@ -27700,7 +28349,7 @@ def walker_for(kind, fh, base, size=None):
     if kind == "btrfs":
         return BtrfsWalker(fh, base)
     if kind == "ubifs":
-        return _cached_walker(fh, base, size, kind, lambda: UbifsWalker(fh, base))
+        return _cached_walker(fh, base, size, kind, lambda: UbifsWalker(fh, base, size))
     if kind == "ubi":
         return _cached_walker(fh, base, size, kind, lambda: UbiWalker(fh, base, size))
     if kind == "jffs2":
@@ -27747,15 +28396,46 @@ def _etfs_reserved_match(fh, base, pagesize, n, need=3):
     return False
 
 
+def _etfs_tail_note(size, pagesize):
+    """What to say of a region that is not a whole number of pages, or None."""
+    unit = pagesize + ETFS_TRANS_SIZE
+    tail = size % unit
+    if not tail:
+        return None
+    return (f"the image or region ends inside a page: after its {size // unit:,} whole "
+            f"pages of {unit:,} bytes ({pagesize:,} of data and {ETFS_TRANS_SIZE} of "
+            f"transaction record) come {tail:,} bytes that are part of one more page, "
+            f"and that page was not read")
+
+
 def etfs_pagesize(fh, base, size):
     """The ETFS page size for the region, or None. A candidate is accepted only
-    when the region divides evenly into (pagesize + 16)-byte pages AND the
-    .filetable carries its reserved names, so a chance size match is rejected.
+    when the .filetable, read in (pagesize + 16)-byte pages, carries its reserved
+    names at their fixed ids.
+
+    Whether the region must also be a whole number of pages depends on what it is,
+    and table_regions() says which: when the image has an MBR, GPT or APM entry,
+    every region tested is a partition or something inside one, its size is the
+    table's and not a cut's, and the whole-page test is kept, which declines almost
+    every such region on arithmetic alone before a byte of it is read. When the
+    image has no partition table, the region is the whole image or a flash region
+    found by its own headers (raw_flash_layout), the shape of a flash dump: that one
+    may end inside a page, because a dump cut inside its last page is still that
+    volume, and the walker says the page was not read (_etfs_tail_note).
     """
+    tabled = None
     for P in ETFS_PAGE_SIZES:
         unit = P + ETFS_TRANS_SIZE
-        if size < unit or size % unit != 0:
+        if size < unit:
             continue
+        if size % unit:
+            if tabled is None:
+                try:
+                    tabled = bool(table_regions(fh)[0])
+                except Exception:                      # pylint: disable=broad-except
+                    tabled = True       # tables that cannot be read: the stricter test
+            if tabled:
+                continue
         if _etfs_reserved_match(fh, base, P, size // unit):
             return P
     return None
@@ -27766,12 +28446,16 @@ def identify_etfs(fh, base, size):
     P = etfs_pagesize(fh, base, size)
     if P is None:
         return None
-    return "etfs", [
+    lines = [
         f"page size    {P:,} bytes data + {ETFS_TRANS_SIZE} bytes transaction",
         f"pages        {size // (P + ETFS_TRANS_SIZE):,}",
         "layout       transaction based, live state replayed from the spare area",
         "reserved     .filetable/.badblks/.counts/.lost+found/.reserved present",
     ]
+    tail = _etfs_tail_note(size, P)
+    if tail:
+        lines.append(f"note         {tail}")
+    return "etfs", lines
 
 
 def identify_efs(fh, base, size):
@@ -28033,11 +28717,12 @@ def _fat_partition_type(fh, base):
     """What the partition table calls the region at ``base``, as text, when that is a FAT
     type, else None. A bare image has no table and so gives no sign it was FAT."""
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
+    mbr = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, mbr)
     for _idx, _name, guid, first, _last in gpt or ():
         if first * ss == base and str(guid).lower() == _EFI_SYSTEM_GUID:
             return "EFI system partition"
-    for _idx, kind, start, _count in parse_mbr(fh) or ():
+    for _idx, kind, start, _count in mbr or ():
         if start * ss == base and kind in _FAT_MBR_TYPES:
             return f"MBR type {kind:#04x}"
         if kind not in EXT_PARTITION_TYPES:
@@ -32530,7 +33215,7 @@ def raid_assemble(images):
         size = image_size(fh)
         parts.append((label, fh, size))
         gpt = parse_gpt(fh)
-        lbs = gpt.sector_size if gpt is not None else SECTOR      # disk_sector_size()
+        lbs = tables_sector_size(fh, gpt, parse_mbr(fh))
         for _idx, pname, tguid, first, _last in (gpt or []):
             kind = RAID_GPT_TYPES.get(tguid.lower())
             if kind:
@@ -32859,7 +33544,7 @@ def _raid_identity_scan(fh):
     partition that ends where the image does belongs to the partition."""
     size = image_size(fh)
     gpt = parse_gpt(fh)
-    lbs = gpt.sector_size if gpt is not None else SECTOR      # as raid_assemble()
+    lbs = tables_sector_size(fh, gpt, parse_mbr(fh))          # as raid_assemble()
     out, md_at = [], {}
     for plabel, base, psize in _raid_places(fh, size):
         psize = min(psize, size - base)
@@ -42625,10 +43310,11 @@ def table_regions(fh):
     regions, names = [], {}
     containers, protective = set(), set()
     # Read first, reported last: the sector size the GPT header was found at is
-    # the unit every LBA on this disk counts, the MBR's included.
+    # the unit every LBA on this disk counts, the MBR's included. An MBR alone is
+    # read at the size its own partitions answer at (tables_sector_size).
     gpt = parse_gpt(fh)
-    ss = gpt.sector_size if gpt is not None else SECTOR
     parts = parse_mbr(fh)
+    ss = tables_sector_size(fh, gpt, parts)
     if parts:
         for idx, t, st, cnt in parts:
             regions.append((f"MBR part {idx}", st * ss, cnt * ss))
@@ -42725,7 +43411,8 @@ def volumes(fh, size=None):
         label       the region as the report names it ("GPT part 3 storage")
         base, size  byte offset and byte length of the region
         lba         base in the disk's logical sectors (4096 bytes on a disk
-                    whose GPT header is at byte 4096, else 512), the identity
+                    whose GPT header is at byte 4096 or whose MBR is read
+                    at 4096, tables_sector_size(); else 512), the identity
                     an extraction is named by
         kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
                     or "not recognised"
@@ -46378,16 +47065,18 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         # its header was found at is the unit of every LBA on this disk,
         # the MBR's included (disk_sector_size).
         gpt, gpt_rejected = read_gpt(fh)
-        ss = gpt.sector_size if gpt is not None else SECTOR
-        image_rec["sector_bytes"] = ss
         parts = parse_mbr(fh)
+        ss = tables_sector_size(fh, gpt, parts)
+        image_rec["sector_bytes"] = ss
         if parts is None:
             print("  MBR      none (no 0x55AA signature at offset 510, or "
                   "sector 0 is a filesystem's own boot sector)")
         else:
             gpt_prot = any(t == 0xEE for _, t, _, _ in parts)
             print(f"  MBR      valid, {len(parts)} entries"
-                  + ("  (0xEE = GPT protective)" if gpt_prot else ""))
+                  + ("  (0xEE = GPT protective)" if gpt_prot else "")
+                  + (f", read in {ss}-byte logical sectors" if ss != SECTOR and gpt is None
+                     else ""))
             for idx, t, st, cnt in parts:
                 tag = f"   <- {MBR_QNX_TYPES[t]}" if t in MBR_QNX_TYPES else ""
                 print(f"    {idx}  type 0x{t:02x}  LBA {st:<12,} {human(cnt*ss):>10}{tag}")
@@ -47139,8 +47828,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
                                                                  written_names, issues=issues,
                                                                  readings=fat_times)
-                            if isinstance(w, F2fsWalker):
-                                w.check_reached()
+                            # YAFFS and JFFS2 list their own unread names below
+                            if isinstance(w, (F2fsWalker, UbiWalker, UbifsWalker)):
+                                if isinstance(w, F2fsWalker):
+                                    w.check_reached()
                                 # a name whose inode cannot be read never reaches the list above
                                 unread, undropped = apply_exclude(
                                     [(p, i, None, None) for p, i in w.unread_entries()], exclude)
@@ -47150,6 +47841,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                "read, so it is not exported, and if it is a "
                                                "folder neither is anything under it", 1)
                                               for p, i, _s, _m in unread)
+                            if isinstance(w, F2fsWalker):
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
                             elif isinstance(w, YaffsWalker):
                                 # a file under a folder with no header in the image, or
@@ -47158,6 +47850,17 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                           in w.unread_entries(files_only=True)]
                                 fa += len(unread)
                                 issues.extend(("", "", "FAILED", detail, 1) for detail in unread)
+                            elif isinstance(w, Jffs2Walker):
+                                # a name whose inode has no readable node is not in the list either
+                                unread, undropped = apply_exclude(
+                                    [(p, i, None, None) for p, i in w.unread_entries()], exclude)
+                                dropped += undropped
+                                fa += len(unread)
+                                issues.extend((p, "", "FAILED", f"its inode ({i:,}) has no "
+                                               "readable node in this region, so it is not "
+                                               "exported, and if it is a folder neither is "
+                                               "anything under it", 1)
+                                              for p, i, _s, _m in unread)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -48908,6 +49611,287 @@ def _f2fs_marker_check(image_gz):
         if i >= 0 and runs[i][0] <= off < runs[i][0] + runs[i][1]:
             in_free += 1
     return has_bit, len(blocks), in_free
+
+
+def _jffs2_reader_checks():
+    """[(label, passed or None for a skip)] for what the JFFS2 reader says about names
+    that are not UTF-8, a region that holds only part of a filesystem, and names the
+    root does not reach. The cut regions are the committed mkfs.jffs2 fixtures stopped
+    at half their length, held against the same fixtures read whole. The other images
+    are a few nodes written here from the layouts cited above the reader, because no
+    committed fixture holds those names or those directories."""
+    import gzip
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    import zlib
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    stems = ("jffs2-le-zlib", "jffs2-be-zlib", "jffs2-le-lzo", "jffs2-le-lzma", "jffs2-le-rtime",
+             "jffs2-le-none", "jffs2-le-sum", "jffs2-nor-history", "jffs2-nand-history")
+    absent = [n for n in stems if not os.path.isfile(os.path.join(here, n + ".img.gz"))]
+    if absent:
+        return [(f"the JFFS2 fixtures are not beside this script ({', '.join(absent)}), so "
+                 "the JFFS2 reader's names and records were not checked", None)]
+
+    def fixture(stem):
+        with gzip.open(os.path.join(here, stem + ".img.gz"), "rb") as gz:
+            return gz.read()
+
+    def walker(raw):
+        return Jffs2Walker(io.BytesIO(raw), 0, len(raw))
+
+    def node(ntype, body):
+        head = struct.pack("<HHI", JFFS2_MAGIC, ntype, 12 + len(body))
+        raw = head + struct.pack("<I", _kcrc32(head)) + body
+        return raw + b"\xff" * (-len(raw) % 4)
+
+    def dirent(pino, version, ino, name, dtype=8):                  # 8: DT_REG, 4: DT_DIR
+        body = struct.pack("<IIIIBBH", pino, version, ino, 0, len(name), dtype, 0)
+        head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_DIRENT, 40 + len(name))
+        head += struct.pack("<I", _kcrc32(head))
+        return node(JFFS2_DIRENT, body + struct.pack("<II", _kcrc32(head + body), _kcrc32(name))
+                    + name)
+
+    def inode(ino, version, data, offset=0, isize=None, mode=S_IFREG | 0o644):
+        body = struct.pack("<IIIHHIIIIIIIBBH", ino, version, mode, 0, 0,
+                           offset + len(data) if isize is None else isize, 0, 0, 0, offset,
+                           len(data), len(data), 0, 0, 0)
+        head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_INODE, 68 + len(data))
+        head += struct.pack("<I", _kcrc32(head))
+        return node(JFFS2_INODE, body + struct.pack("<II", _kcrc32(data), _kcrc32(head + body))
+                    + data)
+
+    def block(*nodes):
+        blk = node(JFFS2_CLEANMARKER, b"") + b"".join(nodes)
+        return blk + b"\xff" * (-len(blk) % 4096)
+
+    def export(raw):
+        """(exit status, the volume's record, exceptions rows, {member: (crc, size)}) from
+        a real --extract, or None in a packaged build."""
+        if getattr(sys, "frozen", False):
+            return None
+        # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+        # each export names its own files and removes them itself.
+        work = tempfile.mkdtemp(prefix="qnxprobe-jffs2-")
+        stem = os.path.join(work, f"jffs2-check-{uuid.uuid4().hex}")
+        image, out = stem + ".img", stem + ".zip"
+        try:
+            with open(image, "wb") as fh:
+                fh.write(raw)
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), image,
+                                   "--extract", out], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=240, check=False)
+            with zipfile.ZipFile(out) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+                rows = []
+                for name in zin.namelist():
+                    if name.endswith(".exceptions.tsv"):
+                        rows += [ln.split("\t") for ln in
+                                 zin.read(name).decode("utf-8", "replace").splitlines()[1:]]
+                members = {i.filename.split("/", 1)[-1]: (i.CRC, i.file_size)
+                           for i in zin.infolist() if "/" in i.filename}
+            return done.returncode, rec, rows, members
+        finally:
+            for leftover in (image, out):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
+
+    def content(w):
+        """{path: bytes} of every regular file the walker lists."""
+        return {p: b"".join(w.read_file(n, sz)) for p, n, sz, _m in collect(w, w.root)
+                if sz is not None}
+
+    def quiet(w, note=False):
+        return not w.damage and not w.folders_not_read and (note or w.note is None) \
+            and not w.unread_entries()
+
+    out = []
+
+    def row(label, check):
+        try:
+            result = check()
+        except Exception as exc:                     # pylint: disable=broad-except
+            label += f" (raised {type(exc).__name__}: {str(exc)[:60]})"
+            result = False
+        out.append((label, result if result is None else bool(result)))
+
+    def names():
+        raw = block(dirent(1, 1, 2, b"caf\xe9.txt"), inode(2, 1, b"one"),
+                    dirent(1, 2, 3, b"caf%E9.txt"), inode(3, 1, b"two"),
+                    dirent(1, 3, 4, b"ln", 10),
+                    inode(4, 1, b"to/caf\xe9.txt", mode=S_IFLNK | 0o777))
+        w = walker(raw)
+        listed = w.listdir(w.root)
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute("create table t (name text)")
+            db.executemany("insert into t values (?)", [(n,) for n, _i in listed])
+            stored = [r[0] for r in db.execute("select name from t order by rowid")]
+        finally:
+            db.close()
+        if (listed != [("caf%E9.txt", 2), ("caf%E9.txt", 3), ("ln", 4)]
+                or stored != [n for n, _i in listed] or len(w.dirents[1]) != 3
+                or [b"".join(w.read_file(i, 3)) for i in (2, 3)] != [b"one", b"two"]
+                or w.readlink(4) != "to/caf%E9.txt" or not quiet(w)):
+            return False
+        got = export(raw)
+        if got is None:
+            return True
+        rc, rec, _rows, members = got
+        return (rc == 0 and rec["files"] == 2 and "note" not in rec
+                and sorted(members.values()) == sorted([(zlib.crc32(b"one"), 3),
+                                                        (zlib.crc32(b"two"), 3)])
+                and not any(0xD800 <= ord(c) <= 0xDFFF for m in members for c in m))
+
+    def whole():
+        counts = []
+        for stem in stems:
+            w = walker(fixture(stem))
+            if not quiet(w) or w.stats["cut"] or w.unreached:
+                return False
+            counts.append(w.linked)
+        got = export(fixture("jffs2-nor-history"))
+        return (counts == [319] * 7 + [13, 13]
+                and (got is None or (got[0] == 0 and "note" not in got[1]
+                                     and "damage_recorded" not in got[1]
+                                     and "folders_not_read" not in got[1] and not got[2])))
+
+    def cut_in_a_node():
+        raw = fixture("jffs2-le-zlib")
+        full = content(walker(raw))
+        half = raw[:len(raw) // 2]
+        w = walker(half)
+        held = content(w)
+        unread = w.unread_entries()
+        if not (w.stats["cut"] == 1 and w.folders_not_read == 1 and len(w.damage) == 1
+                and "ends inside a node" in w.damage[0] and len(unread) == 1
+                and "1 name leads" in (w.note or "") and 0 < len(held) < len(full)
+                and all(full[p] == data for p, data in held.items())):
+            return False
+        got = export(half)
+        if got is None:
+            return True
+        rc, rec, rows, members = got
+        failed = [r for r in rows if r[2] == "FAILED"]
+        return (rc == 1 and rec.get("folders_not_read") == 1 and rec.get("damage_recorded") == 1
+                and "ends inside a node" in rec["damage_first"][0]
+                and "no readable node" in (rec.get("note") or "")
+                and rec["failed"] == 1 and rec["files"] == len(held) == len(members)
+                and len(failed) == 1 and failed[0][0] == unread[0][0]
+                and "no readable node" in failed[0][3]
+                and all(members.get(p) == (zlib.crc32(data), len(data))
+                        for p, data in held.items()))
+
+    def cut_through_a_file():
+        raw = fixture("jffs2-le-none")
+        full = content(walker(raw))
+        half = raw[:len(raw) // 2]
+        got = export(half)
+        if got is not None and (got[0] != 1 or got[1]["short"] != 1
+                                or got[1].get("folders_not_read") != 2):
+            return False
+        w = walker(half)
+        short = {p: (n, sz) for p, n, sz, _m in collect(w, w.root)
+                 if sz is not None and w.run_shortfall(n)}
+        if len(short) != 1:
+            return False
+        (path, (ino, size)), = short.items()
+        before = EOF_SHORTFALL["bytes"]
+        data = b"".join(w.read_file(ino, size))
+        lost = EOF_SHORTFALL["bytes"] - before
+        if not (0 < len(data) < size == len(full[path]) and data == full[path][:len(data)]
+                and lost == size - len(data) and w.folders_not_read == 2
+                and any("do not cover" in d for d in w.damage)):
+            return False
+        if got is None:
+            return True
+        _rc, _rec, rows, members = got
+        member = f"{path}.SHORT-{len(data)}-of-{size}-bytes"
+        told = [r for r in rows if r[2] == "SHORT"]
+        return (members.get(member) == (zlib.crc32(data), len(data)) and path not in members
+                and len(told) == 1 and told[0][0] == path
+                and f"{len(data):,} of {size:,} bytes read" in told[0][3]
+                and "none in the region holds" in told[0][3])
+
+    def gap_inside():
+        # nodes for bytes 0 to 3 and 8 to 11 of a 12-byte file, and none for 4 to 7
+        raw = block(dirent(1, 1, 2, b"gap.bin"), inode(2, 1, b"abcd"),
+                    inode(2, 2, b"ijkl", offset=8),
+                    dirent(1, 2, 3, b"whole.bin"), inode(3, 1, b"abcd"),
+                    inode(3, 2, b"efgh", offset=4), inode(3, 3, b"ijkl", offset=8))
+        w = walker(raw)
+        before = EOF_SHORTFALL["bytes"]
+        data = b"".join(w.read_file(2, 12))
+        lost = EOF_SHORTFALL["bytes"] - before
+        whole_file = b"".join(w.read_file(3, 12))
+        if not (data == b"abcd\0\0\0\0ijkl" and lost == 4 and whole_file == b"abcdefghijkl"
+                and EOF_SHORTFALL["bytes"] - before == 4 and w.run_shortfall(3) is None
+                and "first from byte 4" in w.run_shortfall(2) and w.folders_not_read == 1):
+            return False
+        got = export(raw)
+        if got is None:
+            return True
+        rc, rec, rows, members = got
+        return (rc == 1 and rec["short"] == 1 and rec["files"] == 1
+                and members.get("gap.bin.SHORT-8-of-12-bytes") == (zlib.crc32(data), 12)
+                and members.get("whole.bin") == (zlib.crc32(b"abcdefghijkl"), 12)
+                and [r[0] for r in rows if r[2] == "SHORT"] == ["gap.bin"])
+
+    def unreached():
+        # inode 5 is a directory holding one name, and no name leads to it
+        raw = block(dirent(1, 1, 2, b"a"), inode(2, 1, b"one"),
+                    inode(5, 1, b"", mode=S_IFDIR | 0o755), dirent(5, 1, 6, b"x"),
+                    inode(6, 1, b"six"))
+        w = walker(raw)
+        lines = identify_jffs2(io.BytesIO(raw), 0, len(raw))[1]
+        said = "1 name is in a folder the root does not reach"
+        if not (any("1 name linked from the root" in ln for ln in lines)
+                and any(said in ln for ln in lines)):
+            return False
+        if not (w.linked == 1 and w.unreached == 1 and quiet(w, note=True)
+                and said in (w.note or "") and "not exported" in w.note
+                and [p for p, _n, _s, _m in collect(w, w.root)] == ["a"]):
+            return False
+        got = export(raw)
+        return got is None or (got[0] == 0 and said in (got[1].get("note") or "")
+                               and "damage_recorded" not in got[1]
+                               and "folders_not_read" not in got[1] and got[1]["files"] == 1)
+
+    def unreached_without_a_node():
+        # the same, with no node for inode 6: a name with no path to put in a row
+        raw = block(dirent(1, 1, 2, b"a"), inode(2, 1, b"one"),
+                    inode(5, 1, b"", mode=S_IFDIR | 0o755), dirent(5, 1, 6, b"x"))
+        w = walker(raw)
+        if "1 of them is in a directory the root does not reach" not in (
+                getattr(w, "note", None) or ""):
+            return False
+        return (w.linked == 1 and w.unreached == 1 and not w.unread_entries()
+                and w.folders_not_read == 1 and "does not reach" in w.damage[0])
+
+    row("JFFS2: a name that is not UTF-8 is listed with %XX for its bytes and goes into SQLite, "
+        "a stored name spelling the same text stays a second entry, and a link target "
+        "keeps its slashes", names)
+    row("JFFS2: the nine fixtures read whole record no damage, no note and no failed or short "
+        "file, and every name is linked from the root (319 on each mkfs.jffs2 image, 13 on "
+        "each kernel-written one)", whole)
+    row("JFFS2: a region that ends inside a node says so and exits 1, the name whose inode is "
+        "past the cut is a FAILED row and counted in the volume's note, and every file still "
+        "exported has the bytes of the whole image", cut_in_a_node)
+    row("JFFS2: a file whose data nodes stop before its size is SHORT with the bytes its "
+        "nodes hold and nothing after them, where it was full size with zeros", cut_through_a_file)
+    row("JFFS2: a range inside a file that no node covers is zeros in a SHORT member that "
+        "counts only the bytes held, and a file whose nodes cover it is not SHORT", gap_inside)
+    row("JFFS2: names are counted from the root, and a name in a folder the root does not "
+        "reach is counted in the volume's note, not listed, and leaves the exit status 0",
+        unreached)
+    row("JFFS2: a name the root does not reach whose inode has no node is recorded as damage "
+        "and in the note", unreached_without_a_node)
+    return out
 
 
 def _f2fs_reader_checks():
@@ -55600,6 +56584,44 @@ def self_test():
         exf[510:512] = b"\x55\xaa"
         xp = os.path.join(d, "exfat.img"); open(xp, "wb").write(exf)
 
+        # An MBR states no sector size. On a disk with 4096-byte logical sectors its
+        # entries count 4096-byte sectors, so the partition at LBA 16 begins at byte
+        # 65,536, where read as 512-byte sectors it would be sought at byte 8,192.
+        # Built in memory from the exFAT boot sector above: the same entry with the
+        # volume at 16 x 4096, at 16 x 512, at both, and at neither.
+        def mbr_disk(*volume_at):
+            disk = bytearray(16 * 4096 + len(exf))
+            disk[446 + 4] = 0x07
+            struct.pack_into("<II", disk, 446 + 8, 16, len(exf) // 4096)
+            disk[510:512] = b"\x55\xaa"
+            for at in volume_at:
+                disk[at:at + 512] = exf[:512]
+            return bytes(disk)
+
+        def mbr_read(disk):
+            dfh = io.BytesIO(disk)
+            part = [v for v in volumes(dfh, len(disk)) if v["label"] == "MBR part 1"]
+            return (disk_sector_size(dfh), table_regions(dfh)[4],
+                    [(v["base"], v["lba"], v["kind"]) for v in part])
+
+        try:
+            at4k, at512 = mbr_read(mbr_disk(16 * 4096)), mbr_read(mbr_disk(16 * 512))
+            both = mbr_read(mbr_disk(16 * 512, 16 * 4096))
+            neither = mbr_read(mbr_disk())
+            mgood = (at4k == (4096, 4096, [(65536, 16, "exfat")])
+                     and at512 == (512, 512, [(8192, 16, "exfat")])
+                     and both == (512, 512, [(8192, 16, "exfat")])
+                     and neither[:2] == (512, 512) and neither[2][0][:2] == (8192, 16)
+                     and neither[2][0][2] != "exfat")
+            msaid = (f"the volume at byte 65,536 is read at {at4k[0]}, at byte 8,192 at "
+                     f"{at512[0]}, at both at {both[0]}, at neither at {neither[0]}")
+        except Exception as exc:                     # pylint: disable=broad-except
+            mgood, msaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not mgood:
+            ok = False
+        print(f"  [{'PASS' if mgood else 'FAIL'}] an MBR on a 4096-byte-sector disk is read "
+              f"at the sector size its partition answers at, and at 512 otherwise ({msaid})")
+
         for path, want_kind, label in (
                 (fp, "fat32", "fat32 boot sector recognised"),
                 (xp, "exfat", "exfat boot sector recognised"),
@@ -55679,6 +56701,96 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic ETFS recognised and one file round-tripped: "
               f"kind={kind}")
+
+        # ETFS names, in both places a name is stored: the 32 bytes of a file entry and
+        # the continuation in an extension entry. A byte that is not UTF-8 becomes %XX
+        # of the stored byte and a stored "/" becomes %2F, so two names that differ in
+        # one such byte stay two names, neither invents a folder, and both go into SQLite.
+        try:
+            nt = bytearray(etfs_img)
+            struct.pack_into("<H", nt, 6 * 64, 7)                    # fid 6 continues in fid 7
+            nt[6 * 64 + 32:7 * 64] = b"a\xffb/c".ljust(32, b"\x00")
+            nt[7 * 64:8 * 64] = (struct.pack("<HH", 0x8000, 6) + b"\xfe/x").ljust(64, b"\x00")
+            nt[8 * 64:9 * 64] = (struct.pack("<HH", 0x0000, 0)
+                                 + struct.pack("<7I", 0o100644, 0, 0, 0, 1712000000, 0, 0)
+                                 + b"a\xfdb/c".ljust(32, b"\x00"))
+            ew = walker_for("etfs", io.BytesIO(bytes(nt)), 0, len(nt))
+            et_paths = sorted(e[0] for e in collect(ew, ew.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            edb = sqlite3.connect(":memory:")
+            edb.execute("create table n (name text)")
+            edb.executemany("insert into n values (?)", [(n,) for n in et_paths])
+            ekept = sorted(r[0] for r in edb.execute("select name from n"))
+            edb.close()
+            long_node = dict(ew.listdir(ew.root)).get("a%FFb%2Fc%FE%2Fx")
+            egood = ("a%FFb%2Fc%FE%2Fx" in et_paths and "a%FDb%2Fc" in et_paths
+                     and not any("/" in n or "\ufffd" in n for n in et_paths)
+                     and ekept == et_paths and long_node == 6
+                     and b"".join(ew.read_file(6, len(payload))) == payload)
+            esaid = ", ".join(n for n in et_paths if n.startswith("a"))
+        except Exception as exc:                     # pylint: disable=broad-except
+            egood, esaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not egood:
+            ok = False
+        print(f"  [{'PASS' if egood else 'FAIL'}] ETFS names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, in a file entry and in its extension "
+              f"entry, kept apart and stored in SQLite ({ascii(esaid)[1:-1][:120]})")
+
+        # An ETFS image that ends inside a page. The synthetic volume with one more,
+        # erased, page after it, cut 100 bytes short: no page size divides it. It is
+        # still the volume, with the same members as the whole image, and the export
+        # says the last page was not read. Removed when the row ends, because the
+        # build workflow counts the images left in this folder.
+        def etfs_export(raw):
+            path = os.path.join(d, "etfs_cut_in_page.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = [(i.filename, i.CRC, i.file_size) for i in zf.infolist()
+                            if not i.filename.endswith(".tsv")]
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            erased = etfs_img + b"\xff" * (Pz + ETFS_TRANS_SIZE)
+            wrec, wheld, _wout = etfs_export(erased)
+            trec, theld, tout = etfs_export(erased[:-100])
+            w0, t0 = (wrec[0] if wrec else {}), (trec[0] if trec else {})
+            tgood = (len(wrec) == 1 and w0.get("filesystem") == "etfs" and "note" not in w0
+                     and len(trec) == 1 and t0.get("filesystem") == "etfs"
+                     and theld == wheld and len(theld) >= 1
+                     and t0.get("files") == w0.get("files") and t0.get("short") == 0
+                     and t0.get("failed") == 0 and "damage_recorded" not in t0
+                     and "ends inside a page" in t0.get("note", "")
+                     and f"come {Pz + ETFS_TRANS_SIZE - 100:,} bytes" in t0.get("note", "")
+                     and "that page was not read" in t0.get("note", "")
+                     and "NOTE" in tout and _volumes_not_read(trec) == 0)
+            tsaid = t0.get("note", "not recognised")[:150]
+            # Behind a partition table the region's size is the table's, so the
+            # whole-page test stays: the same volume as a partition of 32 whole pages
+            # (65 sectors) is ETFS, and read as 64 sectors, not a whole number of
+            # pages at any page size, it is declined.
+            tdisk = bytearray(8 * SECTOR) + erased + b"\xff" * (29 * (Pz + ETFS_TRANS_SIZE))
+            tdisk[446 + 4] = 0x83
+            struct.pack_into("<II", tdisk, 446 + 8, 8, 65)
+            tdisk[510:512] = b"\x55\xaa"
+            tfh = io.BytesIO(bytes(tdisk))
+            in_table = (identify_etfs(tfh, 8 * SECTOR, 65 * SECTOR),
+                        identify_etfs(tfh, 8 * SECTOR, 64 * SECTOR))
+            tgood = (tgood and len(tdisk) == 73 * SECTOR and in_table[0] is not None
+                     and in_table[0][0] == "etfs" and in_table[1] is None)
+        except Exception as exc:                     # pylint: disable=broad-except
+            tgood, tsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not tgood:
+            ok = False
+        print(f"  [{'PASS' if tgood else 'FAIL'}] an ETFS image that ends inside a page is "
+              f"still read, with the members of the whole image and a note that the page "
+              f"was not read, and a partition must still be whole pages ({tsaid})")
 
         # A synthetic EFS image: one erase unit whose unit_info sizes it, whose
         # boot record carries the QSSL_F3S signature, and whose header 2
@@ -56132,7 +57244,9 @@ def self_test():
                                          0o100444, 1712000000, 0x11)
         # block 3: the root directory
         root = bytearray(512)
-        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 64, 5, 1, 0, 1,
+        # .bitmap is 2 bytes: one bit per block for the 12 blocks of this image
+        # (fs/qnx4/inode.c qnx4_statfs), which is what the walker's declared end reads.
+        root[0:64] = _q4_ino(TRUE_QNX4_BITMAP, 2, 5, 1, 0, 1,
                              0o100444, 1712000000, 0x01)
         root[64:128] = _q4_ino(b"selftest.txt", len(q4_pay), 6, 1, 0, 1,
                                0o100644, 1712000001, 0x01)
@@ -56192,6 +57306,91 @@ def self_test():
             ok = False
         print(f"  [{mark}] synthetic QNX4: root, .bitmap, link entry, "
               f"two-extent xblk file all read: kind={kind}")
+
+        # QNX4 names. A byte that is not UTF-8 becomes %XX of the stored byte and a "/"
+        # stored inside one name becomes %2F, so two names that differ in one such byte
+        # stay two names, neither invents a folder, and both go into SQLite as they are.
+        try:
+            q4n = bytearray(q4)
+            q4n[1024 + 64:1024 + 80] = b"a\xffb/c".ljust(16, b"\x00")     # was selftest.txt
+            q4n[1024 + 192:1024 + 208] = b"a\xfeb/c".ljust(16, b"\x00")   # was multi.bin
+            nw = Qnx4Walker(io.BytesIO(bytes(q4n)), 0)
+            q4_paths = sorted(e[0] for e in collect(nw, nw.root))
+            import sqlite3                           # pylint: disable=import-outside-toplevel
+            ndb = sqlite3.connect(":memory:")
+            ndb.execute("create table n (name text)")
+            ndb.executemany("insert into n values (?)", [(n,) for n in q4_paths])
+            kept = sorted(r[0] for r in ndb.execute("select name from n"))
+            ndb.close()
+            ngood = (q4_paths == sorted([".bitmap", "a%FEb%2Fc", "a%FFb%2Fc",
+                                         "a_longer_name_than_sixteen.txt"])
+                     and kept == q4_paths and not nw.damage and not nw.folders_not_read)
+            nsaid = ", ".join(q4_paths)
+        except Exception as exc:                     # pylint: disable=broad-except
+            ngood, nsaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not ngood:
+            ok = False
+        print(f"  [{'PASS' if ngood else 'FAIL'}] QNX4 names: an undecodable byte is %XX of "
+              f"the stored byte and a stored / is %2F, kept apart and stored in SQLite "
+              f"({ascii(nsaid)[1:-1][:120]})")
+
+        # A QNX4 volume cut just after its root directory block. The inode entry the long
+        # name links to (block 4) and every file's data lie past the cut. The export has
+        # to say the volume reaches past the end, record the name it could not follow and
+        # count the folder as not read in full, which is what makes the run exit 1; the
+        # whole volume gains none of that. Removed when the row ends, because the build
+        # workflow counts the images left in this folder.
+        def q4_export(raw):
+            path = os.path.join(d, "qnx4_cut_after_root.raw")
+            rec, out = [], io.StringIO()
+            try:
+                with open(path, "wb") as fh_:
+                    fh_.write(raw)
+                with zipfile.ZipFile(io.BytesIO(), "w") as zf, contextlib.redirect_stdout(out):
+                    main(path, extract="x.zip", zf=zf, manifest=rec)
+                    held = zf.namelist()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return rec, held, out.getvalue()
+
+        try:
+            crec, cheld, cout = q4_export(bytes(q4[:1536]))
+            wrec, wheld, wout = q4_export(bytes(q4))
+            c0, w0 = (crec[0] if crec else {}), (wrec[0] if wrec else {})
+            first = (c0.get("damage_first") or [""])[0]
+            # the same cut with a root directory of two blocks: the second is past the cut
+            two = bytearray(q4[:1536])
+            struct.pack_into("<I", two, 512 + 16, 1024)          # RootDir di_size
+            struct.pack_into("<II", two, 512 + 20, 3, 2)         # its extent: blocks 3 and 4
+            tw = Qnx4Walker(io.BytesIO(bytes(two)), 0)
+            tnames = [n for n, _c in tw.listdir(tw.root)]
+            cgood = (len(crec) == 1 and c0.get("filesystem") == "qnx4"
+                     and c0.get("folders_not_read") == 1 and c0.get("damage_recorded") == 1
+                     and "block 4, entry 1" in first
+                     and first.endswith("in the folder with inode 8: "
+                                        "'a_longer_name_than_sixteen.txt'")
+                     and c0.get("files") == 0 and c0.get("short") == 3
+                     and c0.get("extends_past_image_by_bytes") == 9 * 512 - 1536
+                     and "INCOMPLETE" in cout and _volumes_not_read(crec) == 1
+                     and not any("a_longer_name" in n for n in cheld)
+                     and len(wrec) == 1 and w0.get("files") == 4 and w0.get("short") == 0
+                     and "damage_recorded" not in w0 and "folders_not_read" not in w0
+                     and "extends_past_image_by_bytes" not in w0
+                     and "INCOMPLETE" not in wout and _volumes_not_read(wrec) == 0
+                     and len(tnames) == 4 and tw.folders_not_read == 1
+                     and any("a directory block could not be read in full (block 4, 0 of "
+                             "512 bytes)" in line and "from byte 512 of its 1,024" in line
+                             for line in tw.damage))
+            csaid = first[:150] or "no damage record"
+        except Exception as exc:                     # pylint: disable=broad-except
+            cgood, csaid = False, f"raised {type(exc).__name__}: {exc}"
+        if not cgood:
+            ok = False
+        print(f"  [{'PASS' if cgood else 'FAIL'}] a QNX4 volume cut after its root directory "
+              f"records the name whose inode entry is past the cut and a directory block "
+              f"past it, counts the folder as not read and is marked incomplete; the whole "
+              f"volume records nothing ({csaid})")
 
         # Sabotage: break the .bitmap name and detection must refuse, exactly
         # as the kernel refuses to mount without it (qnx4_checkroot).
@@ -58963,6 +60162,11 @@ def self_test():
             lvm_checks += _f2fs_reader_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the F2FS reader checks ran ({type(exc).__name__}: {exc})", False)]
+        # JFFS2 names, cut regions and names the root does not reach.
+        try:
+            lvm_checks += _jffs2_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the JFFS2 reader checks ran ({type(exc).__name__}: {exc})", False)]
         for label, cond in lvm_checks:
             if cond is None:
                 print(f"  [SKIP] {label}")
@@ -60290,6 +61494,343 @@ def self_test():
                   f"copy with a bad data CRC is still read, as the kernel attaches it: "
                   f"{sum(1 for v in ub_res.values() if v is None)} of {len(ub_res)} files match "
                   f"({un_lone} such LEB counted)")
+
+        # UBI and UBIFS, on the fixtures mkfs.ubifs, ubinize and the kernel wrote: names
+        # that are not plain UTF-8, a time before 1970, and images cut short. Each case
+        # is made in memory and, where the export is what is checked, written to this
+        # run's folder and removed again. A stored name is changed in place and its
+        # record's CRC recomputed: ubinize writes a volume name with a slash or a byte
+        # that is not UTF-8 as given, and mkfs.ubifs copies a file name's bytes.
+        def ua_export(ua_image, ua_tag):
+            """(manifest, {member: bytes}, exceptions rows) of one image exported the way
+            --extract does it. Both files it writes are removed."""
+            ua_path = os.path.join(d, f"{ua_tag}.dump")
+            ua_zip = os.path.join(d, f"{ua_tag}.zip")
+            ua_man = []
+            try:
+                with open(ua_path, "wb") as ua_fh:
+                    ua_fh.write(bytes(ua_image))
+                with zipfile.ZipFile(ua_zip, "w") as ua_zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(ua_path, extract=ua_zip, zf=ua_zf, manifest=ua_man)
+                with zipfile.ZipFile(ua_zip) as ua_zr:
+                    ua_got = {i_.filename: ua_zr.read(i_) for i_ in ua_zr.infolist()}
+            finally:
+                for ua_rm in (ua_path, ua_zip):
+                    if os.path.exists(ua_rm):
+                        os.remove(ua_rm)
+            ua_rows = [ln.split("\t") for n_, data_ in ua_got.items()
+                       if n_.endswith(".exceptions.tsv")
+                       for ln in data_.decode("utf-8").splitlines()[1:]]
+            return ua_man, ua_got, ua_rows
+
+        def ua_said(ua_obj, ua_text):
+            """True when a walker's damage list, or a manifest record's, holds the text."""
+            ua_lines = (ua_obj.get("damage_first") or [] if isinstance(ua_obj, dict)
+                        else getattr(ua_obj, "damage", None) or [])
+            return any(ua_text in str(line_) for line_ in ua_lines)
+
+        def ua_sqlite(ua_names):
+            """How many of the names SQLite stores as distinct text, or -1 if it refuses one."""
+            import sqlite3                          # pylint: disable=import-outside-toplevel
+            ua_db = sqlite3.connect(":memory:")
+            try:
+                ua_db.execute("create table t (n text primary key)")
+                ua_db.executemany("insert into t values (?)", [(n_,) for n_ in ua_names])
+                return ua_db.execute("select count(*) from t").fetchone()[0]
+            except (sqlite3.Error, UnicodeError):
+                return -1
+            finally:
+                ua_db.close()
+
+        def ua_row(ua_text, ua_check):
+            """One row: the check returns (passed, detail); an exception is a failure."""
+            try:
+                ua_ok, ua_detail = ua_check()
+            except Exception as exc:                 # pylint: disable=broad-except
+                ua_ok, ua_detail = False, f"raised {type(exc).__name__}: {exc}"
+            print(f"  [{'PASS' if ua_ok else 'FAIL'}] {ua_text} ({ua_detail})")
+            return bool(ua_ok)
+
+        ua_fx = {n_: os.path.join(fx, f"{n_}.img.gz")
+                 for n_ in ("ubi-nor", "ubifs-lzo", "ubi-nand-history")}
+        if all(os.path.isfile(p_) for p_ in ua_fx.values()):
+            import gzip                              # pylint: disable=import-outside-toplevel
+            import contextlib                        # pylint: disable=import-outside-toplevel
+            ua_img = {}
+            for n_, p_ in ua_fx.items():
+                with gzip.open(p_, "rb") as gz:
+                    ua_img[n_] = gz.read()
+            ua_nor, ua_bare, ua_hist = (ua_img[n_] for n_ in ua_fx)
+
+            def ua_volume_names():
+                img = bytearray(ua_nor)
+                w0 = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                new = {"rootfs_data": b"caf\xe8", "rootfs": b"data/vol", "kernel": b"caf\xe9"}
+                for lnum in (0, 1):                  # both copies of the volume table
+                    at = w0.ubi.map[(UBI_LAYOUT_VOL, lnum)]["data_at"]
+                    for vol in w0.ubi.volumes:
+                        rec, raw = at + vol["id"] * UBI_VTBL_REC, new[vol["name"]]
+                        struct.pack_into(">H", img, rec + 14, len(raw))
+                        img[rec + 16:rec + 144] = raw.ljust(128, b"\0")
+                        struct.pack_into(">I", img, rec + 168, _ubi_crc(bytes(img[rec:rec + 168])))
+                w1 = UbiWalker(io.BytesIO(bytes(img)), 0, len(img))
+                names = [n_ for n_, _i in w1.listdir(w1.root)]
+                tops = {p_.split("/")[0] for p_, *_x in collect(w1, w1.root)}
+                return (names == ["caf%E8", "data%2Fvol", "caf%E9"] and tops == set(names)
+                        and ua_sqlite(names) == 3
+                        and len(collect(w1, w1.root)) == len(collect(w0, w0.root)) > 400,
+                        f"listed as {names}")
+            if not ua_row("UBI volume names: a slash stored in a name is %2F and a byte that "
+                          "is not UTF-8 is %XX, so no name invents a folder, two names stay "
+                          "distinct and SQLite stores them", ua_volume_names):
+                ok = False
+
+            def ua_patched_ubifs():
+                """The bare UBIFS fixture with two names in one folder changed to differ
+                only in a byte that is not UTF-8, and the first one's file given the
+                time -315619200 (1960-01-01). (image, folder path, the two names as they
+                should list, the file's inode, its bytes). The key's name hash is left as
+                it was: this reader does not use it."""
+                img = bytearray(ua_bare)
+                w0 = UbifsWalker(io.BytesIO(ua_bare), 0)
+                paths = {n_: p_ for p_, n_, *_x in walk_all(w0)}
+                first = UBIFS_LOG_LNUM + w0.log_lebs + w0.lpt_lebs + w0.orph_lebs
+                groups = collections.defaultdict(list)
+                for lnum in range(first, w0.leb_cnt):
+                    # pylint: disable=protected-access
+                    for offs, raw in w0._scan_leb(lnum, 0):
+                        if raw[20] != UBIFS_DENT_NODE:
+                            continue
+                        parent = struct.unpack_from("<I", raw, 24)[0]
+                        target, nlen = struct.unpack_from("<Q", raw, 40)[0], \
+                            struct.unpack_from("<H", raw, 50)[0]
+                        ent = w0.entry(target)
+                        if (parent in paths and ent and ent[0] & S_IFMT == S_IFREG
+                                and ent[1] > 0 and nlen >= 6
+                                and raw[57:56 + nlen].isascii()):
+                            groups[(parent, nlen)].append((lnum * w0.leb_size + offs, raw, target))
+                (parent, _nlen), pair = next((k, v) for k, v in sorted(groups.items())
+                                             if len(v) >= 2)
+                stem = bytes(pair[0][1][57:56 + _nlen])
+                listed = []
+                for (at, raw, _target), lead in zip(pair[:2], (b"\xe9", b"\xe8")):
+                    img[at + 56:at + 56 + _nlen] = lead + stem
+                    struct.pack_into("<I", img, at + 4,
+                                     _ubi_crc(bytes(img[at + 8:at + len(raw)])))
+                    listed.append(f"%{lead[0]:02X}" + stem.decode("ascii"))
+                inum = pair[0][2]
+                lnum, offs, nlen = w0.inodes[inum]
+                at = lnum * w0.leb_size + offs
+                struct.pack_into("<qqq", img, at + 56, -315619200, -315619200, -315619200)
+                struct.pack_into("<I", img, at + 4, _ubi_crc(bytes(img[at + 8:at + nlen])))
+                data = b"".join(w0.read_file(inum, w0.entry(inum)[1]))
+                return bytes(img), paths[parent], listed, inum, data
+
+            ua_case = {}
+
+            def ua_once(key, make):
+                if key not in ua_case:
+                    ua_case[key] = make()
+                return ua_case[key]
+
+            def ua_ubifs_names():
+                img, folder, listed, _inum, data = ua_once("p", ua_patched_ubifs)
+                w1 = UbifsWalker(io.BytesIO(img), 0)
+                names = [p_ for p_, *_x in walk_all(w1)]
+                before = sum(1 for _e in walk_all(UbifsWalker(io.BytesIO(ua_bare), 0)))
+                want = [f"{folder}/{n_}" if folder else n_ for n_ in listed]
+                surrogates = sum(any(0xD800 <= ord(c_) <= 0xDFFF for c_ in p_) for p_ in names)
+                _man, got, rows = ua_once("x", lambda: ua_export(img, "ubifs_names"))
+                return (all(p_ in names for p_ in want) and not surrogates
+                        and ua_sqlite(names) == len(names) == before
+                        and got.get(f"lba0/{want[0]}") == data and f"lba0/{want[1]}" in got
+                        and not any(r_[2] == "RENAMED" for r_ in rows),
+                        f"two names that differ in one stored byte list as {listed}, "
+                        f"{surrogates} names with a surrogate, {len(names)} names")
+            if not ua_row("UBIFS names: a byte that is not UTF-8 is %XX of the stored byte in "
+                          "the listing and in the zip, never a surrogate, and SQLite stores "
+                          "every name", ua_ubifs_names):
+                ok = False
+
+            def ua_ubifs_time():
+                img, folder, listed, inum, _data = ua_once("p", ua_patched_ubifs)
+                w1 = UbifsWalker(io.BytesIO(img), 0)
+                _man, _got, rows = ua_once("x", lambda: ua_export(img, "ubifs_names"))
+                path = f"{folder}/{listed[0]}" if folder else listed[0]
+                told = [r_[3] for r_ in rows if r_[0] == path and r_[2] == "TIME_NOT_HELD"]
+                return (w1.entry(inum)[2] == -315619200 and len(told) == 1
+                        and "stored time -315619200 (1960-01-01 00:00:00 UTC)" in told[0],
+                        f"the walker gives {w1.entry(inum)[2]}, the table says {told}")
+            if not ua_row("UBIFS times: an inode's seconds are read as signed, as the kernel "
+                          "reads them, so a 1960 time keeps its stored value in the walker "
+                          "and in its TIME_NOT_HELD row", ua_ubifs_time):
+                ok = False
+
+            def ua_cut_ubi():
+                whole = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                kernel = b"".join(whole.read_file(dict(whole.listdir(whole.root))["kernel"],
+                                                  150000))
+                man, got, rows = ua_export(ua_nor[:-4096], "ubi_cut_4k")
+                rec = man[0] if man else {}
+                short = [r_ for r_ in rows if r_[2] == "SHORT"]
+                last = (rec.get("folders_not_read", 0) >= 1 and _volumes_not_read(man) == 1
+                        and ua_said(rec, "ends 61,440 bytes into an eraseblock of 65,536 bytes")
+                        and ua_said(rec, "static volume 2 has 2 of the 3 eraseblocks")
+                        and "lba0/kernel" not in got and len(kernel) == 150000
+                        and got.get("lba0/kernel.SHORT-130816-of-150000-bytes") == kernel[:130816]
+                        and len(short) == 1 and "2 of the 3 eraseblocks" in short[0][3]
+                        and sum(1 for n_ in got if n_.startswith("lba0/rootfs")) == 416)
+                # cut between two eraseblocks: the one that records where the data ends is gone
+                even = UbiWalker(io.BytesIO(ua_nor[:-65536]), 0, len(ua_nor) - 65536)
+                node = dict(even.listdir(even.root))["kernel"]
+                size = even.entry(node)[1]
+                bound = (size == 3 * 65408 and ua_said(even, "196,224 bytes is the most it can hold")
+                         and "the most it can hold" in (getattr(even, "run_shortfall",
+                                                                lambda _n: "")(node) or "")
+                         and b"".join(even.read_file(node, size)) == kernel[:130816]
+                         and getattr(even, "folders_not_read", 0) == 1)
+                half = UbiWalker(io.BytesIO(ua_nor[:len(ua_nor) // 2]), 0, len(ua_nor) // 2)
+                halved = (ua_said(half, "ends 32,768 bytes into an eraseblock")
+                          and ua_said(half, "index node(s) did not read")
+                          and ua_said(half, "note: static volume 2 has no eraseblock here")
+                          and getattr(half, "folders_not_read", 0) >= 2)
+                clean = not getattr(whole, "damage", None) and not getattr(
+                    whole, "folders_not_read", 0)
+                return (last and bound and halved and clean,
+                        f"last 4 KiB cut: {rec.get('damage_recorded', 0)} record(s), "
+                        f"{len(short)} SHORT, the volume counted as not read in full: "
+                        f"{_volumes_not_read(man)}; cut before the last eraseblock: size "
+                        f"shown as {size:,}; cut in half: "
+                        f"{len(getattr(half, 'damage', None) or [])} record(s); whole: "
+                        f"{len(getattr(whole, 'damage', None) or [])}")
+            if not ua_row("a UBI image cut short is recorded: the eraseblock the data ends "
+                          "inside, a static volume with fewer eraseblocks than it records "
+                          "exported SHORT at its recorded size with nothing put in the gap, "
+                          "and the UBIFS index that no longer reads", ua_cut_ubi):
+                ok = False
+
+            def ua_table_and_raw():
+                whole = UbiWalker(io.BytesIO(ua_nor), 0, len(ua_nor))
+                img = bytearray(ua_nor)
+                for lnum in (0, 1):                  # both copies fail their first CRC
+                    img[whole.ubi.map[(UBI_LAYOUT_VOL, lnum)]["data_at"] + 168] ^= 0xFF
+                bare = UbiWalker(io.BytesIO(bytes(img)), 0, len(img))
+                no_table = (ua_said(bare, "the UBI volume table does not read")
+                            and getattr(bare, "folders_not_read", 0) >= 1
+                            and [n_ for n_, _i in bare.listdir(bare.root)]
+                            == ["vol0", "vol1", "vol2"])
+                img = bytearray(ua_nor)
+                vol = next(v for v in whole.ubi.volumes if v["name"] == "rootfs_data")
+                for lnum in (1, 2):                  # the two master LEBs read as erased
+                    at = whole.ubi.map[(vol["id"], lnum)]["data_at"]
+                    img[at:at + 4] = b"\xff" * 4
+                man, got, _rows = ua_export(img, "ubi_no_master")
+                rec = man[0] if man else {}
+                raw = (ua_said(rec, "opens as UBIFS and could not be read as it")
+                       and rec.get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                       and "lba0/rootfs_data" in got
+                       and not any(n_.startswith("lba0/rootfs_data/") for n_ in got))
+                return (no_table and raw,
+                        f"no table: {len(getattr(bare, 'damage', None) or [])} record(s); "
+                        f"UBIFS with no master node: {rec.get('damage_recorded', 0)} record(s), "
+                        f"folders_not_read {rec.get('folders_not_read')}")
+            if not ua_row("a UBI volume table that does not read, and a volume that opens as "
+                          "UBIFS and is exported as raw bytes because it cannot be read, are "
+                          "each recorded and counted as not read in full", ua_table_and_raw):
+                ok = False
+
+            def ua_nand_cut():
+                whole = UbiWalker(io.BytesIO(ua_hist), 0, len(ua_hist))
+                want = [(p_, s_) for p_, _n, s_, _m in collect(whole, whole.root)]
+                cut = UbiWalker(io.BytesIO(ua_hist[:-4096]), 0, len(ua_hist) - 4096)
+                got = [(p_, s_) for p_, _n, s_, _m in collect(cut, cut.root)]
+                paged = (cut.nand == (2048, 64) and got == want and len(want) > 10
+                         and ua_said(cut, "not a whole number of NAND pages")
+                         and ua_said(cut, "its last 128 bytes are part of a page")
+                         and getattr(cut, "folders_not_read", 0) == 1)
+                half = UbiWalker(io.BytesIO(ua_hist[:len(ua_hist) // 2]), 0, len(ua_hist) // 2)
+                journal = (ua_said(half, "the journal was not replayed")
+                           and getattr(half, "folders_not_read", 0) == 1)
+                return (paged and journal and not getattr(whole, "damage", None),
+                        f"cut by 4 KiB: read as {cut.nand} pages, {len(got)} of {len(want)} "
+                        f"files listed, {len(getattr(cut, 'damage', None) or [])} record(s); "
+                        f"cut in half: {len(getattr(half, 'damage', None) or [])} record(s)")
+            if not ua_row("a NAND dump of UBI that ends inside a page is read over its whole "
+                          "pages with the rest recorded, and a UBIFS log whose first "
+                          "eraseblock is gone is recorded as a journal not replayed",
+                          ua_nand_cut):
+                ok = False
+
+            def ua_index_and_inode():
+                man, got, _rows = ua_export(ua_bare[:len(ua_bare) // 2], "ubifs_half")
+                cut = man[0] if man else {}
+                half = (cut.get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                        and ua_said(cut, "index node(s) did not read")
+                        and not any(n_.startswith("lba0/") for n_ in got))
+                w0 = UbifsWalker(io.BytesIO(ua_bare), 0)
+                path, inum = next((p_, n_) for p_, n_, mode_, size_, *_x in walk_all(w0)
+                                  if mode_ & S_IFMT == S_IFREG and size_ > 0)
+                img = bytearray(ua_bare)
+                at = w0.inodes[inum][0] * w0.leb_size + w0.inodes[inum][1]
+                img[at:at + 4] = b"\xff" * 4         # the inode node reads as erased flash
+                man, got, rows = ua_export(img, "ubifs_no_inode")
+                rec = man[0] if man else {}
+                failed = [r_ for r_ in rows if r_[2] == "FAILED"]
+                gone = (rec.get("failed") == 1 and _files_not_exported(man) == 1
+                        and len(failed) == 1 and failed[0][0] == path
+                        and f"its inode ({inum:,}) cannot be read" in failed[0][3]
+                        and f"lba0/{path}" not in got
+                        and sum(1 for n_ in got if n_.startswith("lba0/")) == 409)
+                clean = not getattr(w0, "damage", None) and not getattr(w0, "unread_entries",
+                                                                        list)()
+                return (half and gone and clean,
+                        f"cut in half: folders_not_read {cut.get('folders_not_read')}; "
+                        f"one inode node erased: {len(failed)} FAILED row(s), "
+                        f"{rec.get('failed')} counted as failed")
+            if not ua_row("UBIFS: index nodes that do not read are a volume record counted in "
+                          "folders_not_read, and a name whose inode node does not read is a "
+                          "FAILED row, not a file silently left out", ua_index_and_inode):
+                ok = False
+
+            def ua_stubs():
+                """What is left when a file is cut just after its first structure: every
+                piece whose first header still checks is claimed, recorded and counted."""
+                told = []
+                for tag, image, keep, want in (
+                        ("ubifs_sb", ua_bare, 4096, "lie past the end of the image"),
+                        ("ubi_ec", ua_nor, 64, "no second one follows"),
+                        ("ubi_part", ua_nor, 2112, "no second one follows"),
+                        ("ubi_one", ua_nor, 65536, "no second one follows"),
+                        ("ubi_nand_one", ua_hist, 135168, "no second one follows")):
+                    man, got, _rows = ua_export(image[:keep], tag)
+                    rec = man[0] if len(man) == 1 else {}
+                    good = (want in (rec.get("extract_error") or "")
+                            and _volumes_not_read(man) == 1
+                            and not any(n_.startswith("lba0/") for n_ in got))
+                    told.append(f"{keep:,} bytes: {'recorded' if good else 'NOT RECORDED'}")
+                    if not good:
+                        return False, "; ".join(told)
+                man, got, _rows = ua_export(ua_nor[:131072], "ubi_table_only")
+                rec = man[0] if len(man) == 1 else {}
+                table = (ua_said(rec, "note: the volume table lists")
+                         and not rec.get("folders_not_read") and _volumes_not_read(man) == 0
+                         and sorted(len(v_) for n_, v_ in got.items()
+                                    if n_.startswith("lba0/")) == [0, 0, 0])
+                bad = bytearray(ua_nor[:65536])
+                bad[20] ^= 1                         # the header's CRC no longer holds
+                man, got, _rows = ua_export(bad, "ubi_bad_header")
+                refused = not man and not any(n_.startswith("lba0") for n_ in got)
+                return (table and refused,
+                        "; ".join(told) + f"; the volume table alone: "
+                        f"{'a note' if table else 'NOT A NOTE'}; a first header that "
+                        f"fails its CRC: {'not claimed' if refused else 'CLAIMED'}")
+            if not ua_row("a UBI or UBIFS file cut just after its first structure is claimed "
+                          "by the header that still checks and recorded as not read, and one "
+                          "holding only the volume table gets a note that no volume's "
+                          "eraseblock is here",
+                          ua_stubs):
+                ok = False
 
         # Two JFFS2 partitions side by side in a dump with no partition table:
         # both number their inodes from 2, so read as one filesystem a name from
