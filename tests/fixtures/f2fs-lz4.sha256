@@ -1,0 +1,3 @@
+# what Linux 7.0 read back from an LZ4 volume; incompressible.bin was zeroed and is not listed
+503e89246b2e576eebb1b5e1e1fd88c01da992ee6eb33d5af4a807fedb51703b  compressible.bin
+ffec5626adf602978c051e4c030012ed2066225e1fc8f5147992cf64ecbd86aa  mixed.bin
