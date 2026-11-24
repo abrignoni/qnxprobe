@@ -4307,8 +4307,8 @@ What fails is not used, and is counted:
   image (a partition followed by another), nothing past the region is read as the
   volume's.
 
-After a walk, the walker's `note` also gives the count and the first damaged structure.
-Its `volume_note`, which is what an export writes, does not.
+An export records the count and the first damaged structure as `damage_recorded` and
+`damage_first`, not in `note`.
 
 **A cut volume.** Each inode, directory block, extent B+tree block or symlink block that
 lies past the end is recorded with what follows from it (an inode: what a folder names by
