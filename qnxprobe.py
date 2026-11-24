@@ -38958,12 +38958,17 @@ def _fat_reader_checks():
                 disk = in_mbr(lab, type_byte)
                 disk[1 << 20:(1 << 20) + 512] = noise
                 raw = os.path.join(work, "disk.img")
-                with open(raw, "wb") as out:
-                    out.write(disk)
                 manifest = []
-                with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    main(raw, extract="x.zip", zf=zf, manifest=manifest)
+                try:
+                    with open(raw, "wb") as out:
+                        out.write(disk)
+                    with zipfile.ZipFile(io.BytesIO(), "w") as zf, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        main(raw, extract="x.zip", zf=zf, manifest=manifest)
+                finally:
+                    # the build workflow keeps this folder and counts the images in it
+                    with contextlib.suppress(OSError):
+                        os.remove(raw)
                 return manifest
             typed, other = run(0x06), run(0x83)
         finally:
