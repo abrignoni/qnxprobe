@@ -17510,6 +17510,13 @@ class EfsWalker:
                              + (f" ({self.note})" if self.note else ""))
         self.root = root[1]
 
+    @property
+    def volume_note(self):
+        """What an export records about the volume as a whole, or None. The only
+        note this walker keeps is the cut-short line, which is also a line in
+        ``damage``, so an export records it there and not as a note."""
+        return None
+
     def _count_not_read(self, what, line):
         """Record one thing not read in full, once per ``what``: a line in
         ``damage`` (see damage_lines) and one more in ``folders_not_read``."""
@@ -18550,6 +18557,13 @@ class SquashfsWalker:
         volume to say why."""
         parts = [_sqfs_no_decompressor(self.comp), self._cut]
         return "; ".join(p for p in parts if p) or None
+
+    @property
+    def volume_note(self):
+        """What an export records about the volume as a whole: why this Python
+        cannot read it, or None. A cut is left out, since the export records it
+        as damage (damage_recorded and damage_first)."""
+        return _sqfs_no_decompressor(self.comp) or None
 
     def listdir(self, ref):
         """[(name, node)] for a folder. A folder that cannot be read, or can be
