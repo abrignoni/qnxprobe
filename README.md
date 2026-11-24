@@ -271,10 +271,17 @@ bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as o
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image), `failed`
-(files that could not be read, which are not in the zip), on a
-volume that does, `extends_past_image_by_bytes`, and on an ext volume with something to
-say about the whole volume, `note`. On a split image `image` names the
-first segment and `image_segments` lists every segment joined, with its byte count;
+(files that could not be read, which are not in the zip) and, on a
+volume that does, `extends_past_image_by_bytes`. `note` is what the reader says about the
+volume as a whole, when it says anything: the walker's `volume_note` where it has one, and
+otherwise its `note`. XFS, EFS and SquashFS keep damage out of it: a count of damaged
+structures and the first of them are `damage_recorded` and `damage_first`. On the
+committed fixtures, exported on Python 3.12, `note` gives an F2FS volume cut short or not
+marked as cleanly unmounted, HFS+ files that hold the provenance attribute, an XFS dirty
+log, a Btrfs log tree, default subvolume or one device of two, and zstd data on a Python
+without zstd (Btrfs and SquashFS). The self-test exports the ReFS fixture whose log
+records follow the newest checkpoint, and its `note` says so. On a split image `image`
+names the first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
 For a bare image with no vendor export alongside it, that file is the record
@@ -550,7 +557,8 @@ never touches the rest.
 
 `collect()` returns the regular files in tree order, which is what an extraction
 needs. Something that wants **everything**, directories included, should ask
-`walk_all()` instead, because it takes a faster route where one exists.
+`walk_all()` instead, because it takes a faster route where one exists. `collect()` and
+the tree walk of `walk_all()` go as deep as the volume does and enter each folder once.
 
 ```python
 for path, node, mode, size, mtime, recorded in q.walk_all(walker):
@@ -1199,6 +1207,68 @@ by name with the bytes of its copy, and the superseded extents of the overwritte
 hold 10,240 bytes that are not what the file holds there now. A control sets the removed
 file's extent header to free, and the check has to fail.
 
+**A partition the image holds only part of.** The boot record gives a partition its unit
+count, so where the partition ends is known from the record alone. Through 1.87 a partition
+whose end lay past the end of the image was dropped: nothing was exported from it, no
+record was written and the run exited 0. It is now found (`efs_partitions()`, `volumes()`,
+the report) and read as far as the image goes:
+
+- The report adds a `cut short` line with the bytes the boot record gives the partition
+  and the bytes the image holds. An export marks the volume `INCOMPLETE`, writes
+  `extends_past_image_by_bytes`, puts the same two numbers and the count of units the image
+  does not hold whole in `damage_first`, and counts the volume in `folders_not_read`, so
+  the run exits 1. `volumes()` gives the missing bytes as `missing_past_end` and the line
+  as `note`, and the walker has them as `declared_end`, `units_cut` and `damage`. The
+  export's `volumes.json` does not repeat the line as `note`. In the
+  report's `FLASH` list the size shown is what the image holds of the partition.
+- A unit's header array is at the end of the unit, so a unit the image cuts has no headers
+  and nothing in it is read. A file whose extents all sit in units the image holds whole
+  is exported as it is from a whole image.
+- A folder whose chain of entries stops at a pointer that does not resolve is recorded as
+  not listed in full and counted in `folders_not_read`. What the chain went on to is not
+  known, so files under that folder can be missing from the export.
+- A file whose extent chain stops that way is counted `failed` and is not exported. Its row
+  in the exceptions table gives the extents and bytes the chain reached. EFS records no
+  file size, so such a file cannot be stored as `.SHORT-<got>-of-<size>-bytes` the way a
+  cut file is on a filesystem that records one.
+- These two records are made only on a partition the image holds part of. On a whole
+  partition a chain that stops is read as it stands, as before.
+
+This was tested with cut images only: the end of the image removed, nothing else changed.
+`tests/fixtures/efs-qnx.img.gz` was cut inside its one partition of 524,288 bytes at three
+points and held against QNX's tar, and the self-test runs all three. With the last 4 KiB
+gone, or the second half gone, the 22 files are exported with the tar's bytes, the record
+gives 524,288 bytes against the 520,192 or 262,144 the image holds, and the run exits 1.
+Cut after the first unit, the root folder is recorded as not listed in full, no file is
+exported and the run exits 1. The five corpus images named above other than `115` were cut at
+half their length. The partition the cut crosses is reported with
+its record on all five. Of its 442 files (3, 3, 3, 3 and 430), 339 are exported with the
+bytes the whole image gives, 4 are counted failed and 99 sit under the 8 folders recorded
+as not listed in full. No exported file differs from the whole image's, and the partitions
+in front of the cut export as they do from the whole image.
+
+What a cut still loses without a record: a partition is found only when the unit holding
+its boot record is in the image, up to and including that unit's header 2. When the cut
+falls in front of that, nothing in the image gives the unit count and the partition is not
+reported. Cutting the same five images after the first unit of their first partition, the
+partition was reported with its record on four and not reported on one, where the run
+listed no volume and exited 0. `recover_deleted()` and `unaccounted()` run on a cut
+partition and see only the units the image holds whole. What they return there was not
+checked against anything.
+
+**`walk_all()` on EFS.** `walk_all()` tells folders apart by the first element of a node.
+An EFS node is `(first_logi, first_index, mode, mtime)`, so that element is the logical
+unit of the folder's first entry, and through 1.87 folders whose first entries shared a
+logical unit were walked once between them. On the QNX-written image `walk_all()` returned
+13 of the 31 entries, and on the five corpus images named above other than `115`, in the
+order given there, it returned 1,728, 1,728, 1,925, 1,655 and 1,996 of 2,960, 2,956, 3,530, 2,851 and
+3,678. `collect()`, `--list` and `--extract` do not use that guard and were not affected.
+`walk_all()` now asks a walker that has a `walk_key(node)` method for the key, and
+`EfsWalker.walk_key` gives the logical unit and the header index together. It returns
+every entry a tree walk does on all six images, and the self-test holds the fixture's 31
+against QNX's tar. The node itself is unchanged, so a node kept from an earlier version
+still names the same file and equals the one handed out now.
+
 **Fixtures.** No free tool writes EFS, so `tools/make_efs_fixtures.py` writes the two
 fixtures, one per byte order, from one model and records what it wrote. Run with
 `--oracle`, it has qnxmount read the little-endian one, and every live file comes back as
@@ -1211,7 +1281,8 @@ self-test reads both fixtures and breaks three things to show the checks can fai
   and `status[1]` of header 1 to tell a spare unit, as qnxmount does.
 - A partition whose first unit has no `unit_info` is found by `efs_partitions()` but not
   opened. None of the 60 partitions measured is like that.
-- A partition that runs past the end of the image is not reported.
+- A partition cut in front of the unit that holds its boot record is not reported (see "A
+  partition the image holds only part of" above).
 - Free space is not reported for EFS.
 
 ## APFS
@@ -1459,6 +1530,23 @@ Hard links are one file under several names, and the names the inode records for
 (`INODE_REF` and, for a file with many names in one directory, `INODE_EXTREF`) are read
 by `links()`.
 
+A stored name is bytes, and Btrfs does not require them to be UTF-8. A byte that does not
+decode is listed as `%XX` of the stored byte, in uppercase hex (a name stored as `caf`,
+byte `0xE9`, `.txt` is `caf%E9.txt`), a NUL as `%00` and a `/` inside one name as `%2F`,
+so a listed name never holds a surrogate and is text SQLite and a file path accept. A
+literal `%` is not escaped, so two stored names can come to spell the same; both stay
+listed, each with its own inode. A symlink target gets the same `%XX` for bytes that are
+not UTF-8 and keeps its slashes. Earlier versions returned a lone surrogate for such a
+byte, and `--extract` then spelled the member with the UTF-8 form of that surrogate
+(`caf%ED%B3%A9.txt`).
+
+An inode's four times are read as signed 64-bit seconds with nanoseconds, the way the
+kernel hands them to `stat()`, so a time before 1970 is a negative number in `entry()`
+and `times()`. A zip holds no date before 1980, so `--extract` gives such a file a
+`TIME_NOT_HELD` row with the stored number and its date. Earlier versions read the
+seconds unsigned, and the row for a file stamped 1901 carried
+`18446744071562067968` and no date.
+
 Subvolumes and snapshots are **directories**, where the top-level tree links them, the
 way the kernel and `btrfs restore -s` present them. A link the root tree has no matching
 `ROOT_REF` for (a snapshot's view of a subvolume nested in the subvolume it copied) is
@@ -1508,7 +1596,11 @@ before it was unmounted is inside the free space reported.
 
 A log tree (changes `fsync`'d after the last commit, which the kernel replays at the
 next mount) is not replayed. The volume reads as of its last commit, and the note says a
-log tree is present.
+log tree is present. `--extract` writes the walker's note to the volume's record in
+`volumes.json` as `note` and prints it as a `NOTE` line; earlier versions left it out of
+that record. A log tree that was not replayed does not change the exit status on its own.
+The same line writes the note of every reader: its `volume_note` when it has one, and
+otherwise its `note`.
 
 Validated against images `mkfs.btrfs --rootdir` (btrfs-progs 6.17.1) wrote from one
 source tree, once per compression (none, zlib, zstd, LZO) and once per other checksum
@@ -1536,14 +1628,30 @@ the top level, and two deleted files. All 17 of its files match the sha256 taken
 the mount, and all 27 entries match `lstat()` through the mount to the nanosecond.
 `btrfs-logtree` was copied after an `fsync` and before the next commit: the note says its
 log tree is present, the file committed before it is listed, and the file only the log
-holds is not.
+holds is not. Its export exits 0 with that note in `volumes.json`. Exports of the other
+fixtures carry their notes the same way: one device of two (`btrfs-raid1-dev2`), a
+default subvolume other than the top level (`btrfs-sha256`, `btrfs-live`), and zstd on a
+Python without it (`btrfs-zstd` and `btrfs-live` on 3.12). The mirror superblock and
+striped chunk sentences reach the record through the same line and were not run through
+an export.
+
+Names and times were measured on one more volume `mkfs.btrfs --rootdir` (btrfs-progs
+6.17.1) wrote, which is not kept as a fixture: 15 files, among them a Latin-1 file name,
+a folder whose name is two bytes that are not UTF-8, and modification times of
+-2147483648, -1, 0 and six later ones, four of them at the ends of what a zip holds. All
+15 files export with the sha256 of their source; the two names are members `caf%E9.txt` and
+`%FF%FE_dir/inside.txt`; and the rows for the two times before 1970 give
+`-2147483648 (1901-12-13 20:45:52 UTC)` and `-1 (1969-12-31 23:59:59 UTC)`. Names that
+are not UTF-8 and times before 1970 written by the kernel on a mounted volume were not
+measured.
 
 The self-test also breaks one rule at a time in copies of these images, each in memory
 with its checksum rewritten so the break reaches the check under test: a node that
 points at itself, a generation, a first key and a filesystem id that do not match, a
 leaf that claims more items than fit, a directory entry whose inode is missing, a
-changed `DIR_ITEM` name, a subvolume entry for itself, a `ROOT_REF` too short for its
-name, an inline extent with the wrong size, an inode size past the largest file, broken
+changed `DIR_ITEM` name, names holding a byte that is not UTF-8, a NUL and a slash, a
+symlink target holding such a byte, modification times before 1970, a subvolume entry
+for itself, a `ROOT_REF` too short for its name, an inline extent with the wrong size, an inode size past the largest file, broken
 superblocks, LZO segments with sector padding, zlib streams with a wrong adler32 and
 compressed extents past 128 KiB. Each is recorded or refused as described above.
 
@@ -2979,7 +3087,9 @@ Version 4.0 is read. The 1.x to 3.x layouts, and their big-endian `sqsh` form, a
 recognised and reported but not walked. A volume is claimed only when its superblock
 passes the checks the kernel makes before it mounts one (a block size that agrees with its
 own log, a compression id the format defines) and its root inode reads back as a
-directory.
+directory. Two cases are named without a root inode that reads, and recorded as not read:
+a volume whose decompressor this Python lacks, and an image cut short of the bytes its
+superblock records (both below).
 
 Every compressor mksquashfs offers is read: gzip, xz (including a BCJ filter), the legacy
 lzma format, LZO, LZ4 and, on Python 3.14 or later, zstd. Files split into blocks, files
@@ -2992,6 +3102,64 @@ agree with `unsquashfs -lln` on every image. The tree includes random bytes that
 4 KiB-block image stores uncompressed because they did not shrink, a file shaped to reach
 an LZ decoder's rarer instructions, a directory of 600 entries (more than one directory
 header and metadata block) and a 255-byte name.
+
+**Names.** SquashFS stores a name as the bytes Linux gave it, and the kernel copies them
+without decoding (`fs/squashfs/dir.c`). A stretch of a name that is not UTF-8 is written as
+`%XX` of its stored bytes (a name stored as `a`, byte `0x80`, `b.txt` is `a%80b.txt`), and a
+name never holds a surrogate. A literal `%` is not escaped, so a file really named
+`caf%E9.txt` can match an escaped one, and the duplicate handling keeps both. A `/` or a
+NUL inside one name would be written `%2F` or `%00`; that is not exercised, because a Linux
+file name holds neither and no fixture does. A symlink's target is a path, so its `/`
+separators stay and only bytes that are not UTF-8 are written as `%XX`. Checked on an image
+mksquashfs wrote from 20 entries, 10 of them with a path that is not UTF-8
+(`tools/make_squashfs_odd_fixture.sh`): every name matches the source tree's bytes under
+this rule and goes into SQLite, and the 18 files match their hashes.
+
+**A Python without the decompressor.** gzip is read with Python's `zlib` module, xz and
+the legacy lzma format with its `lzma` module, and zstd with `compression.zstd`, which
+Python has from 3.14. LZO and LZ4 are decoded by qnxprobe's own code, so nothing can be
+missing for them. When the running Python does not have the module a volume needs, the
+volume is still identified and its note names the module. mksquashfs compresses the
+metadata as well unless told not to, so the root folder cannot be read: an export records
+that in `volumes.json` as `folders_not_read` and a damage line that names the module,
+writes no file for the volume, and exits 1. A volume that uses another compressor still
+reads. This is tested for zstd on Python 3.10 and 3.12, which do not have it, and for
+`lzma` and `zlib` by making the import fail, because every Python at hand was built with
+both.
+
+**An image cut short.** The superblock records how many bytes the volume uses, and the
+kernel refuses to mount one that reaches past its device (`fs/squashfs/super.c`). When the
+image holds fewer bytes than that, the volume is still named, provided its superblock
+passes the checks the kernel makes on the superblock alone, even when its root inode is in
+the part that is gone. Its note in `volumes()` and its first damage line give the bytes
+recorded, the bytes the image holds, and the tables the superblock's own offsets place in
+the missing part. An export writes that line to `volumes.json` in `damage_first`, not as
+`note`, and carries the shortfall as `extends_past_image_by_bytes`. A folder whose
+inode or listing cannot be read is recorded with what that leaves out and counted in
+`folders_not_read`, and the run exits 1. A fragment table that cannot be read is recorded
+once, and the read of a file that needs it is refused with that reason. Nothing is
+recovered.
+
+A SquashFS volume holds its file data first, then the inode table, the directory table and
+the smaller tables (the layout in the kernel's `Documentation/filesystems/squashfs.rst`),
+so a cut that reaches file data also takes the root folder, and no file is listed. Checked
+at three cut points (the last 4 KiB, halfway, just after the inode table) on 36 volumes
+mksquashfs wrote: 76 of the 108 cuts list nothing and exit 1 with those records. 26 took
+only tables this reader does not use (the export, id and extended attribute tables): every
+file still reads, the record says what is missing, and the exit status stays 0. 2 fell in
+the padding after the volume's end, where nothing is missing. 4 left a file of 0 bytes,
+which has no superblock to name, so nothing is recorded for it. A folder read only in part
+is recorded by the same code, but no cut tested reached that state.
+
+**Folder depth.** Folders are read at every level. `collect()` and the tree walk of
+`walk_all()`, which every reader's export and listing go through, used to stop below 64
+levels and say nothing: an image mksquashfs wrote with a chain of folders 70 levels deep
+exported 64 of its 70 files and exited 0. Both now keep their own stack of the folders they
+are inside, go as deep as the volume does, and enter each folder once, which is what ends
+a loop. That image (`tools/make_squashfs_deep_fixture.sh`) now exports 70 of 70 files that
+match the source tree. The change is in code every reader shares, so the self-test also
+holds `collect()` against a walk that calls itself on an ext4 and a FAT16 fixture, and
+walks a chain of 3,000 folders that loops back on itself.
 
 ### JFFS2
 
@@ -3101,6 +3269,11 @@ garbage collection freed a block, so a partition can open on blocks holding only
 pages or only erased ones; when the first pages hold tags that fit but no object header,
 or almost nothing but erased pages, the same test runs again over sixteen stretches spread
 across the whole region, each the same number of bytes for every page size tried.
+A YAFFS2 checkpoint page is left out of that test and of the scan. YAFFS2 writes its
+checkpoint to the first empty block, which can be the first block of the partition, and
+tags its pages with a fixed sequence value (0x21) that no object or data page carries;
+YAFFS itself scans none of them for objects. Up to 1.87 a volume whose first used pages
+were a checkpoint was not recognised.
 
 YAFFS2 is read the way its own scan reads it: blocks newest first, the newest object
 header and the newest copy of each data page winning, data past a shrink or past the
@@ -3108,7 +3281,33 @@ newest header's size ignored, and a file's size taken from its newest header or 
 written after it, whichever is further. YAFFS1 orders two copies of a page by their 2-bit
 serial number and takes a file's size from where its furthest live page ends. `lost+found`
 is always listed, as YAFFS lists it; when the flash holds no header for it or for the root,
-no time is shown for them, since YAFFS makes them at mount time.
+no time is shown for them, since YAFFS makes them at mount time. A YAFFS2 data page can
+carry a chunk id up to 2^28 - 1, as YAFFS accepts; the 20-bit limit applies to YAFFS1 only,
+whose tag field is that wide. Up to 1.87 a YAFFS2 page with an id of 2^20 or more was
+dropped, so the part of a file past about 2 GiB (with 2048-byte pages) read as zeros.
+
+A stored name is bytes. A byte that is not UTF-8 shows as `%XX` of the stored byte (`0xE9`
+is `%E9`) and a `/` inside one name as `%2F`, so a name never holds a surrogate and cannot
+invent a folder. A symlink's target is shown the same way with its `/` kept, and its size
+is the stored length. A literal `%` is not escaped.
+
+An object whose parent folder has no header in the image has no path. YAFFS makes such a
+folder itself at mount and puts it under `lost+found`; the image holds no name or time for
+it, so qnxprobe does not invent one. The objects under it are not exported. The volume's
+record counts them (`damage_first`, `folders_not_read`), each file among them is counted
+in `failed` and gets a `FAILED` row in the exceptions table with its object id, size and
+stored name, and the run exits 1. This is what an image cut before a folder's header
+gives: on the YAFFS1 history image with its last 4 KiB removed, 3 of the 49 files are
+exported and 44 files and a folder are recorded that way.
+
+An object that has data pages and no header of its own is recorded too. YAFFS makes a file
+from a data page alone, also under `lost+found`, but the image holds no name, size, time
+or folder for it, so it is not exported. A damage line gives the count and the bytes those
+pages hold, each such object gets a `FAILED` row with its object id, page count and bytes,
+`folders_not_read` is set and the run exits 1. On the same cut image three objects are
+recorded that way, two of them the other two files of the 49. Cut just after its first
+object header, that image lists no file and records four such objects. On the 28 whole
+known-data volumes that are read, neither record appears.
 
 Validated two ways. Aleph One's own image makers wrote four images (YAFFS2 little endian,
 YAFFS2 with big-endian headers, YAFFS2 with its tags two bytes into the spare, and YAFFS1):
@@ -3132,6 +3331,16 @@ and a socket and a FIFO on /data, whose stored modes carry their type, which qnx
 reports and YAFFS's direct interface drops. Directory sizes were not compared (YAFFS
 reports 2048, qnxprobe 0). The /cache partition's first object header is at page 3,968,
 which is what the wider search above is for; before 1.35 it was not recognised.
+
+YAFFS's own core also wrote 22 more YAFFS2 volumes (2048-byte pages, 64-byte spare),
+each read back by that core as known data: clean unmounts with a checkpoint, twelve after
+1 to 12 rounds of writing and deleting a large file so that garbage collection runs before
+the checkpoint is written, a sparse file with data past 2 GiB, names that are not UTF-8, times in 1970, 2038 and 2110, a rename over a file,
+a file unlinked while open, and tags without ECC. 21 of the 22 match on every file's path,
+size, sha256 and time (the two times a zip cannot hold are recorded as `TIME_NOT_HELD`).
+Four of the twelve hold the checkpoint in their first two pages and the sparse file's last
+bytes sit in pages with ids above 2^20. The 22nd uses inband tags, which are not read
+(see the limits below).
 
 ### Deleted files on YAFFS2, JFFS2 and UBIFS
 
@@ -4027,7 +4236,10 @@ Linux servers, NAS units and storage appliances. `--list`, `--extract` and
 superblock is verified: the `XFSB` magic, a geometry that holds as the kernel requires it,
 and on v5 a superblock CRC that holds. A v4 superblock has no CRC, so its root inode must
 also read as a directory. A superblock that fails any of these is not claimed, and the
-other filesystems get their turn at the region.
+other filesystems get their turn at the region. One case is claimed on the superblock
+alone: a v4 volume whose root inode lies past the end of the image or of its region. The
+superblock is whole and states the volume's size, so this is a cut XFS volume, and it is
+named and recorded as one (see below).
 
 What it reads:
 
@@ -4044,6 +4256,14 @@ What it reads:
 - directories in all five forms: shortform (in the inode), block, leaf, node, and node or
   leaf with a B+tree extent map, with and without the file type byte (`ftype`), and
   directory blocks larger than the filesystem block;
+- names as UTF-8. A stretch of a stored name that is not UTF-8 is kept as `%XX` of its
+  bytes (a stored `0x80` is `%80`), and a NUL or a `/` inside one name as `%00` or `%2F`,
+  so no name holds a surrogate. A literal `%` is not escaped, so a file really named
+  `caf%E9.txt` and one stored as `caf`, `0xE9`, `.txt` read alike: both are listed, each
+  with its own inode, the one really named that first. An extraction keeps both: that
+  one under the name, the other as `.dup-2` with a `RENAMED` row whose stored path reads
+  the same, so the row alone does not say which bytes were stored. A symlink target is a
+  path, so its bytes that are not UTF-8 become `%XX` and its `/` stay as they are;
 - symbolic links held inline and in blocks of their own; hard links, which list as one
   inode under each name; FIFOs, listed and not extracted (device nodes the same way, by
   the source: making one needs root, and none was made);
@@ -4087,16 +4307,40 @@ What fails is not used, and is counted:
   image (a partition followed by another), nothing past the region is read as the
   volume's.
 
-The count and the first damaged structure appear in the volume's note.
+An export records the count and the first damaged structure as `damage_recorded` and
+`damage_first`, not in `note`.
+
+**A cut volume.** Each inode, directory block, extent B+tree block or symlink block that
+lies past the end is recorded with what follows from it (an inode: what a folder names by
+it is not listed) and counted in `folders_not_read`, so the extraction exits 1. A cut
+that takes none of them still records the missing end in the note and exits 0. A volume
+cut just after its superblock has one record, that the root folder cannot be read and
+none of its files are listed, and exits 1. Measured on `xfs-v4` (5,319 files): cut 4 KiB
+short, all 5,319 files are exported and the run exits 0; cut in half, 4,611 are exported,
+8 inodes past the cut are recorded and counted, and the run exits 1; cut after its first
+sector, no file is exported and the run exits 1. File data past the end, with its inode
+still there, is the `.SHORT` case above and is not counted in `folders_not_read`; no cut
+tried here produced one.
+
+In an export, `note` in `volumes.json` holds only what the volume says about itself: a
+missing end, a dirty log, the needsrepair flag, a realtime section. It never gives a count
+of damaged structures; those go to `damage_recorded` and `damage_first`.
 
 **The log is not replayed.** Whether it is clean is decided the way `xfs_db` and
 `xfs_logprint` decide it (libxlog `xlog_is_dirty`): find the log's head by the cycle
 numbers stamped in it, and its tail from the last record before the head. A dirty log is
 reported in the volume's lines and its note, and the volume is read as it is stored: what
-was still only in the log is not there. The head is found by the kernel's first pass only;
-its later passes step back over a write torn at the moment of a crash, which this does
-not, so on such a log the head named here can be later than the kernel's. An external log
-is reported as such, its state not known.
+was still only in the log is not there. The note says so in those terms: files and
+content written since the log's tail (the first log record whose changes are not all in
+place) may be missing, or older than the device would show after a mount, with the tail,
+the head and how many 512-byte log blocks lie between them. An export writes it to
+`volumes.json` as `note`. A dirty log alone does not change the exit status. On
+`xfs-dirty`, `xfs_logprint` shows 21 inode items in the log (the 20 files added and their
+folder); the reader lists that folder empty, and the export exits 0 and carries the
+note. The head is found by the kernel's first pass only; its later passes step back over
+a write torn at the moment of a crash, which this does not, so on such a log the head
+named here can be later than the kernel's. An external log is reported as such, its state
+not known.
 
 ### What is refused, and why
 
@@ -4170,6 +4414,14 @@ the superblock; remote symlink headers naming another offset, length, owner or b
 one mapped to 2,000 blocks; a volume cut to half its size, and one in a region shorter
 than the image; and a v4 superblock pasted onto a region with no XFS root inode behind it.
 Each of these checks was shown to fail when the line of the reader it guards was changed.
+
+Four more rows cover names and what an export records, and each fails on the reader as it
+was before them: a shortform directory rewritten in memory to hold a name with a byte
+that is not UTF-8, the name that byte reads as, a `/` and a NUL, with a symlink target
+given such a byte (Linux 6.18 refuses a `/` or a NUL in a name, `xfs_dir2_namecheck` in
+fs/xfs/libxfs/xfs_dir2.c, so those two only show the escape); and, through a real
+`--extract`, the dirty log's note in `volumes.json`, and `xfs-v4` cut after its
+superblock, cut in half and cut 4 KiB short.
 
 The layout is sourced from xfsprogs v6.18.0 (commit
 8b892adad226bb9fef4009c4cba4dbc25b70b011); no xfsprogs code was copied, as xfsprogs is
@@ -4667,6 +4919,8 @@ header, item, key pointer               btrfs_tree.h:482-497, 549-580
 chunk item, stripe, profile bits        btrfs_tree.h:629-663, 1154-1185
 logical to physical                     kernel-shared/volumes.c:2093-2313, 2577-2666
 root, inode, dir and ref items          btrfs_tree.h:853-982
+inode times are signed seconds          linux include/uapi/linux/btrfs_tree.h:876-879,
+                                          fs/btrfs/inode.c:4094-4102, include/linux/fs.h:1629-1630
 file extent item, compression types     btrfs_tree.h:1063-1119, kernel-shared/compression.h:108-111
 reading a file's extents                cmds/restore.c:292-471, 617-760
 LZO framing in an extent                linux fs/btrfs/lzo.c:24-59, 429-546
@@ -4737,6 +4991,13 @@ struct yaffs_obj_hdr (512 bytes)        core/yaffs_guts.h:330
 YAFFS2 packed tags and their ECC        core/yaffs_packedtags2.c
 YAFFS2 scan                             core/yaffs_yaffs2.c yaffs2_scan_chunk
 YAFFS1 tags and deletion                core/yaffs_tagscompat.c, core/yaffs_yaffs1.c
+checkpoint sequence value 0x21          core/yaffs_guts.h:104
+checkpoint page tags                    core/yaffs_checkptrw.c:291-294
+checkpoint blocks are not scanned       core/yaffs_yaffs2.c:1585-1595
+largest YAFFS2 chunk id, 2^28 - 1       core/yaffs_guts.h:50-54, core/yaffs_yaffs2.c:1204
+a file made from a data page alone      core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227
+a folder made for a missing header      core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296
+  starts under lost+found               core/yaffs_guts.c:1657-1661
 root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 ```
 
@@ -4999,13 +5260,14 @@ above are in this README only for now.)
   (the space they held is reported free), extended attributes are not reported, and zstd
   needs Python 3.14. An inode size is refused only past the largest file Btrfs allows
   (2^63 - 1 bytes); a size below that and far past the data is read as the hole it is.
-  This reader has been run only on the fixtures named under Btrfs above, none of them
-  from a real device.
+  This reader has been run only on the fixtures and the one more `mkfs.btrfs` volume
+  named under Btrfs above, none of them from a real device.
 - **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
   (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
   listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
   the reason as the volume's note, so the report, the window and a LEAPP run log say why
-  it lists nothing. In UBIFS each file whose data
+  it lists nothing, and an export records the volume as not read and exits 1 (see
+  [SquashFS](#squashfs)). In UBIFS each file whose data
   is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
   were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
   JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is
@@ -5014,6 +5276,13 @@ above are in this README only for now.)
   big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
   YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
   recognised at all.
+- **A cut YAFFS image mostly shows nothing to record.** YAFFS records no size for the
+  volume, so an image that ends early looks like a smaller volume. One cut halfway returned
+  an older state of the files, with no note, because the newer pages were past the cut. Cut
+  just after their first object header, 18 of the 28 known-data volumes are not recognised
+  and the other 10 list at most one file; 5 of those 10 carry a record. A partial page at
+  the end is dropped. Two cases are recorded: a folder whose header is missing while objects
+  that name it are present, and an object with data pages and no header (both above).
 - **Older versions of live files on flash are not listed.** Each flash reader returns the
   filesystem's current state, the way the filesystem itself reads it, and deleted files
   come from `recover_deleted()` (above). The earlier contents of a file that still exists

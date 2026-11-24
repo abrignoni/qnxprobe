@@ -17308,6 +17308,8 @@ EFS_COND, EFS_FREE, EFS_ALLOC, EFS_DELETE, EFS_BAD = 0x0070, 0x0070, 0x0030, 0x0
 EFS_TYPE, EFS_FILE, EFS_DIR, EFS_SYS = 0x0300, 0x0300, 0x0200, 0x0100
 EFS_COND_NAMES = {EFS_FREE: "free", EFS_ALLOC: "allocated", EFS_DELETE: "deleted",
                   EFS_BAD: "bad"}
+EFS_DAMAGE_CAP = 1000              # damage lines kept; folders_not_read counts them all
+_EFS_UNRESOLVED = "a pointer in its extent chain no longer resolves"
 
 
 def _efs_boot_at(buf, at):
@@ -17346,7 +17348,11 @@ def _efs_unit_info(b):
 
 def _efs_partition_from_sig(fh, sig, limit):
     """The partition whose boot record has its signature at byte sig of the
-    image, or None. limit is the offset the partition must end by."""
+    image, or None. limit is the offset the partition must end by, unless the
+    image itself ends at or before limit: a partition the record places past
+    the end of the image is returned with the size the record gives it, so a
+    cut image does not lose the partition without a word (EfsWalker says what
+    the image holds of it)."""
     if sig < 4:
         return None
     boot = _efs_boot_at(read_at(fh, sig - 4, 24), 4)
@@ -17373,9 +17379,10 @@ def _efs_partition_from_sig(fh, sig, limit):
     if toff != sig - 4 - ustart:
         return None
     base = ustart - boot["unit_index"] * unit_size
-    if (base < 0 or boot["unit_total"] < 1 or boot["unit_index"] >= boot["unit_total"]
-            or base + boot["unit_total"] * unit_size > limit):
+    if base < 0 or boot["unit_total"] < 1 or boot["unit_index"] >= boot["unit_total"]:
         return None
+    if base + boot["unit_total"] * unit_size > limit and limit < image_size(fh):
+        return None                           # it does not fit, and the image goes on
     boot.update(base=base, size=boot["unit_total"] * unit_size, unit_size=unit_size,
                 sig_at=sig - base)
     return boot
@@ -17383,6 +17390,8 @@ def _efs_partition_from_sig(fh, sig, limit):
 
 def _efs_locate(fh, base, size):
     """The EFS partition that starts at base and fits in size bytes, or None.
+    One that runs past the end of the image is returned too
+    (_efs_partition_from_sig).
 
     The first unit has to open with a unit_info, which sizes the units; the boot
     record is then looked for at the front of every unit, since the unit holding
@@ -17392,7 +17401,9 @@ def _efs_locate(fh, base, size):
     if info is None:
         return None
     us = info[1]
-    for u in range(min(size // us, 0x10000)):         # unit_total is a u2
+    # A last unit the image cuts is looked at too: its record still counts when
+    # the header that points at it is in the image.
+    for u in range(min(-(-size // us), 0x10000)):     # unit_total is a u2
         head = read_at(fh, base + u * us, EFS_BOOT_SCAN)
         j = head.find(EFS_SIG)
         while j >= 0:
@@ -17412,7 +17423,8 @@ def efs_partitions(fh, size):
     base and size in bytes, unit_size, endian ("<" or ">"), unit_index,
     unit_total, unit_spare, align_pow2, root, and sig_at, the signature's offset
     from base. Two records that place the same partition count once, and a
-    partition that overlaps one already found is left out."""
+    partition that overlaps one already found is left out. size is what the
+    record gives, so on a cut image base + size can lie past the end."""
     sigs, step, pos = [], 1 << 20, 0
     while pos < size:
         chunk = read_at(fh, pos, min(step + len(EFS_SIG), size - pos))
@@ -17447,7 +17459,20 @@ class EfsWalker:
     An extent is a dict: u and i (physical unit and header index), s0
     (status[0]), status1, off and tsize (its text within the unit), next and
     super (extent pointers). recover_deleted() lists what the flash still holds
-    of deleted and superseded files; unaccounted() is the consistency check."""
+    of deleted and superseded files; unaccounted() is the consistency check.
+
+    A partition the image holds only part of is still read. The boot record
+    gives the unit count, so ``declared_end`` is where the partition ends and
+    ``units_cut`` how many of its units the image does not hold whole. A unit's
+    header array sits at its end, so a unit the image cuts has none and nothing
+    in it is read. ``note`` and the first line of ``damage`` say how many bytes
+    the record gives the partition and how many the image holds, and
+    ``folders_not_read`` counts that once, and once more for each folder whose
+    chain of entries stops at a pointer that does not resolve. A file whose
+    extent chain stops that way is not handed back cut: the directory records no
+    size, so read_file() raises, saying how many bytes the chain reached. On a
+    partition the image holds whole none of this applies and a chain is read as
+    it stands."""
 
     def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
@@ -17464,11 +17489,61 @@ class EfsWalker:
         for u in range(boot["unit_total"]):
             raw = read_at(fh, base + u * self.unit_size, self.unit_size)
             self.units.append((raw, self._extents(raw, u)))
+        self.damage, self.folders_not_read = [], 0
+        self._not_read, self._names = set(), {}
+        self.declared_end = base + boot["size"]
+        self.units_cut = sum(1 for raw, _exts in self.units if len(raw) < self.unit_size)
+        self.note = None
+        if self.units_cut:
+            held = sum(len(raw) for raw, _exts in self.units)
+            one = self.units_cut == 1
+            self.note = (f"cut short: the boot record gives this EFS partition "
+                         f"{boot['unit_total']:,} units of {self.unit_size:,} bytes "
+                         f"({boot['size']:,} bytes) and the image holds {held:,} of those "
+                         f"bytes; {self.units_cut:,} of the units {'is' if one else 'are'} "
+                         f"not whole in the image and {'was' if one else 'were'} not read")
+            self._count_not_read("partition", self.note)
         self.logi_map = self._logi_map()
         root = self._dirent(self._get_ext(boot["root"]))
         if root is None:
-            raise ValueError("the EFS root directory entry does not read")
+            raise ValueError("the EFS root directory entry does not read"
+                             + (f" ({self.note})" if self.note else ""))
         self.root = root[1]
+
+    @property
+    def volume_note(self):
+        """What an export records about the volume as a whole, or None. The only
+        note this walker keeps is the cut-short line, which is also a line in
+        ``damage``, so an export records it there and not as a note."""
+        return None
+
+    def _count_not_read(self, what, line):
+        """Record one thing not read in full, once per ``what``: a line in
+        ``damage`` (see damage_lines) and one more in ``folders_not_read``."""
+        if what in self._not_read:
+            return
+        self._not_read.add(what)
+        self.folders_not_read += 1
+        if len(self.damage) < EFS_DAMAGE_CAP:
+            self.damage.append(line)
+
+    def _stops_at_cut(self, why):
+        """Whether a chain that stopped (_chain_from) did so at a pointer that
+        does not resolve, on a partition the image holds only part of. What the
+        chain went on to is then not known."""
+        return bool(self.units_cut) and why == _EFS_UNRESOLVED
+
+    def _folder_name(self, node):
+        """The path listdir() has seen a folder under, for a damage line."""
+        if node == self.root:
+            return "the root folder"
+        parts = []
+        while node in self._names and len(parts) < 64:
+            node, name = self._names[node]
+            parts.append(name)
+        if not parts or node != self.root:
+            return "a folder not reached from the root"
+        return "/".join(reversed(parts))
 
     def _extents(self, unit, u):
         """The unit's extent headers, index 0 first. They run down from the end
@@ -17563,7 +17638,7 @@ class EfsWalker:
         ext = self._get_ext(first)
         while True:
             if ext is None:
-                return out, "a pointer in its extent chain no longer resolves"
+                return out, _EFS_UNRESOLVED
             if (ext["u"], ext["i"]) in seen:
                 return out, "its extent chain loops"
             seen.add((ext["u"], ext["i"]))
@@ -17575,14 +17650,33 @@ class EfsWalker:
     def _chain(self, node):
         return self._chain_from((node[0], node[1]))[0]
 
+    @staticmethod
+    def walk_key(node):
+        """What walk_all() tells one folder from another by: the folder's first
+        pointer, logical unit and header index together. A node's first element
+        is the logical unit alone, which every folder whose first entry sits in
+        that unit shares, so on that key those folders were walked once between
+        them."""
+        return node[0], node[1]
+
     def listdir(self, node):
         out = []
-        for ext in self._chain(node):
+        chain, why = self._chain_from((node[0], node[1]))
+        for ext in chain:
             if not ext["tsize"]:
                 break
             d = self._dirent(ext)
             if d:
                 out.append(d[:2])
+                if d[1][2] & S_IFMT == S_IFDIR:
+                    self._names.setdefault(d[1], (node, d[0]))     # for _folder_name
+        else:                                        # listed to where the chain stops
+            if self._stops_at_cut(why):
+                self._count_not_read((node[0], node[1]), (
+                    f"folder not listed in full: its chain of entries stops after "
+                    f"{len(chain):,} extent(s) at a pointer that does not resolve, on a "
+                    f"partition the image holds only part of, so what follows is not "
+                    f"known: {self._folder_name(node)}"))
         return out
 
     def _size(self, node):
@@ -17594,8 +17688,15 @@ class EfsWalker:
         return (mode, size, node[3])
 
     def read_file(self, node, size):
+        chain, why = self._chain_from((node[0], node[1]))
+        if self._stops_at_cut(why):
+            raise ValueError(
+                f"not read: its extent chain stops after {len(chain):,} extent(s) holding "
+                f"{sum(ext['tsize'] for ext in chain):,} bytes at a pointer that does not "
+                f"resolve, on a partition the image holds only part of; EFS records no "
+                f"file size, so how much is missing is not known")
         out = bytearray()
-        for ext in self._chain(node):
+        for ext in chain:
             out += self._text(ext)
         yield bytes(out[:size]) if size else bytes(out)
 
@@ -18032,6 +18133,12 @@ def lz4_block_decompress(src, limit=None):
 # on, so a listing that comes back empty says why wherever the volume is shown.
 SQUASHFS_NO_ZSTD_NOTE = ("zstd compressed; this Python has no zstd (3.14 adds it), so "
                          "the listing may be short and no file can be read")
+# The same for xz and the legacy lzma format (the lzma module) and for gzip
+# (zlib). Both are in the standard library, lzma since 3.3, and both are left
+# out when Python is built without the C library behind them.
+SQUASHFS_NO_MODULE_NOTE = ("{0} compressed; this Python has no {1} module (the standard "
+                           "library carries it unless Python was built without {2}), so "
+                           "the listing may be short and no file can be read")
 
 
 def _zstd_module():
@@ -18079,7 +18186,9 @@ def zstd_decompress(src):
 # ---------------------------------------------------------------------------
 SQUASHFS_MAGIC = 0x73717368
 SQFS_METADATA_SIZE = 8192
+SQFS_DAMAGE_KEPT = 1000                 # entries kept in a walker's damage list
 SQFS_INVALID_FRAG = 0xFFFFFFFF
+SQFS_INVALID_BLK = 0xFFFFFFFFFFFFFFFF   # a table the volume does not have (squashfs_fs.h:40)
 SQFS_COMP = {1: "gzip", 2: "lzma", 3: "lzo", 4: "xz", 5: "lz4", 6: "zstd"}
 SQFS_TYPE_MODE = {1: S_IFDIR, 2: S_IFREG, 3: S_IFLNK, 4: 0o060000, 5: 0o020000,
                   6: 0o010000, 7: 0o140000, 8: S_IFDIR, 9: S_IFREG, 10: S_IFLNK,
@@ -18095,6 +18204,36 @@ class SquashfsUnreadable(Exception):
     says which and why."""
 
 
+# What a read of SquashFS metadata raises when it cannot give the bytes back.
+_SQFS_READ_ERRORS = (SquashfsUnreadable, DecompressError, struct.error)
+# The standard library module each compressor is decoded with, and the C library
+# a Python build needs for it. LZO (3) and LZ4 (5) are decoded by this file's own
+# code and zstd (6) is asked for through _zstd_module().
+_SQFS_MODULE = {1: ("zlib", "zlib"), 2: ("lzma", "liblzma"), 4: ("lzma", "liblzma")}
+
+
+def _sqfs_absent_module(comp):
+    """(module, C library) when the standard library module that decodes
+    compression id ``comp`` is not in this Python, else None."""
+    module, library = _SQFS_MODULE.get(comp, (None, None))
+    if module is None:
+        return None
+    try:
+        __import__(module)
+    except ImportError:
+        return module, library
+    return None
+
+
+def _sqfs_no_decompressor(comp):
+    """Why this Python cannot decompress SquashFS compression id ``comp``, as
+    text that names the module and which Python has it, else None."""
+    if comp == 6:
+        return None if _zstd_module() is not None else SQUASHFS_NO_ZSTD_NOTE
+    absent = _sqfs_absent_module(comp)
+    return SQUASHFS_NO_MODULE_NOTE.format(SQFS_COMP[comp], *absent) if absent else None
+
+
 def _sqfs_decompress(comp, data, limit):
     """Turn one compressed SquashFS block back into its bytes. The wrappers are
     fs/squashfs/{zlib,xz,lzo,lz4,zstd}_wrapper.c: gzip is a zlib stream with its
@@ -18105,38 +18244,62 @@ def _sqfs_decompress(comp, data, limit):
     the header's 8-byte size field with the real size; its own decoder puts the
     "unknown" value (all 0xFF) back before decoding and keeps that many bytes
     (squashfs-tools/lzma_xz_wrapper.c lzma_compress and lzma_uncompress, at
-    708c59ae), and so does this."""
-    import lzma, zlib
+    708c59ae), and so does this.
+
+    Each module is imported where its compressor is met, so a Python built
+    without one still reads the volumes that do not use it, and a volume that
+    does says which module is absent instead of stopping the run."""
+    if comp == 3:
+        return lzo1x_decompress(data, limit)
+    if comp == 5:
+        return lz4_block_decompress(data, limit)
+    if comp == 6:
+        return zstd_decompress(data)
+    if comp not in _SQFS_MODULE:
+        raise DecompressError(f"compression id {comp} is not one SquashFS defines")
     try:
         if comp == 1:
-            return zlib.decompress(data)
-        if comp == 4:
-            return lzma.decompress(data, format=lzma.FORMAT_XZ)
-        if comp == 2:
+            import zlib
+            try:
+                return zlib.decompress(data)
+            except zlib.error as exc:
+                raise DecompressError(f"gzip: {exc}") from None
+        import lzma
+        try:
+            if comp == 4:
+                return lzma.decompress(data, format=lzma.FORMAT_XZ)
             if len(data) < 13:
                 raise DecompressError("lzma block shorter than its header")
             want = struct.unpack_from("<I", data, 5)[0]
             out = lzma.decompress(data[:5] + b"\xff" * 8 + data[13:],
                                   format=lzma.FORMAT_ALONE)
             return out[:want]
-        if comp == 3:
-            return lzo1x_decompress(data, limit)
-        if comp == 5:
-            return lz4_block_decompress(data, limit)
-        if comp == 6:
-            return zstd_decompress(data)
-    except (zlib.error, lzma.LZMAError) as exc:
-        raise DecompressError(f"{SQFS_COMP.get(comp)}: {exc}") from None
-    raise DecompressError(f"compression id {comp} is not one SquashFS defines")
+        except lzma.LZMAError as exc:
+            raise DecompressError(f"{SQFS_COMP[comp]}: {exc}") from None
+    except ImportError:
+        module, library = _SQFS_MODULE[comp]
+        raise DecompressError(f"{SQFS_COMP[comp]} needs the standard library's {module} "
+                              f"module (in a Python built with {library}); this Python "
+                              "does not carry it") from None
 
 
 class SquashfsWalker:
     """List and read a SquashFS 4.0 image. A node is an inode reference (the
     metadata block's offset in the inode table, shifted left 16, plus the byte
     offset inside it), which is what a directory entry records, so a hard link
-    is one node reached by two names."""
+    is one node reached by two names.
 
-    def __init__(self, fh, base):
+    What could not be read is recorded in ``damage`` (see damage_lines), the
+    first 1,000 entries of it, and ``folders_not_read`` counts the folders whose
+    inode or listing could not be read in full. Nothing is recovered.
+
+    ``size`` is the byte length of the region the volume sits in.
+    ``declared_end`` is where the superblock says the volume ends. When the
+    image stops before that, ``missing`` is how many bytes short it is, and
+    ``damage`` and ``note`` say so and name the tables the superblock places
+    past that point."""
+
+    def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
         sb = read_at(fh, base, 96)
         if len(sb) < 96 or struct.unpack_from("<I", sb, 0)[0] != SQUASHFS_MAGIC:
@@ -18157,12 +18320,94 @@ class SquashfsWalker:
         self._meta = {}
         self._ids = None
         self._frag_index = None
+        self._frag_error = None
+        self.damage, self._damage_seen = [], set()
+        self.folders_not_read, self._not_read = 0, set()
+        self._folder_names, self._folder_parents = {}, {}
+        self.declared_end = base + self.bytes_used
+        self.held = self._held(size)
+        self.missing = max(self.bytes_used - self.held, 0) if self.held is not None else 0
+        self._cut = self._cut_text() if self.missing else None
+        if self._cut:
+            self._damaged(self._cut)
         # Many small files share one fragment block, so the last few blocks are
         # kept decompressed, as the kernel's fragment cache does (super.c,
         # SQUASHFS_CACHED_FRAGMENTS).
         self._frags = collections.OrderedDict()
 
     root = property(lambda self: self.root_ref)
+
+    # -- what could not be read ----------------------------------------------
+    def _held(self, size):
+        """How many bytes of the volume can be read: what the image holds from
+        ``base`` on, since no read stops at the region's end. A volume read
+        through a map sits past the image's own end (LvmImage); for it, or when
+        the image cannot say how long it is, the region's length is the answer,
+        and None when that is not known either."""
+        try:
+            end = image_size(self.fh)
+        except (OSError, ValueError, TypeError, AttributeError):
+            end = None
+        if isinstance(end, int) and self.base < end:
+            return end - self.base
+        return size
+
+    def _cut_text(self):
+        """What a volume longer than the image says: how much is missing, and the
+        tables the superblock's own offsets place wholly or partly in it, which
+        need not be all that is lost. The inode table runs up to the directory
+        table. Each of the fragment, export and id tables is found through a
+        list of pointers at the offset the superblock gives, written after the
+        blocks it points to (id.c:88-94, fragment.c:79-81), so the table is
+        whole only when that list is. Where the directory table ends is not in
+        the superblock, so it is named only when it begins past the cut. The
+        xattr table is named when its 16-byte header is not all here."""
+        held, gone = self.held, []
+        if self.dir_table > held:
+            gone.append("inode")
+        if self.dir_table >= held:
+            gone.append("directory")
+        for name, start, entries, width in (("fragment", self.frag_table, self.fragments, 16),
+                                            ("export", self.lookup_table, self.inodes, 8),
+                                            ("id", self.id_table, self.no_ids, 4)):
+            pointers = -(-entries * width // SQFS_METADATA_SIZE) * 8
+            if entries and start != SQFS_INVALID_BLK and start + pointers > held:
+                gone.append(name)
+        if self.xattr_table != SQFS_INVALID_BLK and self.xattr_table + 16 > held:
+            gone.append("xattr")
+        text = (f"the superblock records {self.bytes_used:,} bytes and the image holds "
+                f"{held:,} of them, so the last {self.missing:,} bytes are missing")
+        if gone:
+            text += ("; by its offsets they include all or part of the "
+                     + (" and ".join(filter(None, [", ".join(gone[:-1]), gone[-1]])))
+                     + (" tables" if len(gone) > 1 else " table"))
+        return text
+
+    def _damaged(self, what):
+        if what not in self._damage_seen and len(self.damage) < SQFS_DAMAGE_KEPT:
+            self._damage_seen.add(what)
+            self.damage.append(what)
+
+    def _folder_path(self, ref):
+        """A folder's path from the names it was listed under, "" for the root."""
+        parts, hops = [], 0
+        while ref != self.root_ref and ref in self._folder_names and hops < 4096:
+            parts.append(self._folder_names[ref])
+            ref = self._folder_parents.get(ref)
+            hops += 1
+        return "/".join(reversed(parts))
+
+    def _folder_part(self, ref, found):
+        """Record a folder that was not listed in full, counted once per folder.
+        damage_lines() keeps 240 characters of a line, so the folder's path goes last."""
+        if ref == self.root_ref:
+            self._damaged(f"the root folder {found}")
+        else:
+            self._damaged(f"a folder {found}: "
+                          f"{self._folder_path(ref) or f'inode reference {ref:#x}'}")
+        if ref not in self._not_read:
+            self._not_read.add(ref)
+            self.folders_not_read += 1
 
     # -- metadata ----------------------------------------------------------
     def _meta_block(self, pos):
@@ -18224,7 +18469,15 @@ class SquashfsWalker:
     def _fragment(self, index):
         """(start, stored_size_word) for a fragment table entry."""
         if self._frag_index is None:
-            self._frag_index = self._table(self.frag_table, self.fragments, 16)
+            if self._frag_error is None:
+                try:
+                    self._frag_index = self._table(self.frag_table, self.fragments, 16)
+                except _SQFS_READ_ERRORS as exc:
+                    self._frag_error = f"the fragment table could not be read ({exc})"
+                    self._damaged(f"{self._frag_error}, so no file that ends in a shared "
+                                  "fragment can be read to its end")
+            if self._frag_index is None:
+                raise SquashfsUnreadable(self._frag_error)
         if index >= self.fragments:
             raise SquashfsUnreadable(f"fragment {index} is beyond the table")
         start, size = struct.unpack_from("<QI", self._frag_index, index * 16)
@@ -18286,33 +18539,47 @@ class SquashfsWalker:
     def entry(self, ref):
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS:
             return None
         return ino["mode"], ino["size"], ino["mtime"]
 
     def readlink(self, ref):
+        """A symlink's target as stored, a path and not one name: bytes that are not
+        UTF-8 come back as %XX, and its "/" separators are left as they are."""
         ino = self.inode(ref)
-        return ino.get("target", b"").decode("utf-8", "surrogateescape")
+        return ino.get("target", b"").decode("utf-8", "qnxprobe-name")
 
     @property
     def note(self):
-        """Why this volume cannot be read on this Python, or None. listdir()
-        answers an empty list when its directory table cannot be decompressed,
-        so volumes() carries this beside the volume to say why."""
-        if self.comp == 6 and _zstd_module() is None:
-            return SQUASHFS_NO_ZSTD_NOTE
-        return None
+        """Why this volume cannot be read on this Python, and how much of it the
+        image does not hold, or None. listdir() answers an empty list when its
+        directory table cannot be read, so volumes() carries this beside the
+        volume to say why."""
+        parts = [_sqfs_no_decompressor(self.comp), self._cut]
+        return "; ".join(p for p in parts if p) or None
+
+    @property
+    def volume_note(self):
+        """What an export records about the volume as a whole: why this Python
+        cannot read it, or None. A cut is left out, since the export records it
+        as damage (damage_recorded and damage_first)."""
+        return _sqfs_no_decompressor(self.comp) or None
 
     def listdir(self, ref):
+        """[(name, node)] for a folder. A folder that cannot be read, or can be
+        read only in part, answers what was read and is recorded in ``damage``
+        and counted in ``folders_not_read``."""
         try:
             ino = self.inode(ref)
-        except (SquashfsUnreadable, DecompressError, struct.error):
+        except _SQFS_READ_ERRORS as exc:
+            self._folder_part(ref, f"could not be read ({exc}), so nothing in it is listed "
+                                   "or exported")
             return []
         if ino["type"] not in (1, 8):
             return []
         out = []
         pos, off = self.dir_table + ino["dir_start"], ino["dir_off"]
-        left = ino["size"] - 3                       # "." and ".." are not stored
+        total = left = ino["size"] - 3               # "." and ".." are not stored
         try:
             while left > 0:
                 hdr, pos, off = self._meta_read(pos, off, 12)
@@ -18322,15 +18589,29 @@ class SquashfsWalker:
                     raise SquashfsUnreadable("directory header counts more than 256")
                 for _ in range(count + 1):
                     ent, pos, off = self._meta_read(pos, off, 8)
-                    ioff, _delta, _dtype, nlen = struct.unpack("<HhHH", ent)
+                    ioff, _delta, dtype, nlen = struct.unpack("<HhHH", ent)
                     if nlen + 1 > 256:
                         raise SquashfsUnreadable("directory entry name over 256 bytes")
                     name, pos, off = self._meta_read(pos, off, nlen + 1)
                     left -= 8 + nlen + 1
-                    out.append((name.decode("utf-8", "surrogateescape"),
-                                (start << 16) | ioff))
-        except (SquashfsUnreadable, DecompressError, struct.error):
-            pass                                     # report what was read
+                    # the kernel copies the name's bytes and never decodes them
+                    # (fs/squashfs/dir.c), so a stretch that is not UTF-8 is %XX
+                    name = (name.decode("utf-8", "qnxprobe-name")
+                            .replace("\x00", "%00").replace("/", "%2F"))
+                    child = (start << 16) | ioff
+                    out.append((name, child))
+                    if dtype == 1 and child not in self._folder_names:
+                        # the entry's own type field says it is a folder, so a
+                        # record about it can give its path
+                        self._folder_names[child], self._folder_parents[child] = name, ref
+        except _SQFS_READ_ERRORS as exc:             # report what was read
+            if out:
+                self._folder_part(ref, f"was listed in part: {len(out):,} entries were read "
+                                       f"and the last {left:,} of its {total:,} listing bytes "
+                                       f"could not be ({exc}), so entries are missing")
+            else:
+                self._folder_part(ref, f"could not be listed ({exc}), so nothing in it is "
+                                       "listed or exported")
         return out
 
     # -- file data ---------------------------------------------------------
@@ -18383,6 +18664,14 @@ def identify_squashfs(fh, base, size=None):
     a power of two in 4 KiB..1 MiB that agrees with block_log, its compression
     id is one the format defines, and its root inode reads back as a
     directory, the checks super.c applies before it will mount.
+
+    A volume whose root inode cannot be read is still named when its
+    superblock passes the checks super.c makes on the superblock alone (the
+    ones above, a root inode offset inside a metadata block, the inode table
+    before the directory table: super.c:232-289 and 441) and records more
+    bytes than the image holds, with the end of the inode table past what is
+    here. That is an image cut short, which the kernel refuses to mount
+    (super.c:256-261); naming it lets an export record what is missing.
     """
     sb = read_at(fh, base, 96)
     if len(sb) < 32:
@@ -18400,16 +18689,17 @@ def identify_squashfs(fh, base, size=None):
             "contents     a pre-4.0 layout, reported here but not walked; the Linux "
             "kernel's own driver refuses them too (fs/squashfs/super.c)"]
     try:
-        w = SquashfsWalker(fh, base)
+        w = SquashfsWalker(fh, base, size)
     except SquashfsUnreadable:
         return None
     if w.comp not in SQFS_COMP:
         return None
+    root_read = True
     try:
         root = w.inode(w.root)
         root_ok = root["type"] in (1, 8)
     except (SquashfsUnreadable, DecompressError, struct.error, ValueError):
-        root_ok = False
+        root_ok = root_read = False
     flags = [name for bit, name in SQFS_FLAGS if w.flags >> bit & 1]
     lines = [
         "version      4.0",
@@ -18422,13 +18712,18 @@ def identify_squashfs(fh, base, size=None):
     ]
     if flags:
         lines.append("flags        " + ", ".join(flags))
-    if size is not None and w.bytes_used > size:
+    here = min(n for n in (size, w.held, w.bytes_used) if n is not None)
+    if w.bytes_used > here:
         lines.append(f"note         the image records {human(w.bytes_used)} but the region "
-                     f"holds {human(size)}, so its end is missing")
-    if w.comp == 6 and _zstd_module() is None:
-        lines.append("note         " + SQUASHFS_NO_ZSTD_NOTE)
+                     f"holds {human(here)}, so its end is missing")
+    no_module = _sqfs_no_decompressor(w.comp)
+    if no_module:
+        lines.append("note         " + no_module)
     if not root_ok:
-        if w.comp == 6 and _zstd_module() is None:
+        if no_module:
+            return "squashfs", lines
+        if (not root_read and w.missing and w.dir_table > w.held
+                and (w.root_ref & 0xFFFF) <= SQFS_METADATA_SIZE):
             return "squashfs", lines
         return None
     return "squashfs", lines
@@ -20283,6 +20578,17 @@ def ubifs_lines(w):
 #   object ids: root 1, lost+found 2,          core/yaffs_guts.h:94-100
 #     unlinked 3, deleted 4, block summary 0x10
 #   sequence numbers 0x1000..0xefffff00        core/yaffs_guts.h:123-124
+#   checkpoint pages: sequence 0x21, chunk id  core/yaffs_guts.h:104,
+#     the page's number in the checkpoint plus  core/yaffs_checkptrw.c:291-294,
+#     1, n_bytes the page size; a block that    core/yaffs_yaffs2.c:1585-1595
+#     carries that sequence is counted as
+#     checkpoint and its chunks are not scanned
+#   data chunk ids: YAFFS2 up to 2^28 - 1;     core/yaffs_guts.h:50-54,
+#     YAFFS1 holds them in 20 bits              core/yaffs_yaffs2.c:1204,
+#                                               core/yaffs_guts.h:152-159
+#   an object whose folder has no header: the  core/yaffs_yaffs2.c:1416-1418,
+#     scan makes that folder, which a new       core/yaffs_yaffs1.c:293-296,
+#     object starts under lost+found            core/yaffs_guts.c:1657-1661
 #   YAFFS2 packed tags: seq, obj, chunk,       core/yaffs_packedtags2.h/.c
 #     n_bytes (16 bytes) then tag ECC; an
 #     object header's tags may carry its type
@@ -20315,6 +20621,9 @@ def ubifs_lines(w):
 YAFFS_ROOT, YAFFS_LOSTNFOUND, YAFFS_UNLINKED, YAFFS_DELETED = 1, 2, 3, 4
 YAFFS_OBJECTID_SUMMARY = 0x10
 YAFFS_SEQ_LO, YAFFS_SEQ_HI = 0x00001000, 0xEFFFFF00
+YAFFS_SEQ_CHECKPOINT = 0x21                      # core/yaffs_guts.h:104
+YAFFS2_MAX_CHUNK_ID = (1 << 28) - 1              # core/yaffs_guts.h:50-54
+YAFFS_UNREACHED_NAMED = 48                       # damage lines naming a folder with no header
 YAFFS_TYPES = {1: "file", 2: "symlink", 3: "directory", 4: "hardlink", 5: "special"}
 YAFFS_TYPE_MODE = {1: S_IFREG, 2: S_IFLNK, 3: S_IFDIR}
 YAFFS_EXTRA_HDR, YAFFS_EXTRA_SHRINK = 0x80000000, 0x40000000
@@ -20355,13 +20664,33 @@ def _yaffs2_tags(spare, off, e):
                             type=obj >> 28, size_or_equiv=nbytes))
     elif obj >> 28:
         return None
-    if not 0 < t["obj"] < (1 << 18) or t["chunk"] >= (1 << 20):
+    # YAFFS2 takes a chunk id up to YAFFS_MAX_CHUNK_ID, 2^28 - 1
+    # (core/yaffs_guts.h:50-54, tested at core/yaffs_yaffs2.c:1204). The 20-bit
+    # limit is YAFFS1's, whose tag field is that wide (_yaffs1_tags).
+    if not 0 < t["obj"] < (1 << 18) or t["chunk"] > YAFFS2_MAX_CHUNK_ID:
         return None
     ecc = spare[off + 16:off + 28]
     if len(ecc) == 12 and ecc != b"\xff" * 12:
         lp, lpp = struct.unpack_from(e + "II", ecc, 4)
         t["ecc_ok"] = (lp, lpp) == _yaffs2_line_parity(raw)
     return t
+
+
+def _yaffs2_checkpoint_tags(spare, off, e, chunk):
+    """True when the packed tags at `off` are those YAFFS2 writes on a page of
+    its checkpoint (core/yaffs_checkptrw.c:291-294): the fixed sequence value
+    0x21, a chunk id of the page's number in the checkpoint plus 1, and
+    n_bytes equal to the page size. The object id field holds a block number
+    there, so it is not tested. YAFFS counts a block with that sequence value
+    as checkpoint and scans none of its chunks for objects or data
+    (core/yaffs_yaffs2.c:1585-1595), so these pages say nothing about the
+    layout and hold no object."""
+    raw = spare[off:off + 16]
+    if len(raw) < 16:
+        return False
+    seq, _obj, page_no, nbytes = struct.unpack(e + "IIII", raw)
+    return (seq == YAFFS_SEQ_CHECKPOINT and 0 < page_no <= YAFFS2_MAX_CHUNK_ID
+            and nbytes == chunk)
 
 
 def _yaffs1_tags(spare):
@@ -20401,39 +20730,51 @@ def _yaffs_header(data, e):
     rdev = struct.unpack_from(e + "I", data, 460)[0]
     wm = struct.unpack_from(e + "II", data, 480)
     size_hi, _res, shadows, shrink = struct.unpack_from(e + "IIiI", data, 496)
-    return dict(type=otype, parent=parent, name=name.decode("utf-8", "surrogateescape"),
+    # A stored byte that is not UTF-8 shows as %XX, a NUL cannot occur (the name
+    # ends at the first one) and a "/" inside one name shows as %2F so it cannot
+    # invent a folder. A symlink's target is a path, so its "/" stays.
+    return dict(type=otype, parent=parent,
+                name=name.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F"),
                 mode=mode, uid=uid, gid=gid, rdev=rdev, equiv=equiv,
                 mtime=mtime if wm[1] == 0xFFFFFFFF else (wm[1] << 32) | wm[0],
                 size=size_lo if size_hi == 0xFFFFFFFF else (size_hi << 32) | size_lo,
-                alias=alias.decode("utf-8", "surrogateescape"),
+                alias=alias.decode("utf-8", "qnxprobe-name"), alias_len=len(alias),
                 shrink=shrink not in (0, 0xFFFFFFFF))
 
 
 def _yaffs_tag_trials(chunk, spare):
-    """(version, tag offset, byte order, decoder) for every tag placement a
-    geometry allows: YAFFS1 tags on 512+16, and YAFFS2 packed tags at every
-    offset in the spare in both byte orders."""
+    """(version, tag offset, byte order, decoder, checkpoint test) for every tag
+    placement a geometry allows: YAFFS1 tags on 512+16, and YAFFS2 packed tags
+    at every offset in the spare in both byte orders. The checkpoint test says
+    whether a spare the decoder refused is a YAFFS2 checkpoint page's; YAFFS1
+    has no checkpoint, so it is None there."""
     trials = []
     if (chunk, spare) == (512, 16):
-        trials.append((1, 0, "<", lambda s: _yaffs1_tags(s)))
+        trials.append((1, 0, "<", lambda s: _yaffs1_tags(s), None))
     for off in range(0, spare - 15):
         for e in ("<", ">"):
-            trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e)))
+            trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e),
+                           lambda s, off=off, e=e: _yaffs2_checkpoint_tags(s, off, e, chunk)))
     return trials
 
 
-def _yaffs_tags_fit(decode, used):
+def _yaffs_tags_fit(decode, used, checkpoint=None):
     """True when the decoder finds plausible tags on at least 90% of the
-    first 16 used pages; it gives up as soon as that is out of reach."""
-    first = used[:16]
-    allowed = len(first) - 0.9 * len(first)
-    misses = 0
-    for _d, s in first:
+    first 16 used pages; it gives up as soon as that is out of reach. A
+    checkpoint page is not one of the 16: YAFFS2 writes its checkpoint to the
+    first empty block, which can be the first block of the partition."""
+    seen = misses = 0
+    for _d, s in used:
         if not decode(s):
+            if checkpoint is not None and checkpoint(s):
+                continue
             misses += 1
-            if misses > allowed:
+            if misses >= 2:                # 90% of at most 16 pages allows one miss
                 return False
-    return True
+        seen += 1
+        if seen == 16:
+            break
+    return misses <= seen - 0.9 * seen
 
 
 def _yaffs_pages(fh, base, size, chunk, spare, n, windows):
@@ -20509,17 +20850,20 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
         # on these pages; checking that first keeps the tag search off regions
         # that are not. Tags that fit anyway say the headers may lie further on.
         if not any(_yaffs_header(d, he) for d, _s in used for he in ("<", ">")):
-            if not hint and any(_yaffs_tags_fit(dec, used) for _v, _o, _e, dec in trials):
+            if not hint and any(_yaffs_tags_fit(dec, used, ck) for _v, _o, _e, dec, ck in trials):
                 hint = True
             continue
-        for version, off, e, decode in trials:
-            if not _yaffs_tags_fit(decode, used):
+        for version, off, e, decode, checkpoint in trials:
+            if not _yaffs_tags_fit(decode, used, checkpoint):
                 continue                   # most tag offsets fail on the first pages
             good = claimed = eccs = 0
+            counted = len(used)            # the used pages that are not checkpoint pages
             parsed = {"<": 0, ">": 0}
             for d, s in used:
                 t = decode(s)
                 if not t:
+                    if checkpoint is not None and checkpoint(s):
+                        counted -= 1
                     continue
                 good += 1
                 eccs += t.get("ecc_ok", False)
@@ -20529,12 +20873,12 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
                         if _yaffs_header(d, he):
                             parsed[he] += 1
             hdr_e = max(parsed, key=parsed.get)
-            if not (good >= 8 and good >= 0.9 * len(used) and claimed
+            if not (good >= 8 and good >= 0.9 * counted and claimed
                     and parsed[hdr_e] >= 0.9 * claimed):
-                if good >= 0.9 * len(used) and not claimed:
+                if good >= 0.9 * counted and not claimed:
                     hint = True
                 continue
-            rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / len(used))
+            rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / counted)
             if best is None or rank > best[0]:
                 best = (rank, (version, chunk, spare, off, e, hdr_e))
     return (best[1] if best else None), hint
@@ -20542,7 +20886,15 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
 
 class YaffsWalker:
     """List and read a YAFFS1 or YAFFS2 image. A node is an object id; the
-    root is object 1."""
+    root is object 1.
+
+    ``damage`` holds what was found wrong, for damage_lines(): objects whose
+    header names a parent folder that has no header in the image, and objects
+    that have data chunks and no header of their own. No listing from the root
+    reaches them or anything under them, ``unread_entries()`` lists them, and
+    ``folders_not_read`` counts the folders without a header (1 when only
+    objects without their own header were found, whose folder is not known).
+    An export gives each file among them a FAILED row."""
 
     root = YAFFS_ROOT
 
@@ -20569,6 +20921,100 @@ class YaffsWalker:
                 # An unlinked or deleted object's parent is 3 or 4, which no
                 # listing reaches from the root.
                 self.children[h["parent"]].append(oid)
+        self.damage, self.folders_not_read, self._unread, self._headerless = [], 0, [], []
+        self._note_unreached()
+
+    def _note_unreached(self):
+        """Record the objects whose parent folder has no header in the image.
+
+        YAFFS's scan makes such a folder itself and a folder it makes starts
+        under lost+found (core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296,
+        core/yaffs_guts.c:1657-1661). The image holds no name, place or time for
+        it, so nothing is listed in its stead: the objects are recorded here and
+        left out of the listing. An image cut before a folder's header gives this.
+
+        The same goes for an object that has data chunks and no header of its
+        own: YAFFS's scan makes a file from a data chunk alone, again under
+        lost+found (core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227,
+        core/yaffs_guts.c:1657-1661). No name, size, time or folder is known for
+        it, so it is counted with the bytes its chunks hold and not listed."""
+        fixed = (YAFFS_ROOT, YAFFS_LOSTNFOUND, YAFFS_UNLINKED, YAFFS_DELETED)
+        lost = sorted(p for p in self.children
+                      if p not in fixed and not (self.objs.get(p) or {}).get("hdr"))
+        self._headerless = sorted(oid for oid, o in self.objs.items()
+                                  if not o["hdr"] and o["chunks"])
+        if self._headerless:
+            held = sum(v[1] for oid in self._headerless
+                       for v in self.objs[oid]["chunks"].values())
+            n = len(self._headerless)
+            self.folders_not_read = len(lost) or 1
+            self.damage.append(
+                f"{n:,} object{'' if n == 1 else 's'} with data chunks ({held:,} bytes in all) "
+                f"{'has' if n == 1 else 'have'} no header in this image, so no name, size or "
+                f"folder is known for {'it and it is' if n == 1 else 'them and they are'} not "
+                f"exported; an image cut before such a header gives this; first object id "
+                f"{self._headerless[0]:,}")
+        if not lost:
+            return
+        direct = sum(len(self.children[p]) for p in lost)
+        seen = set()
+        for parent in lost:
+            stack = [(oid, parent, self.objs[oid]["hdr"]["name"])
+                     for oid in sorted(self.children[parent], reverse=True)]
+            while stack:
+                oid, above, path = stack.pop()
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                self._unread.append((path, oid, parent, above))
+                stack.extend((c, oid, path + "/" + self.objs[c]["hdr"]["name"])
+                             for c in sorted(self.children.get(oid, ()), reverse=True))
+        self.folders_not_read = len(lost)
+        under = len(self._unread) - direct
+        self.damage.insert(
+            0, f"{direct:,} objects name a parent folder that has no header in this image "
+            f"({len(lost):,} such folder{'' if len(lost) == 1 else 's'}), so their paths are "
+            f"not known and they are not "
+            f"exported" + (f", nor are {under:,} objects under them" if under else "")
+            + "; an image cut before a folder's header gives this")
+        for parent in lost[:YAFFS_UNREACHED_NAMED]:
+            kids = sorted(self.children[parent])
+            self.damage.append(
+                f"folder object {parent:,} has no header in this image: the {len(kids):,} "
+                f"objects that name it as their parent are not exported; the first is object "
+                f"{kids[0]:,}, stored name {self.objs[kids[0]]['hdr']['name']!r}")
+        if len(lost) > YAFFS_UNREACHED_NAMED:
+            self.damage.append(f"{len(lost) - YAFFS_UNREACHED_NAMED:,} more folder objects have "
+                               "no header in this image and are not named here")
+
+    def unread_entries(self, files_only=False):
+        """[(path below the folder with no header, object id, detail)] of every
+        object no listing reaches because a folder above it has no header in
+        the image. The path is not a path from the root, which is not known.
+        Then every object that has data chunks and no header of its own, with
+        an empty path. ``files_only`` leaves out folders, symlinks and special
+        files, which an export does not write as members."""
+        out = []
+        for path, oid, parent, above in self._unread:
+            if files_only and (self.entry(oid) or (0,))[0] & S_IFMT != S_IFREG:
+                continue
+            h = self.objs[oid]["hdr"]
+            kind = YAFFS_TYPES.get(h["type"], "object")
+            size = f", {self.objs[oid]['stored']:,} bytes" if h["type"] == 1 else ""
+            via = "" if above == parent else f", through folder object {above:,}"
+            out.append((path, oid,
+                        f"object {oid:,} ({kind}{size}) is not exported: folder object "
+                        f"{parent:,}, which it is under{via}, has no header in this image, so "
+                        f"its path from the root is not known; stored path below that "
+                        f"folder: {path}"))
+        for oid in self._headerless:
+            chunks = self.objs[oid]["chunks"]
+            out.append(("", oid,
+                        f"object {oid:,} is not exported: {len(chunks):,} data chunks holding "
+                        f"{sum(v[1] for v in chunks.values()):,} bytes carry its id and no "
+                        f"header for it is in this image, so its name, size and folder are "
+                        f"not known"))
+        return out
 
     def _pages(self):
         """(page index, data, spare) for every page, read 64 pages at a time."""
@@ -20593,6 +21039,9 @@ class YaffsWalker:
             if t is None:
                 continue
             self.stats["chunks"] += 1
+            # A checkpoint page never gets here: its sequence value, 0x21, is
+            # below the range _yaffs2_tags takes, and YAFFS scans no chunk of a
+            # checkpoint block (core/yaffs_yaffs2.c:1585-1595).
             # What yaffs2_scan_chunk ignores: a block summary chunk, tags whose
             # ECC does not hold, a data chunk claiming more than a page.
             if t["obj"] == YAFFS_OBJECTID_SUMMARY:
@@ -20710,7 +21159,7 @@ class YaffsWalker:
         if h["type"] == 1:
             return (mode, o["stored"], h["mtime"])
         if h["type"] == 2:
-            return (mode, len(h["alias"].encode("utf-8", "surrogateescape")), h["mtime"])
+            return (mode, h["alias_len"], h["mtime"])        # the stored bytes, not the text
         return (mode, 0, h["mtime"])
 
     def listdir(self, oid):
@@ -20880,6 +21329,8 @@ def identify_yaffs(fh, base, size=None):
               "duplicate chunks their serial numbers do not order"):
         if s[k]:
             lines.append(f"note         {s[k]:,} {k}")
+    if w.damage:
+        lines.append(f"damaged      {w.damage[0]}")
     return kind, lines
 
 
@@ -21453,34 +21904,52 @@ def collect(w, num, prefix="", depth=0, seen=None, out=None, times=None):
     FAT and exFAT are those: they hold a wall-clock reading and no zone, so
     ``mtime`` above stays zero for them and the readings arrive here as text
     instead, where nothing downstream can put a zone on them.
+
+    Every level under the inode is walked, however deep: the walk keeps its
+    own stack of the folders it is inside, so its depth is not Python's. A
+    folder is listed once, when it is first reached, and a folder already in
+    ``seen`` is not entered again, which is what ends a loop.
     """
     if seen is None:
-        seen, out = set(), []
-    if depth > 64 or num in seen:
+        seen = set()
+    if out is None:
+        out = []
+    records = times is not None and hasattr(w, "listdir_records")
+
+    def listing(node):
+        if records:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    if num in seen:
         return out
     seen.add(num)
-    if times is not None and hasattr(w, "listdir_records"):
-        listing = w.listdir_records(num)
-    else:
-        listing = [(name, ino, None) for name, ino in w.listdir(num)]
-    for name, ino, recorded in listing:
-        ent = w.entry(ino)
-        if not ent:
-            continue
-        mode, size, mtime = ent
-        path = f"{prefix}/{name}" if prefix else name
-        if times is not None and recorded:
-            kept = {k: v for k, v in recorded.items() if v}
-            if kept:
-                times[path] = kept
-        if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
-            if getattr(w, "note_folder", None) is not None and w.note_folder(path, ino):
-                out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
-            collect(w, ino, path, depth + 1, seen, out, times)
-        elif (mode & 0o170000) == 0o100000:          # regular files only
-            out.append((path, ino, size, mtime))
+    stack = [(prefix, listing(num))]                 # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
+            ent = w.entry(ino)
+            if not ent:
+                continue
+            mode, size, mtime = ent
+            path = f"{prefix}/{name}" if prefix else name
+            if times is not None and recorded:
+                kept = {k: v for k, v in recorded.items() if v}
+                if kept:
+                    times[path] = kept
+            if mode & S_IFMT == S_IFDIR:    # not mode & S_IFDIR, which a block device also has
+                if getattr(w, "note_folder", None) is not None and w.note_folder(path, ino):
+                    out.append((path, ino, None, mtime))  # a link: see NtfsWalker.entry
+                if ino not in seen:
+                    seen.add(ino)
+                    stack.append((path, listing(ino)))
+                    break                            # its entries come before the rest of this one's
+            elif (mode & 0o170000) == 0o100000:      # regular files only
+                out.append((path, ino, size, mtime))
+            else:
+                out.append((path, ino, None, mtime))     # symlink or special
         else:
-            out.append((path, ino, None, mtime))     # symlink or special
+            stack.pop()
     if depth == 0 and num == getattr(w, "root", None) and hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
     return out
@@ -21516,6 +21985,9 @@ def walk_all(w):
     mode rather than by ``mode & S_IFDIR``, which is also true of a block
     device, whose format bits share that one. The JFFS2 fixtures carry a block
     device, which the looser test would have walked into as a directory.
+
+    The generic route walks every level, as ``collect()`` does, on a stack of
+    its own, and enters a folder once.
     """
     fast = getattr(w, "listing", None)
     if fast is not None:
@@ -21526,32 +21998,33 @@ def walk_all(w):
     if prime is not None:
         prime()
     records = hasattr(w, "listdir_records")
-    seen = set()
 
-    def walk(node, prefix, depth):
-        if depth > 64:
-            return
-        key = node[0] if isinstance(node, tuple) else node
-        if key in seen:
-            return
-        seen.add(key)
+    def listing(node):
         if records:
-            listing = w.listdir_records(node)
-        else:
-            listing = [(name, ino, None) for name, ino in w.listdir(node)]
-        for name, ino, recorded in listing:
+            return iter(w.listdir_records(node))
+        return iter([(name, ino, None) for name, ino in w.listdir(node)])
+
+    def key(node):
+        return (w.walk_key(node) if hasattr(w, "walk_key")
+                else node[0] if isinstance(node, tuple) else node)
+
+    seen = {key(w.root)}
+    stack = [("", listing(w.root))]                  # each folder the walk is inside
+    while stack:
+        prefix, entries = stack[-1]
+        for name, ino, recorded in entries:
             ent = w.entry(ino)
             if not ent:
                 continue
             mode, size, mtime = ent
             path = f"{prefix}/{name}" if prefix else name
             yield (path, ino, mode, size, mtime, recorded)
-            if mode & S_IFMT == S_IFDIR:
-                for item in walk(ino, path, depth + 1):
-                    yield item
-
-    for item in walk(w.root, "", 0):
-        yield item
+            if mode & S_IFMT == S_IFDIR and key(ino) not in seen:
+                seen.add(key(ino))
+                stack.append((path, listing(ino)))
+                break                                # its entries come before the rest of this one's
+        else:
+            stack.pop()
     if hasattr(w, "check_inode_count"):
         w.check_inode_count()                        # a whole volume was just walked
 
@@ -23152,20 +23625,27 @@ def _xfs_log_state(fh, base, sb):
     return "dirty", f"head at log block {head}, tail at {tail}", head, tail
 
 
-def _xfs_root_is_dir(fh, base, sb):
+def _xfs_root_is_dir(fh, base, sb, size=None):
     """True when the root inode the superblock names reads as a directory inode
     (inode magic, a version the volume allows, a directory mode). A v4
     superblock has no CRC, so this is what stands in for one before the volume
-    is claimed."""
+    is claimed. False when the number is out of range or what is read there is
+    not a directory inode. None when the inode cannot be read at all, because
+    it lies past the end of the region (``size`` bytes) or of the image: a cut
+    image, where the superblock is all there is to go on."""
     ino = sb["rootino"]
     agino_log = sb["inopblog"] + sb["agblklog"]
     agno, agino = ino >> agino_log, ino & ((1 << agino_log) - 1)
     agbno, slot = agino >> sb["inopblog"], agino & ((1 << sb["inopblog"]) - 1)
     if not ino or agno >= sb["agcount"] or agbno >= sb["agblocks"]:
         return False
-    raw = read_at(fh, base + (agno * sb["agblocks"] + agbno) * sb["blocksize"]
-                  + slot * sb["inodesize"], 8)
-    return (len(raw) == 8 and raw[:2] == XFS_DINODE_MAGIC and raw[4] in (1, 2, 3)
+    at = (agno * sb["agblocks"] + agbno) * sb["blocksize"] + slot * sb["inodesize"]
+    if size is not None and at + 8 > size:
+        return None
+    raw = read_at(fh, base + at, 8)
+    if len(raw) < 8:
+        return None
+    return (raw[:2] == XFS_DINODE_MAGIC and raw[4] in (1, 2, 3)
             and struct.unpack_from(">H", raw, 2)[0] & S_IFMT == S_IFDIR)
 
 
@@ -23180,6 +23660,11 @@ def identify_xfs(fh, base, size=None):
     as a directory. A candidate that fails is not claimed, and the identifiers
     after this one get their turn. A verified volume this reader will not walk
     (an incompatible feature, say) is still named XFS, with the reason.
+
+    A v4 volume whose root inode lies past the end of its region or of the
+    image is claimed on its superblock alone, and a line says so: the superblock
+    is whole and states the volume's size, so the image is a cut XFS volume and
+    is recorded as one, not passed over as unrecognised.
     """
     head = read_at(fh, base, 512)
     if len(head) < 512 or head[:4] != XFS_SB_MAGIC:
@@ -23195,7 +23680,8 @@ def identify_xfs(fh, base, size=None):
         return None
     if ver == 5 and not xfs_cksum_ok(raw[:sectsize], 224):
         return None
-    if ver == 4 and not _xfs_root_is_dir(fh, base, sb):
+    root = _xfs_root_is_dir(fh, base, sb, size) if ver == 4 else True
+    if root is False:
         return None
     total = sb["dblocks"] * bs
     used = total - sb["fdblocks"] * bs
@@ -23214,6 +23700,10 @@ def identify_xfs(fh, base, size=None):
     if size is not None and total > size:
         lines.append(f"INCOMPLETE   the volume is {human(total)} but its region holds "
                      f"{human(size)}: its end is missing")
+    if root is None:
+        lines.append(f"INCOMPLETE   the root inode ({sb['rootino']:,}) lies past the end of what "
+                     "is here, so the volume is named from its superblock alone and none of "
+                     "its files can be listed")
     if sb["rblocks"]:
         lines.append(f"realtime     a realtime section of {sb['rblocks']:,} blocks, on its own "
                      "device; its files are listed but not read")
@@ -23250,6 +23740,20 @@ class XfsWalker:
     ``size`` is the byte length of the region the volume sits in. When the
     volume says it is larger, the note says its end is missing, a structure
     past the end is counted as damage, and file data past it reads short.
+    ``folders_not_read`` counts the structures that could not be read because
+    they lie past the end (an inode a folder names, a folder's block, a block of
+    an extent map or of a symlink): what they held is not listed, so an
+    extraction that meets one ends with exit status 1.
+
+    A name is the stored bytes read as UTF-8. A stretch that does not decode is
+    kept as %XX of its bytes, and a NUL or "/" inside one name as %00 or %2F, so
+    no name holds a surrogate. A literal % is not escaped, so two stored names
+    can read alike (a real "a%80" beside a stored a, 0x80): both are listed,
+    each with its own inode, the one stored exactly as that text first. A
+    symlink target is a path, so its "/" stay as they are.
+
+    ``volume_note`` is what an export records for the volume: ``note`` without
+    the damage, which the export records on its own.
     """
 
     def __init__(self, fh, base, size=None):
@@ -23295,18 +23799,29 @@ class XfsWalker:
         self.root = sb["rootino"]
         self.damage = []
         self._damage_seen = set()
+        self.folders_not_read = 0
         self._inodes = collections.OrderedDict()
         self.end = base + size if size is not None else None
         self.log_state = _xfs_log_state(fh, base, sb)
-        state, detail = self.log_state[:2]
+        state, _detail, log_head, log_tail = self.log_state
         notes = []
         vol = self.dblocks * self.bs
         if size is not None and vol > size:
             notes.append(f"the volume is {human(vol)} but its region holds {human(size)}: its end "
                          "is missing, so what was stored past that is counted as damaged or read short")
         if state == "dirty":
-            notes.append(f"the log is dirty ({detail}): what it holds was not replayed, "
-                         "so the volume is read as it is stored")
+            # The tail is the first log record whose changes are not all written
+            # back (h_tail_lsn, "lsn of 1st LR w/ buffers not committed",
+            # fs/xfs/libxfs/xfs_log_format.h in Linux 6.18), so what was logged
+            # from there to the head may not be in place.
+            log_bb = sb["logblocks"] * self.bs // XLOG_BBSIZE
+            notes.append(
+                "the log is dirty and was not replayed: files and content written since the "
+                "first log record whose changes are not all in place (its tail, log block "
+                f"{log_tail:,}) may be missing here, or older than the device would show after "
+                f"a mount; {(log_head - log_tail) % log_bb:,} of the log's {log_bb:,} 512-byte "
+                f"blocks lie between that tail and its head (block {log_head:,}), and the "
+                "volume is read as it is stored")
         if self.v5 and sb["incompat"] & XFS_INCOMPAT_NEEDSREPAIR:
             notes.append("the volume is flagged as needing xfs_repair")
         if sb["rblocks"]:
@@ -23337,10 +23852,25 @@ class XfsWalker:
             parts.append(f"{len(self.damage)} damaged structure(s) skipped, first: {self.damage[0]}")
         return "; ".join(parts) or None
 
-    def _damaged(self, what):
-        if what not in self._damage_seen and len(self.damage) < 1000:
+    @property
+    def volume_note(self):
+        """What an export records about the volume as a whole, without the damage
+        (which it records as damage_recorded and damage_first), or None."""
+        return self._static_note or None
+
+    def _damaged(self, what, lost=False):
+        """Record one structure that failed, once. With ``lost`` it is one that
+        could not be read at all because it lies past the end, and is counted in
+        folders_not_read. Both stop at the 1,000 entries the list keeps; a loss
+        met after that still leaves the count at 1 or more."""
+        if what in self._damage_seen:
+            return
+        if len(self.damage) < 1000:
             self._damage_seen.add(what)
             self.damage.append(what)
+            self.folders_not_read += bool(lost)
+        elif lost and not self.folders_not_read:
+            self.folders_not_read = 1
 
     # -- addressing --------------------------------------------------------
     def ag_length(self, agno):
@@ -23371,15 +23901,17 @@ class XfsWalker:
         agno, agbno = fsb >> self.agblklog, fsb & ((1 << self.agblklog) - 1)
         return self.base + (agno * self.agblocks + agbno) * self.bs
 
-    def _meta(self, off, n, what):
-        """n bytes of metadata at ``off``, or None, counted as damage, when any
-        of them lie past the end of the volume's region or of the image."""
+    def _meta(self, off, n, what, so=""):
+        """n bytes of metadata at ``off``, or None when any of them lie past the
+        end of the volume's region or of the image. That is recorded as damage,
+        with ``so`` (what follows from it) after it, and counted in
+        folders_not_read: the structure could not be read at all."""
         if self.end is not None and off + n > self.end:
-            self._damaged(f"{what} lies past the end of the volume's region")
+            self._damaged(f"{what} lies past the end of the volume's region{so}", lost=True)
             return None
         buf = read_at(self.fh, off, n)
         if len(buf) < n:
-            self._damaged(f"{what} lies past the end of the image")
+            self._damaged(f"{what} lies past the end of the image{so}", lost=True)
             return None
         return buf
 
@@ -23425,7 +23957,9 @@ class XfsWalker:
         if off is None:
             self._damaged(f"inode {ino} is outside the volume")
             return None
-        raw = self._meta(off, self.isz, f"inode {ino}")
+        raw = self._meta(off, self.isz, f"inode {ino}", (
+            ", so the root folder cannot be read and none of the volume's files are listed"
+            if ino == self.root else ", so what a folder names by it is not listed"))
         if raw is None:
             return None
         why = self._dinode_problem(ino, raw)
@@ -23609,7 +24143,8 @@ class XfsWalker:
             off = self._fsb_off(fsb)
             if off is None:
                 raise bad(fsb, "is outside its AG or the volume")
-            blk = self._meta(off, self.bs, f"inode {ino}: extent B+tree block {fsb}")
+            blk = self._meta(off, self.bs, f"inode {ino}: extent B+tree block {fsb}",
+                             ", so the file or folder it maps is not read")
             if blk is None:
                 raise XfsUnreadable(f"inode {ino}: extent B+tree block {fsb} is past the end")
             lvl, n = struct.unpack_from(">HH", blk, 4)
@@ -23685,7 +24220,8 @@ class XfsWalker:
         (xfs_symlink_blocks) and reads each mapped extent as one buffer, with a
         header on v5 whose CRC, offset, length, owner, uuid and block number must
         hold (xfs_symlink_remote_read, xfs_symlink_remote.c:236, and
-        xfs_symlink_verify, 86)."""
+        xfs_symlink_verify, 86). The target is a path: bytes that are not UTF-8
+        become %XX, and its "/" are left as they are."""
         d = self.inode(ino)
         if d is None:
             raise XfsUnreadable(f"inode {ino} cannot be read")
@@ -23693,7 +24229,7 @@ class XfsWalker:
         if not 0 < size <= XFS_SYMLINK_MAXLEN:
             raise XfsUnreadable(f"symlink {ino} records a target of {size} bytes")
         if d["format"] == XFS_FMT_LOCAL:
-            return bytes(d["fork"][:size]).decode("utf-8", "surrogateescape")
+            return bytes(d["fork"][:size]).decode("utf-8", "qnxprobe-name")
         hdr = XFS_SYMLINK_HDR if self.v5 else 0
         fsblocks = -(-size // (self.bs - hdr))           # xfs_symlink_blocks
         out, offset = bytearray(), 0
@@ -23702,7 +24238,8 @@ class XfsWalker:
                 break
             count = min(count, fsblocks - lblk)
             off = self._fsb_off(pblk)
-            buf = self._meta(off, count * self.bs, f"symlink {ino}: block {pblk}")
+            buf = self._meta(off, count * self.bs, f"symlink {ino}: block {pblk}",
+                             ", so its target is not read")
             if buf is None:
                 raise XfsUnreadable(f"symlink {ino}: block {pblk} is past the end")
             take = min(len(buf) - hdr, size - offset)
@@ -23719,7 +24256,7 @@ class XfsWalker:
             offset += take
         if offset != size:
             raise XfsUnreadable(f"symlink {ino}: {offset} of {size} target bytes found")
-        return bytes(out).decode("utf-8", "surrogateescape")
+        return bytes(out).decode("utf-8", "qnxprobe-name")
 
     # -- directories -------------------------------------------------------
     def _dir_blocks(self, d, lo, hi):
@@ -23740,7 +24277,8 @@ class XfsWalker:
             parts = []
             for k in range(db * self.dir_fsbcount, (db + 1) * self.dir_fsbcount):
                 off = self._fsb_off(mapped[k]) if k in mapped else None
-                buf = self._meta(off, self.bs, f"directory {d['ino']}: block {db}") if off is not None else None
+                buf = self._meta(off, self.bs, f"directory {d['ino']}: block {db}",
+                                 ", so the entries it holds are not listed") if off is not None else None
                 if buf is None:
                     parts = None
                     break
@@ -23877,8 +24415,16 @@ class XfsWalker:
         return out
 
     def listdir(self, ino):
-        ents = self._dir_entries(ino) or []
-        return sorted((n.decode("utf-8", "surrogateescape"), c) for n, c, _ft in ents)
+        """[(name, inode)] sorted by name. Each name is one stored name: bytes
+        that are not UTF-8 become %XX, a NUL %00 and a "/" %2F. When two stored
+        names read alike, the one stored exactly as that text comes first, so
+        an extraction gives it the name and the other one .dup-2."""
+        out = []
+        for raw, child, _ft in self._dir_entries(ino) or []:
+            name = (raw.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+                    .replace("/", "%2F"))
+            out.append((name, name.encode("utf-8") != raw, child))
+        return [(name, child) for name, _escaped, child in sorted(out)]
 
     def dir_report(self, ino):
         """How a directory is stored, for a check: its format named the way
@@ -24840,7 +25386,7 @@ class BtrfsWalker:
         r = None
         if found is not None:
             key, data = found
-            mtime = struct.unpack_from("<Q", data, 136)[0]
+            mtime = struct.unpack_from("<q", data, 136)[0]
             r = dict(generation=struct.unpack_from("<Q", data, 160)[0],
                      root_dirid=struct.unpack_from("<Q", data, 168)[0],
                      bytenr=struct.unpack_from("<Q", data, 176)[0],
@@ -24857,7 +25403,13 @@ class BtrfsWalker:
 
     def inode(self, node):
         """The INODE_ITEM of a node, parsed (btrfs_tree.h:872-899), or None
-        when there is none. An item that is not 160 bytes, a mode with bits
+        when there is none. Each time's seconds are read signed: the field is
+        a __le64 (linux include/uapi/linux/btrfs_tree.h:876-879) that the
+        kernel hands to inode_set_atime(), inode_set_mtime() and
+        inode_set_ctime() (fs/btrfs/inode.c:4094-4102), whose seconds are a
+        time64_t (include/linux/fs.h:1629-1630, 1663-1664), so a time before
+        1970 is a negative number here as it is for stat(). An item that is
+        not 160 bytes, a mode with bits
         outside the type, set-id, sticky and permission bits (both as
         check_inode_item refuses, linux fs/btrfs/tree-checker.c:1141-1174),
         or a size past the largest file the kernel allows (super.c:963)
@@ -24877,7 +25429,7 @@ class BtrfsWalker:
             if size > BTRFS_MAX_FILE_SIZE:
                 raise BtrfsUnreadable(f"inode {ino} of tree {tree} records size {size:,}, past "
                                       f"the largest file btrfs allows ({BTRFS_MAX_FILE_SIZE:,})")
-            t = {name: struct.unpack_from("<QI", d, at)
+            t = {name: struct.unpack_from("<qI", d, at)
                  for name, at in (("atime", 112), ("ctime", 124), ("mtime", 136),
                                   ("otime", 148))}
             return dict(size=size, nbytes=nbytes, nlink=nlink, uid=uid, gid=gid, mode=mode,
@@ -24988,7 +25540,10 @@ class BtrfsWalker:
             if name in seen:
                 continue
             seen.add(name)
-            text = name.decode("utf-8", "surrogateescape")
+            # One stored name: bytes that are not UTF-8 become %XX, and a NUL
+            # or a slash, which no path can carry inside a name, %00 and %2F.
+            text = (name.decode("utf-8", "qnxprobe-name").replace("\x00", "%00")
+                    .replace("/", "%2F"))
             if loc[1] == BTRFS_ROOT_ITEM_KEY:
                 child = loc[0]
                 if child == tree:
@@ -25144,7 +25699,9 @@ class BtrfsWalker:
         # the target's length either way.
         data = b"".join(btrfs_extent_bytes(self.extents(node), ino_item["size"],
                                            self.read_logical, self.sectorsize))
-        return data.decode("utf-8", "surrogateescape")
+        # A target is a path, so its slashes stay; only bytes that are not
+        # UTF-8 are escaped.
+        return data.decode("utf-8", "qnxprobe-name")
 
     # -- the volume -------------------------------------------------------------
     def default_subvolume(self):
@@ -27021,7 +27578,7 @@ def walker_for(kind, fh, base, size=None):
     if kind == "QNX IFS boot image":
         return IfsWalker(fh, base)
     if kind == "squashfs":
-        return SquashfsWalker(fh, base)
+        return SquashfsWalker(fh, base, size)
     if kind == "xfs":
         return XfsWalker(fh, base, size)
     if kind == "btrfs":
@@ -27103,12 +27660,14 @@ def identify_etfs(fh, base, size):
 
 def identify_efs(fh, base, size):
     """Return ("efs", lines) if an EFS (F3S) partition starts at base and fits in
-    size bytes, else None. The boot record may sit in any of its units."""
+    size bytes, else None. The boot record may sit in any of its units. A
+    partition the record places past the end of the image is named too, with a
+    line saying how much of it the image holds."""
     part = _efs_locate(fh, base, size)
     if part is None:
         return None
     us = part["unit_size"]
-    return "efs", [
+    lines = [
         f"unit size    {human(us)}   {part['unit_total']} units, "
         f"{part['unit_spare']} spare",
         f"byte order   {'little' if part['endian'] == '<' else 'big'}-endian",
@@ -27116,6 +27675,11 @@ def identify_efs(fh, base, size):
         f"boot record  QSSL_F3S at +0x{part['sig_at']:x}, in unit {part['unit_index']}",
         f"root         logical unit {part['root'][0]}, extent {part['root'][1]}",
     ]
+    held = image_size(fh) - base
+    if held < part["size"]:
+        lines.append(f"cut short    the boot record gives it {part['size']:,} bytes and the "
+                     f"image holds {max(held, 0):,} of them")
+    return "efs", lines
 
 
 def identify_apfs(fh, base, damaged=False):
@@ -38529,6 +39093,7 @@ def _xfs_self_checks():
             images.pop(n)                       # keep only the three the damage checks patch
     out.extend(_xfs_damage_checks(images["xfs-v5-4kn"]))
     out.extend(_xfs_structure_checks(images["xfs-v5"], images["xfs-v4"]))
+    out.extend(_xfs_record_checks(images["xfs-v5-4kn"], images["xfs-v4"]))
     return out
 
 
@@ -39007,6 +39572,195 @@ def _xfs_structure_checks(v5, v4):
                 "v4 one whose root inode does not read as a directory are not; the v4 fixture is",
                 identify_xfs(bad_crc, 0, len(v5)) is None and identify_xfs(graft, 0, len(zeros)) is None
                 and (identify_xfs(_XfsPatchedImage(v4), 0, len(v4)) or [None])[0] == "xfs"))
+    return out
+
+
+def _xfs_exported(data, patches=(), end=None):
+    """(exit status, the volume's record or None, members under the volume) from a real
+    --extract of these bytes, cut at ``end`` when given. None when this is a packaged
+    build, which has no script to run."""
+    import shutil
+    import subprocess
+    import tempfile
+    if getattr(sys, "frozen", False):
+        return None
+    # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+    # each export names its own files and removes them itself.
+    work = tempfile.mkdtemp(prefix="qnxprobe-xfs-")
+    stem = os.path.join(work, f"xfs-check-{uuid.uuid4().hex}")
+    raw, out = stem + ".dd", stem + ".zip"
+    limit = len(data) if end is None else end
+    try:
+        with open(raw, "wb") as fh:
+            fh.write(memoryview(data)[:limit])
+            for at, rep in patches:
+                fh.seek(at)
+                fh.write(rep)
+        done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw,
+                               "--extract", out], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=240, check=False)
+        rec, members = None, 0
+        if zipfile.is_zipfile(out):
+            with zipfile.ZipFile(out) as zin:
+                names = zin.namelist()
+                if "volumes.json" in names:
+                    vols = json.loads(zin.read("volumes.json"))["volumes"]
+                    rec = vols[0] if len(vols) == 1 else None
+                if rec is not None:
+                    members = sum(1 for n in names if n.startswith(rec["volume"] + "/"))
+        return done.returncode, rec, members
+    finally:
+        for leftover in (raw, out):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _xfs_record_checks(v5k, v4):
+    """What an XFS name reads as, and what an export records and exits with for a
+    dirty log and for a cut volume. The names are stored bytes written into a
+    shortform directory of the xfs-v4 fixture in memory; the dirty log is the
+    xfs-v5-4kn fixture with its unmount record's flag cleared; the cuts are the
+    xfs-v4 fixture after its superblock, at half, and 4 KiB short."""
+    # pylint: disable=protected-access
+    out = []
+
+    def row(label, check):
+        try:
+            result = check()
+        except Exception as exc:                     # pylint: disable=broad-except
+            label += f" (raised {type(exc).__name__}: {str(exc)[:60]})"
+            result = False
+        out.append((label, result if result is None else bool(result)))
+
+    full = XfsWalker(_XfsPatchedImage(v4), 0)
+    nodes = {p: (n, m) for p, n, m, *_r in walk_all(full)}
+    files = sum(1 for _n, m in nodes.values() if m & S_IFMT == S_IFREG)
+
+    def names():
+        import sqlite3
+        folder, lnk = nodes["times"][0], nodes["links/short"][0]
+        one, two = nodes["times/before_1970.txt"][0], nodes["times/ns.txt"][0]
+        d = full.inode(folder)
+        if d["format"] != XFS_FMT_LOCAL or d["fork"][1] or full.inode(lnk)["format"] != XFS_FMT_LOCAL:
+            return False
+        # the folder's shortform entries rewritten: a byte that is not UTF-8, the
+        # text that byte is read as, a "/" and a NUL
+        stored = [(b"n\x80", one), (b"n%80", two), (b"a/b", one), (b"c\x00d", two)]
+        fork = bytes([len(stored), 0]) + bytes(d["fork"][2:6])
+        for name, ino in stored:
+            fork += (bytes([len(name)]) + b"\0\0" + name + (b"\x01" if full.ftype else b"")
+                     + struct.pack(">I", ino))
+        at, lat = full.inode_offset(folder), full.inode_offset(lnk)
+        w = XfsWalker(_XfsPatchedImage(v4, [(at + 56, struct.pack(">Q", len(fork))),
+                                            (at + full.core, fork),
+                                            (lat + full.core + 3, b"\xe9")]), 0)
+        listed, target = w.listdir(folder), w.readlink(lnk)
+        texts = [n for n, _i in listed] + [target]
+        try:
+            db = sqlite3.connect(":memory:")
+            db.execute("create table t (name text)")
+            db.executemany("insert into t values (?)", [(t,) for t in texts])
+            kept = db.execute("select count(*) from t").fetchone()[0] == len(texts)
+            db.close()
+        except (sqlite3.Error, UnicodeError):
+            kept = False
+        buf, log = io.BytesIO(), []
+        with zipfile.ZipFile(buf, "w") as zout:
+            extract_to_zip(zout, w, "V", collect(w, folder), log)
+        with zipfile.ZipFile(buf) as zin:
+            held = {n: zin.read(n) for n in zin.namelist()}
+
+        def body(ino):
+            return b"".join(full.read_file(ino, full.entry(ino)[1]))
+        return (listed == [("a%2Fb", one), ("c%00d", two), ("n%80", two), ("n%80", one)]
+                and held.get("V/n%80") == body(two)
+                and target == "../%E9ello.txt" and kept and not w.damage
+                and not any(0xD800 <= ord(c) <= 0xDFFF for t in texts for c in t)
+                and len(held) == 4 and body(one) != body(two)
+                and sorted(v for n, v in held.items() if n.startswith("V/n%80"))
+                == sorted([body(one), body(two)]))
+    row("XFS names that are not UTF-8 read as %XX of their bytes, with a NUL as %00 and a "
+        "\"/\" inside one name as %2F, none holds a surrogate and SQLite stores each; two stored "
+        "names that read alike stay two entries and two zip members, the one stored exactly as "
+        "that text keeping the name; a symlink target takes %XX and keeps its \"/\"", names)
+
+    def dirty_log():
+        base = XfsWalker(_XfsPatchedImage(v5k), 0)
+        lstart = base._fsb_off(base.sb["logstart"])
+        head = base.log_state[2]
+        rec = next(i for i in range(head - 1, -1, -1)
+                   if v5k[lstart + i * 512:lstart + i * 512 + 4] == b"\xfe\xed\xba\xbe")
+        op = lstart + (rec + 1) * 512 + 9
+        dirty = _xfs_exported(v5k, [(op, bytes([v5k[op] & ~XLOG_UNMOUNT_TRANS & 0xFF]))])
+        clean = _xfs_exported(v5k)
+        if dirty is None or clean is None:
+            return None
+        note = (dirty[1] or {}).get("note") or ""
+        return (dirty[0] == 0 and "not replayed" in note and "may be missing" in note
+                and "older than the device would show after a mount" in note
+                and clean[0] == 0 and clean[1] is not None and "note" not in clean[1]
+                and dirty[2] == clean[2] > 0)
+    row("an export of an XFS volume with a dirty log records in volumes.json that the log was "
+        "not replayed and that files and content may be missing or older, and exits 0; the "
+        "clean volume's record has no note", dirty_log)
+
+    def damage_only():
+        base = XfsWalker(_XfsPatchedImage(v5k), 0)
+        at = base.inode_offset(dict(base.listdir(base.root))["hello.txt"])
+        got = _xfs_exported(v5k, [(at + 60, bytes([v5k[at + 60] ^ 0x01]))])
+        if got is None:
+            return None
+        rec = got[1] or {}
+        return (rec.get("damage_recorded") == 1 and "note" not in rec
+                and any("fails its CRC" in d for d in rec.get("damage_first", [])))
+    row("an export of an XFS volume with a damaged inode and nothing else to say records the "
+        "damage as damage_recorded and damage_first, and writes no note", damage_only)
+
+    def cut_after_superblock():
+        cut = bytes(v4[:512])
+        found = identify_xfs(_XfsPatchedImage(cut), 0, len(cut))
+        w = XfsWalker(_XfsPatchedImage(cut), 0, len(cut))
+        listed = list(walk_all(w))
+        got = _xfs_exported(v4, end=512)
+        if got is None:
+            return None
+        rc, rec, members = got
+        return (found is not None and found[0] == "xfs"
+                and sum(ln.startswith("INCOMPLETE") for ln in found[1]) == 2
+                and not listed and getattr(w, "folders_not_read", 0) == 1
+                and rc == 1 and rec is not None and rec["filesystem"] == "xfs"
+                and rec["files"] == 0 and members == 0 and rec.get("folders_not_read") == 1
+                and "its end is missing" in (rec.get("note") or "")
+                and any("root folder cannot be read" in d for d in rec.get("damage_first", [])))
+    row("an XFS v4 volume cut just after its superblock is still named xfs: the export records "
+        "that its end is missing and that the root folder cannot be read, and exits 1",
+        cut_after_superblock)
+
+    def cut_in_half():
+        half = len(v4) // 2
+        w = XfsWalker(_XfsPatchedImage(v4), 0, half)
+        listed = sum(1 for _ in walk_all(w))
+        whole = XfsWalker(_XfsPatchedImage(v4), 0, len(v4) - 4096)
+        kept = sum(1 for _ in walk_all(whole))
+        got, tail = _xfs_exported(v4, end=half), _xfs_exported(v4, end=len(v4) - 4096)
+        if got is None or tail is None:
+            return None
+        rc, rec, members = got
+        return (listed < len(nodes) and getattr(w, "folders_not_read", 0) == len(w.damage) > 0
+                and kept == len(nodes) and not getattr(whole, "folders_not_read", 0)
+                and not whole.damage
+                and rc == 1 and rec is not None and members == rec["files"] < files
+                and rec.get("folders_not_read") == rec.get("damage_recorded") == len(w.damage)
+                and tail[0] == 0 and tail[1] is not None and tail[2] == tail[1]["files"] == files
+                and "folders_not_read" not in tail[1] and "damage_recorded" not in tail[1]
+                and "its end is missing" in (tail[1].get("note") or ""))
+    row("an XFS volume cut in half counts each inode past the cut in folders_not_read and its "
+        "export exits 1; cut 4 KiB short, every file is still exported, nothing is counted and "
+        "the export exits 0", cut_in_half)
     return out
 
 
@@ -40065,6 +40819,80 @@ def _btrfs_self_checks():
                     "first stripe, reads its trees from its own copies", ok))
     section("btrfs-convert and btrfs-raid1-dev2", convert_and_raid)
 
+    def names_and_times():
+        # Copies of btrfs-none changed in memory, each block's checksum rewritten.
+        # mkfs.btrfs --rootdir writes a name byte that is not UTF-8 and a time
+        # before 1970 as given to it (measured on btrfs-progs 6.17.1).
+        w0, l0 = walk(none_raw)
+        raw = bytearray(none_raw)
+        rootdir = w0.root & _M64
+        index = {}
+        for k, d in w0._tree_items(BTRFS_FS_TREE_OBJECTID,          # pylint: disable=protected-access
+                                   (rootdir, BTRFS_DIR_INDEX_KEY, 0),
+                                   (rootdir, BTRFS_DIR_INDEX_KEY, _M64)):
+            index[bytes(d[30:30 + struct.unpack_from("<H", d, 27)[0]])] = k
+
+        def put(key, at, data):
+            leaf, _ho, do, _sz = _btrfs_find_item(w0, BTRFS_FS_TREE_OBJECTID, key)
+            _btrfs_edit_block(raw, w0, leaf, lambda b: b.__setitem__(
+                slice(do + at, do + at + len(data)), data))
+
+        # Two stored names that differ, one with a byte that is not UTF-8 and
+        # one that spells that byte's escape; a third with a NUL and a slash.
+        put(index[b"text_700k.txt"], 30, b"t\xe9xt_700k.txt")
+        put(index[b"random_100k.bin"], 30, b"t%E9xt_700k.txt")
+        put(index[b"small_2000.txt"], 30, b"sm/ll\x002000.txt")
+        # A symlink's inline target (21 bytes into its extent item) with such a byte.
+        put((l0["link_abs"][0] & _M64, BTRFS_EXTENT_DATA_KEY, 0), 21, b"/\xe9tc/")
+        for name, sec in (("tiny.txt", -1), ("empty.bin", -2147483648)):
+            put((l0[name][0] & _M64, BTRFS_INODE_ITEM_KEY, 0), 136, struct.pack("<q", sec))
+        w = BtrfsWalker(io.BytesIO(bytes(raw)), 0)
+        names = w.listdir(w.root)
+        twins = [n for t, n in names if t == "t%E9xt_700k.txt"]
+        paths = [p for p, *_r in walk_all(w)]
+        files = [e[0] for e in collect(w, w.root)]
+        stored = True
+        try:
+            import sqlite3                                      # pylint: disable=import-outside-toplevel
+        except ImportError:
+            sqlite3 = None
+        if sqlite3 is not None:                                 # a name has to be storable as it is
+            db = sqlite3.connect(":memory:")
+            try:
+                db.execute("create table t (name text)")
+                db.executemany("insert into t values (?)", [(p,) for p in paths])
+                stored = db.execute("select count(*) from t where name = ?",
+                                    ("t%E9xt_700k.txt",)).fetchone()[0] == 2
+            except (sqlite3.Error, UnicodeError):
+                stored = False
+            db.close()
+        text_ok = True
+        try:
+            for p in paths:
+                p.encode("utf-8")
+        except UnicodeError:
+            text_ok = False
+        out.append(("a name byte that is not UTF-8 is listed as %XX of the stored byte, two stored "
+                    "names that then spell the same stay two entries with two inodes, a stored "
+                    "NUL and slash are %00 and %2F, and every path is text SQLite stores",
+                    len(twins) == 2 and len(set(twins)) == 2
+                    and files.count("t%E9xt_700k.txt") == 2
+                    and "sm%2Fll%002000.txt" in files and len(names) == len(w0.listdir(w0.root))
+                    and len(paths) == len(l0) and text_ok and stored and not w.damage))
+        got = dict(names)
+        out.append(("a symlink target with a byte that is not UTF-8 reads with that byte as %XX "
+                    "and its slashes kept", w.readlink(got["link_abs"]) == "/%E9tc/hostname"))
+        t_ok = True
+        for name, sec in (("tiny.txt", -1), ("empty.bin", -2147483648)):
+            node = got[name]
+            lost = _zip_time_lost(w.entry(node)[2], w, node) or ""
+            t_ok = (t_ok and w.entry(node)[2] == sec and w.times(node)["modified"] == (sec, 0)
+                    and lost.startswith(f"{sec} ("))
+        out.append(("a modification time before 1970 is read as the negative seconds the inode "
+                    "stores (-1 and -2147483648), by entry() and times(), and the text for a time "
+                    "a zip cannot hold carries that number", t_ok))
+    section("names and times before 1970", names_and_times)
+
     # The fixtures only root can make (tools/make_btrfs_root_fixtures.sh): a
     # volume the kernel wrote, with holes, preallocated and punched extents,
     # reflinks, partly overwritten compressed extents, snapshots and deleted
@@ -40146,6 +40974,45 @@ def _btrfs_self_checks():
                     "file committed before it is listed, and the file only the log holds is not",
                     w is not None and "log tree is present" in (w.note or "")
                     and "committed.txt" in got and "fsynced.txt" not in got))
+        label = ("btrfs-logtree: an export writes that note to the volume's record in "
+                 "volumes.json, exits 0, and holds the committed file alone")
+        if getattr(sys, "frozen", False):
+            out.append((label + " (not run: a packaged build cannot launch the script)", None))
+            return
+        import shutil                                           # pylint: disable=import-outside-toplevel
+        import subprocess                                       # pylint: disable=import-outside-toplevel
+        import tempfile                                         # pylint: disable=import-outside-toplevel
+        # The build workflow points mkdtemp at one kept folder and makes rmtree a no-op, so
+        # the export names its own files and removes them itself.
+        work = tempfile.mkdtemp(prefix="qnxprobe-btrfs-")
+        stem = os.path.join(work, f"btrfs-check-{uuid.uuid4().hex}")
+        src, dest = stem + ".raw", stem + ".zip"
+        try:
+            with open(src, "wb") as fh:                         # zero runs are left as holes
+                for at in range(0, len(raw), 1 << 20):
+                    piece = raw[at:at + (1 << 20)]
+                    if piece.count(0) != len(piece):
+                        fh.seek(at)
+                        fh.write(piece)
+                fh.truncate(len(raw))
+            done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), src,
+                                   "--extract", dest], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=240, check=False)
+            with zipfile.ZipFile(dest) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+                members = sorted(n.split("/", 1)[-1] for n in zin.namelist()
+                                 if n != "volumes.json")
+            out.append((label, done.returncode == 0 and members == ["committed.txt"]
+                        and rec.get("note") == w.note and "log tree is present" in rec["note"]
+                        and "NOTE " + w.note in done.stdout.decode("utf-8", "replace")))
+        finally:
+            for leftover in (src, dest):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
     if not os.path.isfile(os.path.join(here, "btrfs-logtree.img.gz")):
         out.append(("btrfs-logtree (a log tree not yet replayed) not checked: its fixture is "
                     "made by tools/make_btrfs_root_fixtures.sh, which needs root", None))
@@ -41471,8 +42338,10 @@ def flash_regions(fh, size):
     """[(label, base, size)] for the flash filesystems found inside an image
     with no partition table, in image order. Only aligned offsets are tried:
 
-      SquashFS  "hsqs" whose superblock and root inode read (identify_squashfs);
-                its extent is the bytes_used it records, rounded up to 4 KiB
+      SquashFS  "hsqs" whose superblock and root inode read, or whose superblock
+                reaches past the end of the image (identify_squashfs); its extent
+                is the bytes_used it records, rounded up to 4 KiB, or what the
+                image holds of that
       UBI       an erase counter header whose CRC holds; its extent runs over
                 the following eraseblocks that carry a header of the same
                 image_seq or are erased
@@ -41495,9 +42364,10 @@ def flash_regions(fh, size):
       EFS       a QNX F3S partition, found by its boot record wherever in the
                 partition wear levelling left it and placed by the record's
                 unit_index (efs_partitions); its extent is the unit count the
-                record gives. The signature is looked for at every offset, not
-                only aligned ones, and the partition's start is aligned to its
-                own unit size
+                record gives, or what the image holds of that when it ends
+                first. The signature is looked for at every offset, not only
+                aligned ones, and the partition's start is aligned to its own
+                unit size
 
     A configuration store is not a filesystem, but it has an extent of its own
     and sits in its own MTD partition, so a JFFS2 in front of it ends there.
@@ -41533,7 +42403,8 @@ def flash_regions(fh, size):
             if _CFG_NAME.match(chunk, k + 4) or _CFG_NAME.match(chunk, k + 5):
                 hits.add((pos + k, b"env"))       # a U-Boot environment's first string
         pos += step
-    efs = {p["base"]: p["size"] for p in _efs_partitions_from_sigs(fh, size, efs_sigs)}
+    efs = {p["base"]: min(p["size"], size - p["base"])
+           for p in _efs_partitions_from_sigs(fh, size, efs_sigs)}
     hits.update((base, b"efs") for base in efs)
     found, taken_to = [], 0
     for off, magic in sorted(hits):
@@ -41883,6 +42754,12 @@ def volumes(fh, size=None):
                                                       and r[0] not in protective], ss)
                 vol["free_extents"] = list(lvm_spare.get(base, []))
             elif kind:
+                if kind == "efs" and base not in placed:
+                    # its boot record sizes it, and can put its end past the image's
+                    part = _efs_locate(fh, base, rsize)
+                    if part:
+                        vol["missing_past_end"] = max(vol["missing_past_end"],
+                                                      base + part["size"] - size)
                 vol["walker"] = walker_for(kind, fh, base, rsize)
                 if vol["walker"] is None:
                     vol["note"] = "recognised, but no walker for this kind"
@@ -46152,6 +47029,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                "folder neither is anything under it", 1)
                                               for p, i, _s, _m in unread)
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
+                            elif isinstance(w, YaffsWalker):
+                                # a file under a folder with no header in the image, or
+                                # with no header of its own, never reaches the list above
+                                unread = [detail for _p, _i, detail
+                                          in w.unread_entries(files_only=True)]
+                                fa += len(unread)
+                                issues.extend(("", "", "FAILED", detail, 1) for detail in unread)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -46171,26 +47055,20 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 manifest[-1]["damage_first"] = dmg
                                 if getattr(w, "folders_not_read", 0):
                                     manifest[-1]["folders_not_read"] = w.folders_not_read
-                            if isinstance(w, (F2fsWalker, HfsPlusWalker, ConfigStoreWalker)) and w.volume_note:
+                            # what the walker says about the volume as a whole: its
+                            # volume_note when it keeps one apart from its damage, and
+                            # then never its note, which can carry the damage
+                            wnote = w.volume_note if hasattr(w, "volume_note") else getattr(w, "note", None)
+                            if wnote:
                                 if manifest is not None:
-                                    manifest[-1]["note"] = w.volume_note
-                                _say(f"            NOTE {w.volume_note}")
-                            if isinstance(w, RefsWalker) and w.note:
-                                # log records the checkpoint read here does not hold
-                                if manifest is not None:
-                                    manifest[-1]["note"] = w.note
-                                _say(f"            NOTE {w.note}")
+                                    manifest[-1]["note"] = wnote
+                                _say(f"            NOTE {wnote}")
                             if miss and manifest is not None:
                                 manifest[-1]["extends_past_image_by_bytes"] = miss
                             locked = getattr(w, "not_read_note", None)
                             if locked:
                                 _zip_volume_not_read(zf, manifest, vol, image_rec,
                                                      ApfsUnreadable(locked))
-                            noted = getattr(w, "volume_note", None)
-                            if noted and manifest is not None:
-                                manifest[-1]["note"] = noted
-                            if noted:
-                                _say(f"            NOTE {noted}")
                             print(f"            {f_:,} files, {human(wr)}"
                                   + (f", {sk:,} symlinks or special files skipped" if sk else "")
                                   + (f", {fa:,} FAILED" if fa else "")
@@ -46324,7 +47202,8 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         if marked_incomplete:
             print("  A volume marked INCOMPLETE above reaches past the end of the file. A file")
             print("  on it that reaches past the end is counted SHORT and stored under a name")
-            print("  that says how much of it is here, not as an extracted file.")
+            print("  that says how much of it is here, or FAILED where the volume records no")
+            print("  size for it, not as an extracted file.")
             print()
 
         if rejected:
@@ -51681,6 +52560,334 @@ def _qnx6_test_volume(bs, cut=None, unit=512, foreign=False, clock=True, bad_crc
             [(ds + (bitmap_b + 1) * bs, 9 * bs)])
 
 
+def _squashfs_reader_checks():
+    """[(label, passed or None for a skip)] for the SquashFS reader, on volumes
+    mksquashfs 4.7.5 wrote and unsquashfs read back (tools/make_squashfs_*.sh), each
+    held against a list made from its source tree. Each row runs on its own, so one
+    that raises is one FAIL that names the exception and the rest still run."""
+    import contextlib                               # pylint: disable=import-outside-toplevel
+    import gzip                                     # pylint: disable=import-outside-toplevel
+    import hashlib                                  # pylint: disable=import-outside-toplevel
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
+    out = []
+
+    def load(name):
+        """A fixture's bytes, gunzipped when it is an image, or None when it is absent."""
+        full = os.path.join(here, name)
+        if not os.path.isfile(full):
+            return None
+        with (gzip.open(full, "rb") if name.endswith(".gz") else open(full, "rb")) as fh:
+            return fh.read()
+
+    def export(data):
+        """The export of one image through main(): (volume records, {stored path: member
+        bytes}, {stored path: member name} from the exceptions table, what was printed)."""
+        man, said, zbuf = [], io.StringIO(), io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout, \
+                contextlib.redirect_stdout(said):
+            main("squashfs.img", extract="(memory)", zf=zout, manifest=man,
+                 image=io.BytesIO(bytes(data)))
+        with zipfile.ZipFile(zbuf) as zin:
+            members = {n.split("/", 1)[-1]: zin.read(n) for n in zin.namelist()
+                       if not n.endswith(".tsv") and n != "volumes.json"}
+        return man, members, said.getvalue()
+
+    def row(name, test):
+        try:
+            got = test()
+            ok = None if got is None else bool(got)
+        except Exception as exc:                    # pylint: disable=broad-except
+            name, ok = f"{name} ({type(exc).__name__}: {exc})", False
+        out.append((name, ok))
+
+    def stored_names():
+        image, listing = load("squashfs-odd.img.gz"), load("squashfs-odd.src.json")
+        if image is None or listing is None:
+            return None
+        import sqlite3                              # pylint: disable=import-outside-toplevel
+
+        def rule(raw):
+            """One stored name as the name rule gives it, worked out a byte at a time."""
+            text, at = "", 0
+            while at < len(raw):
+                for width in (1, 2, 3, 4):
+                    try:
+                        text += raw[at:at + width].decode("utf-8")
+                        at += width
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    text += f"%{raw[at]:02X}"
+                    at += 1
+            return text
+
+        rows = json.loads(listing)
+        for r in rows:
+            r["raw"] = bytes.fromhex(r["path_hex"])
+            r["path"] = "/".join(rule(part) for part in r["raw"].split(b"/"))
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        walked = [(path, node) for path, node, *_rest in walk_all(w)]
+        db = sqlite3.connect(":memory:")
+        db.execute("create table names (name text)")
+        db.executemany("insert into names values (?)", [(path,) for path, _node in walked])
+        apart = db.execute("select count(*) from names where name in ('a%80b.txt', 'a%81b.txt', "
+                           "'%82leading.txt', 'dir%E9', '%FF%FE%FD.bin')").fetchone()[0]
+        link = next(r for r in rows if r["kind"] == "symlink")
+        target = w.readlink(dict(walked)[link["path"]])
+        man, members, _said = export(image)
+        files = [r for r in rows if r["kind"] == "file"]
+        digest = {name: hashlib.sha256(data).hexdigest() for name, data in members.items()}
+        by_raw = {r["raw"]: r["sha256"] for r in files}
+        # a file really named caf%E9.txt and the one stored as caf<E9>.txt come out under
+        # one name, and the export keeps both (the second as .dup-2)
+        return (sorted(path for path, _node in walked) == sorted(r["path"] for r in rows)
+                and sum(1 for r in rows if r["path"].encode("utf-8") != r["raw"]) == 10
+                and apart == 5 and target == rule(bytes.fromhex(link["target_hex"])) == "target%E9"
+                and digest.get("a%80b.txt") == by_raw[b"a\x80b.txt"]
+                and digest.get("a%81b.txt") == by_raw[b"a\x81b.txt"]
+                and digest.get("dir%E9/inner0.txt") == by_raw[b"dir\xe9/inner0.txt"]
+                and sorted(digest.values()) == sorted(by_raw.values())
+                and man[0]["files"] == len(files) and not man[0]["failed"])
+    row("SquashFS: a stored name that is not UTF-8 comes back with those bytes as %XX and no "
+        "surrogate, goes into SQLite, and is the zip member's name; two names that differ in "
+        "one such byte stay apart; a symlink's target is read the same way", stored_names)
+
+    def not_read(run, module):
+        """Whether an export recorded its one volume as not read for want of ``module``."""
+        man, members, _said = run
+        rec = man[0] if man else {}
+        first = (rec.get("damage_first") or [""])[0]
+        return (not members and len(man) == 1 and rec.get("filesystem") == "squashfs"
+                and rec.get("files") == 0 and rec.get("folders_not_read") == 1
+                and rec.get("damage_recorded") == 1 and len(first) <= 240
+                and first.startswith("the root folder could not be read") and module in first
+                and _volumes_not_read(man) == 1)
+
+    def whole(run):
+        man, members, _said = run
+        return (len(members) == 612 and len(man) == 1 and man[0]["files"] == 612
+                and not man[0].get("damage_recorded") and not man[0].get("folders_not_read")
+                and not man[0]["failed"] and _volumes_not_read(man) == 0)
+
+    def without_zstd():
+        image = load("squashfs-zstd.img.gz")
+        if image is None:
+            return None
+        names = globals()
+        real = names["_zstd_module"]
+        try:
+            names["_zstd_module"] = lambda: None     # as on a Python older than 3.14
+            absent = export(image)
+        finally:
+            names["_zstd_module"] = real
+        said = (absent[0][0].get("damage_first") or [""])[0] if absent[0] else ""
+        if not (not_read(absent, "zstd") and "3.14" in said):
+            return False
+        return real() is None or whole(export(image))
+    row("SquashFS: a zstd volume on a Python with no zstd module is recorded as not read, "
+        "with a folder not read and a line that names zstd and Python 3.14, and counts for "
+        "the exit status; where zstd is present it reads whole with no record", without_zstd)
+
+    def without_module():
+        images = {c: load(f"squashfs-{c}.img.gz") for c in ("xz", "lzma", "gzip")}
+        if None in images.values():
+            return None
+
+        def absent(module, test):
+            """test() with "import <module>" failing, as on a Python built without it."""
+            held = sys.modules.get(module)
+            sys.modules[module] = None
+            try:
+                return test()
+            finally:
+                if held is None:
+                    del sys.modules[module]
+                else:
+                    sys.modules[module] = held
+
+        def no_lzma():
+            notes = {c: [v.get("note") for v in volumes(io.BytesIO(d), len(d))]
+                     for c, d in images.items()}
+            return {c: export(d) for c, d in images.items()}, notes
+
+        def no_zlib():
+            w = SquashfsWalker(io.BytesIO(images["gzip"]), 0)
+            return (w.listdir(w.root) == [] and w.folders_not_read == 1
+                    and "zlib module" in w.damage[0] and "zlib module" in (w.note or ""))
+
+        runs, notes = absent("lzma", no_lzma)
+        return (not_read(runs["xz"], "lzma module") and not_read(runs["lzma"], "lzma module")
+                and all("lzma module" in (notes[c][0] or "") for c in ("xz", "lzma"))
+                and whole(runs["gzip"]) and notes["gzip"] == [None]
+                and absent("zlib", no_zlib) and whole(export(images["xz"])))
+    row("SquashFS: with Python's lzma module absent, an xz and a legacy lzma volume are each "
+        "recorded as not read by a line and a note that name the module, and a gzip volume "
+        "still reads whole; a gzip volume without zlib is recorded the same way",
+        without_module)
+
+    def cut_images():
+        packed, stored = load("squashfs-gzip.img.gz"), load("squashfs-none.img.gz")
+        if packed is None or stored is None:
+            return None
+
+        def cut(image, keep):
+            """What an export of the first ``keep`` bytes records, and whether it is true."""
+            used = struct.unpack_from("<Q", image, 40)[0]
+            man, members, said = export(image[:keep])
+            rec = man[0] if len(man) == 1 else {}
+            lines = rec.get("damage_first") or []
+            found = volumes(io.BytesIO(image[:keep]), keep)
+            said_so = (rec.get("filesystem") == "squashfs"
+                       and rec.get("extends_past_image_by_bytes") == used - keep
+                       and "INCOMPLETE" in said and all(len(ln) <= 240 for ln in lines)
+                       and bool(lines) and lines[0].startswith(
+                           f"the superblock records {used:,} bytes and the image holds "
+                           f"{keep:,} of them, so the last {used - keep:,} bytes are missing")
+                       and len(found) == 1 and found[0]["kind"] == "squashfs"
+                       and (found[0].get("note") or "") == lines[0])
+            return said_so, rec, lines, members, man
+
+        def nothing_listed(image, keep, how):
+            said_so, rec, lines, members, man = cut(image, keep)
+            return (said_so and not members and rec["files"] == 0
+                    and rec.get("folders_not_read") == 1 and rec.get("damage_recorded") == 2
+                    and lines[1].startswith(f"the root folder could not be {how} (")
+                    and "so nothing in it is listed or exported" in lines[1]
+                    and _volumes_not_read(man) == 1)
+
+        for image in (packed, stored):
+            if not whole(export(image)) or volumes(io.BytesIO(image), len(image))[0].get("note"):
+                return False
+        after_inodes = [struct.unpack_from("<Q", image, 72)[0] for image in (packed, stored)]
+        # the last 4 KiB of the stored image hold only tables this reader does not use
+        # (export, id, xattr), so every file is still read and the record says what is gone
+        said_so, rec, lines, members, man = cut(stored, len(stored) - 4096)
+        _man, all_members, _said = export(stored)
+        tail_only = (said_so and members == all_members and rec["files"] == 612
+                     and rec.get("damage_recorded") == 1 and not rec.get("folders_not_read")
+                     and lines[0].endswith("the export, id and xattr tables")
+                     and _volumes_not_read(man) == 0)
+        # A caller that holds nodes from the whole image asks the cut one for them: the
+        # inode table is all there, the tables after it are not.
+        full = SquashfsWalker(io.BytesIO(packed), 0)
+        nodes = {path: node for path, node, *_rest in walk_all(full)}
+        short = SquashfsWalker(io.BytesIO(packed[:after_inodes[0]]), 0)
+        folder, small = nodes["dir/sub/deeper"], nodes["small.txt"]
+        listed, refused = short.listdir(folder), []
+        for _again in range(2):
+            try:
+                b"".join(short.read_file(small, full.entry(small)[1]))
+            except SquashfsUnreadable as exc:
+                refused.append(str(exc))
+        asked = (full._folder_path(folder) == "dir/sub/deeper" and not full.damage
+                 and listed == [] and short.folders_not_read == 1
+                 and short.damage[1].startswith("a folder could not be listed (")
+                 and short.damage[1].endswith(f": inode reference {folder:#x}")
+                 and len(refused) == 2 and len(short.damage) == 3
+                 and all(r.startswith("the fragment table could not be read (") for r in refused)
+                 and short.damage[2].startswith(refused[0])
+                 and "no file that ends in a shared fragment" in short.damage[2])
+        return (tail_only and asked
+                and nothing_listed(packed, len(packed) - 4096, "listed")
+                and nothing_listed(packed, len(packed) // 2, "read")
+                and nothing_listed(packed, after_inodes[0], "listed")
+                and nothing_listed(stored, len(stored) // 2, "read")
+                and nothing_listed(stored, after_inodes[1], "listed"))
+    row("SquashFS: an image cut short of what its superblock records is still named and its "
+        "record says how much is missing: cut in half, just after the inode table, or (a gzip "
+        "image) by its last 4 KiB, the root folder is recorded as not read and counts for "
+        "the exit status; an image that lost only tables this reader does not use still "
+        "reads every file; a folder and a fragment table past the cut are recorded when "
+        "they are asked for", cut_images)
+
+    def every_level():
+        image, sums = load("squashfs-deep.img.gz"), load("squashfs-deep.src.sha256")
+        if image is None or sums is None:
+            return None
+        want = dict(reversed(line.split("  ", 1)) for line in sums.decode("utf-8").splitlines())
+        w = SquashfsWalker(io.BytesIO(image), 0)
+        read = {path: hashlib.sha256(b"".join(w.read_file(node, size))).hexdigest()
+                for path, node, size, _mtime in collect(w, w.root)}
+        walked = [path for path, *_rest in walk_all(SquashfsWalker(io.BytesIO(image), 0))]
+        man, members, _said = export(image)
+        return (len(want) == 70 and max(path.count("/") for path in want) == 70
+                and read == want and len(walked) == 140 and set(want) <= set(walked)
+                and {path: hashlib.sha256(data).hexdigest()
+                     for path, data in members.items()} == want
+                and man[0]["files"] == 70 and not man[0].get("damage_recorded")
+                and _volumes_not_read(man) == 0)
+    row("SquashFS: a chain of folders 70 levels deep that mksquashfs wrote is listed and "
+        "exported at every level, 70 of 70 files matching the source tree", every_level)
+
+    def any_depth():
+        class Chain:
+            """A walker over ``depth`` folders, each inside the one before with one file
+            beside it. The last folder also names the root and its own parent, a loop."""
+            root = 0
+
+            def __init__(self, depth):
+                self.depth = depth
+
+            def listdir(self, node):
+                if node < 0:
+                    return []
+                out = [("file.txt", -node - 1)]
+                if node + 1 < self.depth:
+                    return out + [("d", node + 1)]
+                return out + [("back", 0), ("up", max(node - 1, 0))]
+
+            def entry(self, node):
+                return (S_IFREG | 0o644, 1, 0) if node < 0 else (S_IFDIR | 0o755, 0, 0)
+
+        def plain(w, node, prefix, seen, times):
+            """The files under a folder by a walk that calls itself, as collect() did."""
+            if node in seen:
+                return []
+            seen.add(node)
+            out = []
+            listing = (w.listdir_records(node) if times else
+                       [(name, child, None) for name, child in w.listdir(node)])
+            for name, child, _recorded in listing:
+                ent = w.entry(child)
+                if not ent:
+                    continue
+                path = f"{prefix}/{name}" if prefix else name
+                if ent[0] & S_IFMT == S_IFDIR:
+                    out += plain(w, child, path, seen, times)
+                else:
+                    out.append((path, child, ent[1] if ent[0] & S_IFMT == S_IFREG else None,
+                                ent[2]))
+            return out
+
+        depth = 3000                                 # three times Python's own limit
+        files = collect(Chain(depth), 0)
+        every = list(walk_all(Chain(depth)))
+        if not (len(files) == depth == len({path for path, *_rest in files})
+                and files[-1][0] == "d/" * (depth - 1) + "file.txt"
+                and len(every) == 2 * depth + 1):
+            return False
+        for name, times in (("ext4-sparse.img.gz", False), ("fat16-fixture.img.gz", False),
+                            ("fat16-fixture.img.gz", True)):
+            image = load(name)
+            if image is None:
+                return None
+            w = next(v["walker"] for v in volumes(io.BytesIO(image), len(image))
+                     if v.get("walker") is not None)
+            want = plain(w, w.root, "", set(), times)
+            if not want or collect(w, w.root, times={} if times else None) != want:
+                return False
+            if sorted(p for p, *_r in walk_all(w) if p in {x[0] for x in want}) \
+                    != sorted(x[0] for x in want):
+                return False
+        return True
+    row("collect() and walk_all() walk every level and enter a folder once: a chain of "
+        "3,000 folders that loops back on itself gives each of its 3,000 files once, and on "
+        "an ext4 and a FAT16 volume collect() lists what a walk that calls itself lists, in "
+        "its order", any_depth)
+    return out
+
+
 def _qnx6_reader_checks():
     """The qnx6 reader on damaged and unusual volumes, each built by patching the
     self-test's own two-generation volume (_qnx6_test_volume) in memory. Each row
@@ -52926,6 +54133,73 @@ def _efs_qnx_image_check(raw, tar_gz):
     if stray:
         problems.append(f"{stray} bytes that are not 0xFF lie where no extent is")
     return problems, len(got), n_removed, len(old_bytes)
+
+
+def _efs_cut_check(raw, tar_gz, folder):
+    """Cut the EFS image QNX wrote inside its one partition and export each cut.
+
+    Three cuts on the partition's own span: its last 4 KiB gone, half of it gone,
+    and everything after its first erase unit gone. Each has to come back as an
+    EFS volume whose record gives the bytes the boot record sizes the partition
+    at and the bytes the image holds, marked as reaching past the image, counted
+    as not read in full (so a run exits 1) and listed by volumes() with what is
+    missing. No file may be lost without a word: every regular file of QNX's tar
+    is exported with the tar's bytes, or counted as failed, or sits behind a
+    folder the record says was not listed in full. And nothing exported may
+    differ from the tar. The cut image is written to ``folder`` and removed.
+
+    Returns (problems, [files exported per cut])."""
+    import contextlib, io, tarfile, zipfile
+    want = {}
+    with tarfile.open(tar_gz) as tf:
+        for m in tf.getmembers():
+            if m.isfile():
+                want[m.name.strip("/")] = tf.extractfile(m).read()
+    found = efs_partitions(io.BytesIO(raw), len(raw))
+    if len(found) != 1 or found[0]["base"] != 0:
+        return [f"the whole image holds {len(found)} partitions"], []
+    need, unit = found[0]["size"], found[0]["unit_size"]
+    problems, exported = [], []
+    path = os.path.join(folder, "efs_cut.img")
+    for label, at in (("its last 4 KiB", need - 4096), ("half", need // 2),
+                      ("all but the first unit", unit)):
+        man, said, held = [], io.StringIO(), io.BytesIO()
+        try:
+            with open(path, "wb") as out:
+                out.write(raw[:at])
+            with zipfile.ZipFile(held, "w") as zf, contextlib.redirect_stdout(said):
+                main(path, extract="x.zip", zf=zf, manifest=man)
+            with open(path, "rb") as fh:
+                listed = [(v["kind"], v["missing_past_end"]) for v in volumes(fh, at)]
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        rec = man[0] if len(man) == 1 else {}
+        lines = rec.get("damage_first") or [""]
+        if (rec.get("filesystem") != "efs" or rec.get("extends_past_image_by_bytes") != need - at
+                or f"({need:,} bytes)" not in lines[0]
+                or f"the image holds {at:,} of those bytes" not in lines[0]
+                or not rec.get("folders_not_read") or _volumes_not_read(man) != 1
+                or "INCOMPLETE" not in said.getvalue() or listed != [("efs", need - at)]):
+            problems.append(f"cut of {label}: no record of an EFS volume the image holds {at:,} "
+                            f"of {need:,} bytes of ({len(man)} records, volumes() {listed})")
+            exported.append(0)
+            continue
+        with zipfile.ZipFile(held) as zf:
+            got = {n.split("/", 1)[1]: zf.read(n) for n in zf.namelist()
+                   if n.startswith(rec["volume"] + "/")}
+        wrong = sorted(n for n, data in got.items() if want.get(n) != data)
+        unsaid = len(want) - len(got) - (rec.get("failed") or 0)
+        if wrong or rec.get("files") != len(got) or rec.get("short"):
+            problems.append(f"cut of {label}: {len(wrong)} exported files are not the tar's, "
+                            f"{rec.get('files')} counted and {len(got)} in the zip, "
+                            f"{rec.get('short')} short")
+        if unsaid and not (rec["folders_not_read"] > 1 and any(
+                line.startswith("folder not listed in full") for line in lines)):
+            problems.append(f"cut of {label}: {unsaid} files are neither exported nor failed, "
+                            f"and no folder is recorded as not listed in full")
+        exported.append(len(got))
+    return problems, exported
 
 
 def _fat_reader_checks():
@@ -54327,6 +55601,48 @@ def self_test():
                 ok = False
             print(f"  [{mark}] EFS written by QNX, control: with its extent's header set to "
                   "free the removed file no longer comes back, and the check says so")
+            # walk_all() tells folders apart by a key, and EFS folders whose first
+            # entries share a logical unit must not share one (EfsWalker.walk_key).
+            # It has to list what QNX's tar lists, each entry once, and hand out
+            # the nodes a tree walk does, unchanged: (first_logi, first_index,
+            # mode, mtime), which a caller may have stored.
+            import tarfile
+            with tarfile.open(qnx_tar) as tf:
+                tar_names = sorted(m.name.strip("/") for m in tf.getmembers() if m.name.strip("/"))
+            walked = list(walk_all(qw))
+            tree_nodes, stack = {}, [(qw.root, "")]
+            while stack:
+                at, prefix = stack.pop()
+                for name, child in qw.listdir(at):
+                    tree_nodes[f"{prefix}/{name}" if prefix else name] = child
+                    if child[2] & S_IFMT == S_IFDIR:
+                        stack.append((child, f"{prefix}/{name}" if prefix else name))
+            cond = (sorted(item[0] for item in walked) == tar_names
+                    and {item[0]: item[1] for item in walked} == tree_nodes
+                    and all(isinstance(n, tuple) and len(n) == 4 and all(type(x) is int for x in n)
+                            for n in tree_nodes.values()))
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] EFS written by QNX: walk_all() lists "
+                  f"{len(walked)} entries, the {len(tar_names)} of QNX's tar each once, with "
+                  f"the nodes a tree walk hands out")
+            # The same image cut inside its partition. The boot record sizes the
+            # partition, so a cut one is still an EFS volume, and its record has
+            # to say what the image holds of it (_efs_cut_check).
+            try:
+                cut_problems, cut_files = _efs_cut_check(qnx_raw, qnx_tar, d)
+            except Exception as exc:                 # pylint: disable=broad-except
+                cut_problems, cut_files = [f"raised {type(exc).__name__}: {exc}"], []
+            cond = not cut_problems and cut_files == [22, 22, 0]
+            if not cond:
+                ok = False
+                for line in cut_problems:
+                    print("      " + line)
+            print(f"  [{'PASS' if cond else 'FAIL'}] EFS written by QNX, cut inside its "
+                  f"partition (last 4 KiB, half, after the first unit): each cut is an EFS "
+                  f"volume recorded with the bytes it needs and holds and counted as not read "
+                  f"in full, and no file is lost without a record or exported with other "
+                  f"bytes (files exported {cut_files})")
 
         # QNX IFS. The UCL decompressor and the imagefs layout are proven byte
         # for byte against real Ford Sync G4 images; these legs are the both-ways
@@ -57327,6 +58643,11 @@ def self_test():
             lvm_checks += _refs_self_checks()
         except Exception as exc:                     # pylint: disable=broad-except
             lvm_checks += [(f"the ReFS checks ran ({type(exc).__name__}: {exc})", False)]
+        # SquashFS names, and what a volume that cannot be read in full records.
+        try:
+            lvm_checks += _squashfs_reader_checks()
+        except Exception as exc:                     # pylint: disable=broad-except
+            lvm_checks += [(f"the SquashFS reader checks ran ({type(exc).__name__}: {exc})", False)]
         # qnx6 on damaged and unusual volumes, patched from the self-test's own volume.
         try:
             lvm_checks += _qnx6_reader_checks()
@@ -58843,6 +60164,254 @@ def self_test():
                 print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS2 history image opening on {what}: "
                       f"{got} of {want} files match, {eok} of {ewant} entries agree "
                       f"(identified as {r['kind']})")
+
+        # A checkpoint in the first pages, a chunk id past 2^20 and names that
+        # are not UTF-8, each built in memory from a fixture a real writer made.
+        ya_le = os.path.join(fx, "yaffs2-le.img.gz")
+        if os.path.isfile(ya_le):
+            import hashlib as _hl_ya              # pylint: disable=import-outside-toplevel
+            with gzip.open(ya_le, "rb") as gz:
+                ya_raw = gz.read()
+            ya_page = 2048 + 64
+
+            def ya_spare(seq, obj, chunk_id, nbytes):
+                """A YAFFS2 spare: the packed tags and their ECC's two line parities."""
+                tags = struct.pack("<IIII", seq, obj, chunk_id, nbytes)
+                return (tags + struct.pack("<BxxxII", 0, *_yaffs2_line_parity(tags))).ljust(64, b"\xff")
+
+            def ya_state(raw):
+                """(kind, [(path, mode, size, mtime, sha256 of a file's bytes)])."""
+                img = io.BytesIO(bytes(raw))
+                kind = (identify_fs(img, 0, len(raw)) or (None,))[0]
+                if kind is None:
+                    return None, []
+                w = walker_for(kind, img, 0, len(raw))
+                rows = []
+                for p, node, mode, sz, mt, _r in walk_all(w):
+                    dg = ""
+                    if mode & S_IFMT == S_IFREG:
+                        dg = _hl_ya.sha256(b"".join(w.read_file(node, sz))).hexdigest()
+                    rows.append((p, mode, sz, mt, dg))
+                return kind, sorted(rows, key=lambda r_: r_[0])
+
+            ya_kind0, ya_rows0 = ya_state(ya_raw)
+            ya_w0 = YaffsWalker(io.BytesIO(ya_raw), 0)
+            ya_hdr_at = {}                        # object id: page of its newest header
+            for _seq, ya_idx, ya_t, ya_h in ya_w0._entries:   # pylint: disable=protected-access
+                if ya_h is not None:
+                    ya_hdr_at.setdefault(ya_t["obj"], ya_idx)
+
+            # A checkpoint goes to the first empty block (core/yaffs_checkptrw.c:126
+            # yaffs2_checkpt_find_erased_block), which can be block 0, and its
+            # pages carry sequence 0x21, the page's number plus 1 as chunk id and
+            # the page size as n_bytes (:291-294). YAFFS scans none of them for
+            # objects. The control gives the same two pages sequence 0x22, which
+            # is no checkpoint and no valid tag: those must still count against
+            # the layout.
+            def ya_front(seq):
+                block = b"".join(bytes(2048) + ya_spare(seq, 2, n_ + 1, 2048) for n_ in range(2))
+                return block + b"\xff" * (62 * ya_page) + ya_raw
+
+            ya_kind, ya_rows = ya_state(ya_front(0x21))
+            ya_ctl = ya_state(ya_front(0x22))[0]
+            cond = (ya_kind0 == "yaffs2" and ya_kind == "yaffs2" and ya_rows == ya_rows0
+                    and len(ya_rows0) > 100 and ya_ctl is None)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS2 with a checkpoint in its first two "
+                  f"pages is read as the same volume: identified as {ya_kind}, "
+                  f"{sum(1 for a_, b_ in zip(ya_rows, ya_rows0) if a_ == b_)} of {len(ya_rows0)} "
+                  f"entries and file hashes equal; the same pages with sequence 0x22 are not "
+                  f"left out (identified as {ya_ctl})")
+
+            # YAFFS2 takes a data chunk id up to 2^28 - 1 (core/yaffs_guts.h:50-54,
+            # core/yaffs_yaffs2.c:1204). A newer header gives a file a size past
+            # 2 GiB and one data chunk with id 2^20 + 4 holds its last 100 bytes.
+            ya_big = min(o_ for o_, v_ in ya_w0.objs.items()
+                         if v_["hdr"] and v_["hdr"]["type"] == 1 and o_ in ya_hdr_at
+                         and 0 < v_["stored"] <= 2048)
+            ya_cid = (1 << 20) + 4
+            ya_size = (ya_cid - 1) * 2048 + 100
+            ya_tail = bytes(range(100, 200))
+            ya_at = ya_hdr_at[ya_big] * ya_page
+            ya_head = bytearray(ya_raw[ya_at:ya_at + 2048])
+            struct.pack_into("<I", ya_head, 292, ya_size)
+            struct.pack_into("<I", ya_head, 496, 0)
+            ya_seq = ya_w0.max_seq + 1
+            ya_img = (ya_raw + ya_tail.ljust(2048, b"\xff") + ya_spare(ya_seq, ya_big, ya_cid, 100)
+                      + bytes(ya_head) + ya_spare(ya_seq, ya_big, 0, 0xFFFF)
+                      + b"\xff" * (62 * ya_page))
+            ya_w = YaffsWalker(io.BytesIO(ya_img), 0)
+            ya_was = b"".join(ya_w0.read_file(ya_big, ya_w0.objs[ya_big]["stored"]))
+            ya_got, ya_first, ya_last = 0, b"", b""
+            for ya_piece in ya_w.read_file(ya_big, ya_size):
+                if ya_got < len(ya_was):
+                    ya_first += ya_piece
+                ya_got += len(ya_piece)
+                ya_last = ya_piece
+            cond = (ya_w.entry(ya_big)[1] == ya_size and ya_got == ya_size
+                    and ya_first[:len(ya_was)] == ya_was and ya_last == ya_tail)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] a YAFFS2 data chunk with id 2^20 + 4 is "
+                  f"read: the file is {ya_got:,} of {ya_size:,} bytes, its first "
+                  f"{len(ya_was):,} bytes are unchanged and its last 100 are the chunk's "
+                  f"({'yes' if ya_last == ya_tail else 'no'})")
+
+            # A stored name is bytes. One that is not UTF-8 shows as %XX of the
+            # stored byte, never as a surrogate, a "/" inside one name as %2F, and
+            # a symlink's target the same way but with its "/" kept.
+            ya_files = sorted((o_ for o_, v_ in ya_w0.objs.items()
+                               if v_["hdr"] and v_["hdr"]["type"] == 1 and o_ in ya_hdr_at
+                               and v_["hdr"]["name"].isascii()),
+                              key=lambda o_: (len(ya_w0.objs[o_]["hdr"]["name"]), o_))[:3]
+            ya_link = next((o_ for o_, v_ in sorted(ya_w0.objs.items())
+                            if v_["hdr"] and v_["hdr"]["type"] == 2 and o_ in ya_hdr_at
+                            and "/" in v_["hdr"]["alias"][1:]), None)
+            cond = len(ya_files) == 3 and ya_link is not None
+            ya_seen = "no three files and a symlink in the fixture"
+            if cond:
+                ya_img = bytearray(ya_raw)
+                for ya_o, ya_b in zip(ya_files, (0xE9, 0xE8, 0x2F)):
+                    ya_img[ya_hdr_at[ya_o] * ya_page + 10] = ya_b
+                ya_img[ya_hdr_at[ya_link] * ya_page + 300] = 0xE9
+                ya_w = YaffsWalker(io.BytesIO(bytes(ya_img)), 0)
+                ya_names = [ya_w.objs[o_]["hdr"]["name"] for o_ in ya_files]
+                ya_want = [pre + ya_w0.objs[o_]["hdr"]["name"][1:]
+                           for o_, pre in zip(ya_files, ("%E9", "%E8", "%2F"))]
+                ya_target = ya_w0.objs[ya_link]["hdr"]["alias"]
+                ya_paths = [p_ for p_, *_x in walk_all(ya_w)]
+                ya_text = "".join(ya_paths) + ya_w.readlink(ya_link)
+                try:
+                    import sqlite3 as _sq_ya      # pylint: disable=import-outside-toplevel
+                except ImportError:
+                    _sq_ya = None
+                ya_stored = len(ya_paths)
+                if _sq_ya is not None:            # a name has to be storable as it is
+                    ya_db = _sq_ya.connect(":memory:")
+                    ya_db.execute("create table t(n text)")
+                    try:
+                        ya_db.executemany("insert into t values(?)", [(p_,) for p_ in ya_paths])
+                        ya_stored = ya_db.execute("select count(distinct n) from t").fetchone()[0]
+                    except (UnicodeError, _sq_ya.Error):
+                        ya_stored = -1            # SQLite refuses a surrogate
+                    ya_db.close()
+                cond = (ya_names == ya_want and len(set(ya_names[:2])) == 2
+                        and ya_w.readlink(ya_link) == "%E9" + ya_target[1:]
+                        and ya_w.entry(ya_link)[1] == len(ya_target.encode("utf-8"))
+                        and not any(0xD800 <= ord(c_) <= 0xDFFF for c_ in ya_text)
+                        and len(ya_paths) == len(ya_rows0) and ya_stored == len(ya_paths))
+                ya_seen = (f"{', '.join(ya_names)}; target {ya_w.readlink(ya_link)}; "
+                           f"{ya_stored} of {len(ya_paths)} paths stored as distinct text")
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS names with a byte that is not UTF-8 "
+                  f"or a '/' show as %XX and hold no surrogate, and a symlink target keeps "
+                  f"its '/' and its stored length: {ya_seen}"[:400])
+
+        # An image cut before a folder's header: the objects that name that folder
+        # as their parent have their own headers and no path. They are recorded,
+        # with the count, and the run is not reported as complete. The whole
+        # image is the control: nothing recorded.
+        ya_h1 = os.path.join(fx, "yaffs1-history.img.gz")
+        if os.path.isfile(ya_h1):
+            with gzip.open(ya_h1, "rb") as gz:
+                ya_raw = gz.read()
+            ya_full = YaffsWalker(io.BytesIO(ya_raw), 0)
+            ya_cut = YaffsWalker(io.BytesIO(ya_raw[:-4096]), 0)
+            ya_dmg = list(getattr(ya_cut, "damage", ()))
+            ya_lost = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if x_[0]]
+            ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if not x_[0]]
+            # Both files are removed again: CI counts the *.img files left behind.
+            ya_path = os.path.join(d, "yaffs1_folder_header_cut.img")
+            ya_zip = os.path.join(d, "yaffs1_folder_header_cut.zip")
+            ya_man, ya_table = [], ""
+            try:
+                with open(ya_path, "wb") as ya_fh:
+                    ya_fh.write(ya_raw[:-4096])
+                with zipfile.ZipFile(ya_zip, "w") as zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(ya_path, extract=ya_zip, zf=zf, manifest=ya_man)
+                with zipfile.ZipFile(ya_zip) as ya_zr:
+                    ya_held = [i_.filename for i_ in ya_zr.infolist()]
+                    if "lba0.exceptions.tsv" in ya_held:
+                        ya_table = ya_zr.read("lba0.exceptions.tsv").decode("utf-8")
+            finally:
+                for ya_rm in (ya_path, ya_zip):
+                    if os.path.exists(ya_rm):
+                        os.remove(ya_rm)
+            ya_rec = ya_man[0] if ya_man else {}
+            ya_failed = [ln for ln in ya_table.splitlines()[1:]
+                         if ln.split("\t")[:3] == ["", "", "FAILED"]]
+            ya_n = len(collect(ya_full, ya_full.root)) - len(collect(ya_cut, ya_cut.root))
+            cond = (not getattr(ya_full, "damage", None)
+                    and getattr(ya_full, "folders_not_read", None) == 0
+                    and len(ya_dmg) == 3 and ya_dmg[0].startswith("45 objects name a parent folder")
+                    and ya_dmg[1].startswith("3 objects with data chunks") and len(ya_bare) == 3
+                    and all(len(x_) <= 240 for x_ in ya_dmg)
+                    and getattr(ya_cut, "folders_not_read", 0) == 1 and len(ya_lost) == 45
+                    and ya_n >= 45
+                    and ya_rec.get("folders_not_read") == 1 and ya_rec.get("failed") == 47
+                    and ya_rec.get("damage_recorded") == 3 and len(ya_failed) == 47
+                    and _volumes_not_read(ya_man) == 1)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut 4 KiB short, losing a folder's "
+                  f"header: {len(ya_lost)} objects under it and {len(ya_bare)} with data and "
+                  f"no header of their own are recorded and not exported "
+                  f"({len(ya_failed)} FAILED rows, one per file, folders_not_read "
+                  f"{ya_rec.get('folders_not_read')}, counted as not read in full: "
+                  f"{_volumes_not_read(ya_man)}); the whole image records nothing")
+
+            # The same image cut just after its first object header: nothing is
+            # listed, and the data chunks whose headers are gone are counted, so
+            # the export does not report an empty volume as read.
+            ya_first = next((i_ for i_, _d, s_ in ya_full._pages()   # pylint: disable=protected-access
+                             if (_yaffs1_tags(s_) or {"chunk": 1})["chunk"] == 0
+                             and not _yaffs1_tags(s_)["deleted"]), None)
+            cond, ya_seen = False, "no object header found in the fixture"
+            if ya_first is not None:
+                ya_short = ya_raw[:(ya_first + 1) * ya_full.page]
+                ya_cut = YaffsWalker(io.BytesIO(ya_short), 0)
+                ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])()
+                           if not x_[0]]
+                ya_dmg = list(getattr(ya_cut, "damage", ()))
+                ya_have = sorted(o_ for o_, v_ in ya_cut.objs.items()
+                                 if not v_["hdr"] and v_["chunks"])
+                ya_path = os.path.join(d, "yaffs1_first_header_cut.img")
+                ya_zip = os.path.join(d, "yaffs1_first_header_cut.zip")
+                ya_man, ya_table = [], ""
+                try:
+                    with open(ya_path, "wb") as ya_fh:
+                        ya_fh.write(ya_short)
+                    with zipfile.ZipFile(ya_zip, "w") as zf, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        main(ya_path, extract=ya_zip, zf=zf, manifest=ya_man)
+                    with zipfile.ZipFile(ya_zip) as ya_zr:
+                        if "lba0.exceptions.tsv" in ya_zr.namelist():
+                            ya_table = ya_zr.read("lba0.exceptions.tsv").decode("utf-8")
+                finally:
+                    for ya_rm in (ya_path, ya_zip):
+                        if os.path.exists(ya_rm):
+                            os.remove(ya_rm)
+                ya_rec = ya_man[0] if ya_man else {}
+                ya_failed = [ln for ln in ya_table.splitlines()[1:]
+                             if ln.split("\t")[:3] == ["", "", "FAILED"]]
+                cond = (len(ya_have) > 0 and [x_[1] for x_ in ya_bare] == ya_have
+                        and len(ya_dmg) == 1 and len(ya_dmg[0]) <= 240
+                        and ya_dmg[0].startswith(f"{len(ya_have)} objects with data chunks")
+                        and not collect(ya_cut, ya_cut.root)
+                        and ya_rec.get("files") == 0 and ya_rec.get("failed") == len(ya_have)
+                        and ya_rec.get("folders_not_read") == 1
+                        and len(ya_failed) == len(ya_have) and _volumes_not_read(ya_man) == 1)
+                ya_seen = (f"{len(ya_have)} objects with data and no header, {len(ya_bare)} "
+                           f"recorded, {len(ya_failed)} FAILED rows, files exported "
+                           f"{ya_rec.get('files')}, counted as not read in full: "
+                           f"{_volumes_not_read(ya_man)}")
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut just after its first object "
+                  f"header does not pass as an empty volume: {ya_seen}")
 
         # Deleted files, held against what each fixture's writer put in them.
         # tools/yaffs_history.c fills a file with numbered lines (text()); the
