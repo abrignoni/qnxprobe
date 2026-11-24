@@ -1346,8 +1346,9 @@ log tree is present. `--extract` writes the walker's note to the volume's record
 `volumes.json` as `note` and prints it as a `NOTE` line; earlier versions left it out of
 that record. A log tree that was not replayed does not change the exit status on its own.
 The same line carries the note of any reader that has one: on the fixtures that adds the
-note of the two locked APFS images, of the XFS image with a dirty log, and, on a Python
-without zstd, of the zstd SquashFS image, with nothing else in their exports changed.
+note of the two locked APFS images, of the XFS image with a dirty log, of the ReFS image
+with pending log records and, on a Python without zstd, of the zstd SquashFS image, with
+nothing else in their exports changed.
 
 Validated against images `mkfs.btrfs --rootdir` (btrfs-progs 6.17.1) wrote from one
 source tree, once per compression (none, zlib, zstd, LZO) and once per other checksum
