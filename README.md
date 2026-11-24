@@ -2669,8 +2669,9 @@ something lost counts in `folders_not_read`, so the run exits 1. A record that b
 - **A volume table that does not read.** Each volume number with mapped eraseblocks is
   listed as `vol<number>`, and the record says its name, type and padding are not known.
 - **Only the volume table.** When the table reads and no eraseblock of any volume it lists
-  is in the image, each volume is an empty file and the record says their data is not
-  here.
+  is in the image, each volume is an empty file with a note, and the exit status is left
+  alone: `ubinize` writes a dynamic volume with no data as no eraseblock at all, so an
+  empty device and one whose eraseblocks were cut away look the same.
 - **One erase counter header and no second one.** Every eraseblock opens with that header
   and the volume table is kept in two eraseblocks, so a file that opens with a header
   whose CRC holds and has no second one within 8 MiB holds at most one eraseblock. It is
@@ -2718,8 +2719,8 @@ looks the same.
 Cut to 128, 576, 2,112 and 4,096 bytes, the six UBI fixtures are each reported as UBI and
 not read, with a record and exit 1, 24 runs of 24. So are a UBI fixture cut to its
 64-byte header and three cut to one eraseblock. The NOR fixture cut to two eraseblocks,
-which hold its volume table alone, exports three empty files with the record that no
-volume's data is here, and exits 1. The bare UBIFS fixture cut to 4,096 bytes, its whole
+which hold its volume table alone, exports three empty files with the note that no
+volume's eraseblock is here, and exits 0. The bare UBIFS fixture cut to 4,096 bytes, its whole
 superblock node, is reported as UBIFS with 1,773,568 of its 1,777,664 bytes past the end,
 and exits 1. Cut to 128, 576 and 2,112 bytes, inside that node, its CRC cannot be checked
 and the file is not recognised: an empty export and exit 0. The NOR fixture cut to one

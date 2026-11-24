@@ -14277,14 +14277,16 @@ class UbiWalker:
                            f"({str(exc)[:70]}), so it is exported as one file of its raw bytes "
                            f"and none of the files in it are listed: {vol['name']}")
             self.inner.append((vol, view, walker, kind))
-        # The volume table alone: a device also holds its free eraseblocks, and an image
-        # ubinize wrote holds the eraseblocks of each volume's data.
+        # The volume table alone. ubinize writes a dynamic volume with no data as no
+        # eraseblock at all, and the kernel reads it as empty, so this is a note: an
+        # empty device and one whose volumes' eraseblocks were cut away look the same.
         if self.ubi.vtbl_ok and self.inner and not any(view.lebs for _v, view, _w, _k
                                                        in self.inner):
-            self._lose(f"the volume table lists {len(self.inner):,} volume(s) and no "
-                       f"eraseblock of any of them is here, in {self.ubi.npebs:,} "
-                       "eraseblock(s): each is listed as an empty file, and whatever the "
-                       "volumes held is not in the image")
+            self._damage.append(
+                f"note: the volume table lists {len(self.inner):,} volume(s) and no "
+                f"eraseblock of any of them is here, in {self.ubi.npebs:,} eraseblock(s): "
+                "each is listed as an empty file; a volume written with no data and one "
+                "whose eraseblocks are missing look the same")
 
     def _lose(self, what):
         """Record something that could not be read, counted in folders_not_read."""
@@ -47640,8 +47642,8 @@ def self_test():
                         return False, "; ".join(told)
                 man, got, _rows = ua_export(ua_nor[:131072], "ubi_table_only")
                 rec = man[0] if len(man) == 1 else {}
-                table = (ua_said(rec, "no eraseblock of any of them is here")
-                         and rec.get("folders_not_read") == 1 and _volumes_not_read(man) == 1
+                table = (ua_said(rec, "note: the volume table lists")
+                         and not rec.get("folders_not_read") and _volumes_not_read(man) == 0
                          and sorted(len(v_) for n_, v_ in got.items()
                                     if n_.startswith("lba0/")) == [0, 0, 0])
                 bad = bytearray(ua_nor[:65536])
@@ -47650,11 +47652,12 @@ def self_test():
                 refused = not man and not any(n_.startswith("lba0") for n_ in got)
                 return (table and refused,
                         "; ".join(told) + f"; the volume table alone: "
-                        f"{rec.get('damage_recorded', 0)} record(s); a first header that "
+                        f"{'a note' if table else 'NOT A NOTE'}; a first header that "
                         f"fails its CRC: {'not claimed' if refused else 'CLAIMED'}")
             if not ua_row("a UBI or UBIFS file cut just after its first structure is claimed "
                           "by the header that still checks and recorded as not read, and one "
-                          "holding only the volume table says no volume's data is here",
+                          "holding only the volume table gets a note that no volume's "
+                          "eraseblock is here",
                           ua_stubs):
                 ok = False
 
