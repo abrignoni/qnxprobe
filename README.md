@@ -282,7 +282,7 @@ committed fixtures, exported on Python 3.12, `note` gives an F2FS volume cut sho
 marked as cleanly unmounted, HFS+ files that hold the provenance attribute, an XFS dirty
 log, a Btrfs log tree, default subvolume or one device of two, and zstd data on a Python
 without zstd (Btrfs and SquashFS). The self-test exports the ReFS fixture whose log
-records follow the newest checkpoint, and its `note` says so. On a split image `image`
+records follow the newest checkpoint, and its `note` says so. 1.87 wrote no note there. On a split image `image`
 names the first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
 first, with theirs.
@@ -3173,10 +3173,53 @@ directory nodes. Both byte orders are read.
 Every node is scanned and its header CRC checked. A node the filesystem has marked
 obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
 `check_node_data` does, so an older copy of that data shows through where one exists; the
-report counts the nodes dropped, and a name whose inode is left with no readable node is
-not listed, and counted too. For
+report counts the nodes dropped. For
 each name the newest version wins and a newer entry with inode 0 unlinks it; each file
 takes its mode, owner and times from its newest inode node and is cut to that node's size.
+
+A name is stored as bytes with no encoding. Bytes that are not UTF-8 are listed as `%XX`,
+a stored NUL as `%00` and a slash inside one name as `%2F`. A link target is decoded the
+same way and keeps its slashes. Two stored names that come out as the same text stay two
+entries. 1.87 listed such a name with a surrogate character, which SQLite refuses.
+
+The report counts the names linked from the root. A name in a directory the root does not
+reach is counted apart and not listed: the kernel's mount pass removes an inode no name
+links, and a directory's children with it (`fs/jffs2/build.c`). The volume's `note` in
+`volumes.json` states how many there are, that their parent folder has no entry the root
+reaches, and that they are not exported. A region with nothing cut from it can hold such
+names (one real flash region read whole holds 14), so the note is a count and does not
+change the exit status.
+
+JFFS2 records no size and no count of its own, so a region that holds only part of a
+filesystem reads as a smaller one. What the region itself shows is recorded:
+
+- **The region ends inside a node** (a header whose CRC holds and a length that runs past
+  the end of the region). The volume's `damage_first` in `volumes.json` says so, with
+  `folders_not_read`, and the run exits 1.
+- **A file's data nodes do not cover its size.** JFFS2 writes a hole as a node, so a range
+  no node covers is missing, not a hole. The member is
+  `<name>.SHORT-<got>-of-<size>-bytes`, where `<got>` is the bytes its nodes hold. Nothing
+  is written after the last byte a node holds, and a missing range before that is zeros
+  so later bytes keep their offsets. The exceptions table says where. The volume's damage
+  counts such files and the run exits 1. 1.87 wrote the missing range as zeros in a
+  member of full size, with no record.
+- **A name's inode has no readable node.** It is a `FAILED` row, the volume's `note`
+  counts it, and the run exits 1. A name in a directory the root does not reach has no
+  path to put in a row, so it is counted in the note and in the damage.
+
+None of these appears on the nine fixtures read whole. A region cut where no node is
+split, with every name it still holds complete, has nothing to record and reads as a
+smaller filesystem with exit 0. A kernel-written image stopped before the block holding
+its root names is close to that: it exits 0, and its only record is the note counting
+the one name the root no longer reaches. Only cuts were tested. The fixtures were stopped
+at three points each (4 KiB before the end, half way, and after the first node); other
+damage was not tested. On the seven `mkfs.jffs2` images the one file a cut left short had
+lost its end. The kernel-written NAND dump stopped 4 KiB before its end no longer divides
+into pages, so it is read with its spare bytes in place: two nodes fail their data CRC and
+one file is SHORT with 7,000 bytes missing from byte 0, which are zeros in the member. The
+kernel-written NOR image stopped half way holds one name the root does not reach. The
+self-test also runs a range missing in the middle of a file and a name the root does not
+reach on images of a few nodes that it writes.
 The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
 8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
 properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
@@ -5340,9 +5383,13 @@ above are in this README only for now.)
   an image that dropped it has no transaction record after each page, so the
   `.filetable` should not be found and the image should be reported as not recognised;
   no such image was available to run.
-- **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
+- **SquashFS has not been run against flash from a real device, and JFFS2 only without
+  known data.** Their images
   were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
-  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
+  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. JFFS2
+  was also read on two regions of one real device's flash dump, in full: both list and
+  export with no damage recorded, but nothing independent says what those regions should
+  hold, so the content was not checked. YAFFS2
   and UBIFS have been: an Android phone under
   [YAFFS1 and YAFFS2](#yaffs1-and-yaffs2), and that phone and a Foscam R2 camera under
   [Deleted files on YAFFS2, JFFS2 and UBIFS](#deleted-files-on-yaffs2-jffs2-and-ubifs).
