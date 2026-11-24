@@ -2623,11 +2623,19 @@ second version. The report names the older copies:
 A UBI volume name and a UBIFS file name are stored bytes. A byte that is not UTF-8 is shown
 as `%XX` of the stored byte, a NUL as `%00`, and a `/` stored inside one name as `%2F`, so a
 volume `ubinize` named `data/vol` is listed as `data%2Fvol`, one volume, and not as a folder
-`data` holding `vol`. No name holds a surrogate, two stored names that differ stay
-different, and a literal `%` is not escaped. Up to 1.87 a volume name lost such a byte to
-U+FFFD and a file name carried a surrogate, which the zip spelled as three escaped bytes
-(`caf%ED%B3%A9.txt` for a stored `caf<E9>.txt`, now `caf%E9.txt`). A symbolic link's target
-is not a name and is returned as it was.
+`data` holding `vol`. No name holds a surrogate, and a literal `%` is not escaped. Up to
+1.87 a volume name lost such a byte to U+FFFD and a file name carried a surrogate, which
+the zip spelled as three escaped bytes (`caf%ED%B3%A9.txt` for a stored `caf<E9>.txt`, now
+`caf%E9.txt`). A symbolic link's target shows such a byte as `%XX` too, and its slashes
+are left as they are.
+
+Because `%` is not escaped, a name that holds the byte and a name that holds the text of
+its escape can list alike. On a volume `mkfs.ubifs` wrote with `caf<E9>.txt` and a file
+really named `caf%E9.txt` in one folder, both list as `caf%E9.txt` and both files are in
+the zip with their own content. The name stored as plain text is listed first and keeps
+the member name, and the one with the byte is written as `caf%E9.txt.dup-2` with a
+`RENAMED` row. That row gives the listed name, which is the same for both, so it is the
+order that tells them apart.
 
 UBIFS stores an inode's seconds as a signed 64-bit number, and the kernel reads them that
 way (`ubifs_iget`). Up to 1.87 they were read unsigned, and a file dated 1960 came out as
@@ -2660,6 +2668,17 @@ something lost counts in `folders_not_read`, so the run exits 1. A record that b
   kernel takes it to be empty.
 - **A volume table that does not read.** Each volume number with mapped eraseblocks is
   listed as `vol<number>`, and the record says its name, type and padding are not known.
+- **Only the volume table.** When the table reads and no eraseblock of any volume it lists
+  is in the image, each volume is an empty file and the record says their data is not
+  here.
+- **One erase counter header and no second one.** Every eraseblock opens with that header
+  and the volume table is kept in two eraseblocks, so a file that opens with a header
+  whose CRC holds and has no second one within 8 MiB holds at most one eraseblock. It is
+  reported as UBI and not read, and the volume's record says why (`extract_error`).
+- **A bare UBIFS volume cut after its superblock node.** When that node's CRC holds, no
+  master node reads, and the eraseblocks the node counts reach past the end of the image,
+  the volume is reported as UBIFS and not read, and its record says how many of its bytes
+  lie past the end.
 - **A volume that opens as UBIFS or SquashFS and cannot be read as one** is exported as one
   file of its raw bytes, and the record says its files are not listed.
 - **A NAND dump that ends inside a page.** Its whole pages are read with the spare
@@ -2685,16 +2704,27 @@ files and records the 128 bytes of a page left over, with exit 1. Cut in half, t
 `ubinize` images and the bare UBIFS image each record one index node that does not read,
 list no file of the UBIFS volume and exit 1, and the NAND dump records the journal that was
 not replayed and exits 1. Uncut, all seven export as before with no record. On a NAND dump
-from a real device, one of ten UBIFS volumes has 10 index nodes and 1 directory entry node
+from a real device, one of its four UBIFS volumes has 10 index nodes and 1 directory entry node
 that do not read and 6 names whose inode does not read. It now carries two records and six
 more `FAILED` rows.
 
 A cut that falls between two eraseblocks leaves no part of one behind, so it shows only
 through what is then missing: one of the halved `ubinize` images and the halved NAND dump
 are cut that way, and are recorded by the index node and by the log. A static volume whose
-eraseblocks are all gone is then only a note. A file cut inside its first eraseblock is not
-recognised as UBI or UBIFS at all: cut to 128, 576, 2,112 and 4,096 bytes, the fixtures
-gave an empty export and exit 0.
+eraseblocks are all gone is then only a note. A dynamic volume with no eraseblock, beside
+others that have theirs, is an empty file with no record: a volume `ubinize` wrote empty
+looks the same.
+
+Cut to 128, 576, 2,112 and 4,096 bytes, the six UBI fixtures are each reported as UBI and
+not read, with a record and exit 1, 24 runs of 24. So are a UBI fixture cut to its
+64-byte header and three cut to one eraseblock. The NOR fixture cut to two eraseblocks,
+which hold its volume table alone, exports three empty files with the record that no
+volume's data is here, and exits 1. The bare UBIFS fixture cut to 4,096 bytes, its whole
+superblock node, is reported as UBIFS with 1,773,568 of its 1,777,664 bytes past the end,
+and exits 1. Cut to 128, 576 and 2,112 bytes, inside that node, its CRC cannot be checked
+and the file is not recognised: an empty export and exit 0. The NOR fixture cut to one
+eraseblock with one bit of its first header changed, so that the CRC fails, is not taken
+for UBI.
 
 ### YAFFS1 and YAFFS2
 
