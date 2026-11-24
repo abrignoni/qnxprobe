@@ -29279,6 +29279,7 @@ def _ext_reader_checks():
     tree whose sha256 list was recorded before the image existed
     (tools/make_ext_layout_fixtures.sh). The damage is one field or block patched, in
     memory, into a copy of a committed fixture."""
+    import contextlib
     import gzip
     import hashlib
     import shutil
@@ -29390,6 +29391,9 @@ def _ext_reader_checks():
                 crcs = {i.filename.split("/", 1)[-1]: (i.CRC, i.file_size) for i in zin.infolist()}
             return done.returncode, rec, rows, crcs
         finally:
+            for left in ("v.img", "o.zip"):             # the build's temp folder is shared
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(work, left))
             shutil.rmtree(work, ignore_errors=True)
 
     out = []
