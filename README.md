@@ -1402,8 +1402,9 @@ read. An `$MFT` too fragmented for its own record is followed through its
 `$ATTRIBUTE_LIST`, and so is a directory index split over several records.
 
 An image cut short was tested at three points (the last 4 KiB, halfway, and just after the
-boot region) on 13 volumes Windows wrote: each run lost nothing, or recorded what it lost
-and exited 1. The list below says what the reader does when it meets each state. Those
+boot region) on 13 volumes Windows wrote: each run lost nothing or recorded what it lost.
+A cut that only shortens files names them `.SHORT`, records the ranges and exits 0. A cut
+that loses `$MFT` records or a folder exits 1. The list below says what the reader does when it meets each state. Those
 paths were run on patched copies of the fixtures, so they are not a claim that damage in
 general is detected: a lost sector over the start of an MFT record, for one, can lose that
 file or folder with no record.
@@ -1427,8 +1428,10 @@ file or folder with no record.
   wholly past the record's bytes in use, nothing it holds was affected: the record is
   noted and neither the count nor the exit status changes. `listing()` keeps the subtree
   under such a record, and counts the directory when the record does not parse.
-- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut before or through `$MFT`
-  says how many records lie past its end and exits 1. `$Bitmap` is never read past what
+- A torn `$MFT` record 0 is read from `$MFTMirr`. An image cut through `$MFT` says how many
+  records lie past its end and exits 1. One cut before `$MFT` also exits 1. It gives that
+  count only when `$MFTMirr` is still in the image, and otherwise says the MFT's own record
+  is unreadable. `$Bitmap` is never read past what
   the volume's clusters need, and clusters whose bitmap could not be read count as in
   use, so `free_extents()` does not report them free.
 
@@ -1438,12 +1441,13 @@ file: its name, size, dates, and whether the content can still be read. A file w
 data was **resident**, small enough to sit inside the MFT record, is always recoverable
 this way, and it is the only route to one, because it never occupied a cluster a carver
 could find. A non-resident file is recoverable only while `$Bitmap` marks every cluster it
-used as free, its initialized size is not 0, and no other record outranks it on those
-clusters. A cluster is reallocated only after the file holding it was freed, so of two
-records mapping one cluster, the one with the later log sequence number wrote it last: a
-deleted record loses to that one and to any live record, and two records the log cannot
-order are both refused. The `reason` gives the count and names the other record. A reuse
-by a file whose own record has since been overwritten leaves no trace, so a recovered
+used as free, its initialized size is not 0, the image holds every cluster its read needs,
+and no other record has a claim on those clusters. A deleted record claims the clusters
+inside its initialized size. When two deleted records claim one cluster, both are refused,
+because the volume does not record which wrote it last: a later log sequence number shows
+a later update of the record, not of its data. A deleted record sharing a cluster with a
+live record is refused too. The `reason` gives the count and names the other record. A
+reuse by a file whose own record has since been overwritten leaves no trace, so a recovered
 file's bytes are still a candidate, not a proven copy. A deleted file the overlay filter
 compressed, or a cloud placeholder, is reported as not recoverable, since its content is
 not in its unnamed stream. `$ATTRIBUTE_LIST` is not followed for a deleted record, because

@@ -4801,7 +4801,8 @@ class NtfsWalker:
         self._mft0 = None                        # record 0 as $MFTMirr holds it, when used
         self._mft_list_lost = False              # $MFT's own attribute list could not be read
         self._stream_folders = {}                # path -> a folder collect() saw with streams
-        self._conflicts = None                   # deleted record -> why another outranks it
+        self._conflicts = None                   # deleted record -> what else claims its clusters
+        self._room = self._image_room()          # bytes of the image from this volume on
         self._records = {}                       # record number -> attributes
         self._alloc_bitmap = None                # $Bitmap bytes, read on first need
         self._mft_runs = None
@@ -4952,17 +4953,21 @@ class NtfsWalker:
                 have.setdefault(piece.start_vcn, piece)
         return self._runs_in_vcn_order(have)
 
-    def _note_mft_past_end(self):
-        """Record how many $MFT records lie past the end of a cut image. Each may have
-        held a file or folder, and nothing else in the export can count them."""
+    def _image_room(self):
+        """The bytes the image holds from this volume's start, or None if it cannot say."""
         try:
             end = self.fh.seek(0, os.SEEK_END)
         except (OSError, ValueError):
-            return
+            return None
+        return end - self.base if isinstance(end, int) else None
+
+    def _note_mft_past_end(self):
+        """Record how many $MFT records lie past the end of a cut image. Each may have
+        held a file or folder, and nothing else in the export can count them."""
         mft = self._data_attr(0)
-        if not isinstance(end, int) or mft is None or not mft.data_size:
+        if self._room is None or mft is None or not mft.data_size:
             return
-        room, pos, lost, unmapped = end - self.base, 0, 0, 0
+        room, pos, lost, unmapped = self._room, 0, 0, 0
         for lcn, count in mft.runs:
             span = count * self.cluster
             used = min(span, max(mft.data_size - pos, 0))
@@ -5304,19 +5309,44 @@ class NtfsWalker:
         if self.total_clusters and clusters > self.total_clusters:
             return f"its runs store {clusters:,} clusters and this volume has " \
                    f"{self.total_clusters:,}"
+        if self._room is not None:
+            needed = self._initialized_runs(data)
+            held = self._room // self.cluster
+            past = sum(max(0, lcn + run - max(lcn, held)) for lcn, run in needed)
+            if past:
+                return (f"{past:,} of the {sum(run for _lcn, run in needed):,} clusters its read "
+                        "needs lie past the end of the image")
         marked = sum(self._clusters_marked(lcn, run) for lcn, run in stored)
         if marked:
             return f"$Bitmap marks {marked:,} of the {clusters:,} clusters it reads as in use"
         return ""
 
-    def _deleted_conflicts(self):
-        """{record: reason} for deleted records whose clusters another record also maps.
+    def _initialized_runs(self, attr):
+        """[(lcn, clusters)] of an attribute's stored runs inside its initialized size: the
+        clusters a read of it uses. A piece that does not start at VCN 0 holds no sizes of
+        its own, so all of its stored runs count."""
+        if attr.start_vcn:
+            return [(lcn, count) for lcn, count in attr.runs if lcn is not None and count]
+        limit = -(-attr.init_size // self.cluster)
+        out, vcn = [], 0
+        for lcn, count in attr.runs:
+            take = min(count, limit - vcn)
+            if take <= 0:
+                break
+            if lcn is not None:
+                out.append((lcn, take))
+            vcn += count
+        return out
 
-        A cluster is only reallocated after the file holding it was freed, so of two
-        records that map it the one with the later log sequence number (the LSN at 0x08
-        of the record header) wrote it last. A deleted record loses to a live record and to
-        one with a later LSN. Equal LSNs, or one of 0, cannot order the two, and neither is
-        offered. Memory is one bit per cluster plus the runs of the records still in play."""
+    def _deleted_conflicts(self):
+        """{record: reason} for deleted records whose clusters another record also claims.
+
+        A deleted record claims the clusters inside its initialized size, so a record with
+        an initialized size of 0 claims none. When two deleted records claim one cluster,
+        neither is offered: the volume does not record which wrote it last. The log sequence
+        number shows the last update of the record, not of its data. A record still in use
+        holds every cluster of its runs. Memory is one bit per cluster plus the runs of the
+        records still in play."""
         if self._conflicts is not None:
             return self._conflicts
         self._conflicts = {}
@@ -5325,7 +5355,7 @@ class NtfsWalker:
             return self._conflicts
         count = mft.data_size // self.rec_size
         claimed = bytearray((self.total_clusters + 7) // 8)
-        lsns, spans, sizes = {}, [], {}
+        spans, sizes, live = [], {}, set()
         for num in range(count):
             raw = self._record_raw(num)
             parsed = self._parse_deleted(raw) if raw and raw[:4] == NTFS_FILE else None
@@ -5342,47 +5372,46 @@ class NtfsWalker:
             has_list = any(a.type == NTFS_ATTRIBUTE_LIST for a in attrs)
             if self._deleted_blocker(data, attrs, data.data_size, has_list):
                 continue
-            runs = [(lcn, run) for lcn, run in data.runs if lcn is not None and run]
+            runs = self._initialized_runs(data)
             if not runs:
                 continue
-            lsns[num] = struct.unpack_from("<Q", raw, 8)[0]
             sizes[num] = sum(run for _lcn, run in runs)
             for lcn, run in runs:
                 spans.append((lcn, lcn + run, num))
                 self._set_bits(claimed, lcn, lcn + run)
-        if not lsns:
+        if not sizes:
             return self._conflicts
-        candidates = set(lsns)
         for num in range(count):
             raw = self._record_raw(num)
             parsed = self._parse_deleted(raw) if raw and raw[:4] == NTFS_FILE else None
             if parsed is None:
                 continue
             flags, attrs = parsed
+            in_use = bool(flags & NTFS_MFT_IN_USE)
             for a in attrs:
-                if a.resident or (num in candidates and a.type == NTFS_DATA and not a.name):
+                if a.resident or (num in sizes and a.type == NTFS_DATA and not a.name):
                     continue
-                for lcn, run in a.runs:
+                runs = (a.runs if in_use else self._initialized_runs(a))
+                for lcn, run in runs:
                     if lcn is None or lcn < 0 or not run:
                         continue
                     stop = min(lcn + run, self.total_clusters)
                     if lcn < stop and self._bits_set(claimed, lcn, stop):
                         spans.append((lcn, stop, num))
-                        if num not in lsns:         # None stands for a live record
-                            lsns[num] = None if flags & NTFS_MFT_IN_USE else \
-                                struct.unpack_from("<Q", raw, 8)[0]
-        found = self._shared_clusters(spans, lsns, candidates)
-        for num, (shared, other, kind) in found.items():
-            what = (f"live record {other}" if kind == 0 else
-                    f"record {other}, whose log sequence number is later" if kind == 1 else
-                    f"record {other}, and their log sequence numbers do not order them")
-            self._conflicts[num] = f"{shared:,} of its {sizes[num]:,} clusters are also mapped by {what}"
+                        if in_use:
+                            live.add(num)
+        for num, (shared, other, is_live) in self._shared_clusters(spans, live, sizes).items():
+            self._conflicts[num] = (
+                f"{shared:,} of its {sizes[num]:,} clusters are also mapped by live record {other}"
+                if is_live else
+                f"{shared:,} of its {sizes[num]:,} clusters are also claimed by deleted record "
+                f"{other}, and the volume does not record which wrote last")
         return self._conflicts
 
     @staticmethod
-    def _shared_clusters(spans, lsns, candidates):
-        """{candidate: [clusters lost, the other record, 0 live, 1 later or 2 unordered]},
-        from one sweep over the spans in cluster order."""
+    def _shared_clusters(spans, live, candidates):
+        """{candidate: [clusters shared, the other record, whether that record is live]},
+        from one sweep over the spans in cluster order. A live record is named first."""
         import heapq
         spans.sort()
         found, active, ends, index, at = {}, {}, [], 0, 0
@@ -5398,23 +5427,15 @@ class NtfsWalker:
             if index < len(spans):
                 upto = min(upto, spans[index][0])
             if len(active) > 1:
-                live = next((o for o in active if lsns[o] is None), None)
-                if live is not None:
-                    losers = [(o, live, 0) for o in active if o in candidates]
-                else:
-                    best = max(active, key=lambda o: lsns[o])
-                    unordered = (sum(1 for o in active if lsns[o] == lsns[best]) > 1
-                                 or any(not lsns[o] for o in active))
-                    if unordered:
-                        losers = [(o, next(x for x in active if x != o), 2)
-                                  for o in active if o in candidates]
-                    else:
-                        losers = [(o, best, 1) for o in active if o in candidates and o != best]
-                for owner, other, kind in losers:
-                    row = found.setdefault(owner, [0, other, kind])
+                holder = min((o for o in active if o in live), default=None)
+                for owner in active:
+                    if owner not in candidates:
+                        continue
+                    other = holder if holder is not None else min(o for o in active if o != owner)
+                    row = found.setdefault(owner, [0, other, holder is not None])
                     row[0] += upto - at
-                    if kind < row[2]:
-                        row[1], row[2] = other, kind
+                    if holder is not None and not row[2]:
+                        row[1], row[2] = holder, True
             at = upto
             while ends and ends[0][0] == at:
                 _end, owner = heapq.heappop(ends)
@@ -5490,11 +5511,13 @@ class NtfsWalker:
 
         Each result carries ``recoverable``: True for a resident file, and for a
         non-resident one while every cluster it used is free, its initialized size is
-        not 0, and no live record or deleted record with a later log sequence number maps
-        any of them. Two records the log cannot order are both refused. False otherwise,
-        in which case the record is reported as evidence the file existed rather than its
-        content offered. A reuse by a file whose own record has since been overwritten
-        leaves no trace, so recovered bytes are a candidate, not a proven copy. A file the
+        not 0, the image holds every cluster its read needs, and no live record maps one
+        of them and no other deleted record claims one. Two deleted records that claim one
+        cluster are both refused, each naming the other, because the volume does not
+        record which wrote it last. False otherwise, in which case the record is reported
+        as evidence the file existed rather than its content offered. A reuse by a file
+        whose own record has since been overwritten leaves no trace, so recovered bytes
+        are a candidate, not a proven copy. A file the
         overlay filter compressed, or a cloud placeholder, is not recoverable: its content
         is not in its unnamed stream. A record naming a base record is part of that file
         and is not listed. ``$ATTRIBUTE_LIST`` is not followed (see ``_parse_deleted``), so a file
@@ -5575,7 +5598,7 @@ class NtfsWalker:
         if data.resident:
             yield data.value[:want]
             return
-        yield from self._read_nonresident(data, want)
+        yield from self._read_nonresident(data, want, owner=f"deleted record {entry.record}")
 
     def volume_label(self):
         """The volume label, from the $VOLUME_NAME attribute of record 3, or None
@@ -35620,12 +35643,12 @@ def _ntfs_deleted_check(image_gz, listing):
     matched = missing = different = 0
     for name, digest in want.items():
         e = have.get(name)
-        if e is None or not (e.recoverable or "do not order" in e.reason):
+        if e is None or not (e.recoverable or "does not record which" in e.reason):
             missing += 1
             continue
-        # ntfs-3g keeps no log, so every record of this fixture has LSN 0. recording.bin
-        # reuses clusters of files deleted before it, and the two cannot be ordered, so
-        # it is refused. Its bytes are still compared, through the same read path.
+        # recording.bin reuses clusters of files deleted before it, and the volume does not
+        # record which wrote last, so it is refused. Its bytes are still compared, through
+        # the same read path.
         h = hashlib.sha256()
         for chunk in (w.read_deleted(e) if e.recoverable
                       else w._read_nonresident(e._data, e.size)):  # pylint: disable=protected-access
@@ -37626,6 +37649,16 @@ def _ntfs_reader_fix_checks(image_gz):
             raise ValueError("too few free clusters")
         return found[:want]
 
+    def highest_free():
+        """The last free cluster no record maps, and the first one, for a cut between."""
+        free = quiet(1)
+        for want in range(2, records):
+            try:
+                free = quiet(want)
+            except ValueError:
+                break
+        return free[0], free[-1]
+
     def deleted_marked():
         free = quiet(4)
         size = 4 * cluster
@@ -37670,20 +37703,65 @@ def _ntfs_reader_fix_checks(image_gz):
         put(img, spare[1], other)
         return {e.record: e for e in walker(img).deleted_files()}
 
-    def shared_later():
-        got = shared_case(100, 200)
-        return (not got[spare[0]].recoverable and got[spare[1]].recoverable
-                and got[spare[0]].reason == f"2 of its 3 clusters are also mapped by record "
-                                            f"{spare[1]}, whose log sequence number is later")
-    row("a deleted record sharing clusters with a later one is refused, the later one kept",
-        shared_later)
+    def shared_any_lsn():
+        for first, second in ((100, 200), (200, 100), (150, 150), (0, 150)):
+            got = shared_case(first, second)
+            for me, you in ((spare[0], spare[1]), (spare[1], spare[0])):
+                if (got[me].recoverable or got[me].reason !=
+                        f"2 of its 3 clusters are also claimed by deleted record {you}, and "
+                        "the volume does not record which wrote last"):
+                    return False
+        return True
+    row("two deleted records claiming a cluster are both refused, whatever their LSNs",
+        shared_any_lsn)
 
-    def shared_unordered():
-        same = shared_case(150, 150)
-        none = shared_case(0, 150)
-        return all(not g[n].recoverable and "do not order" in g[n].reason
-                   for g in (same, none) for n in spare[:2])
-    row("two deleted records the log cannot order are both refused", shared_unordered)
+    def claim_case(second_init):
+        free = quiet(4)
+        size = 3 * cluster
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 2, [(c, 1) for c in free[:3]], size, size))], 100))
+        put(img, spare[1], free_rec([0x62], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 2, [(free[3], 1), (free[1], 1), (free[2], 1)], size, size,
+            second_init))], 200))
+        return {e.record: e for e in walker(img).deleted_files()}
+
+    def init_zero_claims_nothing():
+        got = claim_case(0)
+        return (got[spare[0]].recoverable and not got[spare[1]].recoverable
+                and "initialized size is 0" in got[spare[1]].reason)
+    row("a deleted record with initialized size 0 cannot refuse another",
+        init_zero_claims_nothing)
+
+    def past_init_claims_nothing():
+        got = claim_case(cluster)
+        return got[spare[0]].recoverable and got[spare[1]].recoverable
+    row("a deleted record claims only the clusters inside its initialized size",
+        past_init_claims_nothing)
+
+    def cut_case():
+        low, high = highest_free()
+        size = 2 * cluster
+        img = bytearray(clean)
+        put(img, spare[0], free_rec([0x61], [(NTFS_DATA, nonresident(
+            NTFS_DATA, "", 0, 1, [(low, 1), (high, 1)], size, size))], 100))
+        w = walker(img[:high * cluster])
+        return w, next(e for e in w.deleted_files() if e.record == spare[0])
+
+    def deleted_past_image():
+        _w, got = cut_case()
+        return (not got.recoverable and got.reason ==
+                "1 of the 2 clusters its read needs lie past the end of the image")
+    row("a deleted file whose read needs clusters past the image's end is not recoverable",
+        deleted_past_image)
+
+    def deleted_gap_names_owner():
+        w, got = cut_case()
+        got.recoverable = True                   # to reach the read path on purpose
+        b"".join(w.read_deleted(got))
+        said = damage(w)
+        return f"deleted record {spare[0]}:" in said and "a file:" not in said
+    row("a deleted file's missing range is recorded under its own record", deleted_gap_names_owner)
 
     def shared_live():
         got = shared_case(900, 100, live=True)
