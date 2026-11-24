@@ -3265,6 +3265,11 @@ garbage collection freed a block, so a partition can open on blocks holding only
 pages or only erased ones; when the first pages hold tags that fit but no object header,
 or almost nothing but erased pages, the same test runs again over sixteen stretches spread
 across the whole region, each the same number of bytes for every page size tried.
+A YAFFS2 checkpoint page is left out of that test and of the scan. YAFFS2 writes its
+checkpoint to the first empty block, which can be the first block of the partition, and
+tags its pages with a fixed sequence value (0x21) that no object or data page carries;
+YAFFS itself scans none of them for objects. Up to 1.87 a volume whose first used pages
+were a checkpoint was not recognised.
 
 YAFFS2 is read the way its own scan reads it: blocks newest first, the newest object
 header and the newest copy of each data page winning, data past a shrink or past the
@@ -3272,7 +3277,33 @@ newest header's size ignored, and a file's size taken from its newest header or 
 written after it, whichever is further. YAFFS1 orders two copies of a page by their 2-bit
 serial number and takes a file's size from where its furthest live page ends. `lost+found`
 is always listed, as YAFFS lists it; when the flash holds no header for it or for the root,
-no time is shown for them, since YAFFS makes them at mount time.
+no time is shown for them, since YAFFS makes them at mount time. A YAFFS2 data page can
+carry a chunk id up to 2^28 - 1, as YAFFS accepts; the 20-bit limit applies to YAFFS1 only,
+whose tag field is that wide. Up to 1.87 a YAFFS2 page with an id of 2^20 or more was
+dropped, so the part of a file past about 2 GiB (with 2048-byte pages) read as zeros.
+
+A stored name is bytes. A byte that is not UTF-8 shows as `%XX` of the stored byte (`0xE9`
+is `%E9`) and a `/` inside one name as `%2F`, so a name never holds a surrogate and cannot
+invent a folder. A symlink's target is shown the same way with its `/` kept, and its size
+is the stored length. A literal `%` is not escaped.
+
+An object whose parent folder has no header in the image has no path. YAFFS makes such a
+folder itself at mount and puts it under `lost+found`; the image holds no name or time for
+it, so qnxprobe does not invent one. The objects under it are not exported. The volume's
+record counts them (`damage_first`, `folders_not_read`), each file among them is counted
+in `failed` and gets a `FAILED` row in the exceptions table with its object id, size and
+stored name, and the run exits 1. This is what an image cut before a folder's header
+gives: on the YAFFS1 history image with its last 4 KiB removed, 3 of the 49 files are
+exported and 44 files and a folder are recorded that way.
+
+An object that has data pages and no header of its own is recorded too. YAFFS makes a file
+from a data page alone, also under `lost+found`, but the image holds no name, size, time
+or folder for it, so it is not exported. A damage line gives the count and the bytes those
+pages hold, each such object gets a `FAILED` row with its object id, page count and bytes,
+`folders_not_read` is set and the run exits 1. On the same cut image three objects are
+recorded that way, two of them the other two files of the 49. Cut just after its first
+object header, that image lists no file and records four such objects. On the 28 whole
+known-data volumes that are read, neither record appears.
 
 Validated two ways. Aleph One's own image makers wrote four images (YAFFS2 little endian,
 YAFFS2 with big-endian headers, YAFFS2 with its tags two bytes into the spare, and YAFFS1):
@@ -3296,6 +3327,16 @@ and a socket and a FIFO on /data, whose stored modes carry their type, which qnx
 reports and YAFFS's direct interface drops. Directory sizes were not compared (YAFFS
 reports 2048, qnxprobe 0). The /cache partition's first object header is at page 3,968,
 which is what the wider search above is for; before 1.35 it was not recognised.
+
+YAFFS's own core also wrote 22 more YAFFS2 volumes (2048-byte pages, 64-byte spare),
+each read back by that core as known data: clean unmounts with a checkpoint, twelve after
+1 to 12 rounds of writing and deleting a large file so that garbage collection runs before
+the checkpoint is written, a sparse file with data past 2 GiB, names that are not UTF-8, times in 1970, 2038 and 2110, a rename over a file,
+a file unlinked while open, and tags without ECC. 21 of the 22 match on every file's path,
+size, sha256 and time (the two times a zip cannot hold are recorded as `TIME_NOT_HELD`).
+Four of the twelve hold the checkpoint in their first two pages and the sparse file's last
+bytes sit in pages with ids above 2^20. The 22nd uses inband tags, which are not read
+(see the limits below).
 
 ### Deleted files on YAFFS2, JFFS2 and UBIFS
 
@@ -4945,6 +4986,13 @@ struct yaffs_obj_hdr (512 bytes)        core/yaffs_guts.h:330
 YAFFS2 packed tags and their ECC        core/yaffs_packedtags2.c
 YAFFS2 scan                             core/yaffs_yaffs2.c yaffs2_scan_chunk
 YAFFS1 tags and deletion                core/yaffs_tagscompat.c, core/yaffs_yaffs1.c
+checkpoint sequence value 0x21          core/yaffs_guts.h:104
+checkpoint page tags                    core/yaffs_checkptrw.c:291-294
+checkpoint blocks are not scanned       core/yaffs_yaffs2.c:1585-1595
+largest YAFFS2 chunk id, 2^28 - 1       core/yaffs_guts.h:50-54, core/yaffs_yaffs2.c:1204
+a file made from a data page alone      core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227
+a folder made for a missing header      core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296
+  starts under lost+found               core/yaffs_guts.c:1657-1661
 root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 ```
 
@@ -5223,6 +5271,13 @@ above are in this README only for now.)
   big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
   YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
   recognised at all.
+- **A cut YAFFS image mostly shows nothing to record.** YAFFS records no size for the
+  volume, so an image that ends early looks like a smaller volume. One cut halfway returned
+  an older state of the files, with no note, because the newer pages were past the cut. Cut
+  just after their first object header, 18 of the 28 known-data volumes are not recognised
+  and the other 10 list at most one file; 5 of those 10 carry a record. A partial page at
+  the end is dropped. Two cases are recorded: a folder whose header is missing while objects
+  that name it are present, and an object with data pages and no header (both above).
 - **Older versions of live files on flash are not listed.** Each flash reader returns the
   filesystem's current state, the way the filesystem itself reads it, and deleted files
   come from `recover_deleted()` (above). The earlier contents of a file that still exists

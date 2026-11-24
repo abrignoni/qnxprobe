@@ -20564,6 +20564,17 @@ def ubifs_lines(w):
 #   object ids: root 1, lost+found 2,          core/yaffs_guts.h:94-100
 #     unlinked 3, deleted 4, block summary 0x10
 #   sequence numbers 0x1000..0xefffff00        core/yaffs_guts.h:123-124
+#   checkpoint pages: sequence 0x21, chunk id  core/yaffs_guts.h:104,
+#     the page's number in the checkpoint plus  core/yaffs_checkptrw.c:291-294,
+#     1, n_bytes the page size; a block that    core/yaffs_yaffs2.c:1585-1595
+#     carries that sequence is counted as
+#     checkpoint and its chunks are not scanned
+#   data chunk ids: YAFFS2 up to 2^28 - 1;     core/yaffs_guts.h:50-54,
+#     YAFFS1 holds them in 20 bits              core/yaffs_yaffs2.c:1204,
+#                                               core/yaffs_guts.h:152-159
+#   an object whose folder has no header: the  core/yaffs_yaffs2.c:1416-1418,
+#     scan makes that folder, which a new       core/yaffs_yaffs1.c:293-296,
+#     object starts under lost+found            core/yaffs_guts.c:1657-1661
 #   YAFFS2 packed tags: seq, obj, chunk,       core/yaffs_packedtags2.h/.c
 #     n_bytes (16 bytes) then tag ECC; an
 #     object header's tags may carry its type
@@ -20596,6 +20607,9 @@ def ubifs_lines(w):
 YAFFS_ROOT, YAFFS_LOSTNFOUND, YAFFS_UNLINKED, YAFFS_DELETED = 1, 2, 3, 4
 YAFFS_OBJECTID_SUMMARY = 0x10
 YAFFS_SEQ_LO, YAFFS_SEQ_HI = 0x00001000, 0xEFFFFF00
+YAFFS_SEQ_CHECKPOINT = 0x21                      # core/yaffs_guts.h:104
+YAFFS2_MAX_CHUNK_ID = (1 << 28) - 1              # core/yaffs_guts.h:50-54
+YAFFS_UNREACHED_NAMED = 48                       # damage lines naming a folder with no header
 YAFFS_TYPES = {1: "file", 2: "symlink", 3: "directory", 4: "hardlink", 5: "special"}
 YAFFS_TYPE_MODE = {1: S_IFREG, 2: S_IFLNK, 3: S_IFDIR}
 YAFFS_EXTRA_HDR, YAFFS_EXTRA_SHRINK = 0x80000000, 0x40000000
@@ -20636,13 +20650,33 @@ def _yaffs2_tags(spare, off, e):
                             type=obj >> 28, size_or_equiv=nbytes))
     elif obj >> 28:
         return None
-    if not 0 < t["obj"] < (1 << 18) or t["chunk"] >= (1 << 20):
+    # YAFFS2 takes a chunk id up to YAFFS_MAX_CHUNK_ID, 2^28 - 1
+    # (core/yaffs_guts.h:50-54, tested at core/yaffs_yaffs2.c:1204). The 20-bit
+    # limit is YAFFS1's, whose tag field is that wide (_yaffs1_tags).
+    if not 0 < t["obj"] < (1 << 18) or t["chunk"] > YAFFS2_MAX_CHUNK_ID:
         return None
     ecc = spare[off + 16:off + 28]
     if len(ecc) == 12 and ecc != b"\xff" * 12:
         lp, lpp = struct.unpack_from(e + "II", ecc, 4)
         t["ecc_ok"] = (lp, lpp) == _yaffs2_line_parity(raw)
     return t
+
+
+def _yaffs2_checkpoint_tags(spare, off, e, chunk):
+    """True when the packed tags at `off` are those YAFFS2 writes on a page of
+    its checkpoint (core/yaffs_checkptrw.c:291-294): the fixed sequence value
+    0x21, a chunk id of the page's number in the checkpoint plus 1, and
+    n_bytes equal to the page size. The object id field holds a block number
+    there, so it is not tested. YAFFS counts a block with that sequence value
+    as checkpoint and scans none of its chunks for objects or data
+    (core/yaffs_yaffs2.c:1585-1595), so these pages say nothing about the
+    layout and hold no object."""
+    raw = spare[off:off + 16]
+    if len(raw) < 16:
+        return False
+    seq, _obj, page_no, nbytes = struct.unpack(e + "IIII", raw)
+    return (seq == YAFFS_SEQ_CHECKPOINT and 0 < page_no <= YAFFS2_MAX_CHUNK_ID
+            and nbytes == chunk)
 
 
 def _yaffs1_tags(spare):
@@ -20682,39 +20716,51 @@ def _yaffs_header(data, e):
     rdev = struct.unpack_from(e + "I", data, 460)[0]
     wm = struct.unpack_from(e + "II", data, 480)
     size_hi, _res, shadows, shrink = struct.unpack_from(e + "IIiI", data, 496)
-    return dict(type=otype, parent=parent, name=name.decode("utf-8", "surrogateescape"),
+    # A stored byte that is not UTF-8 shows as %XX, a NUL cannot occur (the name
+    # ends at the first one) and a "/" inside one name shows as %2F so it cannot
+    # invent a folder. A symlink's target is a path, so its "/" stays.
+    return dict(type=otype, parent=parent,
+                name=name.decode("utf-8", "qnxprobe-name").replace("\x00", "%00").replace("/", "%2F"),
                 mode=mode, uid=uid, gid=gid, rdev=rdev, equiv=equiv,
                 mtime=mtime if wm[1] == 0xFFFFFFFF else (wm[1] << 32) | wm[0],
                 size=size_lo if size_hi == 0xFFFFFFFF else (size_hi << 32) | size_lo,
-                alias=alias.decode("utf-8", "surrogateescape"),
+                alias=alias.decode("utf-8", "qnxprobe-name"), alias_len=len(alias),
                 shrink=shrink not in (0, 0xFFFFFFFF))
 
 
 def _yaffs_tag_trials(chunk, spare):
-    """(version, tag offset, byte order, decoder) for every tag placement a
-    geometry allows: YAFFS1 tags on 512+16, and YAFFS2 packed tags at every
-    offset in the spare in both byte orders."""
+    """(version, tag offset, byte order, decoder, checkpoint test) for every tag
+    placement a geometry allows: YAFFS1 tags on 512+16, and YAFFS2 packed tags
+    at every offset in the spare in both byte orders. The checkpoint test says
+    whether a spare the decoder refused is a YAFFS2 checkpoint page's; YAFFS1
+    has no checkpoint, so it is None there."""
     trials = []
     if (chunk, spare) == (512, 16):
-        trials.append((1, 0, "<", lambda s: _yaffs1_tags(s)))
+        trials.append((1, 0, "<", lambda s: _yaffs1_tags(s), None))
     for off in range(0, spare - 15):
         for e in ("<", ">"):
-            trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e)))
+            trials.append((2, off, e, lambda s, off=off, e=e: _yaffs2_tags(s, off, e),
+                           lambda s, off=off, e=e: _yaffs2_checkpoint_tags(s, off, e, chunk)))
     return trials
 
 
-def _yaffs_tags_fit(decode, used):
+def _yaffs_tags_fit(decode, used, checkpoint=None):
     """True when the decoder finds plausible tags on at least 90% of the
-    first 16 used pages; it gives up as soon as that is out of reach."""
-    first = used[:16]
-    allowed = len(first) - 0.9 * len(first)
-    misses = 0
-    for _d, s in first:
+    first 16 used pages; it gives up as soon as that is out of reach. A
+    checkpoint page is not one of the 16: YAFFS2 writes its checkpoint to the
+    first empty block, which can be the first block of the partition."""
+    seen = misses = 0
+    for _d, s in used:
         if not decode(s):
+            if checkpoint is not None and checkpoint(s):
+                continue
             misses += 1
-            if misses > allowed:
+            if misses >= 2:                # 90% of at most 16 pages allows one miss
                 return False
-    return True
+        seen += 1
+        if seen == 16:
+            break
+    return misses <= seen - 0.9 * seen
 
 
 def _yaffs_pages(fh, base, size, chunk, spare, n, windows):
@@ -20790,17 +20836,20 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
         # on these pages; checking that first keeps the tag search off regions
         # that are not. Tags that fit anyway say the headers may lie further on.
         if not any(_yaffs_header(d, he) for d, _s in used for he in ("<", ">")):
-            if not hint and any(_yaffs_tags_fit(dec, used) for _v, _o, _e, dec in trials):
+            if not hint and any(_yaffs_tags_fit(dec, used, ck) for _v, _o, _e, dec, ck in trials):
                 hint = True
             continue
-        for version, off, e, decode in trials:
-            if not _yaffs_tags_fit(decode, used):
+        for version, off, e, decode, checkpoint in trials:
+            if not _yaffs_tags_fit(decode, used, checkpoint):
                 continue                   # most tag offsets fail on the first pages
             good = claimed = eccs = 0
+            counted = len(used)            # the used pages that are not checkpoint pages
             parsed = {"<": 0, ">": 0}
             for d, s in used:
                 t = decode(s)
                 if not t:
+                    if checkpoint is not None and checkpoint(s):
+                        counted -= 1
                     continue
                 good += 1
                 eccs += t.get("ecc_ok", False)
@@ -20810,12 +20859,12 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
                         if _yaffs_header(d, he):
                             parsed[he] += 1
             hdr_e = max(parsed, key=parsed.get)
-            if not (good >= 8 and good >= 0.9 * len(used) and claimed
+            if not (good >= 8 and good >= 0.9 * counted and claimed
                     and parsed[hdr_e] >= 0.9 * claimed):
-                if good >= 0.9 * len(used) and not claimed:
+                if good >= 0.9 * counted and not claimed:
                     hint = True
                 continue
-            rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / len(used))
+            rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / counted)
             if best is None or rank > best[0]:
                 best = (rank, (version, chunk, spare, off, e, hdr_e))
     return (best[1] if best else None), hint
@@ -20823,7 +20872,15 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
 
 class YaffsWalker:
     """List and read a YAFFS1 or YAFFS2 image. A node is an object id; the
-    root is object 1."""
+    root is object 1.
+
+    ``damage`` holds what was found wrong, for damage_lines(): objects whose
+    header names a parent folder that has no header in the image, and objects
+    that have data chunks and no header of their own. No listing from the root
+    reaches them or anything under them, ``unread_entries()`` lists them, and
+    ``folders_not_read`` counts the folders without a header (1 when only
+    objects without their own header were found, whose folder is not known).
+    An export gives each file among them a FAILED row."""
 
     root = YAFFS_ROOT
 
@@ -20850,6 +20907,100 @@ class YaffsWalker:
                 # An unlinked or deleted object's parent is 3 or 4, which no
                 # listing reaches from the root.
                 self.children[h["parent"]].append(oid)
+        self.damage, self.folders_not_read, self._unread, self._headerless = [], 0, [], []
+        self._note_unreached()
+
+    def _note_unreached(self):
+        """Record the objects whose parent folder has no header in the image.
+
+        YAFFS's scan makes such a folder itself and a folder it makes starts
+        under lost+found (core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296,
+        core/yaffs_guts.c:1657-1661). The image holds no name, place or time for
+        it, so nothing is listed in its stead: the objects are recorded here and
+        left out of the listing. An image cut before a folder's header gives this.
+
+        The same goes for an object that has data chunks and no header of its
+        own: YAFFS's scan makes a file from a data chunk alone, again under
+        lost+found (core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227,
+        core/yaffs_guts.c:1657-1661). No name, size, time or folder is known for
+        it, so it is counted with the bytes its chunks hold and not listed."""
+        fixed = (YAFFS_ROOT, YAFFS_LOSTNFOUND, YAFFS_UNLINKED, YAFFS_DELETED)
+        lost = sorted(p for p in self.children
+                      if p not in fixed and not (self.objs.get(p) or {}).get("hdr"))
+        self._headerless = sorted(oid for oid, o in self.objs.items()
+                                  if not o["hdr"] and o["chunks"])
+        if self._headerless:
+            held = sum(v[1] for oid in self._headerless
+                       for v in self.objs[oid]["chunks"].values())
+            n = len(self._headerless)
+            self.folders_not_read = len(lost) or 1
+            self.damage.append(
+                f"{n:,} object{'' if n == 1 else 's'} with data chunks ({held:,} bytes in all) "
+                f"{'has' if n == 1 else 'have'} no header in this image, so no name, size or "
+                f"folder is known for {'it and it is' if n == 1 else 'them and they are'} not "
+                f"exported; an image cut before such a header gives this; first object id "
+                f"{self._headerless[0]:,}")
+        if not lost:
+            return
+        direct = sum(len(self.children[p]) for p in lost)
+        seen = set()
+        for parent in lost:
+            stack = [(oid, parent, self.objs[oid]["hdr"]["name"])
+                     for oid in sorted(self.children[parent], reverse=True)]
+            while stack:
+                oid, above, path = stack.pop()
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                self._unread.append((path, oid, parent, above))
+                stack.extend((c, oid, path + "/" + self.objs[c]["hdr"]["name"])
+                             for c in sorted(self.children.get(oid, ()), reverse=True))
+        self.folders_not_read = len(lost)
+        under = len(self._unread) - direct
+        self.damage.insert(
+            0, f"{direct:,} objects name a parent folder that has no header in this image "
+            f"({len(lost):,} such folder{'' if len(lost) == 1 else 's'}), so their paths are "
+            f"not known and they are not "
+            f"exported" + (f", nor are {under:,} objects under them" if under else "")
+            + "; an image cut before a folder's header gives this")
+        for parent in lost[:YAFFS_UNREACHED_NAMED]:
+            kids = sorted(self.children[parent])
+            self.damage.append(
+                f"folder object {parent:,} has no header in this image: the {len(kids):,} "
+                f"objects that name it as their parent are not exported; the first is object "
+                f"{kids[0]:,}, stored name {self.objs[kids[0]]['hdr']['name']!r}")
+        if len(lost) > YAFFS_UNREACHED_NAMED:
+            self.damage.append(f"{len(lost) - YAFFS_UNREACHED_NAMED:,} more folder objects have "
+                               "no header in this image and are not named here")
+
+    def unread_entries(self, files_only=False):
+        """[(path below the folder with no header, object id, detail)] of every
+        object no listing reaches because a folder above it has no header in
+        the image. The path is not a path from the root, which is not known.
+        Then every object that has data chunks and no header of its own, with
+        an empty path. ``files_only`` leaves out folders, symlinks and special
+        files, which an export does not write as members."""
+        out = []
+        for path, oid, parent, above in self._unread:
+            if files_only and (self.entry(oid) or (0,))[0] & S_IFMT != S_IFREG:
+                continue
+            h = self.objs[oid]["hdr"]
+            kind = YAFFS_TYPES.get(h["type"], "object")
+            size = f", {self.objs[oid]['stored']:,} bytes" if h["type"] == 1 else ""
+            via = "" if above == parent else f", through folder object {above:,}"
+            out.append((path, oid,
+                        f"object {oid:,} ({kind}{size}) is not exported: folder object "
+                        f"{parent:,}, which it is under{via}, has no header in this image, so "
+                        f"its path from the root is not known; stored path below that "
+                        f"folder: {path}"))
+        for oid in self._headerless:
+            chunks = self.objs[oid]["chunks"]
+            out.append(("", oid,
+                        f"object {oid:,} is not exported: {len(chunks):,} data chunks holding "
+                        f"{sum(v[1] for v in chunks.values()):,} bytes carry its id and no "
+                        f"header for it is in this image, so its name, size and folder are "
+                        f"not known"))
+        return out
 
     def _pages(self):
         """(page index, data, spare) for every page, read 64 pages at a time."""
@@ -20874,6 +21025,9 @@ class YaffsWalker:
             if t is None:
                 continue
             self.stats["chunks"] += 1
+            # A checkpoint page never gets here: its sequence value, 0x21, is
+            # below the range _yaffs2_tags takes, and YAFFS scans no chunk of a
+            # checkpoint block (core/yaffs_yaffs2.c:1585-1595).
             # What yaffs2_scan_chunk ignores: a block summary chunk, tags whose
             # ECC does not hold, a data chunk claiming more than a page.
             if t["obj"] == YAFFS_OBJECTID_SUMMARY:
@@ -20991,7 +21145,7 @@ class YaffsWalker:
         if h["type"] == 1:
             return (mode, o["stored"], h["mtime"])
         if h["type"] == 2:
-            return (mode, len(h["alias"].encode("utf-8", "surrogateescape")), h["mtime"])
+            return (mode, h["alias_len"], h["mtime"])        # the stored bytes, not the text
         return (mode, 0, h["mtime"])
 
     def listdir(self, oid):
@@ -21161,6 +21315,8 @@ def identify_yaffs(fh, base, size=None):
               "duplicate chunks their serial numbers do not order"):
         if s[k]:
             lines.append(f"note         {s[k]:,} {k}")
+    if w.damage:
+        lines.append(f"damaged      {w.damage[0]}")
     return kind, lines
 
 
@@ -46859,6 +47015,13 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                                "folder neither is anything under it", 1)
                                               for p, i, _s, _m in unread)
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
+                            elif isinstance(w, YaffsWalker):
+                                # a file under a folder with no header in the image, or
+                                # with no header of its own, never reaches the list above
+                                unread = [detail for _p, _i, detail
+                                          in w.unread_entries(files_only=True)]
+                                fa += len(unread)
+                                issues.extend(("", "", "FAILED", detail, 1) for detail in unread)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -59987,6 +60150,254 @@ def self_test():
                 print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS2 history image opening on {what}: "
                       f"{got} of {want} files match, {eok} of {ewant} entries agree "
                       f"(identified as {r['kind']})")
+
+        # A checkpoint in the first pages, a chunk id past 2^20 and names that
+        # are not UTF-8, each built in memory from a fixture a real writer made.
+        ya_le = os.path.join(fx, "yaffs2-le.img.gz")
+        if os.path.isfile(ya_le):
+            import hashlib as _hl_ya              # pylint: disable=import-outside-toplevel
+            with gzip.open(ya_le, "rb") as gz:
+                ya_raw = gz.read()
+            ya_page = 2048 + 64
+
+            def ya_spare(seq, obj, chunk_id, nbytes):
+                """A YAFFS2 spare: the packed tags and their ECC's two line parities."""
+                tags = struct.pack("<IIII", seq, obj, chunk_id, nbytes)
+                return (tags + struct.pack("<BxxxII", 0, *_yaffs2_line_parity(tags))).ljust(64, b"\xff")
+
+            def ya_state(raw):
+                """(kind, [(path, mode, size, mtime, sha256 of a file's bytes)])."""
+                img = io.BytesIO(bytes(raw))
+                kind = (identify_fs(img, 0, len(raw)) or (None,))[0]
+                if kind is None:
+                    return None, []
+                w = walker_for(kind, img, 0, len(raw))
+                rows = []
+                for p, node, mode, sz, mt, _r in walk_all(w):
+                    dg = ""
+                    if mode & S_IFMT == S_IFREG:
+                        dg = _hl_ya.sha256(b"".join(w.read_file(node, sz))).hexdigest()
+                    rows.append((p, mode, sz, mt, dg))
+                return kind, sorted(rows, key=lambda r_: r_[0])
+
+            ya_kind0, ya_rows0 = ya_state(ya_raw)
+            ya_w0 = YaffsWalker(io.BytesIO(ya_raw), 0)
+            ya_hdr_at = {}                        # object id: page of its newest header
+            for _seq, ya_idx, ya_t, ya_h in ya_w0._entries:   # pylint: disable=protected-access
+                if ya_h is not None:
+                    ya_hdr_at.setdefault(ya_t["obj"], ya_idx)
+
+            # A checkpoint goes to the first empty block (core/yaffs_checkptrw.c:126
+            # yaffs2_checkpt_find_erased_block), which can be block 0, and its
+            # pages carry sequence 0x21, the page's number plus 1 as chunk id and
+            # the page size as n_bytes (:291-294). YAFFS scans none of them for
+            # objects. The control gives the same two pages sequence 0x22, which
+            # is no checkpoint and no valid tag: those must still count against
+            # the layout.
+            def ya_front(seq):
+                block = b"".join(bytes(2048) + ya_spare(seq, 2, n_ + 1, 2048) for n_ in range(2))
+                return block + b"\xff" * (62 * ya_page) + ya_raw
+
+            ya_kind, ya_rows = ya_state(ya_front(0x21))
+            ya_ctl = ya_state(ya_front(0x22))[0]
+            cond = (ya_kind0 == "yaffs2" and ya_kind == "yaffs2" and ya_rows == ya_rows0
+                    and len(ya_rows0) > 100 and ya_ctl is None)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS2 with a checkpoint in its first two "
+                  f"pages is read as the same volume: identified as {ya_kind}, "
+                  f"{sum(1 for a_, b_ in zip(ya_rows, ya_rows0) if a_ == b_)} of {len(ya_rows0)} "
+                  f"entries and file hashes equal; the same pages with sequence 0x22 are not "
+                  f"left out (identified as {ya_ctl})")
+
+            # YAFFS2 takes a data chunk id up to 2^28 - 1 (core/yaffs_guts.h:50-54,
+            # core/yaffs_yaffs2.c:1204). A newer header gives a file a size past
+            # 2 GiB and one data chunk with id 2^20 + 4 holds its last 100 bytes.
+            ya_big = min(o_ for o_, v_ in ya_w0.objs.items()
+                         if v_["hdr"] and v_["hdr"]["type"] == 1 and o_ in ya_hdr_at
+                         and 0 < v_["stored"] <= 2048)
+            ya_cid = (1 << 20) + 4
+            ya_size = (ya_cid - 1) * 2048 + 100
+            ya_tail = bytes(range(100, 200))
+            ya_at = ya_hdr_at[ya_big] * ya_page
+            ya_head = bytearray(ya_raw[ya_at:ya_at + 2048])
+            struct.pack_into("<I", ya_head, 292, ya_size)
+            struct.pack_into("<I", ya_head, 496, 0)
+            ya_seq = ya_w0.max_seq + 1
+            ya_img = (ya_raw + ya_tail.ljust(2048, b"\xff") + ya_spare(ya_seq, ya_big, ya_cid, 100)
+                      + bytes(ya_head) + ya_spare(ya_seq, ya_big, 0, 0xFFFF)
+                      + b"\xff" * (62 * ya_page))
+            ya_w = YaffsWalker(io.BytesIO(ya_img), 0)
+            ya_was = b"".join(ya_w0.read_file(ya_big, ya_w0.objs[ya_big]["stored"]))
+            ya_got, ya_first, ya_last = 0, b"", b""
+            for ya_piece in ya_w.read_file(ya_big, ya_size):
+                if ya_got < len(ya_was):
+                    ya_first += ya_piece
+                ya_got += len(ya_piece)
+                ya_last = ya_piece
+            cond = (ya_w.entry(ya_big)[1] == ya_size and ya_got == ya_size
+                    and ya_first[:len(ya_was)] == ya_was and ya_last == ya_tail)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] a YAFFS2 data chunk with id 2^20 + 4 is "
+                  f"read: the file is {ya_got:,} of {ya_size:,} bytes, its first "
+                  f"{len(ya_was):,} bytes are unchanged and its last 100 are the chunk's "
+                  f"({'yes' if ya_last == ya_tail else 'no'})")
+
+            # A stored name is bytes. One that is not UTF-8 shows as %XX of the
+            # stored byte, never as a surrogate, a "/" inside one name as %2F, and
+            # a symlink's target the same way but with its "/" kept.
+            ya_files = sorted((o_ for o_, v_ in ya_w0.objs.items()
+                               if v_["hdr"] and v_["hdr"]["type"] == 1 and o_ in ya_hdr_at
+                               and v_["hdr"]["name"].isascii()),
+                              key=lambda o_: (len(ya_w0.objs[o_]["hdr"]["name"]), o_))[:3]
+            ya_link = next((o_ for o_, v_ in sorted(ya_w0.objs.items())
+                            if v_["hdr"] and v_["hdr"]["type"] == 2 and o_ in ya_hdr_at
+                            and "/" in v_["hdr"]["alias"][1:]), None)
+            cond = len(ya_files) == 3 and ya_link is not None
+            ya_seen = "no three files and a symlink in the fixture"
+            if cond:
+                ya_img = bytearray(ya_raw)
+                for ya_o, ya_b in zip(ya_files, (0xE9, 0xE8, 0x2F)):
+                    ya_img[ya_hdr_at[ya_o] * ya_page + 10] = ya_b
+                ya_img[ya_hdr_at[ya_link] * ya_page + 300] = 0xE9
+                ya_w = YaffsWalker(io.BytesIO(bytes(ya_img)), 0)
+                ya_names = [ya_w.objs[o_]["hdr"]["name"] for o_ in ya_files]
+                ya_want = [pre + ya_w0.objs[o_]["hdr"]["name"][1:]
+                           for o_, pre in zip(ya_files, ("%E9", "%E8", "%2F"))]
+                ya_target = ya_w0.objs[ya_link]["hdr"]["alias"]
+                ya_paths = [p_ for p_, *_x in walk_all(ya_w)]
+                ya_text = "".join(ya_paths) + ya_w.readlink(ya_link)
+                try:
+                    import sqlite3 as _sq_ya      # pylint: disable=import-outside-toplevel
+                except ImportError:
+                    _sq_ya = None
+                ya_stored = len(ya_paths)
+                if _sq_ya is not None:            # a name has to be storable as it is
+                    ya_db = _sq_ya.connect(":memory:")
+                    ya_db.execute("create table t(n text)")
+                    try:
+                        ya_db.executemany("insert into t values(?)", [(p_,) for p_ in ya_paths])
+                        ya_stored = ya_db.execute("select count(distinct n) from t").fetchone()[0]
+                    except (UnicodeError, _sq_ya.Error):
+                        ya_stored = -1            # SQLite refuses a surrogate
+                    ya_db.close()
+                cond = (ya_names == ya_want and len(set(ya_names[:2])) == 2
+                        and ya_w.readlink(ya_link) == "%E9" + ya_target[1:]
+                        and ya_w.entry(ya_link)[1] == len(ya_target.encode("utf-8"))
+                        and not any(0xD800 <= ord(c_) <= 0xDFFF for c_ in ya_text)
+                        and len(ya_paths) == len(ya_rows0) and ya_stored == len(ya_paths))
+                ya_seen = (f"{', '.join(ya_names)}; target {ya_w.readlink(ya_link)}; "
+                           f"{ya_stored} of {len(ya_paths)} paths stored as distinct text")
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS names with a byte that is not UTF-8 "
+                  f"or a '/' show as %XX and hold no surrogate, and a symlink target keeps "
+                  f"its '/' and its stored length: {ya_seen}"[:400])
+
+        # An image cut before a folder's header: the objects that name that folder
+        # as their parent have their own headers and no path. They are recorded,
+        # with the count, and the run is not reported as complete. The whole
+        # image is the control: nothing recorded.
+        ya_h1 = os.path.join(fx, "yaffs1-history.img.gz")
+        if os.path.isfile(ya_h1):
+            with gzip.open(ya_h1, "rb") as gz:
+                ya_raw = gz.read()
+            ya_full = YaffsWalker(io.BytesIO(ya_raw), 0)
+            ya_cut = YaffsWalker(io.BytesIO(ya_raw[:-4096]), 0)
+            ya_dmg = list(getattr(ya_cut, "damage", ()))
+            ya_lost = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if x_[0]]
+            ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if not x_[0]]
+            # Both files are removed again: CI counts the *.img files left behind.
+            ya_path = os.path.join(d, "yaffs1_folder_header_cut.img")
+            ya_zip = os.path.join(d, "yaffs1_folder_header_cut.zip")
+            ya_man, ya_table = [], ""
+            try:
+                with open(ya_path, "wb") as ya_fh:
+                    ya_fh.write(ya_raw[:-4096])
+                with zipfile.ZipFile(ya_zip, "w") as zf, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(ya_path, extract=ya_zip, zf=zf, manifest=ya_man)
+                with zipfile.ZipFile(ya_zip) as ya_zr:
+                    ya_held = [i_.filename for i_ in ya_zr.infolist()]
+                    if "lba0.exceptions.tsv" in ya_held:
+                        ya_table = ya_zr.read("lba0.exceptions.tsv").decode("utf-8")
+            finally:
+                for ya_rm in (ya_path, ya_zip):
+                    if os.path.exists(ya_rm):
+                        os.remove(ya_rm)
+            ya_rec = ya_man[0] if ya_man else {}
+            ya_failed = [ln for ln in ya_table.splitlines()[1:]
+                         if ln.split("\t")[:3] == ["", "", "FAILED"]]
+            ya_n = len(collect(ya_full, ya_full.root)) - len(collect(ya_cut, ya_cut.root))
+            cond = (not getattr(ya_full, "damage", None)
+                    and getattr(ya_full, "folders_not_read", None) == 0
+                    and len(ya_dmg) == 3 and ya_dmg[0].startswith("45 objects name a parent folder")
+                    and ya_dmg[1].startswith("3 objects with data chunks") and len(ya_bare) == 3
+                    and all(len(x_) <= 240 for x_ in ya_dmg)
+                    and getattr(ya_cut, "folders_not_read", 0) == 1 and len(ya_lost) == 45
+                    and ya_n >= 45
+                    and ya_rec.get("folders_not_read") == 1 and ya_rec.get("failed") == 47
+                    and ya_rec.get("damage_recorded") == 3 and len(ya_failed) == 47
+                    and _volumes_not_read(ya_man) == 1)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut 4 KiB short, losing a folder's "
+                  f"header: {len(ya_lost)} objects under it and {len(ya_bare)} with data and "
+                  f"no header of their own are recorded and not exported "
+                  f"({len(ya_failed)} FAILED rows, one per file, folders_not_read "
+                  f"{ya_rec.get('folders_not_read')}, counted as not read in full: "
+                  f"{_volumes_not_read(ya_man)}); the whole image records nothing")
+
+            # The same image cut just after its first object header: nothing is
+            # listed, and the data chunks whose headers are gone are counted, so
+            # the export does not report an empty volume as read.
+            ya_first = next((i_ for i_, _d, s_ in ya_full._pages()   # pylint: disable=protected-access
+                             if (_yaffs1_tags(s_) or {"chunk": 1})["chunk"] == 0
+                             and not _yaffs1_tags(s_)["deleted"]), None)
+            cond, ya_seen = False, "no object header found in the fixture"
+            if ya_first is not None:
+                ya_short = ya_raw[:(ya_first + 1) * ya_full.page]
+                ya_cut = YaffsWalker(io.BytesIO(ya_short), 0)
+                ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])()
+                           if not x_[0]]
+                ya_dmg = list(getattr(ya_cut, "damage", ()))
+                ya_have = sorted(o_ for o_, v_ in ya_cut.objs.items()
+                                 if not v_["hdr"] and v_["chunks"])
+                ya_path = os.path.join(d, "yaffs1_first_header_cut.img")
+                ya_zip = os.path.join(d, "yaffs1_first_header_cut.zip")
+                ya_man, ya_table = [], ""
+                try:
+                    with open(ya_path, "wb") as ya_fh:
+                        ya_fh.write(ya_short)
+                    with zipfile.ZipFile(ya_zip, "w") as zf, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        main(ya_path, extract=ya_zip, zf=zf, manifest=ya_man)
+                    with zipfile.ZipFile(ya_zip) as ya_zr:
+                        if "lba0.exceptions.tsv" in ya_zr.namelist():
+                            ya_table = ya_zr.read("lba0.exceptions.tsv").decode("utf-8")
+                finally:
+                    for ya_rm in (ya_path, ya_zip):
+                        if os.path.exists(ya_rm):
+                            os.remove(ya_rm)
+                ya_rec = ya_man[0] if ya_man else {}
+                ya_failed = [ln for ln in ya_table.splitlines()[1:]
+                             if ln.split("\t")[:3] == ["", "", "FAILED"]]
+                cond = (len(ya_have) > 0 and [x_[1] for x_ in ya_bare] == ya_have
+                        and len(ya_dmg) == 1 and len(ya_dmg[0]) <= 240
+                        and ya_dmg[0].startswith(f"{len(ya_have)} objects with data chunks")
+                        and not collect(ya_cut, ya_cut.root)
+                        and ya_rec.get("files") == 0 and ya_rec.get("failed") == len(ya_have)
+                        and ya_rec.get("folders_not_read") == 1
+                        and len(ya_failed) == len(ya_have) and _volumes_not_read(ya_man) == 1)
+                ya_seen = (f"{len(ya_have)} objects with data and no header, {len(ya_bare)} "
+                           f"recorded, {len(ya_failed)} FAILED rows, files exported "
+                           f"{ya_rec.get('files')}, counted as not read in full: "
+                           f"{_volumes_not_read(ya_man)}")
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut just after its first object "
+                  f"header does not pass as an empty volume: {ya_seen}")
 
         # Deleted files, held against what each fixture's writer put in them.
         # tools/yaffs_history.c fills a file with numbered lines (text()); the
