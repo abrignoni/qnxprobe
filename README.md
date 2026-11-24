@@ -389,7 +389,8 @@ first letter escaped, so `nul` is held as `%6Eul`. A name with an extension, suc
 walking a volume (a structure that failed its check, a record it could not resolve) is
 printed under `--list` as `DAMAGE`, counted on the extraction line as `DAMAGED`, with
 the first five shown, and kept in `volumes.json` as `damage_recorded` and
-`damage_first` (up to 50).
+`damage_first` (up to 50). A damaged volume can produce wrong or invented entries that the
+tool may not flag.
 
 ## Reading an image from Python
 
