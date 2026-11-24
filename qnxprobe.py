@@ -35652,12 +35652,31 @@ def _hfs_reader_checks():
     """[(label, passed)] for how the HFS+ reader treats fragmented, linked, damaged and
     unusual volumes. Each volume is built in memory by _HfsTestVolume; the known result is
     what was put into it."""
+    import contextlib
     import random
     import sqlite3
     import subprocess
     import tempfile
     out = []
     block = _HfsTestVolume.BLOCK
+
+    @contextlib.contextmanager
+    def own_folder(name):
+        """A folder of this row's own, emptied by hand: the CI build replaces mkdtemp with
+        one shared folder it keeps and counts, and shutil.rmtree with a no-op."""
+        parent = tempfile.mkdtemp(prefix="qnxprobe-hfs-")
+        work = os.path.join(parent, f"hfs-reader-{name}")
+        os.makedirs(work, exist_ok=True)
+        try:
+            yield work
+        finally:
+            for root, dirs, names in os.walk(work, topdown=False):
+                for item in names:
+                    os.remove(os.path.join(root, item))
+                for item in dirs:
+                    os.rmdir(os.path.join(root, item))
+            os.rmdir(work)
+            _selftest_parent_gone(parent, "qnxprobe-hfs-")
 
     def row(label, check):
         try:
@@ -35943,7 +35962,7 @@ def _hfs_reader_checks():
         v = _HfsTestVolume()
         v.file(HFSP_ROOT, "f.txt", b"x" * 100)
         img = v.image()
-        with tempfile.TemporaryDirectory() as tmp:
+        with own_folder("cut") as tmp:
             path = os.path.join(tmp, "cut.img")
             with open(path, "wb") as fh:
                 fh.write(bytes(img[:len(img) // 2]))
@@ -36224,7 +36243,7 @@ def _hfs_reader_checks():
         real = globals()["_zip_room"]
         globals()["_zip_room"] = lambda zf, wanted: wanted if len(zf.filelist) <= 1 else 0
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with own_folder("full-zip") as tmp:
                 zf = _zip_create(os.path.join(tmp, "o.zip"))
                 try:
                     extract_to_zip(zf, w, "v", ents, log, issues=issues)
