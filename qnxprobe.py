@@ -8152,6 +8152,7 @@ HFSP_ATTRIBUTES_FILE = 8                # kHFSAttributesFileID
 HFSP_VOL_UNMOUNTED    = 0x00000100      # kHFSVolumeUnmountedMask
 HFSP_VOL_JOURNALED    = 0x00002000      # kHFSVolumeJournaledMask
 HFSP_ATTR_INLINE, HFSP_ATTR_FORK = 0x10, 0x20    # kHFSPlusAttrInlineData, ForkData
+HFSP_ATTR_EXTENTS = 0x30                # kHFSPlusAttrExtents
 HFSP_DAMAGE_CAP = 1000                  # items kept in a walker's damage list
 HFSP_STREAMS_NAMED = 8                  # streams named per file in its NAMED_STREAM row
 
@@ -8269,6 +8270,8 @@ class _HfsNodeDamage(Exception):
     def __init__(self, tree, number, why):
         super().__init__(f"{tree.name} B-tree node {number:,}: {why}")
         self.tree, self.number = tree, number
+        # True when the node's bytes reach past the end of the image
+        self.cut = tree.header_cut if number == 0 else tree.last_read_cut
 
 
 class _HfsTree:
@@ -8282,7 +8285,9 @@ class _HfsTree:
         # the shortest key a record of this tree can have (TN1150: HFSPlusCatalogKey,
         # HFSPlusExtentKey, HFSPlusAttrKey)
         self.min_key = {"catalog": 6, "extents overflow": 10, "attributes": 12}.get(name, 0)
+        self.last_read_cut = False
         head = self._raw(0, 512)
+        self.header_cut = self.last_read_cut
         if len(head) < 120:
             raise ValueError(f"the {name} tree has no header node")
         (depth, root, self.leaf_records, first_leaf, _last_leaf, node_size,
@@ -8321,6 +8326,7 @@ class _HfsTree:
             pos += span
             if len(out) >= count:
                 break
+        self.last_read_cut = EOF_SHORTFALL["bytes"] != before
         EOF_SHORTFALL["bytes"] = before
         return bytes(out)
 
@@ -8392,7 +8398,8 @@ class _HfsTree:
                     return False
                 size = struct.unpack_from(">I", node, at + 12)[0]
                 return have == 16 + size + (size & 1)
-            return (kind == HFSP_ATTR_FORK and have >= 88) or (kind == 0x30 and have >= 72)
+            return (kind == HFSP_ATTR_FORK and have >= 88) or (kind == HFSP_ATTR_EXTENTS
+                                                               and have >= 72)
         return True
 
     @staticmethod
@@ -8506,7 +8513,9 @@ class HfsPlusWalker:
     own forks included), symbolic links, hard links through the private
     directory the volume keeps them in, directory hard links, and files
     compressed with the decmpfs attribute: zlib, LZVN, LZFSE or stored, in the
-    attribute or in the resource fork (decmpfs_read()).
+    attribute (held in its record or in its own allocation blocks) or in the
+    resource fork (decmpfs_read()). A file flagged compressed whose attribute
+    cannot be read is refused, not given as an empty file.
 
     What it does not read: a file compressed with LZBITMAP or with a decmpfs
     method this reader does not know. Those are listed with their recorded size
@@ -8571,6 +8580,10 @@ class HfsPlusWalker:
         self._attr_cut = set()                 # ids whose attribute lookup met a damaged node
         self._provenance = None                # (files holding it, whether the count is whole)
         self._block_note = None                # _check_allocation(), when the two differ
+        self._journal_pending = False          # the journal holds transactions not replayed
+        self._stale_nodes = set()              # nodes a pending journal can explain
+        self._stale_folders = set()            # folders whose listing stopped at one
+        self._unclean_facts = []               # what disagrees on a volume not cleanly unmounted
         self._folder_names = {}                # folder id -> (parent id, name), for stream_rows
         self._link_vnodes = {}                 # node past the base -> (id, open folders, repeat, shut)
         self._link_keys = {}
@@ -8580,6 +8593,9 @@ class HfsPlusWalker:
         self._journal_note = self._journal_state()
         for tree in (self._extents, self._attrs):
             if tree is not None and not tree.header_ok:
+                if self._journal_pending and not tree.header_cut:
+                    self._stale_nodes.add((tree.name, 0))
+                    continue
                 # counted as a loss only when a read needs this tree (_tree_fault)
                 self._tree_faults.add((tree.name, 0))
                 self._damaged(f"the {tree.name} tree's header node is not valid")
@@ -8604,12 +8620,31 @@ class HfsPlusWalker:
 
     def _tree_fault(self, exc, detail=None):
         """A B-tree node a read needed could not be used: record it once, and count that
-        what it held may be lost."""
+        what it held may be lost. True when it was recorded as damage.
+
+        While the journal holds transactions, a node in the image that fails its checks can
+        be one whose current version is still in the journal: macOS replayed such volumes
+        to ones fsck_hfs passes. That goes in ``note`` and does not change the exit status.
+        A node the image ends inside is missing whatever the journal holds."""
         key = (exc.tree.name, exc.number)
+        if self._journal_pending and not exc.cut:
+            self._stale_nodes.add(key)
+            return False
         if key not in self._tree_faults:
             self._tree_faults.add(key)
             self._damaged(f"{exc}; what it holds is not read" + (f" ({detail})" if detail else ""))
         self.folders_not_read = max(self.folders_not_read, 1)
+        return True
+
+    def _disagrees(self, text):
+        """A count or order that does not agree. On a cleanly unmounted volume it is damage
+        and a possible loss. On any other the headers can be behind the catalog until the
+        journal is replayed, so it is stated in ``note`` and the exit status does not change."""
+        if self.alternate_header is None and self.attributes & HFSP_VOL_UNMOUNTED:
+            self._damaged(text)
+            self.folders_not_read = max(self.folders_not_read, 1)
+        elif len(self._unclean_facts) < 8:
+            self._unclean_facts.append(text)
 
     def _journal_state(self):
         """Text for ``note`` when the volume was not cleanly unmounted or its journal holds
@@ -8649,6 +8684,7 @@ class HfsPlusWalker:
                         pending = end - start
                     else:
                         pending = (stated - start) + (end - jhdr)
+        self._journal_pending = bool(pending)
         if clean and not pending:
             return None
         said = ("was not cleanly unmounted" if not clean else
@@ -8675,6 +8711,12 @@ class HfsPlusWalker:
                          "contents; each such folder is listed in full under its first name")
         if self._block_note:
             parts.append(self._block_note)
+        parts.extend(self._unclean_facts)
+        if self._stale_nodes:
+            parts.append(f"{len(self._stale_nodes):,} B-tree node(s) do not pass their checks as "
+                         "stored and may be waiting in the journal"
+                         + (f"; {len(self._stale_folders):,} folder listing(s) stop at one"
+                            if self._stale_folders else ""))
         if self._provenance and self._provenance[0]:
             count, whole = self._provenance
             parts.append(f"{'' if whole else 'at least '}{count:,} file(s) hold the "
@@ -8707,9 +8749,8 @@ class HfsPlusWalker:
                 parent = self._cat_parent(key)
                 if parent is not None:
                     if parent < last_parent:
-                        self._damaged(f"the catalog's leaf chain goes back from parent id "
-                                      f"{last_parent:,} to {parent:,}, so its order is damaged")
-                        self.folders_not_read = max(self.folders_not_read, 1)
+                        self._disagrees(f"the catalog's leaf chain goes back from parent id "
+                                        f"{last_parent:,} to {parent:,}")
                     last_parent = max(last_parent, parent)
                 if len(data) >= 2:
                     kind = struct.unpack_from(">H", data, 0)[0]
@@ -8722,9 +8763,8 @@ class HfsPlusWalker:
                                   "tree header counts were read before it")
             return
         if records != tree.leaf_records:
-            self._damaged(f"the catalog's leaf chain holds {records:,} records and its header "
-                          f"records {tree.leaf_records:,}")
-            self.folders_not_read = max(self.folders_not_read, 1)
+            self._disagrees(f"the catalog's leaf chain holds {records:,} records and its header "
+                            f"records {tree.leaf_records:,}")
             return
         if (self.alternate_header is None and self.attributes & HFSP_VOL_UNMOUNTED
                 and (files, folders - 1) != (self.file_count, self.folder_count)):
@@ -8744,9 +8784,8 @@ class HfsPlusWalker:
             size, _clump, blocks = struct.unpack_from(">QII", rec, off)
             total += blocks
             if size > blocks * self.block_size:
-                self._damaged(f"catalog id {cnid}: its {label} fork records {size:,} bytes in "
-                              f"{blocks:,} blocks, which cannot hold them")
-                self.folders_not_read = max(self.folders_not_read, 1)
+                self._disagrees(f"catalog id {cnid}: its {label} fork records {size:,} bytes "
+                                f"in {blocks:,} blocks, which cannot hold them")
         return total
 
     def _check_allocation(self, fork_blocks):
@@ -8822,8 +8861,9 @@ class HfsPlusWalker:
                     self._folder_names[child] = (cnid, name)
                 out.append((name, child, data))
         except _HfsNodeDamage as exc:
-            self._tree_fault(exc)
-            if cnid not in self._cut_folders:
+            if not self._tree_fault(exc):
+                self._stale_folders.add(cnid)
+            elif cnid not in self._cut_folders:
                 self._cut_folders.add(cnid)
                 self.folders_not_read = max(self.folders_not_read, len(self._cut_folders))
                 self._damaged(f"folder {cnid}: {len(out):,} entries were read before {exc}, so "
@@ -9075,9 +9115,9 @@ class HfsPlusWalker:
 
     # -- attributes --------------------------------------------------------
     def _attr_records(self, cnid):
-        """[(name, record data)] of one file's attributes tree records. When the lookup
-        meets a damaged node, what it reached is returned and the id goes in ``_attr_cut``,
-        because its other attributes may be among what was lost."""
+        """[(name, record data, start block)] of one file's attributes tree records, in key
+        order. When the lookup meets a damaged node, what it reached is returned and the id
+        goes in ``_attr_cut``, because its other attributes may be among what was lost."""
         if self._attrs is None:
             return []
 
@@ -9101,31 +9141,64 @@ class HfsPlusWalker:
                 # id, start block, then the name's length in UTF-16 units at 10 and
                 # the name itself at 12.
                 if len(key) >= 12:
-                    out.append((_hfs_name(key, 10)[0], data))
+                    out.append((_hfs_name(key, 10)[0], data,
+                                struct.unpack_from(">I", key, 6)[0]))
         except _HfsNodeDamage as exc:
             self._tree_fault(exc)
             self._attr_cut.add(cnid)
         return out
 
-    def _xattr(self, cnid, name):
-        """One extended attribute's bytes, or None. Only the inline form is
-        read: an attribute large enough to need its own fork is not one this
-        walker consumes."""
-        for got, data in self._attr_records(cnid):
-            if got != name or len(data) < 16:
+    def _xattr(self, cnid, name, limit=DECMPFS_MAX_ATTR):
+        """One extended attribute's bytes, or None. The value is in the record (inline), or
+        in allocation blocks named by a fork record and, past eight extents, by extent
+        records under the same name (hfs_format.h; hfs_xattr.c writes a value over the
+        inline limit this way, which is 1,754 bytes with 4096-byte attribute nodes). A value
+        in blocks that cannot be read whole, or longer than ``limit``, gives None and puts
+        the id in ``_attr_cut``."""
+        rows = [(data, start) for got, data, start in self._attr_records(cnid) if got == name]
+        for data, _start in rows:
+            if len(data) < 16:
                 continue
-            if struct.unpack_from(">I", data, 0)[0] != HFSP_ATTR_INLINE:
-                continue
-            size = struct.unpack_from(">I", data, 12)[0]
-            return data[16:16 + size]
+            kind = struct.unpack_from(">I", data, 0)[0]
+            if kind == HFSP_ATTR_INLINE:
+                size = struct.unpack_from(">I", data, 12)[0]
+                return data[16:16 + size]
+            if kind == HFSP_ATTR_FORK:
+                value = self._attr_fork_value(data, rows, limit)
+                if value is None:
+                    self._attr_cut.add(cnid)
+                return value
         return None
+
+    def _attr_fork_value(self, data, rows, limit):
+        """The bytes of a fork-form attribute, or None when they cannot all be read."""
+        if len(data) < 88:
+            return None
+        size, _clump, _blocks = struct.unpack_from(">QII", data, 8)
+        if size > limit:
+            return None
+        extents = [(s, c) for s, c in struct.iter_unpack(">II", data[24:88]) if c]
+        at = sum(c for _s, c in extents)
+        for more, start in rows:
+            if len(more) < 72 or struct.unpack_from(">I", more, 0)[0] != HFSP_ATTR_EXTENTS:
+                continue
+            if start != at:
+                return None
+            for first, count in struct.iter_unpack(">II", more[8:72]):
+                if count:
+                    extents.append((first, count))
+                    at += count
+        before = EOF_SHORTFALL["bytes"]        # metadata: not part of the file being read
+        value = self._read_extents(extents, size, 0, pad=False)
+        EOF_SHORTFALL["bytes"] = before
+        return value if len(value) == size else None
 
     def _attr_streams(self, cnid):
         """[(name, size)] of the attributes a user can see on this id. The ones left out are
         how the volume stores the file itself: com.apple.decmpfs, and the com.apple.system.*
         names macOS never lists (xattr_protected)."""
         out = []
-        for name, data in self._attr_records(cnid):
+        for name, data, _start in self._attr_records(cnid):
             if name == HFSP_DECMPFS or name.startswith("com.apple.system.") or len(data) < 16:
                 continue
             kind = struct.unpack_from(">I", data, 0)[0]
@@ -9431,10 +9504,11 @@ class HfsPlusWalker:
         if blob:
             yield from self._read_compressed(target, rec, blob)
             return
-        if len(rec) >= 42 and rec[41] & UF_COMPRESSED and target in self._attr_cut:
-            raise HfsUnreadable("the file is flagged compressed and the attributes tree that "
-                                "holds its compression record is damaged")
         fork_size, extents = self._fork(target, rec)
+        if len(rec) >= 42 and rec[41] & UF_COMPRESSED and (target in self._attr_cut
+                                                           or not fork_size):
+            raise HfsUnreadable("the file is flagged compressed and its compression attribute "
+                                "cannot be read")
         want = fork_size if size is None else min(size, fork_size)
         self._note_fork_shortfall(cnid, extents, want)
         # nothing after the last extent the volume holds can be read, so a damaged size
@@ -35831,6 +35905,10 @@ def _hfs_reader_checks():
     def journal_note(pending):
         v = _HfsTestVolume()
         v.file(HFSP_ROOT, "f.txt", b"x")
+        journaled(v, pending)
+        return walker(v.image())
+
+    def journaled(v, pending):
         v.attributes = _HT_JOURNALED | _HT_NODES_ZEROED
         v.journal_block = 8
         info = bytearray(512)
@@ -35840,7 +35918,6 @@ def _hfs_reader_checks():
         end = 4096 + pending
         v.img[9 * block:9 * block + 44] = struct.pack("<IIQQQIII", 0x4A4E4C78, 0x12345678, 4096,
                                                       end, 16 * block, 4096, 0, 512)
-        return walker(v.image())
 
     def journal_recorded():
         w = journal_note(12288)
@@ -36025,6 +36102,116 @@ def _hfs_reader_checks():
                 and any("attributes tree's header" in d for d in w.damage))
     row("HFS+: with the attributes header lost, a compressed file fails rather than "
         "exporting empty", attr_header_lost)
+
+    def unclean_count():
+        v = _HfsTestVolume(4096)
+        many(v, 60)
+        journaled(v, 12288)
+        img = v.image()
+        at = v.node_at("catalog", 0)
+        stated = struct.unpack_from(">I", img, at + 14 + 6)[0]
+        struct.pack_into(">I", img, at + 14 + 6, stated + 40)
+        w = walker(img)
+        kids = w.listdir(HFSP_ROOT)
+        return (len(kids) == 60 and lost(w) == 0 and not w.damage
+                and f"holds {stated:,} records" in note(w))
+    row("HFS+: with a journal pending, a leaf count behind the header is in the note and is "
+        "not a loss", unclean_count)
+
+    def unclean_order():
+        v = _HfsTestVolume(4096)
+        many(v, 60)
+        journaled(v, 12288)
+        img = v.image()
+        at = v.node_at("catalog", 2)
+        first = struct.unpack_from(">H", img, at + block - 2)[0]
+        struct.pack_into(">I", img, at + first + 2, 1)   # the first key's parent id
+        w = walker(img)
+        w.listdir(HFSP_ROOT)
+        return lost(w) == 0 and "goes back from parent id" in note(w)
+    row("HFS+: with a journal pending, a catalog order that goes back is in the note and is "
+        "not a loss", unclean_order)
+
+    def stale_node():
+        v = _HfsTestVolume()
+        cnid = v.file(HFSP_ROOT, "f.txt", b"x")
+        v.xattr(cnid, "user.k", b"1")
+        journaled(v, 12288)
+        img = v.image()
+        at = v.node_at("attributes", 1)
+        whole = bytes(img)
+        img[at:at + block] = bytes(block)
+        w, tally, _issues, _z = export(img)
+        quiet = (lost(w) == 0 and not w.damage and tally[3] == 0
+                 and "may be waiting in the journal" in note(w))
+        cut = walker(whole[:v.node_at("catalog", 1)])
+        cut.listdir(HFSP_ROOT)
+        return quiet and lost(cut) >= 1 and cut.damage
+    row("HFS+: with a journal pending, a node that fails its checks is in the note, and a node "
+        "past the end of a cut image is still a loss", stale_node)
+
+    def fork_form_attr(split):
+        v = _HfsTestVolume()
+        content = rng.randbytes(2000)
+        attr = DECMPFS_MAGIC + struct.pack("<IQ", 1, len(content)) + content
+        cnid = v.file(HFSP_ROOT, "c.txt", b"", owner_flags=UF_COMPRESSED)
+        name = HFSP_DECMPFS
+        value = attr
+        if split:
+            name, value = "user.big", rng.randbytes(10 * block)
+        count = -(-len(value) // block)
+        first = v._alloc(count)                  # pylint: disable=protected-access
+        v.img[first * block:first * block + len(value)] = value
+        pieces = [(first + i, 1) for i in range(count)] if split else [(first, count)]
+        rec = bytearray(88)
+        struct.pack_into(">IIQII", rec, 0, 0x20, 0, len(value), 0, count)
+        for i, (s, n) in enumerate(pieces[:8]):
+            struct.pack_into(">II", rec, 24 + i * 8, s, n)
+        units = name.encode("utf-16-be")
+        v.attrs[(cnid, units)] = bytes(rec)
+        return v, cnid, content, value, pieces, units
+
+    def attr_fork():
+        v, cnid, content, _value, _p, _u = fork_form_attr(False)
+        w = walker(v.image())
+        return w.entry(cnid)[1] == len(content) and body(w, cnid) == content and not w.damage
+    row("HFS+: a compression attribute stored in its own blocks is read", attr_fork)
+
+    def attr_extents():
+        v, cnid, _c, value, pieces, units = fork_form_attr(True)
+        more = bytearray(72)
+        struct.pack_into(">II", more, 0, 0x30, 0)
+        for i, (s, n) in enumerate(pieces[8:]):
+            struct.pack_into(">II", more, 8 + i * 8, s, n)
+        img = None
+        real = v._tree                           # pylint: disable=protected-access
+
+        def with_extents(name, pairs):
+            if name == "attributes":
+                key = struct.pack(">HIIH", 0, cnid, 8, len(units) // 2) + units
+                pairs = sorted(pairs + [(key, bytes(more))],
+                               key=lambda p: (p[0][2:6], p[0][12:], p[0][6:10]))
+            return real(name, pairs)
+
+        v._tree = with_extents                   # pylint: disable=protected-access
+        img = v.image()
+        w = walker(img)
+        reader = getattr(w, "_xattr")
+        try:
+            return reader(cnid, "user.big", limit=len(value)) == value
+        except TypeError:                        # a reader with no fork form to read
+            return reader(cnid, "user.big") == value
+    row("HFS+: an attribute value past eight extents continues in its extent records",
+        attr_extents)
+
+    def flagged_no_attr():
+        v = _HfsTestVolume()
+        v.file(HFSP_ROOT, "c.txt", b"", owner_flags=UF_COMPRESSED)
+        _w, tally, issues, zf = export(v.image())
+        return (tally[3] == 1 and "v/c.txt" not in zf.namelist()
+                and any(r[0] == "c.txt" and r[2] == "FAILED" for r in issues))
+    row("HFS+: a file flagged compressed with no readable attribute fails rather than "
+        "exporting empty", flagged_no_attr)
 
     def compressed_attr_lost():
         v = _HfsTestVolume()

@@ -1188,8 +1188,10 @@ fragments outgrew the eight extent descriptors a catalog record holds and contin
 the extents overflow tree (the catalog's and attributes tree's own forks too), symbolic
 links, hard links through the private directory the volume keeps their indirect nodes
 in, directory hard links, and files compressed with the `decmpfs` attribute (zlib, LZVN,
-LZFSE or stored, since 1.74), whether the compressed data sits in the attribute or in
-the resource fork behind a block table. HFSX, the case-sensitive variant, is read the
+LZFSE or stored, since 1.74), whether the compressed data sits in the attribute (in its
+record, or in its own allocation blocks when it is too long for the record) or in the
+resource fork behind a block table. A file flagged compressed whose attribute cannot be
+read is recorded as failed, not exported as an empty file. HFSX, the case-sensitive variant, is read the
 same way and reported as itself. A volume in an Apple Partition Map is found from the
 map's entries, on a disk with no GPT.
 
@@ -1200,9 +1202,11 @@ link back into a folder already open on the same path is not followed and is rec
 The first name of each linked folder is always listed in full. After 500,000 entries of
 repeated contents a later name lists nothing, and the volume's `note` counts those names.
 
-A resource fork or an extended attribute a user can see is not exported as a member. Each
-file or folder holding any gets one `NAMED_STREAM` row in the exceptions table, with each
-stream's name and size (eight are named, then a count), and `--list` names them.
+A resource fork or an extended attribute held in the attributes tree is not exported as a
+member. Each file or folder holding any gets one `NAMED_STREAM` row in the exceptions table,
+with each stream's name and size (eight are named, then a count), and `--list` names them.
+`com.apple.FinderInfo` is kept in the catalog record, not the attributes tree, so it gets no
+row.
 `com.apple.decmpfs`, a resource fork holding the file's compressed data and the
 `com.apple.system.*` names are how the volume stores the file, so they are left out. A
 file with an empty data fork and a resource fork stays a 0-byte member with that row.
@@ -1211,7 +1215,9 @@ file with an empty data fork and a resource fork stays a 0-byte member with that
 
 A pending journal is recorded and not replayed. When a volume was not cleanly unmounted,
 its `note` says so and gives the bytes of transactions the journal holds: newer data may
-exist there, and the listing shows the blocks as stored.
+exist there, and the listing shows the blocks as stored. On such a volume a catalog count or
+order that disagrees with its header, or a node that does not pass its checks, can be
+waiting in the journal, so it is stated in the `note` and does not change the exit status.
 
 Damage is recorded in `damage_first`. A B-tree node that fails its checks is never read as
 the end of a folder. The walk keeps what it reached, and `folders_not_read` and exit status
