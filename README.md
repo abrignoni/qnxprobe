@@ -489,6 +489,42 @@ before 1980, and a time from 2100 to 2107 is the member's date. An F2FS file fla
 encrypted gets an `ENCRYPTED` row, and one that takes anything from the roll-forward log a
 `ROLL_FORWARD` row. Neither changes the exit status.
 
+A FAT12, FAT16, FAT32 or exFAT member's date is the modified reading the entry stores.
+FAT stores a wall clock with no zone and a zip date has no zone either, so the reading
+goes in as it is. A zip date counts seconds in steps of two, so an odd second (only
+exFAT's 10 ms field gives one) shows as the even second before it. When an exFAT entry
+marks its modified time's UTC offset valid (the top bit of the offset byte, exFAT
+specification section 7.4.10), the member also gets an extended timestamp (extra field
+0x5455) holding the reading minus that offset, as UTC. When the offset is not marked
+valid, the member has the reading alone and it is never shifted. A reading that names no
+real day gives 1980-01-01, and a UTC past 2038-01-19, which the field's signed 32 bits
+cannot hold, is left out. Earlier versions gave every FAT and exFAT member 1980-01-01.
+
+The UTC is only as right as the offset the last writer stored. Nordvik and Axelsson
+([FSI: Digital Investigation 42-43, 2022](https://doi.org/10.1016/j.fsidi.2022.301476))
+found offsets marked valid that no longer matched the stored time after a drive moved
+between operating systems: the Linux driver rewrote unset offsets to +00:00 without
+changing the times, and exfat-fuse updated an access time without its offset. Measured
+here, on volumes each written by one system, the UTC is within 2 seconds of the mtime
+the writer reported for every file: 3,138 of 3,138 on four volumes Windows 11 build 26200
+wrote (every offset -05:00), 422 of 422 from the Linux 7.0 kernel driver (+00:00) and
+422 of 422 from exfat-fuse 1.4.0 (+09:00), the last two written in a UTC+9 zone. A
+volume moved between systems was not measured.
+
+Each FAT or exFAT volume also gets `<volume>.times.tsv`, named in `volumes.json` as
+`times_table`. It has one row per file and folder: `zip_member` (blank for a folder and
+for a file not written), `stored_path`, `kind`, then for modified, created and accessed
+the reading as stored, its 10 ms byte (`modified_10ms`, `created_10ms`) and its UTC
+offset byte in hex (`modified_utc_offset_byte`, `created_utc_offset_byte`,
+`accessed_utc_offset_byte`), and `member_utc`, the UTC written into the member, blank
+when none was. A cell is blank where the format has no such field: FAT has a 10 ms byte
+only for the creation time and no offset at all, keeps the access time as a date, and
+neither format has a 10 ms byte for the access time. The reading already counts the
+10 ms byte into its seconds. Each time keeps its own offset byte, because one entry can
+carry different offsets on its three times. A stored exFAT value that is no valid time
+is given in hex. A table that cannot be written leaves `times_table` as `null`, and the
+run says so.
+
 Since 1.68 a member's name is made safe before it is written: a stored name of `.` or
 `..`, an empty one (a `/` the filesystem kept inside a name, or a leading one), and any
 backslash, colon or control character are written escaped as `%XX`, so no member can
@@ -2247,12 +2283,15 @@ stream that is not compressed. One of the 846 files has one below its size (8,19
 ### FAT32 and exFAT times are readings, and are listed as such
 
 A FAT32 or exFAT file's times are a wall clock the volume stored with no zone
-(exFAT stores a UTC offset beside each one, which is shown and not applied), so a
-walker for either gives `entry()` an mtime of 0 and hands the readings out through
+(exFAT stores a UTC offset beside each one, which a listing shows and does not apply),
+so a walker for either gives `entry()` an mtime of 0 and hands the readings out through
 `listdir_records()` instead. `--list` prints them that way, `modified 2023-06-01
 12:00:00 (as stored, no zone)`, never as an instant and never as `1970-01-01`,
 and the window's Contents pane puts them in a **Recorded (as stored)** column with
-the three (UTC) columns left blank.
+the three (UTC) columns left blank. `--extract` puts the reading in each member's date
+and, where an exFAT offset is marked valid, the UTC it gives in an extended timestamp,
+with every raw value in `<volume>.times.tsv` (see
+[Listing and extracting](#listing-and-extracting-without-mounting)).
 
 ### Deleted files on FAT32 and exFAT
 

@@ -1902,9 +1902,9 @@ def _fmt_reading(recorded):
     mtime of 0 and the readings arrive through listdir_records() instead. A
     listing prints the reading as stored, marked so it cannot be read as an
     instant, and prints nothing rather than 1970-01-01 when there is none. exFAT
-    also stores a UTC offset beside each stamp; it is shown and not applied, the
-    stance GLEAPP takes on the same field, since one writer has been measured
-    and a listing should not assert an instant from it.
+    also stores a UTC offset beside each stamp. The listing shows it beside the
+    reading and does not apply it. A zip export gives the UTC it yields as well
+    (_zip_reading_time).
     """
     when = (recorded or {}).get("modified")
     if not when:
@@ -5929,6 +5929,11 @@ class Fat32Walker:
     # also takes in table reads past the end of the image.
     read_file_never_pads = True
 
+    # True adds "raw" to each listdir_records() entry: {time: (stored value, 10 ms
+    # byte, UTC offset byte)}, None where the format has no such field. Only the zip
+    # export sets it, for <volume>.times.tsv (_zip_write_times).
+    keep_raw_times = False
+
     def __init__(self, fh, base):
         self.fh = fh
         self.base = base
@@ -6629,13 +6634,16 @@ class Fat32Walker:
             # A folder with no first cluster is given 1, which is no cluster: 0 is how the
             # root node names the FAT16 fixed root, and this folder is not the root.
             node = (first if first or not is_sub else 1, sz, is_sub)
-            out.append((name, node, {
+            held = {
                 "modified": _fat_stamp(struct.unpack_from("<H", e, 24)[0],
                                        struct.unpack_from("<H", e, 22)[0]),
                 "created": _fat_stamp(struct.unpack_from("<H", e, 16)[0],
                                       struct.unpack_from("<H", e, 14)[0], e[13]),
                 "accessed date": _fat_date(struct.unpack_from("<H", e, 18)[0]),
-            }))
+            }
+            if self.keep_raw_times:                # the readings above keep the words
+                held["raw"] = {"created": (None, e[13], None)}
+            out.append((name, node, held))
         return out
 
     def _deleted_in(self, node, in_deleted_dir):
@@ -7317,11 +7325,11 @@ def _exfat_stamp(value, tenths=0):
 def _exfat_offset(byte):
     """An exFAT UTC offset byte as text, exactly as stored, or "" if not set.
 
-    The low seven bits are a signed count of fifteen minute steps and the top
-    bit says whether the field was written at all. This is reported rather than
-    applied: on the one exFAT volume measured here the stored reading was not
-    the writing machine's local clock and this field was the negation of its
-    zone, so applying it would assert an instant the evidence does not support.
+    The low seven bits are a signed count of fifteen minute steps from UTC to the
+    stored reading, and the top bit (OffsetValid) says whether they hold one. The
+    text is the field as stored. A zip export takes the reading minus this offset
+    as the file's UTC modified time (_zip_reading_time); a listing shows both and
+    applies neither to the other.
     """
     if not byte & 0x80:
         return ""
@@ -7797,6 +7805,8 @@ class ExfatWalker:
     # EOF_SHORTFALL tally can be larger: it also takes in FAT reads and a decrypting
     # reader's whole chunk.
     read_file_never_pads = True
+
+    keep_raw_times = False                           # as Fat32Walker.keep_raw_times
 
     def __init__(self, fh, base):
         self.fh = fh
@@ -8638,8 +8648,8 @@ class ExfatWalker:
     def listdir_records(self, node, live=True):
         """(name, node, recorded times as stored) for every entry.
 
-        exFAT carries a UTC offset beside each timestamp, unlike FAT. It is
-        reported as stored rather than applied, so no instant is asserted.
+        exFAT carries a UTC offset beside each timestamp, unlike FAT. Each is
+        given as stored and neither is applied to the other here (see _exfat_offset).
 
         An entry set the folder's end cuts short is recorded as damage. It is listed
         under the part of its name that is there, and not at all when none of it is.
@@ -8814,6 +8824,10 @@ class ExfatWalker:
                     "created utc offset": _exfat_offset(raw[i + 22]),
                     "accessed utc offset": _exfat_offset(raw[i + 24]),
                 }
+                if self.keep_raw_times:
+                    held["raw"] = {"created": (cre, raw[i + 20], raw[i + 22]),
+                                   "modified": (mod, raw[i + 21], raw[i + 23]),
+                                   "accessed": (acc, None, raw[i + 24])}
                 if live:
                     for label, value in (("modified", mod), ("created", cre), ("accessed", acc)):
                         if value and not held[label]:
@@ -21706,6 +21720,93 @@ def _zip_time(v):
     return (d.year, d.month, d.day, d.hour, d.minute, d.second)
 
 
+_ZIP_FAT_KINDS = ("fat12", "fat16", "fat32", "exfat")    # exported with <volume>.times.tsv
+
+
+def _zip_reading_time(recorded):
+    """(zip date, UTC Unix seconds or None) for a FAT or exFAT file's modified time,
+    from its record as listdir_records() gives it.
+
+    The date is the reading as stored: FAT keeps no zone, and a zip's date has none
+    either. A zip holds it in two-second steps. The UTC is the reading minus the
+    entry's exFAT UTC offset, given only when OffsetValid is set and the result fits
+    the extended timestamp's signed 32 bits (to 2038-01-19). No reading, or one that
+    names no real day or time, gives 1980-01-01 and no UTC."""
+    recorded = recorded or {}
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)", recorded.get("modified") or "")
+    try:
+        when = datetime.datetime(*(int(x) for x in m.groups()),
+                                 tzinfo=datetime.timezone.utc) if m else None
+    except ValueError:
+        when = None
+    if when is None:
+        return (1980, 1, 1, 0, 0, 0), None
+    utc = None
+    off = re.fullmatch(r"([+-])(\d\d):(\d\d)", recorded.get("modified utc offset") or "")
+    if off:
+        minutes = (int(off[2]) * 60 + int(off[3])) * (-1 if off[1] == "-" else 1)
+        utc = int(when.timestamp()) - minutes * 60
+        if not -(1 << 31) <= utc < 1 << 31:
+            utc = None
+    return when.timetuple()[:6], utc
+
+
+def _zip_utc_extra(utc):
+    """Info-ZIP's extended timestamp extra field (0x5455) with the modified time only,
+    in UTC Unix seconds. With only that flag set, the local and central copies are the
+    same bytes."""
+    return struct.pack("<HHBl", 0x5455, 5, 1, utc)
+
+
+_ZIP_TIMES_COLUMNS = ["zip_member", "stored_path", "kind",
+                      "modified", "modified_10ms", "modified_utc_offset_byte",
+                      "created", "created_10ms", "created_utc_offset_byte",
+                      "accessed", "accessed_utc_offset_byte", "member_utc"]
+
+
+def _zip_times_rows(volume, times, files, written_names):
+    """One row per entry of a FAT or exFAT volume for <volume>.times.tsv: each time as
+    the entry stores it, its 10 ms byte and its UTC offset byte as stored (blank where
+    the format has none), and the UTC written into the member's extended timestamp.
+    ``times`` is collect()'s, from a walker with keep_raw_times set."""
+    for path, rec in times.items():
+        raw = rec.get("raw") or {}
+        member = written_names.get(zip_member_name(volume, path), "") if path in files else ""
+        cells = [member, path, "file" if path in files else "folder"]
+        for label, key, sub in (("modified", "modified", True), ("created", "created", True),
+                                ("accessed", "accessed date" if "accessed date" in rec
+                                 else "accessed", False)):
+            value, tens, offset = raw.get(label, (None, None, None))
+            shown = rec.get(key) or (f"not a valid time (stored value {value:#010x})"
+                                     if value else "")
+            cells.append(shown)
+            if sub:
+                cells.append("" if tens is None else tens)
+            cells.append("" if offset is None else f"0x{offset:02X}")
+        utc = _zip_reading_time(rec)[1] if member else None
+        cells.append("" if utc is None else datetime.datetime.fromtimestamp(
+            utc, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        yield cells
+
+
+def _zip_write_times(zf, volume, times, entries, written_names, rec, pad):
+    """Write <volume>.times.tsv for a FAT or exFAT volume and name it in its record as
+    times_table, None when it could not be written. ``entries`` is collect()'s list
+    before --exclude, so a file left out is still a file."""
+    name = _zip_component(f"{volume}.times.tsv")
+    try:
+        _zip_store_table(zf, name, _ZIP_TIMES_COLUMNS,
+                         _zip_times_rows(volume, times, {e[0] for e in entries}, written_names))
+    except Exception as exc:                         # pylint: disable=broad-except
+        name = None
+        print(f"{pad}could not write the times table: {_zip_reason(exc)}")
+    if rec is not None:
+        rec["times_table"] = name
+    if name:
+        _say(f"{pad}every file's and folder's times as stored, with their 10 ms and UTC "
+             f"offset bytes: {name}")
+
+
 def _zip_zero_is_no_time(w, node):
     """True when this walker's mtime of 0 stands for no time rather than a stored 0.
     FAT and exFAT answer 0 always (their readings come through collect()). The NTFS,
@@ -22588,6 +22689,13 @@ def _zip_finish(zf, path, manifest):
         whole = False
         print(f"\nCOULD NOT WRITE the file table of {lost:,} volume(s). Those volumes' "
               f"records in volumes.json say so, and the zip does not name their files.")
+    timeless = sum(1 for rec in manifest or []
+                   if "times_table" in rec and rec["times_table"] is None)
+    if timeless:
+        whole = False
+        print(f"\nCOULD NOT WRITE the times table of {timeless:,} FAT or exFAT volume(s). "
+              f"Those volumes' records in volumes.json say so, and the zip does not keep "
+              f"their times as stored.")
     return whole
 
 
@@ -22933,7 +23041,7 @@ def _zip_reason(exc):
 
 
 def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=None,
-                   issues=None, table_room=None):
+                   issues=None, table_room=None, readings=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -22982,6 +23090,10 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
     failed too. Members of earlier calls stay, since their tables already name them.
     table_room, when given, returns the bytes this volume's table will take; without it
     that is measured from ``issues``.
+
+    readings, when given, is collect()'s ``times`` from a FAT or exFAT walker, whose
+    mtime is 0. A member then carries the stored modified reading as its date, and the
+    UTC the exFAT offset gives in an extended timestamp (_zip_reading_time).
     """
     import tempfile
     total_files = sum(1 for _, _, size, _ in entries if size is not None)
@@ -23041,7 +23153,11 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
             continue
         info = None
         try:
-            info = zipfile.ZipInfo(final, date_time=_zip_time(mtime))
+            when, utc = (_zip_time(mtime), None) if readings is None \
+                else _zip_reading_time(readings.get(path))
+            info = zipfile.ZipInfo(final, date_time=when)
+            if utc is not None:
+                info.extra = _zip_utc_extra(utc)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
             got = 0
@@ -47003,20 +47119,26 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         except Exception as exc:
                             print(f"        could not walk this filesystem: {exc}")
                     if zf is not None:
+                        fat_times = {} if kind in _ZIP_FAT_KINDS else None
                         vol = _zip_names(zf).volume(name_prefix + (vol_names.get(b) or f"lba{b // ss}"),
-                                                    (".exceptions.tsv",))
+                                                    (".exceptions.tsv",) if fat_times is None
+                                                    else (".exceptions.tsv", ".times.tsv"))
                         _say(f"        EXTRACTING to {extract}  as {vol}/")
                         try:
                             w = walker_for(kind, fh, b, sz)
-                            ents = collect(w, w.root)
+                            if fat_times is not None:
+                                w.keep_raw_times = True
+                            listed = ents = collect(w, w.root, times=fat_times)
                             ents, dropped = apply_exclude(ents, exclude)
                             if getattr(w, "exclude_noted", None) is not None:
                                 w.exclude_noted(exclude)
                             log = []
                             miss = missing_past_end(b, getattr(w, "declared_end", None))
                             issues = []
+                            written_names = {}
                             f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                 issues=issues)
+                                                                 written_names, issues=issues,
+                                                                 readings=fat_times)
                             if isinstance(w, F2fsWalker):
                                 w.check_reached()
                                 # a name whose inode cannot be read never reaches the list above
@@ -47047,6 +47169,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 })
                             _zip_record_exceptions(zf, vol, manifest[-1] if manifest is not None
                                                    else None, issues, " " * 12)
+                            if fat_times is not None:
+                                _zip_write_times(zf, vol, fat_times, listed, written_names,
+                                                 manifest[-1] if manifest is not None else None,
+                                                 " " * 12)
                             if hasattr(w, "note_unreached_sets"):
                                 w.note_unreached_sets()
                             n_dmg, dmg = damage_lines(w, _ZIP_DAMAGE_KEPT)
@@ -50819,6 +50945,110 @@ def _fat_listing_check(image_gz, wcls):
     if missing:
         return False, f"reading not printed for {missing[:3]}"
     return True, f"{len(files)} files, readings printed as stored"
+
+
+def _zip_export_times(image, work, stem):
+    """--extract of ``image`` (bytes) through main(), from a file in ``work`` that is
+    removed again. Returns ({member: (date_time, UTC from 0x5455 or None)}, times table
+    rows, volumes.json records)."""
+    import contextlib, csv
+    raw, out = os.path.join(work, stem + ".raw"), os.path.join(work, stem + ".zip")
+    with open(raw, "wb") as fh:
+        fh.write(image)
+    try:
+        man = []
+        with zipfile.ZipFile(out, "w") as zf, contextlib.redirect_stdout(io.StringIO()):
+            main(raw, extract=out, zf=zf, manifest=man)
+        with zipfile.ZipFile(out) as zin:
+            members = {}
+            for info in zin.infolist():
+                utc, at = None, 0
+                while at + 4 <= len(info.extra):
+                    hid, size = struct.unpack_from("<HH", info.extra, at)
+                    if hid == 0x5455 and size >= 5 and info.extra[at + 4] & 1:
+                        utc = struct.unpack_from("<l", info.extra, at + 5)[0]
+                    at += 4 + size
+                members[info.filename] = (tuple(info.date_time), utc)
+            name = next((n for n in zin.namelist() if n.endswith(".times.tsv")), None)
+            rows = list(csv.DictReader(io.StringIO(zin.read(name).decode("utf-8")),
+                                       delimiter="\t")) if name else []
+    finally:
+        for path in (raw, out):
+            if os.path.exists(path):
+                os.remove(path)
+    return members, rows, man
+
+
+def _exfat_zip_time_checks(image_gz, work):
+    """The exFAT fixture's members against its entry sets, read here by a scan of
+    32-byte slots for File entries whose SetChecksum holds: each member's date is the
+    modified reading, its extended timestamp the reading minus the stored offset, and the
+    times table holds the stored 10 ms and offset bytes. Then every offset byte is set to
+    0x00 (not valid, as exfat-fuse 1.3 writes it) with the checksum made good, and no
+    member may carry an extended timestamp. Returns [(ok, text)]."""
+    import gzip
+    with gzip.open(image_gz, "rb") as gz:
+        img = bytearray(gz.read())
+    sets = {}
+    for at in range(0, len(img) - 96, 32):
+        if img[at] != 0x85 or img[at + 32] != 0xC0:
+            continue
+        end = at + 32 * (img[at + 1] + 1)
+        if _exfat_set_checksum(bytes(img[at:end])) != struct.unpack_from("<H", img, at + 2)[0]:
+            continue
+        units = b"".join(img[k + 2:k + 32] for k in range(at + 64, end, 32))
+        name = units[:2 * img[at + 35]].decode("utf-16-le")
+        sets[name] = at
+
+    def stored(at, field, tens):
+        v = struct.unpack_from("<I", img, at + field)[0]
+        day, tm = v >> 16, v & 0xFFFF
+        return datetime.datetime(1980 + (day >> 9), (day >> 5) & 15, day & 31, tm >> 11,
+                                 (tm >> 5) & 63, (tm & 31) * 2 + tens // 100,
+                                 tzinfo=datetime.timezone.utc)
+
+    members, rows, _man = _zip_export_times(bytes(img), work, "exfat-times")
+    files = {r["stored_path"].rsplit("/", 1)[-1]: r for r in rows if r["kind"] == "file"}
+    good = table_ok = 0
+    for name, at in sets.items():
+        when = stored(at, 12, img[at + 21])
+        quarters = img[at + 23] & 0x7F
+        quarters -= 0x80 if quarters & 0x40 else 0
+        row = files.get(name)
+        got = members.get(row["zip_member"]) if row else None
+        good += bool(img[at + 23] & 0x80 and got
+                     and got[0] == when.timetuple()[:5] + (when.second // 2 * 2,)
+                     and got[1] == int(when.timestamp()) - quarters * 900)
+        table_ok += bool(row and row["modified_10ms"] == str(img[at + 21])
+                         and row["created_10ms"] == str(img[at + 20])
+                         and [row[f"{t}_utc_offset_byte"] for t in ("created", "modified",
+                                                                     "accessed")]
+                         == [f"0x{img[at + k]:02X}" for k in (22, 23, 24)])
+    out = [(bool(sets) and good == len(sets),
+            f"an exFAT member's date is the modified reading its entry stores, and its "
+            f"extended timestamp the reading minus the valid UTC offset stored beside it "
+            f"({good} of {len(sets)} files)"),
+           (bool(sets) and table_ok == len(sets) and len(rows) >= len(sets),
+            f"the exFAT times table holds each file's 10 ms and UTC offset bytes as stored "
+            f"({table_ok} of {len(sets)} files, {len(rows)} rows)")]
+    for at in sets.values():
+        img[at + 22:at + 25] = b"\0\0\0"
+        end = at + 32 * (img[at + 1] + 1)
+        struct.pack_into("<H", img, at + 2, _exfat_set_checksum(bytes(img[at:end])))
+    members, rows, man = _zip_export_times(bytes(img), work, "exfat-times-unset")
+    files = {r["stored_path"].rsplit("/", 1)[-1]: r for r in rows if r["kind"] == "file"}
+    plain = 0
+    for name, at in sets.items():
+        when = stored(at, 12, img[at + 21])
+        row = files.get(name)
+        got = members.get(row["zip_member"]) if row else None
+        plain += bool(got and got == (when.timetuple()[:5] + (when.second // 2 * 2,), None)
+                      and row["modified_utc_offset_byte"] == "0x00" and not row["member_utc"])
+    out.append((bool(sets) and plain == len(sets)
+                and not any(rec.get("exceptions") for rec in man),
+                f"an exFAT offset not marked valid gives the member the reading alone, with no "
+                f"extended timestamp ({plain} of {len(sets)} files)"))
+    return out
 
 
 def _counting_image(data):
@@ -58421,6 +58651,39 @@ def self_test():
                             and _with == _without
                             and all(len(e) == 4 for e in _with)
                             and len(_with) == 2)
+        # --extract gives each FAT member the reading its entry stores as its date, and
+        # no extended timestamp, since FAT stores no zone; the times table keeps it.
+        # The calls are main()'s for a FAT volume.
+        try:
+            import csv as _csv
+            import contextlib
+            _fzw = Fat32Walker(io.BytesIO(bytes(_fatbuf)), 0)
+            _fzw.keep_raw_times = True
+            _fz_times, _fz_names, _fz_rec, _fz_buf = {}, {}, {}, io.BytesIO()
+            _fz_ents = collect(_fzw, _fzw.root, times=_fz_times)
+            with zipfile.ZipFile(_fz_buf, "w") as _fz, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                extract_to_zip(_fz, _fzw, "v", _fz_ents, [], None, _fz_names, issues=[],
+                               readings=_fz_times)
+                _zip_write_times(_fz, "v", _fz_times, _fz_ents, _fz_names, _fz_rec, "")
+            with zipfile.ZipFile(io.BytesIO(_fz_buf.getvalue())) as _fz:
+                _fz_members = {i.filename: (tuple(i.date_time), i.extra)
+                               for i in _fz.infolist()}
+                _fz_seen = {r["stored_path"]: (r["zip_member"], r["kind"], r["modified"],
+                                               r["modified_utc_offset_byte"], r["member_utc"])
+                            for r in _csv.DictReader(io.StringIO(
+                                _fz.read("v.times.tsv").decode("utf-8")), delimiter="\t")}
+            fat_zip_dates_ok = (
+                _fz_members.get("v/HELLO.TXT") == ((2023, 6, 1, 12, 30, 30), b"")
+                and _fz_members.get("v/SUB/DEEP.TXT") == ((1999, 12, 31, 23, 59, 58), b"")
+                and _fz_seen.get("HELLO.TXT") == ("v/HELLO.TXT", "file", FAT_ENTRY_WRITTEN,
+                                                  "", "")
+                and _fz_seen.get("SUB/DEEP.TXT") == ("v/SUB/DEEP.TXT", "file",
+                                                     FAT_DEEP_WRITTEN, "", "")
+                and _fz_seen.get("SUB", ("x",))[:2] == ("", "folder")
+                and _fz_rec == {"times_table": "v.times.tsv"})
+        except Exception:                            # pylint: disable=broad-except
+            fat_zip_dates_ok = False
 
         # Cut each image so the read of the next FAT entry falls off the end.
         try:
@@ -58563,7 +58826,10 @@ def self_test():
                 ("an exFAT UTC offset decodes both ways from its stored steps, "
                  "and an unset one says nothing", offset_ok),
                 ("collect carries the recorded readings when asked, and returns "
-                 "the same tuples either way", collect_times_ok)):
+                 "the same tuples either way", collect_times_ok),
+                ("--extract gives a FAT member the modified reading its entry stores as "
+                 "its date, with no extended timestamp, and the times table names it",
+                 fat_zip_dates_ok)):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
@@ -59517,6 +59783,21 @@ def self_test():
                 ok = False
             print(f"  [{'PASS' if lok else 'FAIL'}] a {label} listing prints each file's "
                   f"modified reading as stored and never 1970-01-01 ({ldetail})")
+        fix = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "tests", "fixtures", "exfat-deleted.img.gz")
+        if os.path.isfile(fix):
+            try:
+                ztimes = _exfat_zip_time_checks(fix, d)
+            except Exception as exc:                 # pylint: disable=broad-except
+                ztimes = [(False, f"the exFAT export time checks raised "
+                                  f"{type(exc).__name__}: {exc}")]
+            for zcond, ztext in ztimes:
+                if not zcond:
+                    ok = False
+                print(f"  [{'PASS' if zcond else 'FAIL'}] {ztext}")
+        else:
+            print("  [SKIP] the exFAT fixture is not beside this script, so its export's "
+                  "member times were not checked")
         # FAT16, TFAT16 and FAT12 each hold a fragmented file and an empty one,
         # and their lists name every file, so those three must show both shapes.
         # The FAT32 and exFAT fixtures hold neither, and the built volumes
@@ -61511,7 +61792,9 @@ getting the files out, without mounting:
   a zip, which is the shape a LEAPP tool expects. Directories are implied by
   the paths; symlinks and special files are counted and skipped. Entries are
   stamped with the file's own mtime, clamped to 1980 where the stored time
-  predates what the zip format can hold.
+  predates what the zip format can hold. A FAT or exFAT entry gets the modified
+  reading it stores, plus the UTC from a valid exFAT offset in an extended
+  timestamp, and <volume>.times.tsv keeps every time and offset as stored.
 
   This exists because mounting is a Linux-only answer. macOS ships no qnx6
   driver, the WSL2 kernel is built with CONFIG_QNX6FS_FS unset, and the FUSE
