@@ -2511,7 +2511,9 @@ Version 4.0 is read. The 1.x to 3.x layouts, and their big-endian `sqsh` form, a
 recognised and reported but not walked. A volume is claimed only when its superblock
 passes the checks the kernel makes before it mounts one (a block size that agrees with its
 own log, a compression id the format defines) and its root inode reads back as a
-directory.
+directory. Two cases are named without a root inode that reads, and recorded as not read:
+a volume whose decompressor this Python lacks, and an image cut short of the bytes its
+superblock records (both below).
 
 Every compressor mksquashfs offers is read: gzip, xz (including a BCJ filter), the legacy
 lzma format, LZO, LZ4 and, on Python 3.14 or later, zstd. Files split into blocks, files
@@ -2545,9 +2547,32 @@ volume is still identified and its note names the module. mksquashfs compresses 
 metadata as well unless told not to, so the root folder cannot be read: an export records
 that in `volumes.json` as `folders_not_read` and a damage line that names the module,
 writes no file for the volume, and exits 1. A volume that uses another compressor still
-reads. This is tested for zstd on
-Python 3.10 and 3.12, which do not have it, and for `lzma` and `zlib` by making the import
-fail, because every Python at hand was built with both.
+reads. This is tested for zstd on Python 3.10 and 3.12, which do not have it, and for
+`lzma` and `zlib` by making the import fail, because every Python at hand was built with
+both.
+
+**An image cut short.** The superblock records how many bytes the volume uses, and the
+kernel refuses to mount one that reaches past its device (`fs/squashfs/super.c`). When the
+image holds fewer bytes than that, the volume is still named, provided its superblock
+passes the checks the kernel makes on the superblock alone, even when its root inode is in
+the part that is gone. Its note and its first damage line give the bytes recorded, the
+bytes the image holds, and the tables the superblock's own offsets place in the missing
+part; `volumes.json` carries the shortfall as `extends_past_image_by_bytes`. A folder whose
+inode or listing cannot be read is recorded with what that leaves out and counted in
+`folders_not_read`, and the run exits 1. A fragment table that cannot be read is recorded
+once, and the read of a file that needs it is refused with that reason. Nothing is
+recovered.
+
+A SquashFS volume holds its file data first, then the inode table, the directory table and
+the smaller tables (the layout in the kernel's `Documentation/filesystems/squashfs.rst`),
+so a cut that reaches file data also takes the root folder, and no file is listed. Checked
+at three cut points (the last 4 KiB, halfway, just after the inode table) on 36 volumes
+mksquashfs wrote: 76 of the 108 cuts list nothing and exit 1 with those records. 26 took
+only tables this reader does not use (the export, id and extended attribute tables): every
+file still reads, the record says what is missing, and the exit status stays 0. 2 fell in
+the padding after the volume's end, where nothing is missing. 4 left a file of 0 bytes,
+which has no superblock to name, so nothing is recorded for it. A folder read only in part
+is recorded by the same code, but no cut tested reached that state.
 
 ### JFFS2
 

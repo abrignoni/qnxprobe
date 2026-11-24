@@ -12582,6 +12582,7 @@ SQUASHFS_MAGIC = 0x73717368
 SQFS_METADATA_SIZE = 8192
 SQFS_DAMAGE_KEPT = 1000                 # entries kept in a walker's damage list
 SQFS_INVALID_FRAG = 0xFFFFFFFF
+SQFS_INVALID_BLK = 0xFFFFFFFFFFFFFFFF   # a table the volume does not have (squashfs_fs.h:40)
 SQFS_COMP = {1: "gzip", 2: "lzma", 3: "lzo", 4: "xz", 5: "lz4", 6: "zstd"}
 SQFS_TYPE_MODE = {1: S_IFDIR, 2: S_IFREG, 3: S_IFLNK, 4: 0o060000, 5: 0o020000,
                   6: 0o010000, 7: 0o140000, 8: S_IFDIR, 9: S_IFREG, 10: S_IFLNK,
@@ -12684,9 +12685,15 @@ class SquashfsWalker:
 
     What could not be read is recorded in ``damage`` (see damage_lines), the
     first 1,000 entries of it, and ``folders_not_read`` counts the folders whose
-    inode or listing could not be read in full. Nothing is recovered."""
+    inode or listing could not be read in full. Nothing is recovered.
 
-    def __init__(self, fh, base):
+    ``size`` is the byte length of the region the volume sits in.
+    ``declared_end`` is where the superblock says the volume ends. When the
+    image stops before that, ``missing`` is how many bytes short it is, and
+    ``damage`` and ``note`` say so and name the tables the superblock places
+    past that point."""
+
+    def __init__(self, fh, base, size=None):
         self.fh, self.base = fh, base
         sb = read_at(fh, base, 96)
         if len(sb) < 96 or struct.unpack_from("<I", sb, 0)[0] != SQUASHFS_MAGIC:
@@ -12711,6 +12718,12 @@ class SquashfsWalker:
         self.damage, self._damage_seen = [], set()
         self.folders_not_read, self._not_read = 0, set()
         self._folder_names, self._folder_parents = {}, {}
+        self.declared_end = base + self.bytes_used
+        self.held = self._held(size)
+        self.missing = max(self.bytes_used - self.held, 0) if self.held is not None else 0
+        self._cut = self._cut_text() if self.missing else None
+        if self._cut:
+            self._damaged(self._cut)
         # Many small files share one fragment block, so the last few blocks are
         # kept decompressed, as the kernel's fragment cache does (super.c,
         # SQUASHFS_CACHED_FRAGMENTS).
@@ -12719,6 +12732,51 @@ class SquashfsWalker:
     root = property(lambda self: self.root_ref)
 
     # -- what could not be read ----------------------------------------------
+    def _held(self, size):
+        """How many bytes of the volume can be read: what the image holds from
+        ``base`` on, since no read stops at the region's end. A volume read
+        through a map sits past the image's own end (LvmImage); for it, or when
+        the image cannot say how long it is, the region's length is the answer,
+        and None when that is not known either."""
+        try:
+            end = image_size(self.fh)
+        except (OSError, ValueError, TypeError, AttributeError):
+            end = None
+        if isinstance(end, int) and self.base < end:
+            return end - self.base
+        return size
+
+    def _cut_text(self):
+        """What a volume longer than the image says: how much is missing, and the
+        tables the superblock's own offsets place wholly or partly in it, which
+        need not be all that is lost. The inode table runs up to the directory
+        table. Each of the fragment, export and id tables is found through a
+        list of pointers at the offset the superblock gives, written after the
+        blocks it points to (id.c:88-94, fragment.c:79-81), so the table is
+        whole only when that list is. Where the directory table ends is not in
+        the superblock, so it is named only when it begins past the cut. The
+        xattr table is named when its 16-byte header is not all here."""
+        held, gone = self.held, []
+        if self.dir_table > held:
+            gone.append("inode")
+        if self.dir_table >= held:
+            gone.append("directory")
+        for name, start, entries, width in (("fragment", self.frag_table, self.fragments, 16),
+                                            ("export", self.lookup_table, self.inodes, 8),
+                                            ("id", self.id_table, self.no_ids, 4)):
+            pointers = -(-entries * width // SQFS_METADATA_SIZE) * 8
+            if entries and start != SQFS_INVALID_BLK and start + pointers > held:
+                gone.append(name)
+        if self.xattr_table != SQFS_INVALID_BLK and self.xattr_table + 16 > held:
+            gone.append("xattr")
+        text = (f"the superblock records {self.bytes_used:,} bytes and the image holds "
+                f"{held:,} of them, so the last {self.missing:,} bytes are missing")
+        if gone:
+            text += ("; by its offsets they include all or part of the "
+                     + (" and ".join(filter(None, [", ".join(gone[:-1]), gone[-1]])))
+                     + (" tables" if len(gone) > 1 else " table"))
+        return text
+
     def _damaged(self, what):
         if what not in self._damage_seen and len(self.damage) < SQFS_DAMAGE_KEPT:
             self._damage_seen.add(what)
@@ -12887,10 +12945,12 @@ class SquashfsWalker:
 
     @property
     def note(self):
-        """Why this volume cannot be read on this Python, or None. listdir()
-        answers an empty list when its directory table cannot be decompressed,
-        so volumes() carries this beside the volume to say why."""
-        return _sqfs_no_decompressor(self.comp)
+        """Why this volume cannot be read on this Python, and how much of it the
+        image does not hold, or None. listdir() answers an empty list when its
+        directory table cannot be read, so volumes() carries this beside the
+        volume to say why."""
+        parts = [_sqfs_no_decompressor(self.comp), self._cut]
+        return "; ".join(p for p in parts if p) or None
 
     def listdir(self, ref):
         """[(name, node)] for a folder. A folder that cannot be read, or can be
@@ -12991,6 +13051,14 @@ def identify_squashfs(fh, base, size=None):
     a power of two in 4 KiB..1 MiB that agrees with block_log, its compression
     id is one the format defines, and its root inode reads back as a
     directory, the checks super.c applies before it will mount.
+
+    A volume whose root inode cannot be read is still named when its
+    superblock passes the checks super.c makes on the superblock alone (the
+    ones above, a root inode offset inside a metadata block, the inode table
+    before the directory table: super.c:232-289 and 441) and records more
+    bytes than the image holds, with the end of the inode table past what is
+    here. That is an image cut short, which the kernel refuses to mount
+    (super.c:256-261); naming it lets an export record what is missing.
     """
     sb = read_at(fh, base, 96)
     if len(sb) < 32:
@@ -13008,16 +13076,17 @@ def identify_squashfs(fh, base, size=None):
             "contents     a pre-4.0 layout, reported here but not walked; the Linux "
             "kernel's own driver refuses them too (fs/squashfs/super.c)"]
     try:
-        w = SquashfsWalker(fh, base)
+        w = SquashfsWalker(fh, base, size)
     except SquashfsUnreadable:
         return None
     if w.comp not in SQFS_COMP:
         return None
+    root_read = True
     try:
         root = w.inode(w.root)
         root_ok = root["type"] in (1, 8)
     except (SquashfsUnreadable, DecompressError, struct.error, ValueError):
-        root_ok = False
+        root_ok = root_read = False
     flags = [name for bit, name in SQFS_FLAGS if w.flags >> bit & 1]
     lines = [
         "version      4.0",
@@ -13030,14 +13099,18 @@ def identify_squashfs(fh, base, size=None):
     ]
     if flags:
         lines.append("flags        " + ", ".join(flags))
-    if size is not None and w.bytes_used > size:
+    here = min(n for n in (size, w.held, w.bytes_used) if n is not None)
+    if w.bytes_used > here:
         lines.append(f"note         the image records {human(w.bytes_used)} but the region "
-                     f"holds {human(size)}, so its end is missing")
+                     f"holds {human(here)}, so its end is missing")
     no_module = _sqfs_no_decompressor(w.comp)
     if no_module:
         lines.append("note         " + no_module)
     if not root_ok:
         if no_module:
+            return "squashfs", lines
+        if (not root_read and w.missing and w.dir_table > w.held
+                and (w.root_ref & 0xFFFF) <= SQFS_METADATA_SIZE):
             return "squashfs", lines
         return None
     return "squashfs", lines
@@ -21444,7 +21517,7 @@ def walker_for(kind, fh, base, size=None):
     if kind == "QNX IFS boot image":
         return IfsWalker(fh, base)
     if kind == "squashfs":
-        return SquashfsWalker(fh, base)
+        return SquashfsWalker(fh, base, size)
     if kind == "xfs":
         return XfsWalker(fh, base, size)
     if kind == "btrfs":
@@ -34079,8 +34152,10 @@ def flash_regions(fh, size):
     """[(label, base, size)] for the flash filesystems found inside an image
     with no partition table, in image order. Only aligned offsets are tried:
 
-      SquashFS  "hsqs" whose superblock and root inode read (identify_squashfs);
-                its extent is the bytes_used it records, rounded up to 4 KiB
+      SquashFS  "hsqs" whose superblock and root inode read, or whose superblock
+                reaches past the end of the image (identify_squashfs); its extent
+                is the bytes_used it records, rounded up to 4 KiB, or what the
+                image holds of that
       UBI       an erase counter header whose CRC holds; its extent runs over
                 the following eraseblocks that carry a header of the same
                 image_seq or are erased
@@ -40455,6 +40530,81 @@ def _squashfs_reader_checks():
         "recorded as not read by a line and a note that name the module, and a gzip volume "
         "still reads whole; a gzip volume without zlib is recorded the same way",
         without_module)
+
+    def cut_images():
+        packed, stored = load("squashfs-gzip.img.gz"), load("squashfs-none.img.gz")
+        if packed is None or stored is None:
+            return None
+
+        def cut(image, keep):
+            """What an export of the first ``keep`` bytes records, and whether it is true."""
+            used = struct.unpack_from("<Q", image, 40)[0]
+            man, members, said = export(image[:keep])
+            rec = man[0] if len(man) == 1 else {}
+            lines = rec.get("damage_first") or []
+            found = volumes(io.BytesIO(image[:keep]), keep)
+            said_so = (rec.get("filesystem") == "squashfs"
+                       and rec.get("extends_past_image_by_bytes") == used - keep
+                       and "INCOMPLETE" in said and all(len(ln) <= 240 for ln in lines)
+                       and bool(lines) and lines[0].startswith(
+                           f"the superblock records {used:,} bytes and the image holds "
+                           f"{keep:,} of them, so the last {used - keep:,} bytes are missing")
+                       and len(found) == 1 and found[0]["kind"] == "squashfs"
+                       and (found[0].get("note") or "") == lines[0])
+            return said_so, rec, lines, members, man
+
+        def nothing_listed(image, keep, how):
+            said_so, rec, lines, members, man = cut(image, keep)
+            return (said_so and not members and rec["files"] == 0
+                    and rec.get("folders_not_read") == 1 and rec.get("damage_recorded") == 2
+                    and lines[1].startswith(f"the root folder could not be {how} (")
+                    and "so nothing in it is listed or exported" in lines[1]
+                    and _volumes_not_read(man) == 1)
+
+        for image in (packed, stored):
+            if not whole(export(image)) or volumes(io.BytesIO(image), len(image))[0].get("note"):
+                return False
+        after_inodes = [struct.unpack_from("<Q", image, 72)[0] for image in (packed, stored)]
+        # the last 4 KiB of the stored image hold only tables this reader does not use
+        # (export, id, xattr), so every file is still read and the record says what is gone
+        said_so, rec, lines, members, man = cut(stored, len(stored) - 4096)
+        _man, all_members, _said = export(stored)
+        tail_only = (said_so and members == all_members and rec["files"] == 612
+                     and rec.get("damage_recorded") == 1 and not rec.get("folders_not_read")
+                     and lines[0].endswith("the export, id and xattr tables")
+                     and _volumes_not_read(man) == 0)
+        # A caller that holds nodes from the whole image asks the cut one for them: the
+        # inode table is all there, the tables after it are not.
+        full = SquashfsWalker(io.BytesIO(packed), 0)
+        nodes = {path: node for path, node, *_rest in walk_all(full)}
+        short = SquashfsWalker(io.BytesIO(packed[:after_inodes[0]]), 0)
+        folder, small = nodes["dir/sub/deeper"], nodes["small.txt"]
+        listed, refused = short.listdir(folder), []
+        for _again in range(2):
+            try:
+                b"".join(short.read_file(small, full.entry(small)[1]))
+            except SquashfsUnreadable as exc:
+                refused.append(str(exc))
+        asked = (full._folder_path(folder) == "dir/sub/deeper" and not full.damage
+                 and listed == [] and short.folders_not_read == 1
+                 and short.damage[1].startswith("a folder could not be listed (")
+                 and short.damage[1].endswith(f": inode reference {folder:#x}")
+                 and len(refused) == 2 and len(short.damage) == 3
+                 and all(r.startswith("the fragment table could not be read (") for r in refused)
+                 and short.damage[2].startswith(refused[0])
+                 and "no file that ends in a shared fragment" in short.damage[2])
+        return (tail_only and asked
+                and nothing_listed(packed, len(packed) - 4096, "listed")
+                and nothing_listed(packed, len(packed) // 2, "read")
+                and nothing_listed(packed, after_inodes[0], "listed")
+                and nothing_listed(stored, len(stored) // 2, "read")
+                and nothing_listed(stored, after_inodes[1], "listed"))
+    row("SquashFS: an image cut short of what its superblock records is still named and its "
+        "record says how much is missing: cut in half, just after the inode table, or (a gzip "
+        "image) by its last 4 KiB, the root folder is recorded as not read and counts for "
+        "the exit status; an image that lost only tables this reader does not use still "
+        "reads every file; a folder and a fragment table past the cut are recorded when "
+        "they are asked for", cut_images)
     return out
 
 
