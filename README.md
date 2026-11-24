@@ -4551,14 +4551,21 @@ had to divide evenly into pages of data plus 16 bytes of transaction record, so 
 cut anywhere but on a page boundary was "not recognised" and exported nothing, with exit
 0. The two qnxmount volumes with their last 4 KiB removed read so, though the pages
 that cut touches are erased ones (data all 0xFF, transaction code 3, `ETFS_TRANS_FOXES`
-in `fs/etfs.h`). The size test is gone and the reserved-name test stays.
+in `fs/etfs.h`). The size test now applies only where a size is not a cut's: when the
+image has a partition table (`table_regions()` finds an MBR, GPT or APM entry), every
+region tested is a partition or lies in one, and it must still be a whole number of
+pages. That keeps the test that declines almost every such region without reading it:
+with it gone everywhere, listing the volumes of a 248 GB disk image with six
+unrecognised partitions took about six times as long. When the image has no partition
+table, the region is the whole image or a flash region found by its own headers, and
+it may end inside a page. The reserved-name test applies in both cases.
 Such an image is read as the volume it is, and its record in `volumes.json` carries a
 `note` (also printed as `NOTE`) saying the image or region ends inside a page, how many
 bytes of that page are there, and that the page was not read. Whole pages cut off with
 it are not counted: the note speaks for the one partial page only. Checked on the two qnxmount volumes: whole, each still matches the tar its writer
 made on path, size, CRC and modification time (23 and 14 regular files) and exports
 exactly what it did before; cut by 4 KiB, each exports the same members as whole, with
-the note. With the size test gone the reserved names are all that claims a region, so
+the note. Where the size test no longer applies the reserved names are all that claims a region, so
 the change was also run over 23 raw flash dumps from the test corpus that hold no ETFS:
 none gained an ETFS volume, and each lists the same kinds of volume as before.
 

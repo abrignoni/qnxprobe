@@ -26241,14 +26241,31 @@ def _etfs_tail_note(size, pagesize):
 def etfs_pagesize(fh, base, size):
     """The ETFS page size for the region, or None. A candidate is accepted only
     when the .filetable, read in (pagesize + 16)-byte pages, carries its reserved
-    names at their fixed ids. The region need not be a whole number of pages: an
-    image cut inside its last page is still that volume, and the walker says the
-    page was not read (_etfs_tail_note).
+    names at their fixed ids.
+
+    Whether the region must also be a whole number of pages depends on what it is,
+    and table_regions() says which: when the image has an MBR, GPT or APM entry,
+    every region tested is a partition or something inside one, its size is the
+    table's and not a cut's, and the whole-page test is kept, which declines almost
+    every such region on arithmetic alone before a byte of it is read. When the
+    image has no partition table, the region is the whole image or a flash region
+    found by its own headers (raw_flash_layout), the shape of a flash dump: that one
+    may end inside a page, because a dump cut inside its last page is still that
+    volume, and the walker says the page was not read (_etfs_tail_note).
     """
+    tabled = None
     for P in ETFS_PAGE_SIZES:
         unit = P + ETFS_TRANS_SIZE
         if size < unit:
             continue
+        if size % unit:
+            if tabled is None:
+                try:
+                    tabled = bool(table_regions(fh)[0])
+                except Exception:                      # pylint: disable=broad-except
+                    tabled = True       # tables that cannot be read: the stricter test
+            if tabled:
+                continue
         if _etfs_reserved_match(fh, base, P, size // unit):
             return P
     return None
@@ -52410,13 +52427,26 @@ def self_test():
                      and "that page was not read" in t0.get("note", "")
                      and "NOTE" in tout and _volumes_not_read(trec) == 0)
             tsaid = t0.get("note", "not recognised")[:150]
+            # Behind a partition table the region's size is the table's, so the
+            # whole-page test stays: the same volume as a partition of 32 whole pages
+            # (65 sectors) is ETFS, and read as 64 sectors, not a whole number of
+            # pages at any page size, it is declined.
+            tdisk = bytearray(8 * SECTOR) + erased + b"\xff" * (29 * (Pz + ETFS_TRANS_SIZE))
+            tdisk[446 + 4] = 0x83
+            struct.pack_into("<II", tdisk, 446 + 8, 8, 65)
+            tdisk[510:512] = b"\x55\xaa"
+            tfh = io.BytesIO(bytes(tdisk))
+            in_table = (identify_etfs(tfh, 8 * SECTOR, 65 * SECTOR),
+                        identify_etfs(tfh, 8 * SECTOR, 64 * SECTOR))
+            tgood = (tgood and len(tdisk) == 73 * SECTOR and in_table[0] is not None
+                     and in_table[0][0] == "etfs" and in_table[1] is None)
         except Exception as exc:                     # pylint: disable=broad-except
             tgood, tsaid = False, f"raised {type(exc).__name__}: {exc}"
         if not tgood:
             ok = False
         print(f"  [{'PASS' if tgood else 'FAIL'}] an ETFS image that ends inside a page is "
               f"still read, with the members of the whole image and a note that the page "
-              f"was not read ({tsaid})")
+              f"was not read, and a partition must still be whole pages ({tsaid})")
 
         # A synthetic EFS image: one erase unit whose unit_info sizes it, whose
         # boot record carries the QSSL_F3S signature, and whose header 2
