@@ -6564,14 +6564,166 @@ def _fat_deleted_long_name(parts, entry):
     return name, cut
 
 
-_EXFAT_DIR_MAX = 256 << 20       # exFAT specification 7.6.5: a directory's largest DataLength
+_EXFAT_DIR_MAX = 256 << 20       # exFAT specification 7.6.7: a directory's largest DataLength
+
+
+def _exfat_name_last(kind, name):
+    """The end of a damage record naming a file or folder. Records are cut at 240 characters,
+    so the name comes after what was found and what it means."""
+    if name is None:
+        return ""
+    return f" ({'its name' if kind == 'its' else kind + ' name'} {name!r})"
+
+
+def _exfat_boot_sum(region, bps):
+    """The Boot Checksum of a Main or Backup Boot region: a 32-bit rotate right and add
+    over its first eleven sectors, leaving out VolumeFlags (bytes 106 and 107) and
+    PercentInUse (byte 112), which change without the checksum being rewritten. From
+    Microsoft's exFAT specification, section 3.4."""
+    total = 0
+    for i, byte in enumerate(region[:11 * bps]):
+        if i not in (106, 107, 112):
+            total = (((total << 31) | (total >> 1)) + byte) & 0xFFFFFFFF
+    return total
+
+
+def _exfat_boot_ok(region):
+    """True when these bytes are a whole boot region: the exFAT name, the boot signature,
+    sector and cluster shifts inside the specification's ranges (3.1.14, 3.1.15), and
+    sector 11 filled with the checksum of the eleven before it (3.4)."""
+    if len(region) < 512 or region[3:11] != b"EXFAT   " or region[510:512] != b"\x55\xaa":
+        return False
+    shift = region[108]
+    if not 9 <= shift <= 12 or region[109] > 25 - shift:
+        return False
+    bps = 1 << shift
+    if len(region) < 12 * bps:
+        return False
+    return region[11 * bps:12 * bps] == struct.pack("<I", _exfat_boot_sum(region, bps)) * (bps // 4)
+
+
+def _exfat_backup_boot(fh, base):
+    """The Backup Boot region, twelve sectors after the main one, when it passes
+    _exfat_boot_ok, else None. Its own shift has to agree with where it was found."""
+    for shift in range(9, 13):
+        region = read_at(fh, base + (12 << shift), 12 << shift)
+        if len(region) > 108 and region[108] == shift and _exfat_boot_ok(region):
+            return region
+    return None
+
+
+def _exfat_lost_main(fh, base):
+    """The Backup Boot region of a volume at ``base`` whose main boot sector is gone, else
+    None. A good region followed twelve sectors later by another is a MAIN region that
+    starts at sector 12, with its own backup after it, and not this volume's backup."""
+    region = _exfat_backup_boot(fh, base)
+    if region is None:
+        return None
+    bps = 1 << region[108]
+    return None if _exfat_boot_ok(read_at(fh, base + 24 * bps, 12 * bps)) else region
+
+
+def _exfat_boot_choice(fh, base):
+    """(boot sector, VolumeFlags, whether its fields passed the check, damage text or None).
+
+    The main region is used when it passes. When it does not and the backup does, the
+    backup's fields are used. When neither does the main one is read as it stands, so a
+    stale checksum alone never refuses a volume. VolumeFlags is taken from the main
+    sector while that still names exFAT, since the backup's copy is not kept current
+    (specification 3.1.13)."""
+    main = read_at(fh, base, 512)
+    if len(main) > 108 and 9 <= main[108] <= 12:
+        main = read_at(fh, base, 12 << main[108])
+    if _exfat_boot_ok(main):
+        return main, struct.unpack_from("<H", main, 106)[0], True, None
+    backup = _exfat_backup_boot(fh, base)
+    if backup is not None:
+        source = main if main[3:11] == b"EXFAT   " and len(main) >= 108 else backup
+        return backup, struct.unpack_from("<H", source, 106)[0], True, (
+            "the Main Boot region fails its Boot Checksum or its field ranges, so the fields "
+            "of the Backup Boot region, which passes, were used")
+    main = main.ljust(512, b"\x00")
+    flags = struct.unpack_from("<H", main, 106)[0]
+    if struct.unpack_from("<I", main, 80)[0] < 24:
+        # The FAT starts inside the 24 sectors the two boot regions take (specification
+        # 3.1.6), so this layout has no checksum sector to hold it to.
+        return main, flags, False, None
+    return main, flags, False, (
+        "neither the Main nor the Backup Boot region passes its Boot Checksum and field "
+        "ranges, so the Main Boot region was read and its fields are not verified")
+
+
+def _exfat_name_units(raw, at, secs, types):
+    """The UTF-16 bytes of the File Name entries of the set at ``at``, joined in order, up
+    to the first slot that is not one of ``types`` or the end of ``raw``."""
+    out = bytearray()
+    for k in range(2, secs + 1):
+        ent = raw[at + 32 * k:at + 32 * k + 32]
+        if len(ent) < 32 or ent[0] not in types:
+            break
+        out += ent[2:32]
+    return bytes(out)
+
+
+def _exfat_text(units):
+    """UTF-16 code units as text, decoded in one piece so a surrogate pair that crosses two
+    File Name entries stays one character, as Linux assembles the name in
+    exfat_get_uniname_from_ext_entry. An unpaired surrogate, which Windows stores as it
+    was given, becomes %XX of its two stored bytes, so a name never holds a surrogate."""
+    return units[:len(units) & ~1].decode("utf-16-le", "qnxprobe-name")
+
+
+def _exfat_stored_name(units, name_len):
+    """A set's name from its joined File Name units: NameLength of them, or with a
+    NameLength of 0 the text up to the first NUL. A NUL left inside becomes %00, because
+    os.stat raises on it and SQL length() stops at it."""
+    text = _exfat_text(units[:name_len * 2]) if name_len else _exfat_text(units).split("\x00")[0]
+    return text.replace("\x00", "%00")
+
+
+def _exfat_path_safe(name):
+    """(a name that cannot act as a path, whether it had to change). The specification
+    (7.7.3, Table 35) forbids "/", "." and ".." as stored names, and each would change
+    where a file lands once a caller joins it to its folder."""
+    if name in (".", ".."):
+        return "%2E" * len(name), True
+    if "/" in name:
+        return name.replace("/", "%2F"), True
+    return name, False
+
+
+_EXFAT_BENIGN_SLOTS = (0x81, 0x82, 0x83, 0xA0, 0xA1, 0xA2)   # in use, and not part of a file set
+_EXFAT_SET_SLOTS = (0xC0, 0xC1, 0xE0, 0xE1)                 # secondary entries of a set
+
+
+class _ExfatClusterSet:
+    """Clusters already seen on one chain, one bit each in pages made as they are needed,
+    so a loop check on a very long chain stays small."""
+
+    def __init__(self):
+        self.pages = {}
+
+    def add(self, clus):
+        """False when the cluster was already in the set."""
+        page = self.pages.get(clus >> 16)
+        if page is None:
+            page = self.pages[clus >> 16] = bytearray(8192)
+        bit = 1 << (clus & 7)
+        if page[(clus & 0xFFFF) >> 3] & bit:
+            return False
+        page[(clus & 0xFFFF) >> 3] |= bit
+        return True
 
 
 class _ExfatFileNode(tuple):
-    """The node of an exFAT file whose ValidDataLength differs from its DataLength: the
-    same four values as any other node, so it unpacks and compares the same, with the
-    stored ValidDataLength in ``valid``. Every other file has a plain tuple."""
+    """The node of an exFAT file that needs more than its four values: the same four, so it
+    unpacks and compares the same, with the stored ValidDataLength in ``valid`` when it
+    differs from DataLength, in ``refused`` why its entry set records nowhere to read, and
+    in ``unvouched`` that its set failed SetChecksum, so its bytes are exported and where
+    they came from is not vouched for. Every other file has a plain tuple."""
     valid = None
+    refused = None
+    unvouched = None
 
 
 class ExfatWalker:
@@ -6581,7 +6733,14 @@ class ExfatWalker:
     A file's size is its DataLength. Its ValidDataLength (Stream Extension offset 8,
     exFAT specification 7.6.5; valid_size in Linux fs/exfat/exfat_raw.h) says how far user
     data has been written: what the clusters hold past it is undefined and a read there
-    returns zeros, so read_file() never reads those clusters."""
+    returns zeros, so read_file() never reads those clusters.
+
+    The boot region is checked before it is used (specification 3.1 and 3.4) and the FAT
+    and Allocation Bitmap read are the ones VolumeFlags names active (3.1.13.1). An entry
+    set that fails its SetChecksum stays listed, is recorded in ``damage`` and is read as
+    its fields say, with an exceptions row saying where the bytes came from is not vouched
+    for. A set with no Stream Extension, or that clears AllocationPossible and passes its
+    checksum, records nowhere to read, and read_file() refuses it."""
 
     # read_file() hands back only bytes it read and the zeros past ValidDataLength. It never
     # pads over a gap, so the bytes it returned are the count of the file that is there. The
@@ -6592,19 +6751,36 @@ class ExfatWalker:
     def __init__(self, fh, base):
         self.fh = fh
         self.base = base
-        b = read_at(fh, base, 512)
-        self.bps = 1 << b[108]
-        self.spc = 1 << b[109]
+        self.damage = []
+        b, flags, verified, told = _exfat_boot_choice(fh, base)
+        self._root_why = None
+        geometry = 9 <= b[108] <= 12 and b[109] <= 25 - b[108]
+        if told:
+            self.damage.append(told)
+        if not geometry:
+            # No offset worked out from these would be a place on this volume.
+            self._root_why = (f"cannot be placed: the boot sector records a sector shift of "
+                              f"{b[108]} and a cluster shift of {b[109]}, outside the "
+                              f"specification's ranges")
+        self.bps = 1 << b[108] if geometry else 512
+        self.spc = 1 << b[109] if geometry else 1
         self.fat_off = struct.unpack_from("<I", b, 80)[0]
+        fat_len = struct.unpack_from("<I", b, 84)[0]
         self.heap_off = struct.unpack_from("<I", b, 88)[0]
-        self.root_clus = struct.unpack_from("<I", b, 96)[0]
-        self.cluster_count = struct.unpack_from("<I", b, 92)[0]
+        self.root_clus = struct.unpack_from("<I", b, 96)[0] if geometry else 0
+        self.cluster_count = struct.unpack_from("<I", b, 92)[0] if geometry else 0
         self.cluster_bytes = self.bps * self.spc
-        self.fat_start = base + self.fat_off * self.bps
+        # TexFAT: bit 0 of VolumeFlags names the active FAT and Allocation Bitmap, and the
+        # other pair is stale (specification 3.1.13.1 and 7.1.2.1).
+        self.active_fat = int(bool(geometry and b[110] == 2 and flags & 1 and fat_len
+                                   and self.fat_off + 2 * fat_len <= self.heap_off))
+        self.fat_start = base + (self.fat_off + self.active_fat * fat_len) * self.bps
         self.heap_start = base + self.heap_off * self.bps
         self.root = (self.root_clus, 0, True, False)
+        # where the boot sector says the volume ends, only from fields that passed the check
+        self.declared_end = (base + struct.unpack_from("<Q", b, 72)[0] * self.bps
+                             if verified and geometry else None)
         self._orphan_cache = None                    # recover_deleted() fills it once
-        self.damage = []
         self.folders_not_read = 0
         self._not_read = set()
         self._folder_names = {}                      # a folder's first cluster -> its name
@@ -6617,10 +6793,9 @@ class ExfatWalker:
     def _folder_part_read(self, first, detail, count=True):
         """Record a folder read only in part, once per detail. With ``count`` it is counted
         in folders_not_read, once per folder, because files it records may not be listed."""
-        name = self._folder_names.get(first)
-        what = ("the root folder" if first == self.root_clus else
-                f"folder {name!r}" if name is not None else "a folder")
-        line = f"{what} at cluster {first:#x}: {detail}"
+        name = self._folder_names.get(first) if first != self.root_clus else None
+        what = "the root folder" if first == self.root_clus else "a folder"
+        line = f"{what} at cluster {first:#x}: {detail}" + _exfat_name_last("folder", name)
         if line in self._not_read:
             return
         self._not_read.add(line)
@@ -6632,24 +6807,58 @@ class ExfatWalker:
     def _folder_bytes(self, node, live=True):
         """The bytes of a folder, in whole clusters. A NoFatChain folder is one run of
         clusters for its recorded size (exFAT specification 6.3.4.2), held to the volume, to
-        the 256MB the specification allows a directory (7.6.5) and to the image, and read to
+        the 256MB the specification allows a directory (7.6.7) and to the image, and read to
         the end of the last cluster that size touches. _folder_run() says where a run stops
         early. What stops it, and a size that is not a whole number of clusters, is recorded
-        as damage when ``live``. The root, a FAT-chained folder and a folder recording no
-        size are read as _read() reads them. A folder with no first cluster holds nothing
-        that can be read: cluster 0 would be an offset below the cluster heap."""
+        as damage when ``live``. A FAT-chained folder is read for the clusters its recorded
+        size needs (7.6.7: DataLength is the folder's whole allocation), since real writers
+        leave chains running past it. The root records no size and is read along its chain,
+        up to the 256MB a folder can hold. A folder with no first cluster holds nothing that
+        can be read: cluster 0 would be an offset below the cluster heap."""
         clus, size, _, contig = node
         if clus < 2:
             return b""
-        if not contig or not size:
-            out = self._read(clus, 0, contig)
-            if live and not contig and size and out and len(out) < size:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes is more than "
-                                             f"the {len(out):,} bytes its FAT chain and this "
-                                             f"image hold, so any files recorded after them "
-                                             f"are not listed")
-            return out
         cb = self.cluster_bytes
+
+        def recorded(read, what, lost):
+            """A size the folder's bytes disagree with. With the end marker in what was read
+            every entry is listed, so nothing is lost and it does not count as not read."""
+            if read[::32].find(0) != -1:
+                self._folder_part_read(clus, f"{what}, and its end-of-directory marker is "
+                                             f"inside what was read, so every entry it records "
+                                             f"is listed", count=False)
+            else:
+                self._folder_part_read(clus, f"{what}, {lost}")
+
+        if not contig:
+            limit = (min(size, _EXFAT_DIR_MAX) + cb - 1) // cb if size else _EXFAT_DIR_MAX // cb
+            # a deleted folder stops at its first cluster allocated again, as _folder_run does
+            out, end, walked, looped = self._chain_read(clus, limit, stop_in_use=not live)
+            if live and out:
+                if size > _EXFAT_DIR_MAX:
+                    recorded(out, f"its recorded size of {size:,} bytes is over the 256MB exFAT "
+                                  f"allows a folder",
+                             f"so only its first {len(out):,} bytes were read and any files "
+                             f"recorded after them are not listed")
+                elif size and len(out) < size:
+                    recorded(out, f"its recorded size of {size:,} bytes is more than the "
+                                  f"{len(out):,} bytes its FAT chain and this image hold",
+                             "so any files recorded after them are not listed")
+                elif size and size % cb:
+                    recorded(out, f"its recorded size of {size:,} bytes is not a whole number "
+                                  f"of {cb:,}-byte clusters",
+                             "so it was read to the end of the cluster that size ends in and "
+                             "any files recorded past that cluster are not listed")
+                elif not size:
+                    self._note_chain_end(clus, out, end, walked, looped, limit)
+            return out
+        if not size:
+            out = self._read(clus, 0, True)
+            if live and out and out[::32].find(0) == -1:
+                recorded(out, "it is a NoFatChain folder recording a size of 0",
+                         "so only its first cluster was read and any files recorded after it "
+                         "are not listed")
+            return out
         count, stop = self._folder_run(clus, size, live)
         out = self._clusters(clus, count)
         if live and out:
@@ -6661,24 +6870,71 @@ class ExfatWalker:
                                              "a free cluster in its run may be listed from",
                                        count=False)
             if stop:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes runs into "
-                                             f"{stop}, {kept}")
+                recorded(out, f"its recorded size of {size:,} bytes runs into {stop}", kept)
             if size > _EXFAT_DIR_MAX:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes is over "
-                                             f"the 256MB exFAT allows a folder, {kept}")
+                recorded(out, f"its recorded size of {size:,} bytes is over the 256MB exFAT "
+                              f"allows a folder", kept)
             elif len(out) < size and count * cb < size and not stop:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes runs off "
-                                             f"the end of this volume, {kept}")
+                recorded(out, f"its recorded size of {size:,} bytes runs off the end of this "
+                              f"volume", kept)
             elif len(out) < count * cb:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes runs past "
-                                             f"the end of the image, {kept}")
+                recorded(out, f"its recorded size of {size:,} bytes runs past the end of the "
+                              f"image", kept)
             if size % cb:
-                self._folder_part_read(clus, f"its recorded size of {size:,} bytes is not a "
-                                             f"whole number of {cb:,}-byte clusters, so it was "
-                                             f"read to the end of the cluster that size ends "
-                                             f"in and any files recorded past that cluster "
-                                             f"are not listed")
+                recorded(out, f"its recorded size of {size:,} bytes is not a whole number of "
+                              f"{cb:,}-byte clusters",
+                         "so it was read to the end of the cluster that size ends in and any "
+                         "files recorded past that cluster are not listed")
         return out
+
+    def _chain_read(self, first, limit, stop_in_use=False):
+        """(bytes of up to ``limit`` clusters along a FAT chain, the FAT value after the last
+        cluster read, clusters read, whether the chain came back to one it had read). Ends
+        at the first short read, so nothing after a gap lands in its place. ``stop_in_use``
+        is for a deleted folder: a later cluster the bitmap marks allocated is no longer
+        the folder's, and its bytes are not read as entries."""
+        out = bytearray()
+        seen = _ExfatClusterSet()
+        c, walked = first, 0
+        while walked < limit and self._chain_goes_on(c):
+            if not seen.add(c):
+                return bytes(out), c, walked, True
+            if stop_in_use and walked and self._cluster_in_use(c):
+                break
+            part = read_at(self.fh, self._cluster_off(c), self.cluster_bytes)
+            out += part
+            walked += 1
+            if len(part) < self.cluster_bytes:
+                break
+            c = self._fat_next(c)
+        return bytes(out), c, walked, False
+
+    def _root_bytes(self):
+        """The root folder's bytes along its chain, up to the 256MB a folder can hold."""
+        return self._chain_read(self.root_clus, _EXFAT_DIR_MAX // self.cluster_bytes)[0]
+
+    def _note_chain_end(self, first, raw, end, walked, looped, limit):
+        """Record a folder that records no size, the root above all, whose chain stops
+        before an end-of-directory marker on anything but an end-of-chain mark, or whose
+        clusters the image does not hold. With a marker in what was read, nothing is lost."""
+        if raw[::32].find(0) != -1:
+            return
+        if len(raw) < walked * self.cluster_bytes:
+            what = "runs past the end of the image"
+        elif looped:
+            what = f"loops back to cluster {end:#x}"
+        elif walked >= limit and self._chain_goes_on(end):
+            what = "runs past the 256MB exFAT allows a folder"
+        elif end >= 0xFFFFFFF8:
+            return
+        elif end == 0xFFFFFFF7:
+            what = "reaches a cluster marked bad"
+        elif end < 2:
+            what = f"ends on the FAT value {end:#x}, which is not an end-of-chain mark"
+        else:
+            what = f"links to cluster {end:#x}, past the end of this volume"
+        self._folder_part_read(first, f"its FAT chain {what} after {walked:,} clusters, so any "
+                                      f"files recorded after them are not listed")
 
     def _clusters(self, first, count):
         """``count`` clusters from ``first`` as one run, ending at the first short read."""
@@ -6728,7 +6984,7 @@ class ExfatWalker:
         a bitmap that is missing or short stops nothing. Read once."""
         bits = getattr(self, "_every_bitmap", None)
         if bits is None:
-            raw = self._read(self.root_clus, 0, False)
+            raw = self._root_bytes()
             for i in range(0, len(raw) - 31, 32):
                 if raw[i] == 0x00:
                     break
@@ -6736,11 +6992,7 @@ class ExfatWalker:
                     continue
                 first = struct.unpack_from("<I", raw, i + 20)[0]
                 length = struct.unpack_from("<Q", raw, i + 24)[0]
-                if self.cluster_count:
-                    length = min(length, (self.cluster_count + 7) // 8)
-                one = self._read(first, length, False) if length else b""
-                if len(one) < length:                # no chain in the FAT: it is one run
-                    one = self._read(first, length, True)
+                one = self._bitmap_bytes(first, length)
                 if bits is None:
                     bits = one
                 else:
@@ -6782,7 +7034,9 @@ class ExfatWalker:
         _named_first. Pages keep a large volume to the clusters really named. ``check``
         holds each entry set to its checksum. Without it every slot of a set is looked at
         too, because a set that would fail its checksum does not hide the slots after its
-        first, so what the pass without ``check`` marks always covers the pass with it."""
+        first, so what the pass without ``check`` marks always covers the pass with it. A
+        folder whose set failed names nothing itself, but the listing goes into it, so both
+        passes do too and its children are marked."""
         pages = {}
 
         def mark(c):
@@ -6800,8 +7054,12 @@ class ExfatWalker:
                 continue
             if contig and size:
                 raw = self._clusters(first, self._folder_run(first, size, True, named=False)[0])
+            elif contig:
+                raw = self._read(first, 0, True)
             else:
-                raw = self._read(first, 0, contig)
+                raw = self._chain_read(first, (min(size, _EXFAT_DIR_MAX) + self.cluster_bytes - 1)
+                                       // self.cluster_bytes if size
+                                       else _EXFAT_DIR_MAX // self.cluster_bytes)[0]
             i = inside = 0
             while i + 32 <= len(raw):
                 etype = raw[i]
@@ -6819,18 +7077,23 @@ class ExfatWalker:
                     continue
                 secs = raw[i + 1]
                 end = i + 32 * (secs + 1)
-                if secs < 2 or end > len(raw) or raw[i + 32] != 0xC0:
+                if i + 64 > len(raw) or raw[i + 32] != 0xC0:
                     i += 32
                     continue
                 c, length = struct.unpack_from("<IQ", raw, i + 52)
                 is_dir = bool(raw[i + 4] & 0x10)
+                child = (c, length, True, bool(raw[i + 33] & 0x02))
+                if secs < 2 or end > len(raw) or (
+                        check and c >= 2 and (is_dir or length)
+                        and _exfat_set_checksum(raw[i:end])
+                        != struct.unpack_from("<H", raw, i + 2)[0]):
+                    if is_dir and c >= 2 and child not in seen:
+                        seen.add(child)
+                        stack.append(child)
+                    i += 32
+                    continue
                 if c >= 2 and (is_dir or length):
-                    if check and (_exfat_set_checksum(raw[i:end])
-                                  != struct.unpack_from("<H", raw, i + 2)[0]):
-                        i += 32
-                        continue
                     mark(c)
-                    child = (c, length, True, bool(raw[i + 33] & 0x02))
                     if is_dir and child not in seen:
                         seen.add(child)
                         stack.append(child)
@@ -6838,16 +7101,18 @@ class ExfatWalker:
                 i = end if check else i + 32
         return pages
 
-    def _folder_not_read(self, what, first, why=None):
+    def _folder_not_read(self, what, first, why=None, name=None):
         """Record a folder that could not be read, once. Its files cannot be listed, so
-        nothing else would show they exist."""
-        if (what, first) in self._not_read:
+        nothing else would show they exist. Its name goes last, so a long one cannot cut
+        off what happened."""
+        if (what, first, name) in self._not_read:
             return
-        self._not_read.add((what, first))
+        self._not_read.add((what, first, name))
         self.folders_not_read += 1
         why = why or (f"is outside this volume's clusters (2 to {self.cluster_count + 1:,})")
         self.damage.append(f"{what}: first cluster {first:#x} {why}, so the folder was not "
-                           f"read and the files under it are not listed")
+                           f"read and the files under it are not listed"
+                           + _exfat_name_last("folder", name))
 
     def _fat_next(self, clus):
         raw = read_at(self.fh, self.fat_start + clus * 4, 4)
@@ -6900,6 +7165,50 @@ class ExfatWalker:
             c = self._fat_next(c)
         return bytes(out[:size]) if size else bytes(out)
 
+    def _chain_chunks(self, clus, want, whole=False):
+        """A file's bytes along its FAT chain in pieces of about 1 MiB, so a large chained
+        file is not held in memory. Stops at the end of the chain, at a cluster the chain
+        has already been through, and at the first short read. ``whole`` says ``want`` is
+        the file's whole size, so a chain that goes on past it can be recorded."""
+        out = bytearray()
+        got = 0
+        seen = _ExfatClusterSet()
+        c = clus
+        while got < want and self._chain_goes_on(c) and seen.add(c):
+            n = min(self.cluster_bytes, want - got)
+            part = read_at(self.fh, self._cluster_off(c), n)
+            out += part
+            got += len(part)
+            if len(part) < n:                        # what follows would land in its place
+                break
+            if len(out) >= 1 << 20:
+                yield bytes(out)
+                out = bytearray()
+            if got >= want:
+                if whole:
+                    self._note_chain_past_size(clus, c, want)
+                break
+            c = self._fat_next(c)
+        if out:
+            yield bytes(out)
+
+    def _note_chain_past_size(self, first, last, size):
+        """Record a file whose FAT chain carries on past the clusters its size needs. The
+        file is exported to its size, so this is what says the volume holds more for it."""
+        c = self._fat_next(last)
+        if not self._chain_goes_on(c) or ("over", first) in self._not_read:
+            return
+        self._not_read.add(("over", first))
+        seen, extra = {last}, 0
+        while self._chain_goes_on(c) and c not in seen:
+            seen.add(c)
+            extra += 1
+            c = self._fat_next(c)
+        need = (size + self.cluster_bytes - 1) // self.cluster_bytes
+        self.damage.append(f"the file at first cluster {first:#x} records {size:,} bytes, which "
+                           f"need {need:,} clusters, and its FAT chain goes on for {extra:,} "
+                           f"more, which were not read")
+
     def _chain_goes_on(self, clus):
         """True for a FAT value naming a data cluster of this volume. A count of 0 in the
         boot sector says nothing, so it bounds nothing."""
@@ -6922,8 +7231,17 @@ class ExfatWalker:
         An entry set the folder's end cuts short is recorded as damage. It is listed
         under the part of its name that is there, and not at all when none of it is.
         ``live`` is false for a deleted folder, whose damage is not the volume's.
+
+        A set that fails its SetChecksum is still listed and read, and is recorded, and
+        the slots after it are read one by one, since its count of them cannot be relied
+        on. A set with no Stream Extension, or that clears AllocationPossible, records
+        nowhere to read and its read is refused. A name the specification forbids is
+        listed escaped, so it cannot act as a path, and a set with no name is listed under
+        a placeholder holding its byte offset.
         """
         clus = node[0]
+        if self._root_why:                           # no offset on this volume can be worked out
+            raise NtfsUnreadable(f"the root folder {self._root_why}")
         if not self._cluster_on_volume(clus):
             if node == self.root:
                 self._folder_not_read("the root folder", clus)
@@ -6931,8 +7249,14 @@ class ExfatWalker:
         raw = self._folder_bytes(node, live)
         if not raw:                                  # its cluster lies past the image's end
             self._folder_not_read("a folder", clus, "lies past the end of the image")
+        elif live and node == self.root and not self._root_names_bitmap(raw):
+            self._folder_part_read(clus, "it names no Allocation Bitmap, which the exFAT "
+                                         "specification (7.1) requires in the root folder, so "
+                                         "files recorded there may have been lost from this "
+                                         "listing")
         out = []
-        i = 0
+        i = stray = 0
+        after_failed = False
         while i + 32 <= len(raw):
             etype = raw[i]
             if etype == 0x00:
@@ -6953,71 +7277,209 @@ class ExfatWalker:
                 valid_len = struct.unpack_from("<Q", s2, 8)[0]
                 is_dir = bool(raw[i + 4] & 0x10)
                 contiguous = bool(flags & 0x02)
-                # name entries follow, 0xC1, 15 UTF-16 chars each
-                name = ""
-                for k in range(2, secs + 1):
-                    ent = raw[i + 32 * k:i + 32 * k + 32]
-                    if len(ent) < 32 or ent[0] != 0xC1:
-                        break
-                    name += ent[2:32].decode("utf-16-le", "replace")
-                name = name[:name_len]
-                if i + 32 * (secs + 1) > len(raw):
+                set_end = i + 32 * (secs + 1)
+                whole = set_end <= len(raw)
+                cut = False
+                if not whole:                       # really cut, or a damaged count of slots
+                    k = i + 32
+                    while k < len(raw) and raw[k] >= 0xC0:
+                        k += 32
+                    cut = k >= len(raw)
+                failed = secs < 2 or ((_exfat_set_checksum(raw[i:set_end])
+                                       != struct.unpack_from("<H", raw, i + 2)[0])
+                                      if whole else not cut)
+                cut = cut and not failed
+                refused = unvouched = None
+                no_stream = s2[0] != 0xC0
+                if no_stream:
+                    refused = (f"its entry set at byte {i:,} of the folder has no Stream "
+                               f"Extension where one is required, so it records no first "
+                               f"cluster or size")
+                    first, data_len, valid_len, contiguous = 0, 0, 0, False
+                elif failed:
+                    unvouched = f"its entry set at byte {i:,} of the folder fails its SetChecksum"
+                elif not flags & 0x01 and (first or data_len):
+                    refused = (f"its entry set at byte {i:,} of the folder clears "
+                               f"AllocationPossible, which leaves its first cluster "
+                               f"({first:#x}) and size ({data_len:,} bytes) undefined")
+                # name entries follow, 0xC1, 15 UTF-16 code units each. A set that failed
+                # may have a wrong count of them, so its name is read as far as they go.
+                units = _exfat_name_units(raw, i, 18 if failed else secs, (0xC1,))
+                name = _exfat_stored_name(units, name_len)
+                if not name_len:
+                    if live and name and not no_stream:
+                        self._folder_part_read(clus, f"the entry set at byte {i:,} records a "
+                                                     f"NameLength of 0, so it is listed under "
+                                                     f"the {len(name)} characters its name "
+                                                     f"entries hold", count=False)
+                if no_stream and not name:           # no name, cluster or size to list it by
+                    if live:
+                        self._folder_part_read(clus, f"{refused}, and no name, so it is not "
+                                                     f"listed", count=False)
+                    i += 32                          # its count of slots cannot be relied on
+                    after_failed = True
+                    continue
+                if cut:
                     if live:
                         told = (f"so its file (first cluster {first:#x}, {data_len:,} bytes) "
                                 f"is not listed" if not name else
-                                f"so its file is listed as {name!r}, {len(name)} of the "
-                                f"{name_len} characters of its name")
+                                f"so its file is listed under "
+                                f"{min(len(units) // 2, name_len)} of the "
+                                f"{name_len} characters of its name, as {name!r}")
                         self._folder_part_read(clus, f"the entry set at byte {i:,} is cut at "
                                                      f"the end of the folder, {told}")
                     if not name:
                         break
-                if name not in (".", ".."):
-                    if is_dir:
-                        self._folder_names.setdefault(first, name)
-                    if is_dir and first and not self._cluster_on_volume(first):
-                        self._folder_not_read(f"folder {name!r}", first)
-                    elif live and is_dir and not first and data_len:
-                        # A folder with a size has a first cluster. Two folders of one name
-                        # are told apart by the folder holding them.
-                        self._folder_not_read(f"folder {name!r} in the folder at cluster "
-                                              f"{clus:#x}, recording {data_len:,} bytes", first)
-                    child = (first, data_len, is_dir, contiguous)
-                    if not is_dir and valid_len != data_len:
-                        child = _ExfatFileNode(child)
+                if not name:
+                    name = f"$NoName-{i}"
+                    if live:
+                        self._folder_part_read(clus, f"the entry set at byte {i:,} holds no "
+                                                     f"file name, so it is listed as {name!r}",
+                                               count=False)
+                stored = name
+                name, escaped = _exfat_path_safe(stored)
+                if escaped and live:
+                    self._folder_part_read(clus, f"the entry set at byte {i:,} stores a name "
+                                                 f"the specification forbids, so it is listed "
+                                                 f"escaped, as {name!r}, from {stored!r}",
+                                           count=False)
+                if is_dir:
+                    self._folder_names.setdefault(first, name)
+                if is_dir and no_stream:
+                    if live:
+                        self._folder_not_read(f"a folder in the folder at cluster {clus:#x}",
+                                              first, "is not recorded, because its entry set "
+                                              "has no Stream Extension", name=name)
+                elif is_dir and first and not self._cluster_on_volume(first):
+                    self._folder_not_read("a folder", first, name=name)
+                elif live and is_dir and not first and data_len:
+                    # A folder with a size has a first cluster. Two folders of one name
+                    # are told apart by the folder holding them.
+                    self._folder_not_read(f"a folder in the folder at cluster {clus:#x}, "
+                                          f"recording {data_len:,} bytes", first, name=name)
+                elif live and is_dir and (refused or unvouched):
+                    self._folder_part_read(clus, f"a folder in it: {refused or unvouched}, so "
+                                                 f"the files listed under it may not be its "
+                                                 f"own" + _exfat_name_last("its", name),
+                                           count=False)
+                child = (first, data_len, is_dir, contiguous)
+                if not is_dir and (refused or unvouched or valid_len != data_len):
+                    child = _ExfatFileNode(child)
+                    if valid_len != data_len:
                         child.valid = valid_len
-                        if live and valid_len > data_len:
-                            self._folder_part_read(clus, f"file {name!r} records a "
-                                                         f"ValidDataLength of {valid_len:,} "
-                                                         f"bytes, more than its DataLength of "
-                                                         f"{data_len:,}, so it is read to its "
-                                                         f"DataLength", count=False)
-                    cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
-                    out.append((name, child, {
-                        "modified": _exfat_stamp(mod, raw[i + 21]),
-                        "created": _exfat_stamp(cre, raw[i + 20]),
-                        "accessed": _exfat_stamp(acc),
-                        "modified utc offset": _exfat_offset(raw[i + 23]),
-                        "created utc offset": _exfat_offset(raw[i + 22]),
-                        "accessed utc offset": _exfat_offset(raw[i + 24]),
-                    }))
-                i += 32 * (secs + 1)
+                    if refused:
+                        child.refused = refused
+                        if live:
+                            self._folder_part_read(clus, f"a file in it: {refused}, so its "
+                                                         f"content is not exported"
+                                                         + _exfat_name_last("file", name),
+                                                   count=False)
+                    if unvouched:
+                        child.unvouched = unvouched
+                        if live:
+                            self._folder_part_read(clus, f"a file in it: {unvouched}, so where "
+                                                         f"its content came from is not "
+                                                         f"vouched for"
+                                                         + _exfat_name_last("file", name),
+                                                   count=False)
+                    if live and valid_len > data_len:
+                        self._folder_part_read(clus, f"a file in it records a "
+                                                     f"ValidDataLength of {valid_len:,} "
+                                                     f"bytes, more than its DataLength of "
+                                                     f"{data_len:,}, so it is read to its "
+                                                     f"DataLength"
+                                                     + _exfat_name_last("file", name),
+                                               count=False)
+                cre, mod, acc = struct.unpack_from("<III", raw, i + 8)
+                held = {
+                    "modified": _exfat_stamp(mod, raw[i + 21]),
+                    "created": _exfat_stamp(cre, raw[i + 20]),
+                    "accessed": _exfat_stamp(acc),
+                    "modified utc offset": _exfat_offset(raw[i + 23]),
+                    "created utc offset": _exfat_offset(raw[i + 22]),
+                    "accessed utc offset": _exfat_offset(raw[i + 24]),
+                }
+                if live:
+                    for label, value in (("modified", mod), ("created", cre), ("accessed", acc)):
+                        if value and not held[label]:
+                            self._folder_part_read(clus, f"an entry in it stores a {label} "
+                                                         f"time of {value:#010x}, which is not "
+                                                         f"a valid date, so no reading is shown"
+                                                         + _exfat_name_last("entry", name),
+                                                   count=False)
+                out.append((name, child, held))
+                i += 32 if no_stream or failed else 32 * (secs + 1)
+                after_failed = no_stream or failed
             else:
+                if not (after_failed and etype in _EXFAT_SET_SLOTS):
+                    after_failed = False
+                    if etype >= 0x80 and etype not in _EXFAT_BENIGN_SLOTS:
+                        stray += 1
                 i += 32
+        if live and stray:
+            self._folder_part_read(clus, f"{stray:,} in-use slots lie outside any entry set, so "
+                                         f"entries recorded there may have been lost from this "
+                                         f"listing", count=False)
         return out
 
+    def _bitmap_bytes(self, first, length):
+        """One Allocation Bitmap: along its FAT chain, and as one run when the chain holds
+        less than the bitmap, which is how Linux reads it (fs/exfat/balloc.c). The fallback
+        is recorded, because the FAT link that was lost says something is damaged."""
+        if self.cluster_count:
+            length = min(length, (self.cluster_count + 7) // 8)
+        if first < 2 or not length:
+            return b""
+        one = self._read(first, length, False)
+        if len(one) < length:
+            whole = self._read(first, length, True)
+            if len(whole) > len(one):
+                if ("bitmap", first) not in self._not_read:
+                    self._not_read.add(("bitmap", first))
+                    self.damage.append(f"the Allocation Bitmap at cluster {first:#x}: its FAT "
+                                       f"chain holds {len(one):,} of its {length:,} bytes, so "
+                                       f"it was read as one run of clusters")
+                one = whole
+        return one
+
+    @staticmethod
+    def _root_names_bitmap(raw):
+        """True when a root folder's bytes hold an Allocation Bitmap entry before their end
+        marker."""
+        for i in range(0, len(raw) - 31, 32):
+            if raw[i] == 0x00:
+                return False
+            if raw[i] == 0x81:
+                return True
+        return False
+
+    def _bitmap_entry(self, raw):
+        """(first cluster, length) of the Allocation Bitmap entry in a root folder's bytes
+        that BitmapFlags bit 0 marks as the active one, or None. A volume with one FAT has
+        one bitmap, marked 0. A TexFAT volume has two (specification 7.1.2.1)."""
+        for i in range(0, len(raw) - 31, 32):
+            if raw[i] == 0x00:                       # end of the directory
+                break
+            if raw[i] == 0x81 and (raw[i + 1] & 0x01) == self.active_fat:
+                return (struct.unpack_from("<I", raw, i + 20)[0],
+                        struct.unpack_from("<Q", raw, i + 24)[0])
+        return None
+
     def _cluster_in_use(self, clus):
-        """True when the Allocation Bitmap marks this cluster used. Read once."""
+        """True when the active Allocation Bitmap marks this cluster used. Read once."""
         bits = getattr(self, "_alloc_bits", None)
         if bits is None:
             bits = b""
-            clus_r, _, _, contig = self.root
-            raw = self._read(clus_r, 0, contig)
-            for i in range(0, len(raw), 32):
-                if raw[i] == 0x81:                   # Allocation Bitmap entry
-                    first = struct.unpack_from("<I", raw, i + 20)[0]
-                    length = struct.unpack_from("<Q", raw, i + 24)[0]
-                    bits = self._read(first, length, True)
-                    break
+            raw = self._root_bytes()
+            found = self._bitmap_entry(raw)
+            if found is None:                        # none marked active: the first one named
+                for i in range(0, len(raw) - 31, 32):
+                    if raw[i] == 0x81:
+                        found = (struct.unpack_from("<I", raw, i + 20)[0],
+                                 struct.unpack_from("<Q", raw, i + 24)[0])
+                        break
+            if found is not None:
+                bits = self._bitmap_bytes(found[0], found[1])
             self._alloc_bits = bits
         idx = clus - 2
         if idx < 0 or (idx >> 3) >= len(bits):
@@ -7084,6 +7546,15 @@ class ExfatWalker:
             else:
                 i += 32
         return out
+
+    def _kept_chain(self, first, need):
+        """(up to ``need`` clusters of the FAT chain from ``first``, the FAT value it stopped
+        on). It never leaves the volume or goes round a loop."""
+        chain, c, seen = array.array("I"), first, _ExfatClusterSet()
+        while len(chain) < need and self._chain_goes_on(c) and seen.add(c):
+            chain.append(c)
+            c = self._fat_next(c)
+        return chain, c
 
     def deleted_files(self, *, min_size=0, max_depth=32):
         """Yield the deleted directory entries of the whole volume.
@@ -7192,23 +7663,14 @@ class ExfatWalker:
         return [(name, child) for name, child, _times in self.listdir_records(node)]
 
     def _first_bitmap(self):
-        """The bytes of the first Allocation Bitmap, or b"" when the root
-        directory names none. A TexFAT volume has two, and BitmapFlags bit 0
-        marks the second."""
-        raw = self._read(self.root_clus, 0, False)
-        for i in range(0, len(raw) - 31, 32):
-            if raw[i] == 0x00:                       # end of the directory
-                break
-            if raw[i] != 0x81:
-                continue
-            if raw[i + 1] & 0x01:                    # the second TexFAT bitmap
-                continue
-            first_clus = struct.unpack_from("<I", raw, i + 20)[0]
-            length = struct.unpack_from("<Q", raw, i + 24)[0]
-            if not first_clus or not length:
-                return b""
-            return self._read(first_clus, length, False)
-        return b""
+        """The bytes of the active Allocation Bitmap, or b"" when the root directory
+        names none. A TexFAT volume has two, BitmapFlags bit 0 marks the second, and
+        VolumeFlags says which is active."""
+        raw = self._root_bytes()
+        found = self._bitmap_entry(raw)
+        if found is None or not found[0] or not found[1]:
+            return b""
+        return self._bitmap_bytes(found[0], found[1])
 
     # ---- orphan entry sets --------------------------------------------------
     # A directory cluster can stay allocated after the tree stops reaching it:
@@ -7609,6 +8071,9 @@ class ExfatWalker:
         return out
 
     def read_file(self, node, size):
+        refused = getattr(node, "refused", None)
+        if refused:
+            raise NtfsUnreadable(f"not read: {refused}")
         clus, sz, _, contig = node
         want = sz if size is None else min(size, sz)
         if want <= 0:
@@ -7631,10 +8096,9 @@ class ExfatWalker:
                 left -= min(len(part), left)
             got = real - left
         elif real:
-            # _read() stops at real, so only the bytes that hold it are read.
-            part = self._read(clus, real, False, exact=True)
-            got = len(part)
-            yield part
+            for part in self._chain_chunks(clus, real, whole=real == sz):
+                got += len(part)
+                yield part
         if real >= want or got < real:               # all of it, or a gap: no zeros after one
             return
         left = min(want, self._allocated_bytes(node)) - real
@@ -7675,6 +8139,37 @@ class ExfatWalker:
             told += f"{held:,} bytes of its content are exported, with no zeros after them"
         return ("PAST_VALID_DATA", told + ". The clusters past ValidDataLength were not read, "
                                           "so whatever they hold is not in this export")
+
+    def file_notes(self, node, held):
+        """[(issue, detail)] for the exceptions table, beside any ValidDataLength row: that
+        the file's entry set failed SetChecksum, and that clusters its read touched are
+        marked free. Neither refuses the file, and neither changes the exit status."""
+        rows = []
+        unvouched = getattr(node, "unvouched", None)
+        if unvouched is not None:
+            rows.append(("ENTRY_SET_CHECKSUM", f"{unvouched}. Its {held:,} bytes are exported as "
+                                               f"the entry records them, and where they came "
+                                               f"from is not vouched for"))
+        clus, sz, _, contig = node
+        valid = getattr(node, "valid", None)
+        reads = min(sz, held if valid is None else min(valid, held))
+        cb = self.cluster_bytes
+        need = (reads + cb - 1) // cb
+        if clus >= 2 and need:
+            if contig:
+                last = clus + need
+                if self.cluster_count:
+                    last = min(last, self.cluster_count + 2)
+                named = range(clus, max(last, clus))
+            else:
+                named = self._kept_chain(clus, need)[0]
+            free = sum(1 for c in named if self._marked_free(c))
+            if free:
+                rows.append(("CLUSTERS_MARKED_FREE",
+                             f"{free:,} of the {len(named):,} clusters its read touched are "
+                             f"marked free in the Allocation Bitmap. The bytes are exported as "
+                             f"the entry records them"))
+        return rows
 
     def run_shortfall(self, node):
         """Why a NoFatChain file's recorded size cannot be read from this volume, as text,
@@ -16510,6 +17005,18 @@ def _valid_data_note(w, node, held):
         return None
 
 
+def _file_notes(w, node, held):
+    """[(issue, detail)] a walker has to say about one exported file beyond its ValidDataLength
+    (exFAT: a failed entry set, clusters marked free). Empty for any other walker."""
+    report = getattr(w, "file_notes", None)
+    if report is None:
+        return []
+    try:
+        return report(node, held)
+    except Exception:                                # pylint: disable=broad-except
+        return []
+
+
 def chain_shortfall(w, node):
     """(clusters in the chain, clusters the recorded size needs) when a FAT32
     or exFAT file's cluster chain ends before its recorded size is covered,
@@ -17407,8 +17914,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
     read short, was renamed or lost its time is otherwise not recorded in the zip. The
     two ValidDataLength counts, the count of FAT files whose chain crosses a link the FAT
     copies disagree on, the count of files exported as stored because they are flagged
-    encrypted and the count of files read from an F2FS roll-forward log appear only when
-    not zero and do not change the exit status."""
+    encrypted, the count of files read from an F2FS roll-forward log and the exFAT entry-set
+    checksum and marked-free counts appear only when not zero and do not change the exit
+    status."""
     names = _zip_names(zf)
     held, names.last_volume = names.last_volume, None
     if held is not None and rec is not None and isinstance(zf.fp, _ZipOutput):
@@ -17431,7 +17939,9 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
                        ("fat_copies_differ", "FAT_COPIES_DIFFER"),
                        ("encrypted", "ENCRYPTED"),
                        ("roll_forward", "ROLL_FORWARD"),
-                       ("blocks_unreached", "BLOCKS_UNREACHED")):
+                       ("blocks_unreached", "BLOCKS_UNREACHED"),
+                       ("entry_set_checksum", "ENTRY_SET_CHECKSUM"),
+                       ("clusters_marked_free", "CLUSTERS_MARKED_FREE")):
         if counts[issue]:                            # none is a failure or a short read
             summary[key] = counts[issue]
     name = _zip_component(f"{volume}.exceptions.tsv")
@@ -17457,6 +17967,10 @@ def _zip_record_exceptions(zf, volume, rec, issues, pad="        ", quiet=False)
             valid += ", each file read from the roll-forward log"
         if counts["BLOCKS_UNREACHED"]:
             valid += ", each file whose inode counts more blocks than its map reaches"
+        if counts["ENTRY_SET_CHECKSUM"]:
+            valid += ", each exFAT file whose entry set failed its checksum"
+        if counts["CLUSTERS_MARKED_FREE"]:
+            valid += ", each exFAT file reading clusters the bitmap marks free"
         _say(f"{pad}every failed, short or renamed file{valid}, and each time a zip cannot "
              f"hold: {name}")
 
@@ -17683,6 +18197,8 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, written_names=Non
                 written += size
             valid_note = _valid_data_note(w, ino, min(got, size))
             for row in [valid_note] if isinstance(valid_note, tuple) else valid_note or ():
+                note(path, info.filename, *row)
+            for row in _file_notes(w, ino, min(got, size)):
                 note(path, info.filename, *row)
             shown = _zip_time_lost(mtime, w, ino) if issues is not None else None
             if shown is not None:
@@ -22482,10 +22998,20 @@ def identify_fat(fh, base, typed=False):
                                  typed=typed or b[82:90] in (b"FAT32   ", b"TFAT32  "))
     if from_copy is not None:
         b = from_copy
+    if b[3:11] != b"EXFAT   " and b[510:512] != b"\x55\xaa":
+        # no boot sector here at all: exFAT keeps a backup twelve sectors on
+        backup = _exfat_lost_main(fh, base)
+        if backup is not None:
+            b = backup[:512]
     if len(b) < 512 or b[510:512] != b"\x55\xaa":
         if b[3:11] != b"EXFAT   ":
             return None
+    if b[3:11] == b"EXFAT   " and len(b) < 112:
+        return "exfat", [f"boot sector  cut: only {len(b)} of its 512 bytes are in the image"]
     if b[3:11] == b"EXFAT   ":
+        bad = _exfat_boot_choice(fh, base)
+        if bad[3] and bad[2]:        # the main region failed and the backup passed
+            b = bad[0][:512]
         bps = 1 << b[108]
         spc = 1 << b[109]
         clusters = struct.unpack_from("<I", b, 92)[0]
@@ -35635,6 +36161,643 @@ def _exfat_run_image(content, *, first=5, clusters=3, size=None, count=32, past=
     return bytes(buf)
 
 
+def _exfat_reader_checks():
+    """[(label, passed)] for the exFAT reader's handling of names, damage and the boot
+    region. Every volume here is built by hand, with 4 KiB clusters and both
+    checksums written from the specification's formulas and not with the reader's."""
+    import contextlib
+    import tempfile
+    import tracemalloc
+    cb, fat_at, heap = 4096, 24, 40
+    stamp = (22209 << 16) | 24576
+    emoji = "\U0001F600"
+
+    @contextlib.contextmanager
+    def scratch():
+        """A folder of its own, emptied by hand. The CI build replaces mkdtemp with one kept
+        fixtures folder and rmtree with a no-op, so neither is used here."""
+        work = os.path.join(tempfile.gettempdir(), f"qnxprobe-exfat-{uuid.uuid4().hex}")
+        os.mkdir(work, 0o700)
+        try:
+            yield work
+        finally:
+            for root, dirs, names in os.walk(work, topdown=False):
+                for name in names:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(work)
+
+    def seal(buf):
+        """Write the Boot Checksum, then copy the Main Boot region over the backup."""
+        total = 0
+        for i in range(11 * 512):
+            if i not in (106, 107, 112):
+                total = ((0x80000000 if total & 1 else 0) + (total >> 1) + buf[i]) & 0xFFFFFFFF
+        buf[11 * 512:12 * 512] = struct.pack("<I", total) * 128
+        buf[12 * 512:24 * 512] = buf[:12 * 512]
+
+    def entries(units, first, size, *, is_dir=False, in_use=True, valid=None, flags=0x03,
+                when=stamp, length=None, second=0xC0):
+        """One entry set for a name given as UTF-16 bytes."""
+        chars = len(units) // 2
+        slots = max(1, (chars + 14) // 15)
+        ent = bytearray(32 * (2 + slots))
+        ent[0], ent[1] = 0x85, 1 + slots
+        ent[4] = 0x10 if is_dir else 0x20
+        struct.pack_into("<II", ent, 8, when, when)
+        ent[32], ent[33], ent[35] = second, flags, chars if length is None else length
+        struct.pack_into("<Q", ent, 40, size if valid is None else valid)
+        struct.pack_into("<I", ent, 52, first)
+        struct.pack_into("<Q", ent, 56, size)
+        for k in range(slots):
+            ent[64 + 32 * k] = 0xC1
+            ent[66 + 32 * k:96 + 32 * k] = units[30 * k:30 * (k + 1)].ljust(30, b"\0")
+        total = 0
+        for i, byte in enumerate(ent):
+            if i not in (2, 3):
+                total = ((0x8000 if total & 1 else 0) + (total >> 1) + byte) & 0xFFFF
+        struct.pack_into("<H", ent, 2, total)
+        if not in_use:
+            ent[0], ent[32] = 0x05, 0x40
+            for k in range(slots):
+                ent[64 + 32 * k] = 0x41
+        return bytes(ent)
+
+    def one(name, first, size, **kw):
+        return entries(name.encode("utf-16-le", "surrogatepass"), first, size, **kw)
+
+    def at(clus):
+        return heap * 512 + (clus - 2) * cb
+
+    def link(buf, clus, nxt, table=0):
+        struct.pack_into("<I", buf, (fat_at + 8 * table) * 512 + clus * 4, nxt)
+
+    def mark(buf, clus):
+        buf[at(2) + ((clus - 2) >> 3)] |= 1 << ((clus - 2) & 7)
+
+    def volume(root=b"", count=120, used=(), data=None, fat=None):
+        """Bitmap at 2, up-case table at 3, root at 4. ``data`` is {cluster: bytes}."""
+        buf = bytearray(heap * 512 + count * cb)
+        buf[3:11] = b"EXFAT   "
+        struct.pack_into("<Q", buf, 72, heap + count * 8)
+        struct.pack_into("<IIIII", buf, 80, fat_at, 8, heap, count, 4)
+        buf[108], buf[109], buf[110] = 9, 3, 1
+        buf[510:512] = b"\x55\xaa"
+        seal(buf)
+        for clus in (2, 3, 4):
+            link(buf, clus, 0xFFFFFFFF)
+            mark(buf, clus)
+        for clus in used:
+            mark(buf, clus)
+        for clus, nxt in (fat or {}).items():
+            link(buf, clus, nxt)
+        head = bytearray(64)
+        head[0] = 0x81
+        struct.pack_into("<IQ", head, 20, 2, (count + 7) // 8)
+        head[32] = 0x82
+        struct.pack_into("<IQ", head, 52, 3, 512)
+        whole = bytes(head) + root
+        buf[at(4):at(4) + len(whole)] = whole
+        for clus, body in (data or {}).items():
+            buf[at(clus):at(clus) + len(body)] = body
+        return buf
+
+    def walker(buf):
+        return ExfatWalker(io.BytesIO(bytes(buf)), 0)
+
+    def body(seed, size):
+        return bytes((seed + i * 7) % 251 + 1 for i in range(size))
+
+    def names_right():
+        wanted = [f"emoji_{emoji}.txt", f"12345678901234{emoji}.txt",
+                  "n" * 29 + emoji + "tail.txt", f"{emoji}{emoji}.bin", f"last{emoji}"]
+        root = b"".join(one(n, 0, 0) for n in wanted)
+        w = walker(volume(root))
+        lone = walker(volume(one("lone_\ud800.txt", 0, 0) + one("lone_\ud801.txt", 0, 0)
+                             + one("low_\udc00.txt", 0, 0) + one("50%.txt", 0, 0)))
+        got = [e[0] for e in collect(lone, lone.root)]
+        try:
+            import sqlite3
+        except ImportError:
+            sqlite3 = None
+        if sqlite3 is not None:                      # a name has to be storable as it is
+            db = sqlite3.connect(":memory:")
+            db.execute("create table t (name text unique)")
+            db.executemany("insert into t values (?)", [(n,) for n in got])
+            db.close()
+        return ([e[0] for e in collect(w, w.root)] == wanted
+                and got == ["lone_%00%D8.txt", "lone_%01%D8.txt", "low_%00%DC.txt", "50%.txt"]
+                and all(n.encode("utf-8") for n in got))
+
+    def exported(buf, console=False):
+        """(exit status, the volume's record) of a real --extract run on these bytes, and
+        what it printed when ``console`` is set."""
+        import subprocess
+        with scratch() as work:
+            raw, out = os.path.join(work, "n.dd"), os.path.join(work, "n.zip")
+            with open(raw, "wb") as fh:
+                fh.write(buf)
+            run = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw,
+                                  "--extract", out], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+                                 check=False)
+            with zipfile.ZipFile(out) as zin:
+                rec = json.loads(zin.read("volumes.json"))["volumes"][0]
+            if console:
+                return run.returncode, rec, run.stdout.decode("utf-8", "replace")
+            return run.returncode, rec
+
+    def full_beside_chained_sibling():
+        full = (b"".join(one(f"f{n:02}.txt", 0, 0) for n in range(42))
+                + (b"\xA1" + bytes(31)) * 2)
+        root = one("full", 10, cb, is_dir=True) + one("grown", 12, 2 * cb, is_dir=True, flags=0x01)
+        w = walker(volume(root, used=(10, 11, 12), fat={12: 11, 11: 0xFFFFFFFF},
+                          data={10: full, 12: full.replace(b"f0", b"g0"),
+                                11: one("second.txt", 0, 0)}))
+        return (len(collect(w, w.root)) == 85 and not w.damage and w.folders_not_read == 0)
+
+    def chain_past_size_not_followed():
+        inner = one("mine.txt", 0, 0)
+        root = one("dir", 10, cb, is_dir=True, flags=0x01)
+        w = walker(volume(root, used=(10, 11), fat={10: 0},
+                          data={10: inner, 11: one("other.txt", 0, 0)}))
+        clean = [e[0] for e in collect(w, w.root)] == ["dir/mine.txt"] and not w.damage
+        full = (b"".join(one(f"a{n:02}.txt", 0, 0) for n in range(42))
+                + (b"\xA1" + bytes(31)) * 2)
+        two = one("A", 20, cb, is_dir=True, flags=0x01) + one("B", 21, cb, is_dir=True, flags=0x01)
+        linked = walker(volume(two, used=(20, 21), fat={20: 21, 21: 0xFFFFFFFF},
+                               data={20: full, 21: one("b.txt", 0, 0)}))
+        names = [e[0] for e in collect(linked, linked.root)]
+        return clean and "A/b.txt" not in names and "B/b.txt" in names and len(names) == 43
+
+    def root_read_is_bounded():
+        global _EXFAT_DIR_MAX
+        sets = b"".join(one(f"r{n:02}.txt", 0, 0) for n in range(42))
+        later = b"".join(one(f"s{n:02}.txt", 0, 0) for n in range(42)) + (b"\xA1" + bytes(31)) * 2
+        links = {4: 5, 5: 6, 6: 7, 7: 0xFFFFFFFF}
+        buf = volume(sets, used=(5, 6, 7), data={5: later, 6: later, 7: later})
+        for clus, nxt in links.items():
+            link(buf, clus, nxt)
+        was = _EXFAT_DIR_MAX
+        _EXFAT_DIR_MAX = 2 * cb
+        try:
+            w = walker(buf)
+            got = len(collect(w, w.root))
+        finally:
+            _EXFAT_DIR_MAX = was
+        return got == 84 and any("256MB" in d for d in w.damage)
+
+    def root_names_no_bitmap():
+        if getattr(sys, "frozen", False):
+            return None
+        good = volume(one("a.bin", 10, 100), used=(10,), data={10: body(1, 100)})
+        bad = bytearray(good)
+        bad[at(4):at(4) + 512] = bytes(512)
+        w = walker(bad)
+        collect(w, w.root)
+        ok = walker(good)
+        collect(ok, ok.root)
+        rc, rec = exported(bad)
+        good_rc, good_rec = exported(good)
+        return (w.folders_not_read == 1 and not ok.damage
+                and any("names no Allocation Bitmap" in d and "may have been lost" in d
+                        for d in w.damage)
+                and rc == 1 and rec.get("folders_not_read") == 1
+                and good_rc == 0 and not good_rec.get("damage_recorded"))
+
+    def long_name_keeps_the_consequence():
+        if getattr(sys, "frozen", False):
+            return None
+        rc, rec, said = exported(volume(one("L" * 255, 0x7FFFFFF0, cb, is_dir=True)),
+                                 console=True)
+        lines = rec.get("damage_first") or []
+
+        def long(k):
+            return f"{k}" + "N" * 254
+
+        broken = bytearray(one(long(1), 31, 100))
+        broken[2] ^= 0xFF
+        bad_time = (40 << 25) | (13 << 21) | (1 << 16)
+        root = (one(long(0), 30, 100, flags=0x00) + bytes(broken)
+                + one(long(2), 32, 100, valid=200) + one(long(3), 33, 100, when=bad_time)
+                + one(long(4), 0x7FFFFFF0, cb, is_dir=True))
+        w = walker(volume(root, used=(30, 31, 32, 33)))
+        collect(w, w.root)
+        cut = [line[:240] for line in w.damage]
+        wanted = ("so its content is not exported", "where its content came from is not vouched",
+                  "so it is read to its DataLength", "so no reading is shown",
+                  "so the folder was not read")
+        return (rc == 1 and any("so the folder was not read" in line for line in lines)
+                and "so the folder was not read" in said
+                and all(any(x in line for line in cut) for x in wanted))
+
+    def short_chain_with_marker_is_read():
+        inner = one("mine.txt", 0, 0)
+        w = walker(volume(one("dir", 10, 3 * cb, is_dir=True, flags=0x01), used=(10,),
+                          fat={10: 0xFFFFFFFF}, data={10: inner}))
+        return ([e[0] for e in collect(w, w.root)] == ["dir/mine.txt"]
+                and w.folders_not_read == 0 and any("every entry" in d for d in w.damage))
+
+    def no_name_gets_placeholder():
+        plain = bytearray(one("abc.bin", 10, 100))
+        plain[64] = 0x00                             # its one File Name entry is gone
+        total = 0
+        for i, byte in enumerate(plain):
+            if i not in (2, 3):
+                total = ((0x8000 if total & 1 else 0) + (total >> 1) + byte) & 0xFFFF
+        struct.pack_into("<H", plain, 2, total)
+        w = walker(volume(bytes(plain) + bytes(plain), used=(10,), data={10: body(24, 100)}))
+        names = [e[0] for e in collect(w, w.root)]
+        return (len(names) == 2 and len(set(names)) == 2
+                and all(n.startswith("$NoName-") and not n.endswith("/") for n in names)
+                and sum("holds no file name" in d for d in w.damage) == 2)
+
+    def damaged_count_keeps_file():
+        content = body(30, 700)
+        for count in (1, 0):
+            ent = bytearray(one("good.bin", 10, 700))
+            ent[1] = count                           # the Stream entry is intact
+            w = walker(volume(bytes(ent) + one("next.txt", 0, 0), used=(10,),
+                              data={10: content}))
+            listed = collect(w, w.root)
+            out, issues, rec = io.BytesIO(), [], {}
+            with zipfile.ZipFile(out, "w") as zf:
+                tally = extract_to_zip(zf, w, "v", listed, [], issues=issues)
+                _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+            with zipfile.ZipFile(io.BytesIO(out.getvalue())) as zin:
+                held = zin.read("v/good.bin")
+            if ([e[0] for e in listed] != ["good.bin", "next.txt"] or tally[3] or held != content
+                    or [r[2] for r in issues] != ["ENTRY_SET_CHECKSUM"]
+                    or w.folders_not_read):
+                return False
+        return True
+
+    def failed_folder_keeps_neighbour():
+        filler_sets = b"".join(one(f"f{n:02}.txt", 0, 0) for n in range(41))
+        sub_dir = one("sub", 11, cb, is_dir=True)
+        full = filler_sets + sub_dir + (b"\xA1" + bytes(31)) * 2
+        ent = bytearray(one("names", 10, cb, is_dir=True))
+        struct.pack_into("<Q", ent, 40, 2 * cb)
+        struct.pack_into("<Q", ent, 56, 2 * cb)      # one damaged length, checksum left stale
+        w = walker(volume(bytes(ent), used=(10, 11),
+                          data={10: full, 11: one("child.txt", 0, 0)}))
+        got = {e[0] for e in collect(w, w.root)}
+        return "names/sub/child.txt" in got and "names/child.txt" not in got
+
+    def failed_set_keeps_valid_length_row():
+        ent = bytearray(one("v.bin", 10, 3000, valid=1000))
+        ent[2] ^= 0xFF
+        w = walker(volume(bytes(ent), used=(10,), data={10: body(31, 3000)}))
+        listed = collect(w, w.root)
+        out, issues, rec = io.BytesIO(), [], {}
+        with zipfile.ZipFile(out, "w") as zf:
+            extract_to_zip(zf, w, "v", listed, [], issues=issues)
+            _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+        return (sorted(r[2] for r in issues) == ["ENTRY_SET_CHECKSUM", "PAST_VALID_DATA"]
+                and rec["exceptions"].get("past_valid_data") == 1
+                and rec["exceptions"].get("entry_set_checksum") == 1)
+
+    def stray_slots_are_counted():
+        root = one("a.txt", 0, 0) + b"\xFF" * 512 + one("b.txt", 0, 0)
+        w = walker(volume(root))
+        listed = [e[0] for e in collect(w, w.root)]
+        return (listed == ["a.txt", "b.txt"] and w.folders_not_read == 0
+                and any(d.endswith("16 in-use slots lie outside any entry set, so entries "
+                                   "recorded there may have been lost from this listing")
+                        for d in w.damage))
+
+    def bitmap_chain_falls_back_to_a_run():
+        count, fat_sectors, first_heap = 6000, 48, 72
+        buf = bytearray((first_heap + count) * 512)
+        buf[3:11] = b"EXFAT   "
+        struct.pack_into("<Q", buf, 72, first_heap + count)
+        struct.pack_into("<IIIII", buf, 80, 24, fat_sectors, first_heap, count, 5)
+        buf[108], buf[109], buf[110] = 9, 0, 1
+        buf[510:512] = b"\x55\xaa"
+        seal(buf)
+        for clus, nxt in ((2, 0), (3, 0xFFFFFFFF), (5, 0xFFFFFFFF)):   # the bitmap's link is lost
+            struct.pack_into("<I", buf, 24 * 512 + clus * 4, nxt)
+        bitmap = bytearray((count + 7) // 8)
+        for clus in (2, 3, 5, 4200):                 # 4200's bit is in the bitmap's second cluster
+            bitmap[(clus - 2) >> 3] |= 1 << ((clus - 2) & 7)
+        at_clus = lambda c: (first_heap + c - 2) * 512
+        buf[at_clus(2):at_clus(2) + len(bitmap)] = bitmap
+        head = bytearray(32)
+        head[0] = 0x81
+        struct.pack_into("<IQ", head, 20, 2, len(bitmap))
+        buf[at_clus(5):at_clus(5) + 32] = head
+        w = walker(buf)
+        free = w.free_extents()
+        in_free = any(off <= at_clus(4200) < off + n for off, n in free)
+        return (w._first_bitmap() == bytes(bitmap) and w._cluster_in_use(4200)
+                and not w._marked_free(4200) and not in_free
+                and any("read as one run" in d for d in w.damage))
+
+    def live_chain_on_free_clusters():
+        content = body(41, 2 * cb)
+        w = walker(volume(one("c.bin", 10, 2 * cb, flags=0x01), used=(10,),
+                          fat={10: 11, 11: 0xFFFFFFFF},
+                          data={10: content[:cb], 11: content[cb:]}))
+        clean = walker(volume(one("c.bin", 10, 2 * cb, flags=0x01), used=(10, 11),
+                              fat={10: 11, 11: 0xFFFFFFFF},
+                              data={10: content[:cb], 11: content[cb:]}))
+        rows = []
+        for one_w in (w, clean):
+            out, issues, rec = io.BytesIO(), [], {}
+            with zipfile.ZipFile(out, "w") as zf:
+                tally = extract_to_zip(zf, one_w, "v", collect(one_w, one_w.root), [],
+                                       issues=issues)
+                _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+            with zipfile.ZipFile(io.BytesIO(out.getvalue())) as zin:
+                rows.append((tally[3], zin.read("v/c.bin"), [r[2] for r in issues],
+                             rec.get("exceptions", {}).get("clusters_marked_free")))
+        return (rows[0][:3] == (0, content, ["CLUSTERS_MARKED_FREE"]) and rows[0][3] == 1
+                and rows[1][:3] == (0, content, []))
+
+    def cut_boot_sector_keeps_the_run():
+        if getattr(sys, "frozen", False):
+            return None
+        import subprocess
+        whole = volume(one("whole.bin", 10, 500), count=40, used=(10,), data={10: body(42, 500)})
+        cut = volume(one("cut.bin", 10, 500), count=40, used=(10,), data={10: body(43, 500)})
+        lba1, lba2 = 2048, 2048 + len(whole) // 512 + 8
+        disk = bytearray(lba2 * 512 + 100)
+        for k, (lba, n) in enumerate(((lba2, len(cut) // 512), (lba1, len(whole) // 512))):
+            row = bytearray(16)
+            row[4] = 0x07
+            struct.pack_into("<II", row, 8, lba, n)
+            disk[446 + 16 * k:462 + 16 * k] = row
+        disk[510:512] = b"\x55\xaa"
+        disk[lba1 * 512:lba1 * 512 + len(whole)] = whole
+        disk[lba2 * 512:lba2 * 512 + 100] = cut[:100]
+        found = identify_fat(io.BytesIO(bytes(cut[:100])), 0)
+        with scratch() as work:
+            raw, out = os.path.join(work, "d.dd"), os.path.join(work, "d.zip")
+            with open(raw, "wb") as fh:
+                fh.write(disk)
+            subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw, "--extract", out],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=120, check=False)
+            with zipfile.ZipFile(out) as zin:
+                names = zin.namelist()
+                body_ok = any(n.endswith("/whole.bin") and zin.read(n) == body(42, 500)
+                              for n in names)
+                vols = json.loads(zin.read("volumes.json"))["volumes"]
+        return (found is not None and found[0] == "exfat" and body_ok
+                and any(v.get("extract_error") for v in vols))
+
+    def run_folder_of_size_zero():
+        full = (b"".join(one(f"z{n:02}.txt", 0, 0) for n in range(42))
+                + (b"\xA1" + bytes(31)) * 2)
+        w = walker(volume(one("dir", 10, 0, is_dir=True), used=(10, 11), data={10: full}))
+        collect(w, w.root)
+        return w.folders_not_read == 1 and any("recording a size of 0" in d for d in w.damage)
+
+    def bad_stamp_is_recorded():
+        bad = (46 << 25) | (13 << 21) | (15 << 16) | (12 << 11)
+        w = walker(volume(one("m.bin", 0, 0, when=bad)))
+        row = w.listdir_records(w.root)[0]
+        return row[2]["modified"] == "" and w.folders_not_read == 0 and any(
+            f"{bad:#010x}" in d and "not a valid date" in d for d in w.damage)
+
+    def bad_checksum_refused():
+        ent = bytearray(one("bad.bin", 10, 100))
+        struct.pack_into("<I", ent, 52, 11)          # the first cluster, checksum left stale
+        w = walker(volume(bytes(ent) + one("good.bin", 12, 50),
+                          used=(10, 11, 12), data={10: body(7, 100), 11: body(8, 100),
+                                                   12: body(9, 50)}))
+        listed = collect(w, w.root)
+        out, issues, rec = io.BytesIO(), [], {}
+        with zipfile.ZipFile(out, "w") as zf:
+            tally = extract_to_zip(zf, w, "v", listed, [], issues=issues)
+            _zip_record_exceptions(zf, "v", rec, issues, quiet=True)
+        with zipfile.ZipFile(io.BytesIO(out.getvalue())) as zin:
+            held = zin.read("v/bad.bin")
+        return ([e[0] for e in listed] == ["bad.bin", "good.bin"] and tally[3] == 0
+                and held == body(8, 100) and w.folders_not_read == 0
+                and any("SetChecksum" in d for d in w.damage)
+                and [row[2] for row in issues] == ["ENTRY_SET_CHECKSUM"]
+                and "not vouched for" in issues[0][3]
+                and rec["exceptions"]["entry_set_checksum"] == 1
+                and rec["exceptions"]["failed"] == 0)
+
+    def active_fat_and_bitmap():
+        content = body(10, 3 * cb)
+        second = bytearray(32)
+        second[0], second[1] = 0x81, 1
+        struct.pack_into("<IQ", second, 20, 6, 15)
+        buf = volume(second + one("chain.bin", 10, 3 * cb, flags=0x01), used=(10, 11, 12))
+        buf[110] = 2
+        struct.pack_into("<H", buf, 106, 1)
+        seal(buf)
+        buf[at(6):at(6) + 15] = buf[at(2):at(2) + 15]         # the active bitmap
+        buf[at(6)] |= 1 << 5                                  # cluster 7 is in use in it only
+        for clus in (2, 3, 4):
+            link(buf, clus, 0xFFFFFFFF, 1)
+        for clus, nxt in ((10, 12), (12, 11), (11, 0xFFFFFFFF)):
+            link(buf, clus, nxt, 1)                           # the active FAT
+        link(buf, 10, 11)                                     # the stale one
+        link(buf, 11, 12)
+        link(buf, 12, 0xFFFFFFFF)
+        for n, clus in enumerate((10, 12, 11)):
+            buf[at(clus):at(clus) + cb] = content[n * cb:(n + 1) * cb]
+        w = walker(buf)
+        node = dict(w.listdir(w.root))["chain.bin"]
+        free = {off for off, _n in w.free_extents()}
+        return b"".join(w.read_file(node, None)) == content and w._cluster_in_use(7) and (
+            at(7) not in free)
+
+    def root_chain_cut():
+        sets = b"".join(one(f"r{n:02}.txt", 0, 0) for n in range(42))
+        buf = volume(sets, used=(5,), data={5: one("second.txt", 0, 0)})
+        link(buf, 4, 0)
+        w = walker(buf)
+        return (len(collect(w, w.root)) == 42
+                and any("not an end-of-chain mark" in d for d in w.damage))
+
+    def boot_case(change):
+        content = body(13, 700)
+        buf = volume(one("file.bin", 10, 700), used=(10,), data={10: content})
+        change(buf)
+        w = walker(buf)
+        node = dict(w.listdir(w.root)).get("file.bin")
+        return node is not None and b"".join(w.read_file(node, None)) == content, w
+
+    def boot_stale_uses_backup():
+        def change(buf):
+            struct.pack_into("<I", buf, 88, heap + 8)
+        good, w = boot_case(change)
+        return good and any("Backup Boot" in d for d in w.damage)
+
+    def boot_shift_uses_backup():
+        def change(buf):
+            buf[108] = 0
+        good, w = boot_case(change)
+        return good and any("Backup Boot" in d for d in w.damage)
+
+    def boot_wiped_uses_backup():
+        def change(buf):
+            buf[:512] = bytes(512)
+        good, w = boot_case(change)
+        buf = volume(one("file.bin", 10, 700), used=(10,), data={10: body(13, 700)})
+        change(buf)
+        found = identify_fat(io.BytesIO(bytes(buf)), 0)
+        return good and found is not None and found[0] == "exfat" and any(
+            "Backup Boot" in d for d in w.damage)
+
+    def boot_both_stale_still_read():
+        def change(buf):
+            buf[120] ^= 0xFF
+            buf[12 * 512 + 120] ^= 0x55
+        good, w = boot_case(change)
+        return good and any("neither the Main nor the Backup" in d for d in w.damage)
+
+    def chained_read_in_pieces():
+        count = 800
+        size = 3 << 20
+        clusters = list(range(10, 10 + size // cb))
+        links = {c: c + 1 for c in clusters[:-1]}
+        links[clusters[-1]] = 0xFFFFFFFF
+        content = body(15, size)
+        buf = volume(one("big.bin", 10, size, flags=0x01), count=count, used=clusters, fat=links)
+        buf[at(10):at(10) + size] = content
+        w = walker(buf)
+        node = dict(w.listdir(w.root))["big.bin"]
+        parts = [len(p) for p in w.read_file(node, None)]
+        again = b"".join(w.read_file(node, None))
+        return len(parts) > 1 and max(parts) <= (1 << 20) + cb and again == content
+
+    def cut_volume_recorded():
+        if getattr(sys, "frozen", False):
+            return None
+        import subprocess
+        buf = volume(one("file.bin", 10, 700), used=(10,), data={10: body(16, 700)})
+        with scratch() as work:
+            raw, out = os.path.join(work, "cut.dd"), os.path.join(work, "cut.zip")
+            with open(raw, "wb") as fh:
+                fh.write(buf[:at(40)])
+            subprocess.run([sys.executable, "-B", os.path.abspath(__file__), raw, "--extract",
+                            out], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=120, check=False)
+            with zipfile.ZipFile(out) as zin:
+                record = json.loads(zin.read("volumes.json"))["volumes"][0]
+        return record.get("extends_past_image_by_bytes") == len(buf) - at(40)
+
+    def namelength_zero():
+        w = walker(volume(one("stored.txt", 0, 0, length=0)))
+        return ([e[0] for e in collect(w, w.root)] == ["stored.txt"]
+                and any("NameLength of 0" in d for d in w.damage))
+
+    def stored_slash():
+        w = walker(volume(one("a/b.txt", 0, 0)))
+        return ([e[0] for e in collect(w, w.root)] == ["a%2Fb.txt"]
+                and any("forbids" in d for d in w.damage))
+
+    def stored_dots():
+        w = walker(volume(one("..", 0, 0) + one(".", 0, 0)))
+        return (sorted(e[0] for e in collect(w, w.root)) == ["%2E", "%2E%2E"]
+                and sum("forbids" in d for d in w.damage) == 2)
+
+    def refused(w, name):
+        node = dict(w.listdir(w.root))[name]
+        try:
+            b"".join(w.read_file(node, None))
+        except NtfsUnreadable:
+            return True
+        return False
+
+    def no_stream_entry():
+        w = walker(volume(one("odd.bin", 10, 100, second=0xC1), used=(10,),
+                          data={10: body(17, 100)}))
+        return refused(w, "odd.bin") and any("no Stream" in d for d in w.damage)
+
+    def allocation_not_possible():
+        w = walker(volume(one("odd.bin", 10, 100, flags=0x02), used=(10,),
+                          data={10: body(18, 100)}))
+        return refused(w, "odd.bin") and any("AllocationPossible" in d for d in w.damage)
+
+    def chain_past_size():
+        w = walker(volume(one("long.bin", 10, 5000, flags=0x01), used=(10, 11, 12),
+                          fat={10: 11, 11: 12, 12: 0xFFFFFFFF},
+                          data={10: body(19, cb), 11: body(20, cb), 12: body(21, cb)}))
+        node = dict(w.listdir(w.root))["long.bin"]
+        return (len(b"".join(w.read_file(node, None))) == 5000
+                and any("goes on for 1" in d for d in w.damage))
+
+    rows = []
+    for label, check in (
+            ("an exFAT name with a character outside the BMP reads whole, also across two "
+             "name entries, and an unpaired surrogate becomes %XX of its stored bytes, which "
+             "SQLite accepts and which keep two such names apart", names_right),
+            ("in-use slots outside any entry set are counted in a note", stray_slots_are_counted),
+            ("an Allocation Bitmap whose FAT link is lost is read as one run, and that is "
+             "recorded", bitmap_chain_falls_back_to_a_run),
+            ("a live chain through clusters the bitmap marks free is exported with a row",
+             live_chain_on_free_clusters),
+            ("an exFAT boot sector cut under 112 bytes is recorded and the next volume exports",
+             cut_boot_sector_keeps_the_run),
+            ("a NoFatChain folder recording size 0 with no end marker counts as not read",
+             run_folder_of_size_zero),
+            ("a stored exFAT time that is not a date is recorded with its value",
+             bad_stamp_is_recorded),
+            ("a damaged SecondaryCount with its Stream intact exports the file with a checksum "
+             "row", damaged_count_keeps_file),
+            ("a folder whose set failed does not read a live neighbour as its own child",
+             failed_folder_keeps_neighbour),
+            ("a failed set with ValidDataLength under its size keeps both exception counts",
+             failed_set_keeps_valid_length_row),
+            ("a root folder naming no Allocation Bitmap is recorded and exits 1",
+             root_names_no_bitmap),
+            ("a 255-character name cannot push a record's consequence past the 240-character "
+             "cut in volumes.json or on the console", long_name_keeps_the_consequence),
+            ("a chained folder short of its size with its end marker read is not a folder not "
+             "read", short_chain_with_marker_is_read),
+            ("an exFAT entry set failing SetChecksum is exported with a row saying its source "
+             "is not vouched for, and is not counted as failed", bad_checksum_refused),
+            ("a full NoFatChain folder followed by a chained sibling's cluster is not damage",
+             full_beside_chained_sibling),
+            ("a chained exFAT folder is read only to its DataLength, so a chain running past "
+             "it neither adds files nor is called damage", chain_past_size_not_followed),
+            ("the exFAT root's read stops at the size a folder can hold, and says so",
+             root_read_is_bounded),
+            ("an exFAT set with no File Name entry gets a unique placeholder and a record",
+             no_name_gets_placeholder),
+            ("TexFAT ActiveFat=1 reads the second FAT and the second Allocation Bitmap",
+             active_fat_and_bitmap),
+            ("an exFAT root whose chain is cut on a set boundary is recorded", root_chain_cut),
+            ("a stale Main Boot region gives way to a Backup Boot region that passes",
+             boot_stale_uses_backup),
+            ("a sector shift outside the specification gives way to the Backup Boot region",
+             boot_shift_uses_backup),
+            ("a wiped exFAT boot sector is identified and read from the Backup Boot region",
+             boot_wiped_uses_backup),
+            ("when neither boot region passes the main one is still read, and that is recorded",
+             boot_both_stale_still_read),
+            ("a chained exFAT file is read in pieces and not held whole",
+             chained_read_in_pieces),
+            ("an exFAT volume cut before its VolumeLength is marked as reaching past the image",
+             cut_volume_recorded),
+            ("a NameLength of 0 is recorded and listed under the name entries' text",
+             namelength_zero),
+            ("a stored slash in an exFAT name is escaped and recorded", stored_slash),
+            ("a stored . or .. in an exFAT name is listed escaped and recorded", stored_dots),
+            ("an exFAT File entry with no Stream Extension is listed, recorded and not read",
+             no_stream_entry),
+            ("an exFAT entry clearing AllocationPossible is listed, recorded and not read",
+             allocation_not_possible),
+            ("an exFAT chain longer than the recorded size is recorded", chain_past_size)):
+        try:
+            passed = check()
+        except Exception:                            # pylint: disable=broad-except
+            passed = False
+        if passed is None:
+            print(f"  [SKIP] {label}: this platform or build cannot run it")
+        else:
+            rows.append((label, bool(passed)))
+    return rows
+
+
 def _exfat_nofatchain_checks():
     """[(label, passed)] for an exFAT folder flagged NoFatChain, the way Linux creates
     them: it is one run of clusters as long as its recorded size."""
@@ -35687,7 +36850,8 @@ def _exfat_nofatchain_checks():
                 and any("runs off the end of this volume" in d for d in w.damage))
 
     def over_limit():
-        w, names = listed(_exfat_run_image(b"".join(sets), size=(256 << 20) + 4096))
+        w, names = listed(_exfat_run_image(b"".join(sets) + filler * 24,   # no end marker
+                                           size=(256 << 20) + 4096))
         return (len(names) == 120 and w.folders_not_read == 1
                 and any("over the 256MB" in d for d in w.damage))
 
@@ -35735,7 +36899,7 @@ def _exfat_nofatchain_checks():
                 and w.chain_shortfall((2, 1024, False, False)) == (1, 2))
 
     def chained_folder_short_of_size():
-        data = bytes(8 * 512)
+        data = (b"\xA1" + bytes(31)) * 128           # every slot used, so no end marker
         short = chained({2: 0xFFFFFFFF}, data)
         whole = chained({2: 3, 3: 0xFFFFFFFF}, data)
         return (len(short._folder_bytes((2, 1536, True, False))) == 512
@@ -35756,7 +36920,7 @@ def _exfat_nofatchain_checks():
 
     def size_not_whole_clusters():
         for size in (1, 31, 96, 100):
-            w, names = listed(_exfat_run_image(b"".join(sets[:42]), clusters=1, size=size))
+            w, names = listed(_exfat_run_image(full, clusters=1, size=size))
             if (names != first42 or w.folders_not_read != 1
                     or not any("whole number" in d for d in w.damage)):
                 return False
@@ -35882,7 +37046,8 @@ def _exfat_nofatchain_checks():
         plant = {10: real, 11: tail, 12: stale, 14: real, 15: tail, 16: stale, 17: stale,
                  20: stale, 21: stale, 23: b"O" * 4096, 25: real, 26: b"R" * 904 + stale[904:],
                  27: b"R" * 100 + stale[100:]}
-        raw = bytearray(_exfat_run_image(b"", clusters=1, root_extra=extra, plant=plant))
+        raw = bytearray(_exfat_run_image(b"", clusters=1, root_extra=extra, plant=plant,
+                                         used=(10, 11, 12, 14, 15, 17, 23, 25, 26, 27)))
         for clus, nxt in ((14, 15), (15, 17), (17, 0xFFFFFFFF), (27, 0xFFFFFFFF)):
             struct.pack_into("<I", raw, 4 * 512 + clus * 4, nxt)
         tally, held, issues, rec, w = exported_bytes(bytes(raw))
@@ -44965,6 +46130,7 @@ def self_test():
                  _logical_stream_self_check()),
                 *_zip_export_checks(),
                 *_exfat_nofatchain_checks(),
+                *_exfat_reader_checks(),
                 *_zip_directory_bound_checks(),
                 *_zip_moved_end_checks(),
                 *_ifs_decline_checks(),
@@ -46269,6 +47435,12 @@ def self_test():
             struct.pack_into("<Q", _exsf, at + 56, size)
             _exsf[at + 64] = 0xC1
             _exsf[at + 66:at + 66 + 2 * len(name)] = name.encode("utf-16-le")
+            _set_sum = 0                             # SetChecksum, from the specification
+            for _i, _byte in enumerate(_exsf[at:at + 96]):
+                if _i not in (2, 3):
+                    _set_sum = ((0x8000 if _set_sum & 1 else 0) + (_set_sum >> 1)
+                                + _byte) & 0xFFFF
+            struct.pack_into("<H", _exsf, at + 2, _set_sum)
 
         _ex_file(_ex_root + 32, "CUT", 5, 0x01, EX_FILE_BYTES)
         _ex_file(_ex_root + 128, "WHOLE", 12, 0x01, EX_FILE_BYTES)

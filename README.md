@@ -373,7 +373,10 @@ folder, named in `volumes.json` as `exceptions_table`, with a count per kind in
 (`stored_path`, `zip_member`, `issue`, `detail`), a `NO_POINTER_ZEROS` row for a qnx6 file
 with blocks that have no pointer (see "QNX6 superblock choice and damaged volumes"), and
 `TIME_NOT_HELD` rows for stored times
-a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. Up to eight
+a zip cannot hold (before 1980 or after 2107), whose member shows 1980-01-01. An exFAT file
+also gets a row when its ValidDataLength differs from its size (`PAST_VALID_DATA`,
+`VALID_DATA_DAMAGED`) or its entry set failed its checksum (`ENTRY_SET_CHECKSUM`). Those three
+are exported and do not change the exit status. Up to eight
 files are named per stored value and one row with no path counts the rest. A time of 0 is
 not recorded from FAT, exFAT, NTFS, ReFS, HFS+ or APFS, whose readers use 0 for no
 time, and for the last four for a value out of their range too. F2FS keeps the signed value
@@ -1908,6 +1911,58 @@ self-test compares the bytes with its recorded size cut in memory to 65,535 clus
 fragmented file whose run reaches clusters in use is refused by this reader and is the one case
 `icat` will read on the contiguous assumption.
 
+### exFAT: what the reader checks before it trusts a structure
+
+- **Boot region.** The Boot Checksum and the sector and cluster shifts are checked. When the
+  main region fails and the backup at sector 12 passes, the backup's fields are used and
+  `damage` says so. A boot sector wiped with its 0x55AA signature no longer hides the volume.
+  One that keeps the signature without the exFAT name is not recognised, so that volume is not
+  read. When both fail, the
+  main region is read as it stands and `damage` says that, so a stale checksum alone never
+  refuses a volume. A sector or cluster shift outside the specification cannot be read at
+  all and is reported as the volume's error.
+- **Which FAT.** On a volume with two FATs, bit 0 of VolumeFlags names the active FAT and
+  Allocation Bitmap, and those are the ones read. A bitmap is read along its FAT chain, and
+  as one run when the chain holds less than the bitmap, which is recorded. The other pair is stale by definition.
+  This was tested on built volumes. No TexFAT writer was available.
+- **Entry sets.** A set that fails its SetChecksum stays listed and its bytes are exported
+  as its fields say, with an `ENTRY_SET_CHECKSUM` row in the exceptions table saying where
+  they came from is not vouched for. That row is not a failure and does not change the exit
+  status. The slots after such a set are read one by one, because its SecondaryCount cannot be
+  relied on. A set with no Stream Extension, or that passes its checksum and clears
+  AllocationPossible while recording a cluster or size, records nowhere to read: it stays
+  listed and its content is refused (`FAILED`). In-use slots outside any entry set are counted
+  per folder in a note, since entries there may have been lost, and the note does not change
+  the exit status. A file whose read touches clusters the bitmap marks free is exported with a
+  `CLUSTERS_MARKED_FREE` row, also with no change to the exit status. A folder whose set failed
+  is still walked,
+  and `damage` says the files under it may not be its own.
+- **Names.** In the live listing a name is decoded as one UTF-16 string, so a character
+  outside the BMP is right even across two name entries. An unpaired surrogate, which Windows stores, becomes `%XX` of
+  its two stored bytes in on-disk order (U+D800 is `%00%D8`), because a surrogate is refused
+  by SQLite, by UTF-8 and by file paths. A literal `%` is not escaped, so a file really named
+  that way can match an escaped one, and the export's duplicate handling keeps both. A stored
+  `/`, `.` or `..` is escaped (`%2F`, `%2E`) and recorded. A NameLength of 0 is recorded and
+  listed under the text its name entries hold. A NUL inside a name becomes `%00`. A set with
+  no name at all is listed as
+  `$NoName-<byte offset in its folder>` and recorded.
+- **Folders.** A folder is read for the clusters its DataLength needs (specification 7.6.7),
+  whether it is one run or a FAT chain, since real writers leave chains running past it. The
+  root records no size and is read along its chain up to the 256MB a folder can hold. The
+  listing stops at the end-of-directory marker, as the specification requires.
+  A root folder that names no Allocation Bitmap, which the specification requires (7.1), is
+  recorded, counts as not read and exits 1.
+  A root chain that stops before a marker on anything but an end-of-chain mark is recorded.
+  A folder whose recorded size disagrees with what could be read, but whose end marker is in
+  what was read, lists every entry: that is recorded and is not counted as a folder not read.
+  These records state what the reader found. They are not a claim that damage to a sector is
+  detected in general.
+- **Files and volumes.** A FAT-chained file is read in pieces of about 1 MiB and is not held
+  in memory. A chain longer than the recorded size is recorded when the read reaches that size. A
+  file whose ValidDataLength is below its size stops earlier, so the rest of its chain is not
+  looked at. A volume that ends before
+  its VolumeLength is marked `INCOMPLETE`, with `extends_past_image_by_bytes`.
+
 ### exFAT: orphan directory entries
 
 Since 1.61. An exFAT volume can hold directory clusters that the Allocation Bitmap marks
@@ -1933,12 +1988,12 @@ says what it is in `note`, and none of them is ever added to the live listing.
 
 - **What counts as reached.** The root directory's chain, every directory's clusters,
   every file's clusters (the run its size needs when NoFatChain is set, else its whole
-  chain in the first FAT), both allocation bitmaps and the up-case table. The tree is
+  chain in the active FAT), both allocation bitmaps and the up-case table. The tree is
   walked once per walker, the first time `recover_deleted()` is called.
 - **What is searched.** Every allocated cluster outside that set, for a `0x85` File entry
   followed by its `0xC0` stream extension and `0xC1` name entries, with the checksum the
   File entry records. A set that runs off the end of its cluster is completed from the
-  cluster the first FAT links next, or the one after it, and the checksum decides.
+  cluster the active FAT links next, or the one after it, and the checksum decides.
 - **Directories are walked down.** The clusters an orphan directory entry names are read
   as its directory when they are allocated and unreached, so a file under it has
   `parent_path` set to the directory names that lead to it. A file whose entry sits in a
@@ -1946,7 +2001,7 @@ says what it is in `note`, and none of them is ever added to the live listing.
   volume says what that directory was called. `parent` is the cluster the entry set is in
   and `ident` the file's first cluster.
 - **When a file is recoverable.** Its size is not zero and every cluster it names is
-  allocated and unreached: the run when NoFatChain is set, else a chain in the first FAT
+  allocated and unreached: the run when NoFatChain is set, else a chain in the active FAT
   that runs to an end-of-chain mark and covers the size. Otherwise `reason` says what
   failed, and `read_deleted()` refuses it. A cluster a live file holds is never read as
   the orphan's.
@@ -1958,7 +2013,7 @@ says what it is in `note`, and none of them is ever added to the live listing.
   the same cluster both stay recoverable and `note` says the bytes may be another file's,
   because the volume does not say which wrote last.
 
-It does not search free clusters, does not follow the second FAT, does not list entries
+It does not search free clusters, does not follow the inactive FAT, does not list entries
 marked deleted, and does not list the orphan directories themselves. Why a volume holds
 such clusters is not established here.
 
