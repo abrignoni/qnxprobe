@@ -2794,8 +2794,16 @@ record counts them (`damage_first`, `folders_not_read`), each file among them is
 in `failed` and gets a `FAILED` row in the exceptions table with its object id, size and
 stored name, and the run exits 1. This is what an image cut before a folder's header
 gives: on the YAFFS1 history image with its last 4 KiB removed, 3 of the 49 files are
-exported and 44 files and a folder are recorded that way. The other two files lost their
-own headers to the cut, and nothing in the image records them.
+exported and 44 files and a folder are recorded that way.
+
+An object that has data pages and no header of its own is recorded too. YAFFS makes a file
+from a data page alone, also under `lost+found`, but the image holds no name, size, time
+or folder for it, so it is not exported. A damage line gives the count and the bytes those
+pages hold, each such object gets a `FAILED` row with its object id, page count and bytes,
+`folders_not_read` is set and the run exits 1. On the same cut image three objects are
+recorded that way, two of them the other two files of the 49. Cut just after its first
+object header, that image lists no file and records four such objects. On the 28 whole
+known-data volumes that are read, neither record appears.
 
 Validated two ways. Aleph One's own image makers wrote four images (YAFFS2 little endian,
 YAFFS2 with big-endian headers, YAFFS2 with its tags two bytes into the spare, and YAFFS1):
@@ -4401,6 +4409,7 @@ checkpoint sequence value 0x21          core/yaffs_guts.h:104
 checkpoint page tags                    core/yaffs_checkptrw.c:291-294
 checkpoint blocks are not scanned       core/yaffs_yaffs2.c:1585-1595
 largest YAFFS2 chunk id, 2^28 - 1       core/yaffs_guts.h:50-54, core/yaffs_yaffs2.c:1204
+a file made from a data page alone      core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227
 a folder made for a missing header      core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296
   starts under lost+found               core/yaffs_guts.c:1657-1661
 root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
@@ -4681,10 +4690,11 @@ above are in this README only for now.)
   recognised at all.
 - **A cut YAFFS image mostly shows nothing to record.** YAFFS records no size for the
   volume, so an image that ends early looks like a smaller volume. One cut halfway returned
-  an older state of the files, with no note, because the newer pages were past the cut. One
-  cut after its first page is not recognised. A partial page at the end is dropped. The one
-  case recorded is a folder whose header is missing while objects that name it are present
-  (above).
+  an older state of the files, with no note, because the newer pages were past the cut. Cut
+  just after their first object header, 18 of the 28 known-data volumes are not recognised
+  and the other 10 list at most one file; 5 of those 10 carry a record. A partial page at
+  the end is dropped. Two cases are recorded: a folder whose header is missing while objects
+  that name it are present, and an object with data pages and no header (both above).
 - **Older versions of live files on flash are not listed.** Each flash reader returns the
   filesystem's current state, the way the filesystem itself reads it, and deleted files
   come from `recover_deleted()` (above). The earlier contents of a file that still exists

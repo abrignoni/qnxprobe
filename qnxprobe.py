@@ -17034,9 +17034,11 @@ class YaffsWalker:
     root is object 1.
 
     ``damage`` holds what was found wrong, for damage_lines(): objects whose
-    header names a parent folder that has no header in the image. No listing
-    from the root reaches them or anything under them, ``unread_entries()``
-    lists them, and ``folders_not_read`` counts the folders without a header.
+    header names a parent folder that has no header in the image, and objects
+    that have data chunks and no header of their own. No listing from the root
+    reaches them or anything under them, ``unread_entries()`` lists them, and
+    ``folders_not_read`` counts the folders without a header (1 when only
+    objects without their own header were found, whose folder is not known).
     An export gives each file among them a FAILED row."""
 
     root = YAFFS_ROOT
@@ -17064,7 +17066,7 @@ class YaffsWalker:
                 # An unlinked or deleted object's parent is 3 or 4, which no
                 # listing reaches from the root.
                 self.children[h["parent"]].append(oid)
-        self.damage, self.folders_not_read, self._unread = [], 0, []
+        self.damage, self.folders_not_read, self._unread, self._headerless = [], 0, [], []
         self._note_unreached()
 
     def _note_unreached(self):
@@ -17074,10 +17076,29 @@ class YaffsWalker:
         under lost+found (core/yaffs_yaffs2.c:1416-1418, core/yaffs_yaffs1.c:293-296,
         core/yaffs_guts.c:1657-1661). The image holds no name, place or time for
         it, so nothing is listed in its stead: the objects are recorded here and
-        left out of the listing. An image cut before a folder's header gives this."""
+        left out of the listing. An image cut before a folder's header gives this.
+
+        The same goes for an object that has data chunks and no header of its
+        own: YAFFS's scan makes a file from a data chunk alone, again under
+        lost+found (core/yaffs_yaffs1.c:146-148, core/yaffs_yaffs2.c:1225-1227,
+        core/yaffs_guts.c:1657-1661). No name, size, time or folder is known for
+        it, so it is counted with the bytes its chunks hold and not listed."""
         fixed = (YAFFS_ROOT, YAFFS_LOSTNFOUND, YAFFS_UNLINKED, YAFFS_DELETED)
         lost = sorted(p for p in self.children
                       if p not in fixed and not (self.objs.get(p) or {}).get("hdr"))
+        self._headerless = sorted(oid for oid, o in self.objs.items()
+                                  if not o["hdr"] and o["chunks"])
+        if self._headerless:
+            held = sum(v[1] for oid in self._headerless
+                       for v in self.objs[oid]["chunks"].values())
+            n = len(self._headerless)
+            self.folders_not_read = len(lost) or 1
+            self.damage.append(
+                f"{n:,} object{'' if n == 1 else 's'} with data chunks ({held:,} bytes in all) "
+                f"{'has' if n == 1 else 'have'} no header in this image, so no name, size or "
+                f"folder is known for {'it and it is' if n == 1 else 'them and they are'} not "
+                f"exported; an image cut before such a header gives this; first object id "
+                f"{self._headerless[0]:,}")
         if not lost:
             return
         direct = sum(len(self.children[p]) for p in lost)
@@ -17095,8 +17116,8 @@ class YaffsWalker:
                              for c in sorted(self.children.get(oid, ()), reverse=True))
         self.folders_not_read = len(lost)
         under = len(self._unread) - direct
-        self.damage.append(
-            f"{direct:,} objects name a parent folder that has no header in this image "
+        self.damage.insert(
+            0, f"{direct:,} objects name a parent folder that has no header in this image "
             f"({len(lost):,} such folder{'' if len(lost) == 1 else 's'}), so their paths are "
             f"not known and they are not "
             f"exported" + (f", nor are {under:,} objects under them" if under else "")
@@ -17111,12 +17132,17 @@ class YaffsWalker:
             self.damage.append(f"{len(lost) - YAFFS_UNREACHED_NAMED:,} more folder objects have "
                                "no header in this image and are not named here")
 
-    def unread_entries(self):
+    def unread_entries(self, files_only=False):
         """[(path below the folder with no header, object id, detail)] of every
         object no listing reaches because a folder above it has no header in
-        the image. The path is not a path from the root, which is not known."""
+        the image. The path is not a path from the root, which is not known.
+        Then every object that has data chunks and no header of its own, with
+        an empty path. ``files_only`` leaves out folders, symlinks and special
+        files, which an export does not write as members."""
         out = []
         for path, oid, parent, above in self._unread:
+            if files_only and (self.entry(oid) or (0,))[0] & S_IFMT != S_IFREG:
+                continue
             h = self.objs[oid]["hdr"]
             kind = YAFFS_TYPES.get(h["type"], "object")
             size = f", {self.objs[oid]['stored']:,} bytes" if h["type"] == 1 else ""
@@ -17126,6 +17152,13 @@ class YaffsWalker:
                         f"{parent:,}, which it is under{via}, has no header in this image, so "
                         f"its path from the root is not known; stored path below that "
                         f"folder: {path}"))
+        for oid in self._headerless:
+            chunks = self.objs[oid]["chunks"]
+            out.append(("", oid,
+                        f"object {oid:,} is not exported: {len(chunks):,} data chunks holding "
+                        f"{sum(v[1] for v in chunks.values()):,} bytes carry its id and no "
+                        f"header for it is in this image, so its name, size and folder are "
+                        f"not known"))
         return out
 
     def _pages(self):
@@ -40672,10 +40705,10 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                               for p, i, _s, _m in unread)
                                 w.encrypted_files = sum(r[4] for r in issues if r[2] == "ENCRYPTED")
                             elif isinstance(w, YaffsWalker):
-                                # a file under a folder with no header in the image has
-                                # no path, so it never reaches the list above
-                                unread = [detail for _p, i, detail in w.unread_entries()
-                                          if (w.entry(i) or (0,))[0] & S_IFMT == S_IFREG]
+                                # a file under a folder with no header in the image, or
+                                # with no header of its own, never reaches the list above
+                                unread = [detail for _p, _i, detail
+                                          in w.unread_entries(files_only=True)]
                                 fa += len(unread)
                                 issues.extend(("", "", "FAILED", detail, 1) for detail in unread)
                             if manifest is not None:
@@ -51214,7 +51247,8 @@ def self_test():
             ya_full = YaffsWalker(io.BytesIO(ya_raw), 0)
             ya_cut = YaffsWalker(io.BytesIO(ya_raw[:-4096]), 0)
             ya_dmg = list(getattr(ya_cut, "damage", ()))
-            ya_lost = getattr(ya_cut, "unread_entries", lambda: [])()
+            ya_lost = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if x_[0]]
+            ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])() if not x_[0]]
             # Both files are removed again: CI counts the *.img files left behind.
             ya_path = os.path.join(d, "yaffs1_folder_header_cut.img")
             ya_zip = os.path.join(d, "yaffs1_folder_header_cut.zip")
@@ -51239,20 +51273,72 @@ def self_test():
             ya_n = len(collect(ya_full, ya_full.root)) - len(collect(ya_cut, ya_cut.root))
             cond = (not getattr(ya_full, "damage", None)
                     and getattr(ya_full, "folders_not_read", None) == 0
-                    and len(ya_dmg) == 2 and ya_dmg[0].startswith("45 objects name a parent folder")
+                    and len(ya_dmg) == 3 and ya_dmg[0].startswith("45 objects name a parent folder")
+                    and ya_dmg[1].startswith("3 objects with data chunks") and len(ya_bare) == 3
                     and all(len(x_) <= 240 for x_ in ya_dmg)
                     and getattr(ya_cut, "folders_not_read", 0) == 1 and len(ya_lost) == 45
                     and ya_n >= 45
-                    and ya_rec.get("folders_not_read") == 1 and ya_rec.get("failed") == 44
-                    and ya_rec.get("damage_recorded") == 2 and len(ya_failed) == 44
+                    and ya_rec.get("folders_not_read") == 1 and ya_rec.get("failed") == 47
+                    and ya_rec.get("damage_recorded") == 3 and len(ya_failed) == 47
                     and _volumes_not_read(ya_man) == 1)
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut 4 KiB short, losing a folder's "
-                  f"header: {len(ya_lost)} objects under it are recorded and not exported "
+                  f"header: {len(ya_lost)} objects under it and {len(ya_bare)} with data and "
+                  f"no header of their own are recorded and not exported "
                   f"({len(ya_failed)} FAILED rows, one per file, folders_not_read "
                   f"{ya_rec.get('folders_not_read')}, counted as not read in full: "
                   f"{_volumes_not_read(ya_man)}); the whole image records nothing")
+
+            # The same image cut just after its first object header: nothing is
+            # listed, and the data chunks whose headers are gone are counted, so
+            # the export does not report an empty volume as read.
+            ya_first = next((i_ for i_, _d, s_ in ya_full._pages()   # pylint: disable=protected-access
+                             if (_yaffs1_tags(s_) or {"chunk": 1})["chunk"] == 0
+                             and not _yaffs1_tags(s_)["deleted"]), None)
+            cond, ya_seen = False, "no object header found in the fixture"
+            if ya_first is not None:
+                ya_short = ya_raw[:(ya_first + 1) * ya_full.page]
+                ya_cut = YaffsWalker(io.BytesIO(ya_short), 0)
+                ya_bare = [x_ for x_ in getattr(ya_cut, "unread_entries", lambda: [])()
+                           if not x_[0]]
+                ya_dmg = list(getattr(ya_cut, "damage", ()))
+                ya_have = sorted(o_ for o_, v_ in ya_cut.objs.items()
+                                 if not v_["hdr"] and v_["chunks"])
+                ya_path = os.path.join(d, "yaffs1_first_header_cut.img")
+                ya_zip = os.path.join(d, "yaffs1_first_header_cut.zip")
+                ya_man, ya_table = [], ""
+                try:
+                    with open(ya_path, "wb") as ya_fh:
+                        ya_fh.write(ya_short)
+                    with zipfile.ZipFile(ya_zip, "w") as zf, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        main(ya_path, extract=ya_zip, zf=zf, manifest=ya_man)
+                    with zipfile.ZipFile(ya_zip) as ya_zr:
+                        if "lba0.exceptions.tsv" in ya_zr.namelist():
+                            ya_table = ya_zr.read("lba0.exceptions.tsv").decode("utf-8")
+                finally:
+                    for ya_rm in (ya_path, ya_zip):
+                        if os.path.exists(ya_rm):
+                            os.remove(ya_rm)
+                ya_rec = ya_man[0] if ya_man else {}
+                ya_failed = [ln for ln in ya_table.splitlines()[1:]
+                             if ln.split("\t")[:3] == ["", "", "FAILED"]]
+                cond = (len(ya_have) > 0 and [x_[1] for x_ in ya_bare] == ya_have
+                        and len(ya_dmg) == 1 and len(ya_dmg[0]) <= 240
+                        and ya_dmg[0].startswith(f"{len(ya_have)} objects with data chunks")
+                        and not collect(ya_cut, ya_cut.root)
+                        and ya_rec.get("files") == 0 and ya_rec.get("failed") == len(ya_have)
+                        and ya_rec.get("folders_not_read") == 1
+                        and len(ya_failed) == len(ya_have) and _volumes_not_read(ya_man) == 1)
+                ya_seen = (f"{len(ya_have)} objects with data and no header, {len(ya_bare)} "
+                           f"recorded, {len(ya_failed)} FAILED rows, files exported "
+                           f"{ya_rec.get('files')}, counted as not read in full: "
+                           f"{_volumes_not_read(ya_man)}")
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] YAFFS1 cut just after its first object "
+                  f"header does not pass as an empty volume: {ya_seen}")
 
         # Deleted files, held against what each fixture's writer put in them.
         # tools/yaffs_history.c fills a file with numbered lines (text()); the
