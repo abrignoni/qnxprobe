@@ -64,6 +64,9 @@ Bytes in a stored name or a symlink target that are not UTF-8 are kept as `%XX`,
 path component at a time, so two names that differ only in such a byte stay two files.
 Before, such bytes became U+FFFD and two names like that became one. No name on the
 three volumes has such a byte, so this is proven on the self-test's synthetic image only.
+A literal `%` is not escaped, so a name stored as the text `%E9` and one stored with the
+byte 0xE9 can list alike. An extraction keeps both, one of them as `.dup-2` with a
+`RENAMED` row, and that row does not say which bytes were stored.
 
 The zlib method is read as the gzip stream `mkifs` writes with `gzopen()`
 (`mk_image_fsys.c:441`); a plain zlib stream is accepted too. Before, the gzip header
