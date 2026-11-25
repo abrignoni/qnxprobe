@@ -38056,6 +38056,8 @@ def _apfs_reader_checks():
     source = os.path.join(here, "apfs-fixture.img.gz")
     if not os.path.isfile(source):
         return [("the APFS damage checks (need the APFS fixture)", None)]
+    decmpfs_gz = os.path.join(here, "decmpfs-apfs.img.gz")
+    have_decmpfs = os.path.isfile(decmpfs_gz)
     with gzip.open(source, "rb") as handle:
         clean = handle.read()
     bs = 4096
@@ -38155,7 +38157,9 @@ def _apfs_reader_checks():
                 and body == whole[:bs] + bytes(bs) + whole[2 * bs:])
 
     def no_decmpfs():
-        with gzip.open(os.path.join(here, "decmpfs-apfs.img.gz"), "rb") as handle:
+        if not have_decmpfs:
+            return None
+        with gzip.open(decmpfs_gz, "rb") as handle:
             w = walker(handle.read())
         for _path, entry in sorted(listed(w).items()):
             oid = w._select(entry[1])                # pylint: disable=protected-access
@@ -38277,15 +38281,20 @@ def _apfs_reader_checks():
 
     work = tempfile.mkdtemp(prefix="qnxprobe-apfs-")
 
+    # the locked-volume rows and the decmpfs rows read fixtures of their own; a copy
+    # without one skips the rows that need it
+    encrypted_gz = os.path.join(here, "apfs-encrypted.sparseimage.gz")
+    have_encrypted = os.path.isfile(encrypted_gz)
+
     def encrypted_image():
-        gz = os.path.join(here, "apfs-encrypted.sparseimage.gz")
+        gz = encrypted_gz
         path = os.path.join(work, "apfs-encrypted.sparseimage")
         with gzip.open(gz, "rb") as src, open(path, "wb") as dst:
             shutil.copyfileobj(src, dst)
         return path
 
     def locked_recorded():
-        if ewfprobe is None:                         # it reads the sparse image
+        if ewfprobe is None or not have_encrypted:   # it reads the sparse image
             return None
         path = encrypted_image()
         out, manifest = os.path.join(work, "locked.zip"), []
@@ -38344,7 +38353,7 @@ def _apfs_reader_checks():
         """A volume whose file-system tree root is gone: the container's other volume still
         reads. An unusable volume map is now read around from an older checkpoint, and
         clearing every older copy of it can clear blocks the newest checkpoint reuses."""
-        if _BDE_AES is None or ewfprobe is None:
+        if _BDE_AES is None or ewfprobe is None or not have_encrypted:
             return None
         base = 20480
         with open_image(encrypted_image()) as fh:
@@ -38360,7 +38369,7 @@ def _apfs_reader_checks():
                     and any(w.volumes[0][2] in str(d) for d in w.damage))
 
     def same_names():
-        if ewfprobe is None:
+        if ewfprobe is None or not have_encrypted:
             return None
         base = 20480
         with open_image(encrypted_image()) as fh:
@@ -38430,7 +38439,7 @@ def _apfs_reader_checks():
                 and "blocks are ciphertext in" not in note and "root node fails" not in note)
 
     def zero_root_cipher():
-        if ewfprobe is None:
+        if ewfprobe is None or not have_encrypted:
             return None
         base = 20480
         with open_image(encrypted_image()) as fh:
@@ -38444,7 +38453,7 @@ def _apfs_reader_checks():
                     and "could not be read" in note and "could not be read" in hit.not_read_note)
 
     def typed_magic():
-        if ewfprobe is None:
+        if ewfprobe is None or not have_encrypted:
             return None
         base = 20480
         with open_image(encrypted_image()) as fh:
@@ -38726,7 +38735,9 @@ def _apfs_reader_checks():
         return any(r[2] == "TIME_NOT_HELD" and r[3].startswith("stored time 0 (1970-01-01") for r in rows)
 
     def dataless_note():
-        with gzip.open(os.path.join(here, "decmpfs-apfs.img.gz"), "rb") as handle:
+        if not have_decmpfs:
+            return None
+        with gzip.open(decmpfs_gz, "rb") as handle:
             image = handle.read()
 
         def with_type(kind):
